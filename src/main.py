@@ -208,8 +208,24 @@ def create_gunicorn_app():
     signal_handler = SignalHandler(signal_config, dispatcher)
     logger.info(f"Signal handler configured for {config.signal_phone_number[-4:]}")
     
+    # Start message poller as fallback for webhooks
+    # This actively polls signal-api since RECEIVE_WEBHOOK_URL is broken
+    from .signal import SignalPoller
+    
+    poller = SignalPoller(
+        api_url=config.signal_api_url,
+        phone_number=config.signal_phone_number,
+        on_message=signal_handler.handle_webhook,
+        poll_interval=1.0,  # Poll every second
+    )
+    poller.start()
+    logger.info("Message poller started (fallback for webhooks)")
+    
     # Create and return Flask app
-    return create_app(signal_handler)
+    app = create_app(signal_handler)
+    app.signal_poller = poller  # Keep reference to prevent GC
+    return app
+
 
 
 if __name__ == "__main__":
