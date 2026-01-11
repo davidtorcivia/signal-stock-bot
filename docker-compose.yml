@@ -7,7 +7,7 @@ services:
     container_name: signal-api
     restart: unless-stopped
     environment:
-      - MODE=native
+      - MODE=json-rpc
       - LOG_LEVEL=debug
     volumes:
       - ./data/signal-cli:/home/.local/share/signal-cli
