@@ -405,3 +405,157 @@ class CryptoCommand(BaseCommand):
         except ProviderError as e:
             return CommandResult.error(f"Crypto data unavailable: {e}")
 
+
+class OptionCommand(BaseCommand):
+    """Command for options quotes"""
+    name = "option"
+    aliases = ["opt", "o"]
+    description = "Get option quote"
+    usage = "!opt TSLA230120C00150000"
+    
+    def __init__(self, provider_manager: ProviderManager):
+        self.providers = provider_manager
+    
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(
+                f"Usage: {self.usage}\n"
+                "Provide the full OCC symbol (e.g. AAPL230616C00150000)"
+            )
+        
+        symbol = ctx.args[0].upper()
+        # Ensure O: prefix for Massive if using standard strings or pass as is? 
+        # Manually prepending O: if not present might be safer for MassiveProvider logic.
+        # But MassiveProvider logic tries to handle it.
+        # Let's pass as is.
+        
+        try:
+            q = await self.providers.get_option_quote(symbol)
+            
+            lines = [
+                f"🎫 {q.symbol}",
+                f"{q.type.capitalize()} on {q.underlying}",
+                f"Strike: ${q.strike:.2f} | Exp: {q.expiration.strftime('%Y-%m-%d')}",
+                "",
+                f"Price: {format_price(q.price)}",
+                f"{format_change(q.change, q.change_percent)}",
+                f"Vol: {q.volume} | OI: {q.open_interest}",
+                "",
+            ]
+            
+            if q.greeks:
+                g = q.greeks
+                lines.append(f"Delta: {g.get('delta', 'N/A')}")
+                # Add other greeks if desired
+            
+            if q.implied_volatility:
+                lines.append(f"IV: {q.implied_volatility:.2f}")
+
+            return CommandResult.ok("\n".join(lines))
+            
+        except SymbolNotFoundError:
+             return CommandResult.error(f"Option not found: {symbol}")
+        except ProviderError as e:
+            return CommandResult.error(f"Option data unavailable: {e}")
+
+
+class FuturesCommand(BaseCommand):
+    """Command for futures quotes"""
+    name = "future"
+    aliases = ["fut", "f"]
+    description = "Get futures quote"
+    usage = "!future ES"
+    
+    def __init__(self, provider_manager: ProviderManager):
+        self.providers = provider_manager
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(f"Usage: {self.usage}")
+        
+        symbol = ctx.args[0].upper()
+        
+        try:
+            q = await self.providers.get_future_quote(symbol)
+            
+            emoji = "📉"
+            sign = ""
+            if q.change >= 0:
+                emoji = "📈"
+                sign = "+"
+            
+            lines = [
+                f"🚜 {q.symbol}",
+                f"{emoji} {format_price(q.price)}",
+                f"{sign}{q.change:.2f} ({sign}{q.change_percent:.2f}%)",
+                f"Vol: {format_number(q.volume)}"
+            ]
+            return CommandResult.ok("\n".join(lines))
+        except SymbolNotFoundError:
+             return CommandResult.error(f"Future not found: {symbol}")
+        except ProviderError as e:
+             return CommandResult.error(f"Futures data unavailable: {e}")
+
+
+class ForexCommand(BaseCommand):
+    """Command for forex rates"""
+    name = "forex"
+    aliases = ["fx", "curr"]
+    description = "Get forex rate"
+    usage = "!fx EUR/USD"
+    
+    def __init__(self, provider_manager: ProviderManager):
+        self.providers = provider_manager
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(f"Usage: {self.usage}")
+        
+        symbol = ctx.args[0].upper()
+        
+        try:
+            q = await self.providers.get_forex_quote(symbol)
+            
+            lines = [
+                f"💱 {q.symbol}",
+                f"{format_price(q.rate)}",
+                f"{format_change(q.change, q.change_percent)}"
+            ]
+            return CommandResult.ok("\n".join(lines))
+        except SymbolNotFoundError:
+             return CommandResult.error(f"Pair not found: {symbol}")
+        except ProviderError as e:
+             return CommandResult.error(f"Forex data unavailable: {e}")
+
+
+class EconomyCommand(BaseCommand):
+    """Command for economic indicators"""
+    name = "economy"
+    aliases = ["eco", "macro"]
+    description = "Get economic data"
+    usage = "!eco CPI"
+    
+    def __init__(self, provider_manager: ProviderManager):
+        self.providers = provider_manager
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(f"Usage: {self.usage}")
+        
+        indicator = ctx.args[0].upper()
+        
+        try:
+            data = await self.providers.get_economy_data(indicator)
+            
+            lines = [
+                f"🏦 {data.name}",
+                f"Value: {data.value}{data.unit}",
+                f"Date: {data.date.strftime('%Y-%m-%d')}"
+            ]
+            if data.previous:
+                 lines.append(f"Prev: {data.previous}{data.unit}")
+            
+            return CommandResult.ok("\n".join(lines))
+        except ProviderError as e:
+             return CommandResult.error(f"Economy data unavailable: {e}")
+

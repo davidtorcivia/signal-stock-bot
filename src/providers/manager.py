@@ -16,6 +16,10 @@ from .base import (
     Quote,
     HistoricalBar,
     Fundamentals,
+    OptionQuote,
+    ForexQuote,
+    FuturesQuote,
+    EconomyIndicator,
     ProviderCapability,
     ProviderError,
     RateLimitError,
@@ -249,6 +253,78 @@ class ProviderManager:
                 last_error = e
         
         raise last_error or ProviderError("All providers failed")
+
+    async def get_option_quote(self, symbol: str) -> OptionQuote:
+        """Get option quote with fallback"""
+        providers = self._get_available_providers(ProviderCapability.OPTIONS)
+        if not providers:
+             raise ProviderError("No providers available for options")
+        
+        last_error = None
+        for provider in providers:
+            try:
+                return await provider.get_option_quote(symbol)
+            except RateLimitError as e:
+                self._mark_rate_limited(provider, e.retry_after or 60)
+                last_error = e
+            except Exception as e:
+                logger.warning(f"Error fetching option quote from {provider.name}: {e}")
+                last_error = e
+        raise last_error or ProviderError("All providers failed to return option quote")
+
+    async def get_forex_quote(self, symbol: str) -> ForexQuote:
+        """Get forex quote with fallback"""
+        providers = self._get_available_providers(ProviderCapability.FOREX)
+        if not providers:
+             raise ProviderError("No providers available for forex")
+        
+        last_error = None
+        for provider in providers:
+            try:
+                return await provider.get_forex_quote(symbol)
+            except RateLimitError as e:
+                 self._mark_rate_limited(provider, e.retry_after or 60)
+                 last_error = e
+            except Exception as e:
+                logger.warning(f"Error fetching forex quote from {provider.name}: {e}")
+                last_error = e
+        raise last_error or ProviderError("All providers failed to return forex quote")
+
+    async def get_future_quote(self, symbol: str) -> FuturesQuote:
+        """Get futures quote with fallback"""
+        providers = self._get_available_providers(ProviderCapability.FUTURES)
+        if not providers:
+             raise ProviderError("No providers available for futures")
+        
+        last_error = None
+        for provider in providers:
+            try:
+                return await provider.get_future_quote(symbol)
+            except RateLimitError as e:
+                 self._mark_rate_limited(provider, e.retry_after or 60)
+                 last_error = e
+            except Exception as e:
+                logger.warning(f"Error fetching futures quote from {provider.name}: {e}")
+                last_error = e
+        raise last_error or ProviderError("All providers failed to return futures quote")
+
+    async def get_economy_data(self, indicator: str) -> EconomyIndicator:
+        """Get economic data with fallback"""
+        providers = self._get_available_providers(ProviderCapability.ECONOMY)
+        if not providers:
+             raise ProviderError("No providers available for economy data")
+        
+        last_error = None
+        for provider in providers:
+            try:
+                return await provider.get_economy_data(indicator)
+            except RateLimitError as e:
+                 self._mark_rate_limited(provider, e.retry_after or 60)
+                 last_error = e
+            except Exception as e:
+                logger.warning(f"Error fetching economy data from {provider.name}: {e}")
+                last_error = e
+        raise last_error or ProviderError("All providers failed to return economy data")
     
     async def health_check(self) -> dict[str, bool]:
         """Check health of all providers"""

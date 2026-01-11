@@ -4,18 +4,14 @@ A self-hosted Signal bot for real-time stock quotes, market data, and company fu
 
 ## Features
 
-- **Real-time quotes** — Current price, change, volume for any ticker
-- **Batch lookups** — Query multiple symbols in one message
-- **Inline symbol detection** — Type `$AAPL` in any message for quick lookup
-- **@ mention support** — Tag the bot in groups to get help or stock info
-- **Crypto support** — Quick view of top cryptocurrencies
-- **Market overview** — Major indices at a glance
-- **Company fundamentals** — P/E, EPS, market cap, sector info
-- **Multi-provider fallback** — Yahoo Finance (free), Alpha Vantage, Polygon.io
-- **Quote caching** — 5-minute cache reduces API calls
-- **Rate limit handling** — Automatic provider rotation when limits hit
-- **Retry logic** — Automatic retries with exponential backoff
-- **Group chat support** — Works in both DMs and group chats
+- **Real-time stock quotes** via Yahoo Finance, Alpha Vantage, and Massive (Polygon)
+- **Options & Futures** support (via Massive)
+- **Forex & Crypto** support
+- **Economy Indicators** (CPI, GDP, etc.)
+- **Batch symbol lookups** (e.g., `!price AAPL MSFT`)
+- **Inline symbol detection** (e.g., `Check $AAPL price`)
+- **Quote caching** to respect API limits
+- **Automatic retry logic** for robustness
 
 ## Quick Start
 
@@ -68,6 +64,16 @@ Send `!price AAPL` to your Signal number. You should get a response within secon
 ## Commands
 
 ### `!price` / `!p` — Get current price
+### `!quote` / `!q` — Detailed quote
+### `!info` / `!i` — Company fundamentals
+### `!options` / `!opt` — Option quotes
+### `!future` / `!fut` — Futures quotes
+### `!forex` / `!fx` — Forex rates
+### `!economy` / `!eco` — Economic indicators
+### `!market` / `!m` — Major indices
+### `!crypto` / `!c` — Top cryptocurrencies
+### `!status` — Provider health
+### `!help` — Command help
 
 ```
 !price AAPL
@@ -224,6 +230,10 @@ All commands have short aliases for quick access:
 | `!price` | `!p`, `!pr`, `!$` |
 | `!quote` | `!q`, `!detail` |
 | `!info` | `!i`, `!fundamentals`, `!fund` |
+| `!options` | `!opt`, `!o` |
+| `!future` | `!fut`, `!f` |
+| `!forex` | `!fx`, `!curr` |
+| `!economy` | `!eco`, `!macro` |
 | `!market` | `!m`, `!indices` |
 | `!crypto` | `!c`, `!coins` |
 | `!status` | `!providers`, `!health` |

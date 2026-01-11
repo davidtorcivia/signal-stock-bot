@@ -10,6 +10,10 @@ from .stock_commands import (
     HelpCommand,
     StatusCommand,
     CryptoCommand,
+    OptionCommand,
+    ForexCommand,
+    FuturesCommand,
+    EconomyCommand,
 )
 
 __all__ = [
@@ -24,5 +28,9 @@ __all__ = [
     "HelpCommand",
     "StatusCommand",
     "CryptoCommand",
+    "OptionCommand",
+    "ForexCommand",
+    "FuturesCommand",
+    "EconomyCommand",
 ]
 

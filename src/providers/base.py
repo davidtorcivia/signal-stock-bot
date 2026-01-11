@@ -20,6 +20,9 @@ class ProviderCapability(Enum):
     HISTORICAL = "historical"
     FUNDAMENTALS = "fundamentals"
     OPTIONS = "options"
+    FUTURES = "futures"
+    FOREX = "forex"
+    ECONOMY = "economy"
     NEWS = "news"
     CRYPTO = "crypto"
 
@@ -71,6 +74,64 @@ class Fundamentals:
     provider: str
 
 
+@dataclass
+class OptionQuote:
+    """Quote for an options contract"""
+    symbol: str  # Contract symbol (e.g. O:TSLA230120C00150000)
+    underlying: str
+    expiration: datetime
+    strike: float
+    type: str  # "call" or "put"
+    price: float
+    change: float
+    change_percent: float
+    volume: int
+    open_interest: int
+    implied_volatility: Optional[float]
+    greeks: Optional[dict[str, float]]
+    timestamp: datetime
+    provider: str
+
+
+@dataclass
+class ForexQuote:
+    """Quote for a forex pair"""
+    symbol: str  # e.g. EUR/USD
+    rate: float
+    change: float
+    change_percent: float
+    timestamp: datetime
+    provider: str
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+
+
+@dataclass
+class FuturesQuote:
+    """Quote for a futures contract"""
+    symbol: str
+    price: float
+    change: float
+    change_percent: float
+    volume: int
+    open_interest: int
+    expiration: Optional[datetime]
+    timestamp: datetime
+    provider: str
+
+
+@dataclass
+class EconomyIndicator:
+    """Economic indicator data"""
+    name: str  # e.g. CPI, GDP
+    value: float
+    unit: str
+    date: datetime  # Date of the value
+    period: str  # "monthly", "quarterly", etc.
+    provider: str
+    previous: Optional[float] = None  # Previous period value
+
+
 class ProviderError(Exception):
     """Base exception for provider errors"""
     pass
@@ -100,6 +161,10 @@ class BaseProvider(ABC):
     Optional overrides:
     - get_historical()
     - get_fundamentals()
+    - get_option_quote()
+    - get_forex_quote()
+    - get_future_quote()
+    - get_economy_data()
     """
     
     name: str
@@ -127,6 +192,22 @@ class BaseProvider(ABC):
     async def get_fundamentals(self, symbol: str) -> Fundamentals:
         """Get fundamental data. Override if supported."""
         raise NotImplementedError(f"{self.name} doesn't support fundamentals")
+
+    async def get_option_quote(self, symbol: str) -> OptionQuote:
+        """Get option quote. Override if supported."""
+        raise NotImplementedError(f"{self.name} doesn't support options")
+
+    async def get_forex_quote(self, symbol: str) -> ForexQuote:
+        """Get forex quote. Override if supported."""
+        raise NotImplementedError(f"{self.name} doesn't support forex")
+
+    async def get_future_quote(self, symbol: str) -> FuturesQuote:
+        """Get futures quote. Override if supported."""
+        raise NotImplementedError(f"{self.name} doesn't support futures")
+    
+    async def get_economy_data(self, indicator: str) -> EconomyIndicator:
+        """Get economic data. Override if supported."""
+        raise NotImplementedError(f"{self.name} doesn't support economy data")
     
     @abstractmethod
     async def health_check(self) -> bool:

@@ -19,7 +19,7 @@ import sys
 import os
 
 from .config import Config
-from .providers import ProviderManager, YahooFinanceProvider, AlphaVantageProvider
+from .providers import ProviderManager, YahooFinanceProvider, AlphaVantageProvider, MassiveProvider
 from .commands import (
     CommandDispatcher,
     PriceCommand,
@@ -29,6 +29,10 @@ from .commands import (
     HelpCommand,
     StatusCommand,
     CryptoCommand,
+    OptionCommand,
+    ForexCommand,
+    FuturesCommand,
+    EconomyCommand,
 )
 from .signal import SignalHandler, SignalConfig
 from .server import create_app
@@ -72,9 +76,11 @@ def create_provider_manager(config: Config) -> ProviderManager:
             else:
                 logging.warning("Alpha Vantage configured but no API key provided")
         
-        # Add more providers here as needed
-        # elif provider_config.name == "polygon":
-        #     manager.add_provider(PolygonProvider(provider_config.api_key))
+        elif provider_config.name == "massive":
+            if provider_config.api_key:
+                manager.add_provider(MassiveProvider(provider_config.api_key))
+            else:
+                logging.warning("Massive configured but no API key provided")
     
     if not manager.providers:
         logging.warning("No providers configured! Adding Yahoo Finance as fallback.")
@@ -94,6 +100,10 @@ def create_dispatcher(provider_manager: ProviderManager, prefix: str) -> Command
     market_cmd = MarketCommand(provider_manager)
     status_cmd = StatusCommand(provider_manager)
     crypto_cmd = CryptoCommand(provider_manager)
+    opt_cmd = OptionCommand(provider_manager)
+    fx_cmd = ForexCommand(provider_manager)
+    fut_cmd = FuturesCommand(provider_manager)
+    eco_cmd = EconomyCommand(provider_manager)
     
     # Register commands
     dispatcher.register(price_cmd)
@@ -102,9 +112,16 @@ def create_dispatcher(provider_manager: ProviderManager, prefix: str) -> Command
     dispatcher.register(market_cmd)
     dispatcher.register(status_cmd)
     dispatcher.register(crypto_cmd)
+    dispatcher.register(opt_cmd)
+    dispatcher.register(fx_cmd)
+    dispatcher.register(fut_cmd)
+    dispatcher.register(eco_cmd)
     
     # Help command needs list of all other commands
-    help_cmd = HelpCommand([price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd])
+    help_cmd = HelpCommand([
+        price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd,
+        opt_cmd, fx_cmd, fut_cmd, eco_cmd
+    ])
     dispatcher.register(help_cmd)
     
     return dispatcher
