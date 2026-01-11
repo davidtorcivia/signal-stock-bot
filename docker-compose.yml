@@ -8,9 +8,9 @@ services:
     restart: unless-stopped
     environment:
       - MODE=json-rpc
-      - MODE=json-rpc
+      - LOG_LEVEL=debug
       # Send messages to stock-bot webhook
-      - WEBHOOK_URL=http://stock-bot:5000/webhook
+      - RECEIVE_WEBHOOK_URL=http://stock-bot:5000/webhook
     volumes:
       - ./data/signal-cli:/home/.local/share/signal-cli
     dns:
