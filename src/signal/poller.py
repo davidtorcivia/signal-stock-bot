@@ -102,6 +102,19 @@ class SignalPoller:
         logger.info("Connected to signal-cli JSON-RPC socket")
         
         try:
+            # Send subscribeReceive request to start receiving messages
+            # This tells signal-cli to push incoming messages to this connection
+            subscribe_request = {
+                "jsonrpc": "2.0",
+                "method": "subscribeReceive",
+                "params": {"account": self.phone_number},
+                "id": 1
+            }
+            request_line = json.dumps(subscribe_request) + "\n"
+            writer.write(request_line.encode("utf-8"))
+            await writer.drain()
+            logger.info(f"Sent subscribeReceive request for {self.phone_number[-4:]}")
+            
             buffer = ""
             while self._running:
                 # Read data with timeout
