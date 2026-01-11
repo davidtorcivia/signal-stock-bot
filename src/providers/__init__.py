@@ -13,6 +13,7 @@ from .base import (
 from .manager import ProviderManager
 from .yahoo import YahooFinanceProvider
 from .alphavantage import AlphaVantageProvider
+from .massive import MassiveProvider
 
 __all__ = [
     "BaseProvider",
@@ -26,4 +27,5 @@ __all__ = [
     "ProviderManager",
     "YahooFinanceProvider",
     "AlphaVantageProvider",
+    "MassiveProvider",
 ]
