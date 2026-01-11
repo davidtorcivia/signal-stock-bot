@@ -1,0 +1,1 @@
+"""Signal Stock Bot package."""

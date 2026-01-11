@@ -1,0 +1,199 @@
+"""
+Signal Stock Bot - Main entry point.
+
+Usage:
+    python -m src.main
+
+Environment variables:
+    SIGNAL_API_URL - URL of signal-cli-rest-api (default: http://localhost:8080)
+    SIGNAL_PHONE_NUMBER - Bot's phone number (required)
+    COMMAND_PREFIX - Command prefix (default: !)
+    LOG_LEVEL - Logging level (default: INFO)
+    
+    ALPHAVANTAGE_API_KEY - Alpha Vantage API key (optional)
+    POLYGON_API_KEY - Polygon API key (optional)
+"""
+
+import logging
+import sys
+import os
+
+from .config import Config
+from .providers import ProviderManager, YahooFinanceProvider, AlphaVantageProvider
+from .commands import (
+    CommandDispatcher,
+    PriceCommand,
+    QuoteCommand,
+    FundamentalsCommand,
+    MarketCommand,
+    HelpCommand,
+    StatusCommand,
+    CryptoCommand,
+)
+from .signal import SignalHandler, SignalConfig
+from .server import create_app
+
+
+def setup_logging(level: str):
+    """Configure logging for the application"""
+    
+    # Create logs directory if it doesn't exist
+    os.makedirs("logs", exist_ok=True)
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("logs/bot.log"),
+        ]
+    )
+    
+    # Reduce noise from libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+
+def create_provider_manager(config: Config) -> ProviderManager:
+    """Create and configure provider manager"""
+    manager = ProviderManager()
+    
+    for provider_config in config.providers:
+        if not provider_config.enabled:
+            continue
+        
+        if provider_config.name == "yahoo":
+            manager.add_provider(YahooFinanceProvider())
+            
+        elif provider_config.name == "alphavantage":
+            if provider_config.api_key:
+                manager.add_provider(AlphaVantageProvider(provider_config.api_key))
+            else:
+                logging.warning("Alpha Vantage configured but no API key provided")
+        
+        # Add more providers here as needed
+        # elif provider_config.name == "polygon":
+        #     manager.add_provider(PolygonProvider(provider_config.api_key))
+    
+    if not manager.providers:
+        logging.warning("No providers configured! Adding Yahoo Finance as fallback.")
+        manager.add_provider(YahooFinanceProvider())
+    
+    return manager
+
+
+def create_dispatcher(provider_manager: ProviderManager, prefix: str) -> CommandDispatcher:
+    """Create and configure command dispatcher"""
+    dispatcher = CommandDispatcher(prefix=prefix)
+    
+    # Create commands
+    price_cmd = PriceCommand(provider_manager)
+    quote_cmd = QuoteCommand(provider_manager)
+    info_cmd = FundamentalsCommand(provider_manager)
+    market_cmd = MarketCommand(provider_manager)
+    status_cmd = StatusCommand(provider_manager)
+    crypto_cmd = CryptoCommand(provider_manager)
+    
+    # Register commands
+    dispatcher.register(price_cmd)
+    dispatcher.register(quote_cmd)
+    dispatcher.register(info_cmd)
+    dispatcher.register(market_cmd)
+    dispatcher.register(status_cmd)
+    dispatcher.register(crypto_cmd)
+    
+    # Help command needs list of all other commands
+    help_cmd = HelpCommand([price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd])
+    dispatcher.register(help_cmd)
+    
+    return dispatcher
+
+
+def main():
+    """Main entry point"""
+    
+    # Load configuration
+    config = Config.from_env()
+    
+    # Setup logging
+    setup_logging(config.log_level)
+    logger = logging.getLogger(__name__)
+    
+    logger.info("Starting Signal Stock Bot")
+    
+    # Validate configuration
+    errors = config.validate()
+    if errors:
+        for error in errors:
+            logger.error(f"Configuration error: {error}")
+        sys.exit(1)
+    
+    # Set up providers
+    provider_manager = create_provider_manager(config)
+    logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
+    
+    # Set up commands
+    dispatcher = create_dispatcher(provider_manager, config.command_prefix)
+    logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
+    
+    # Set up Signal handler
+    signal_config = SignalConfig(
+        api_url=config.signal_api_url,
+        phone_number=config.signal_phone_number,
+    )
+    signal_handler = SignalHandler(signal_config, dispatcher)
+    logger.info(f"Signal handler configured for {config.signal_phone_number[-4:]}")
+    
+    # Create and run Flask app
+    app = create_app(signal_handler)
+    
+    logger.info(f"Starting webhook server on {config.host}:{config.port}")
+    app.run(
+        host=config.host,
+        port=config.port,
+        debug=config.log_level.upper() == "DEBUG",
+    )
+
+
+def create_gunicorn_app():
+    """
+    Factory function for gunicorn to create the Flask app.
+    
+    Called by gunicorn with: gunicorn src.main:create_gunicorn_app
+    """
+    config = Config.from_env()
+    setup_logging(config.log_level)
+    
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Signal Stock Bot (gunicorn)")
+    
+    # Validate configuration
+    errors = config.validate()
+    if errors:
+        for error in errors:
+            logger.error(f"Configuration error: {error}")
+        raise RuntimeError(f"Configuration errors: {errors}")
+    
+    # Set up providers
+    provider_manager = create_provider_manager(config)
+    logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
+    
+    # Set up commands
+    dispatcher = create_dispatcher(provider_manager, config.command_prefix)
+    logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
+    
+    # Set up Signal handler
+    signal_config = SignalConfig(
+        api_url=config.signal_api_url,
+        phone_number=config.signal_phone_number,
+    )
+    signal_handler = SignalHandler(signal_config, dispatcher)
+    logger.info(f"Signal handler configured for {config.signal_phone_number[-4:]}")
+    
+    # Create and return Flask app
+    return create_app(signal_handler)
+
+
+if __name__ == "__main__":
+    main()

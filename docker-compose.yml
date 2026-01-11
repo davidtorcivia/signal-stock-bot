@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  # Signal CLI REST API - handles Signal protocol
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signal-api
+    restart: unless-stopped
+    environment:
+      - MODE=json-rpc
+      - AUTO_RECEIVE_SCHEDULE=0 */5 * * * *
+      # Send messages to stock-bot webhook
+      - WEBHOOK_URL=http://stock-bot:5000/webhook
+    volumes:
+      - ./data/signal-cli:/home/.local/share/signal-cli
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Stock Bot - processes commands and fetches data
+  stock-bot:
+    build: .
+    container_name: stock-bot
+    restart: unless-stopped
+    depends_on:
+      signal-api:
+        condition: service_healthy
+    environment:
+      - SIGNAL_API_URL=http://signal-api:8080
+      - SIGNAL_PHONE_NUMBER=${SIGNAL_PHONE_NUMBER}
+      - COMMAND_PREFIX=${COMMAND_PREFIX:-!}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY:-}
+      - POLYGON_API_KEY=${POLYGON_API_KEY:-}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  bot-network:
+    driver: bridge

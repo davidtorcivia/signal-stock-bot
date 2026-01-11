@@ -1,0 +1,11 @@
+# Core dependencies
+flask>=3.0
+aiohttp>=3.9
+yfinance>=0.2.40
+pyyaml>=6.0
+
+# Production server
+gunicorn>=21.0
+
+# For development
+python-dotenv>=1.0
