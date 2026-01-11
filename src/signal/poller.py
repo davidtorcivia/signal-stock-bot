@@ -1,28 +1,27 @@
 """
-JSON-RPC socket listener for signal-cli daemon.
+Message poller for signal-cli-rest-api in native mode.
 
-Connects directly to signal-cli's JSON-RPC socket to receive messages
-in real-time. This bypasses the broken webhook mechanism in signal-cli-rest-api.
+Polls the /v1/receive endpoint to fetch incoming messages
+and forwards them to the message handler.
 """
 
 import asyncio
-import json
 import logging
-import socket
 import threading
-import time
 from typing import Callable, Optional
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
 class SignalPoller:
     """
-    Connects to signal-cli's JSON-RPC socket and listens for incoming messages.
+    Polls signal-cli-rest-api for incoming messages.
     
-    In json-rpc mode, signal-cli runs as a daemon and exposes a JSON-RPC
-    interface on TCP port 6001. This class connects to that socket and
-    forwards received messages to the handler.
+    In native mode, the /v1/receive/<number> endpoint returns
+    any pending messages. This class polls that endpoint and
+    forwards messages to the handler.
     """
     
     def __init__(
@@ -30,150 +29,114 @@ class SignalPoller:
         api_url: str,
         phone_number: str,
         on_message: Callable[[dict], None],
-        poll_interval: float = 1.0,
-        jsonrpc_port: int = 6001,
+        poll_interval: float = 2.0,
+        jsonrpc_port: int = 6001,  # Unused in native mode, kept for compatibility
     ):
         """
-        Initialize the listener.
+        Initialize the poller.
         
         Args:
-            api_url: Base URL of signal-cli-rest-api (used to extract host)
-            phone_number: Bot's phone number for filtering messages
+            api_url: Base URL of signal-cli-rest-api (e.g., http://signal-api:8080)
+            phone_number: Bot's phone number for receiving messages
             on_message: Async callback function to handle incoming messages
-            poll_interval: Reconnect delay on failure
-            jsonrpc_port: TCP port for JSON-RPC socket (default 6001)
+            poll_interval: Seconds between poll attempts
         """
-        # Extract host from URL (e.g., "http://signal-api:8080" -> "signal-api")
-        self.host = api_url.replace("http://", "").replace("https://", "").split(":")[0]
+        self.api_url = api_url.rstrip("/")
         self.phone_number = phone_number
         self.on_message = on_message
         self.poll_interval = poll_interval
-        self.jsonrpc_port = jsonrpc_port
         self._running = False
         self._thread: Optional[threading.Thread] = None
     
     def start(self):
-        """Start the listener in a background thread."""
+        """Start the poller in a background thread."""
         if self._running:
-            logger.warning("Listener already running")
+            logger.warning("Poller already running")
             return
         
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info(f"Signal listener started (connecting to {self.host}:{self.jsonrpc_port})")
+        logger.info(f"Signal poller started (interval: {self.poll_interval}s)")
     
     def stop(self):
-        """Stop the listener."""
+        """Stop the poller."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
-        logger.info("Signal listener stopped")
+        logger.info("Signal poller stopped")
     
     def _run_loop(self):
         """Run the async event loop in the background thread."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._listen_loop())
+            loop.run_until_complete(self._poll_loop())
         except Exception as e:
-            logger.error(f"Listener loop error: {e}")
+            logger.error(f"Poller loop error: {e}")
         finally:
             loop.close()
     
-    async def _listen_loop(self):
-        """Main listening loop with reconnection logic."""
-        while self._running:
-            try:
-                await self._connect_and_listen()
-            except ConnectionRefusedError:
-                logger.debug(f"Connection refused to {self.host}:{self.jsonrpc_port}, retrying...")
-            except Exception as e:
-                logger.error(f"Socket error: {e}")
-            
-            if self._running:
+    async def _poll_loop(self):
+        """Main polling loop."""
+        # URL encode the phone number (+ becomes %2B)
+        encoded_number = self.phone_number.replace("+", "%2B")
+        receive_url = f"{self.api_url}/v1/receive/{encoded_number}"
+        
+        logger.info(f"Polling endpoint: {receive_url}")
+        
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while self._running:
+                try:
+                    await self._poll_once(session, receive_url)
+                except aiohttp.ClientError as e:
+                    logger.debug(f"Poll request failed: {e}")
+                except Exception as e:
+                    logger.error(f"Poll error: {e}")
+                
                 await asyncio.sleep(self.poll_interval)
     
-    async def _connect_and_listen(self):
-        """Connect to JSON-RPC socket and process events."""
-        logger.info(f"Connecting to JSON-RPC socket at {self.host}:{self.jsonrpc_port}")
-        
-        reader, writer = await asyncio.open_connection(self.host, self.jsonrpc_port)
-        logger.info("Connected to signal-cli JSON-RPC socket")
-        
-        try:
-            # Send subscribeReceive request to start receiving messages
-            # This tells signal-cli to push incoming messages to this connection
-            subscribe_request = {
-                "jsonrpc": "2.0",
-                "method": "subscribeReceive",
-                "params": {"account": self.phone_number},
-                "id": 1
-            }
-            request_line = json.dumps(subscribe_request) + "\n"
-            writer.write(request_line.encode("utf-8"))
-            await writer.drain()
-            logger.info(f"Sent subscribeReceive request for {self.phone_number[-4:]}")
-            
-            buffer = ""
-            while self._running:
-                # Read data with timeout
-                try:
-                    data = await asyncio.wait_for(reader.read(4096), timeout=30.0)
-                except asyncio.TimeoutError:
-                    # Send keepalive / check connection
-                    continue
+    async def _poll_once(self, session: aiohttp.ClientSession, url: str):
+        """Perform a single poll request."""
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                messages = await resp.json()
                 
-                if not data:
-                    logger.warning("Socket closed by server")
-                    break
-                
-                buffer += data.decode("utf-8")
-                
-                # Process complete JSON objects (newline-delimited)
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
+                if messages:
+                    logger.info(f"Received {len(messages)} message(s) via polling")
                     
-                    try:
-                        msg = json.loads(line)
-                        await self._handle_message(msg)
-                    except json.JSONDecodeError as e:
-                        logger.debug(f"Failed to parse JSON: {e}")
-        finally:
-            writer.close()
-            await writer.wait_closed()
+                    for msg in messages:
+                        try:
+                            # Convert to webhook format
+                            webhook_data = self._convert_to_webhook_format(msg)
+                            if webhook_data:
+                                await self.on_message(webhook_data)
+                        except Exception as e:
+                            logger.error(f"Error processing polled message: {e}")
+            
+            elif resp.status == 204:
+                # No new messages - this is normal
+                pass
+            else:
+                text = await resp.text()
+                logger.warning(f"Poll returned {resp.status}: {text[:200]}")
     
-    async def _handle_message(self, msg: dict):
-        """Handle a JSON-RPC message from signal-cli."""
-        # JSON-RPC notification format: {"jsonrpc": "2.0", "method": "receive", "params": {...}}
-        method = msg.get("method")
+    def _convert_to_webhook_format(self, msg: dict) -> Optional[dict]:
+        """
+        Convert signal-cli receive format to webhook envelope format.
         
-        if method == "receive":
-            params = msg.get("params", {})
-            envelope = params.get("envelope", {})
-            account = params.get("account", "")
-            
-            # Check if this message is for our account
-            if account and account != self.phone_number:
-                logger.debug(f"Ignoring message for account {account[-4:]}")
-                return
-            
-            # Convert to webhook format and forward
-            webhook_data = {"envelope": envelope}
-            
-            data_msg = envelope.get("dataMessage", {})
-            text = data_msg.get("message", "")
-            source = envelope.get("source", "")[-4:]
-            
-            logger.info(f"Received message from ...{source}: {text[:50]}")
-            
-            try:
-                await self.on_message(webhook_data)
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
+        The receive endpoint returns messages in a slightly different format
+        than webhooks. This normalizes them.
+        """
+        # Already in envelope format
+        if "envelope" in msg:
+            return msg
         
-        elif method:
-            logger.debug(f"Ignoring JSON-RPC method: {method}")
+        # Raw message format - wrap in envelope
+        if "source" in msg or "sourceNumber" in msg:
+            return {"envelope": msg}
+        
+        # Unknown format - log and return as-is wrapped
+        logger.debug(f"Unknown message format, wrapping: {list(msg.keys())}")
+        return {"envelope": msg}
