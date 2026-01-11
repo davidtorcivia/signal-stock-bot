@@ -28,7 +28,7 @@ A self-hosted Signal bot for real-time stock quotes, market data, and company fu
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/youruser/signal-stock-bot.git
+git clone https://github.com/davidtorcivia/signal-stock-bot.git
 cd signal-stock-bot
 
 # Create environment file
