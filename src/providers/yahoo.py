@@ -12,6 +12,12 @@ from datetime import datetime
 
 import yfinance as yf
 
+# Set yfinance cache path to avoid permission errors in Docker
+try:
+    yf.set_tz_cache_location("/tmp/yfinance-cache")
+except Exception:
+    pass  # Ignore if it fails
+
 from .base import (
     BaseProvider,
     Quote,

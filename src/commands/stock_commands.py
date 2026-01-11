@@ -3,10 +3,77 @@ Stock-related command implementations.
 """
 
 import re
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from .base import BaseCommand, CommandContext, CommandResult
 from ..providers import ProviderManager, SymbolNotFoundError, ProviderError
+
+
+# Eastern Time zone for US market hours
+ET = ZoneInfo("America/New_York")
+
+
+class Symbols:
+    """
+    Unicode symbols for polished output.
+    
+    Options for esoteric unicode instead of emojis:
+    
+    ARROWS:
+        ▲ ▼  (triangles - clean, minimal)
+        △ ▽  (outline triangles)
+        ↑ ↓  (simple arrows)
+        ⬆ ⬇  (bold arrows)
+        ⇧ ⇩  (shift-style arrows)
+        
+    INDICATORS:
+        ● ○  (filled/empty circles)
+        ◆ ◇  (diamonds)
+        ■ □  (squares)
+        ★ ☆  (stars)
+        
+    CURRENCY:
+        ◈ ◉  (fancy circles)
+        ❖ ✦  (decorative)
+        ⬢ ⬡  (hexagons)
+        
+    CURRENT SELECTION (esoteric unicode):
+    """
+    # Price/Value indicators
+    PRICE = "◈"      # Diamond in circle - for price
+    UP = "▲"         # Up triangle - for positive change
+    DOWN = "▼"       # Down triangle - for negative change
+    NEUTRAL = "◆"    # Diamond - for no change
+    
+    # Status indicators
+    VOLUME = "⊡"     # Squared plus - for volume
+    TIME = "◷"       # Clock face - for timestamp
+    BULL = "●"       # Filled circle - bullish/positive
+    BEAR = "○"       # Empty circle - bearish/negative
+    
+    # Multi-quote indicators
+    GREEN = "▲"      # Up - for positive
+    RED = "▼"        # Down - for negative  
+    GRAY = "◇"       # Diamond outline - for not found
+    
+    # Separators
+    DOT = "·"        # Middle dot separator
+    DASH = "─"       # Horizontal line
+
+
+def get_timestamp() -> str:
+    """Get current timestamp in ET timezone with market-appropriate format."""
+    now = datetime.now(ET)
+    # Format: "3:45 PM ET" or "10:30 AM ET"
+    return now.strftime("%-I:%M %p ET").replace(" 0", " ")
+
+
+def format_timestamp() -> str:
+    """Get formatted timestamp line for responses."""
+    return f"{Symbols.TIME} as of {get_timestamp()}"
+
 
 # Valid symbol pattern: alphanumeric, dots, hyphens, carets (for indices)
 # Examples: AAPL, BRK.B, BTC-USD, ^GSPC
@@ -52,8 +119,8 @@ def format_number(n: Optional[float | int], prefix: str = "") -> str:
 
 
 def format_change(change: float, pct: float) -> str:
-    """Format price change with emoji indicator"""
-    arrow = "📈" if change >= 0 else "📉"
+    """Format price change with unicode indicator"""
+    arrow = Symbols.UP if change >= 0 else Symbols.DOWN
     sign = "+" if change >= 0 else ""
     return f"{arrow} {sign}{change:.2f} ({sign}{pct:.2f}%)"
 
@@ -107,9 +174,10 @@ class PriceCommand(BaseCommand):
                 
                 return CommandResult.ok(
                     f"{name_display}\n"
-                    f"💵 {format_price(quote.price)}\n"
+                    f"{Symbols.PRICE} {format_price(quote.price)}\n"
                     f"{format_change(quote.change, quote.change_percent)}\n"
-                    f"📊 Vol: {format_number(quote.volume)}"
+                    f"{Symbols.VOLUME} Vol: {format_number(quote.volume)}\n"
+                    f"{format_timestamp()}"
                 )
             else:
                 quotes = await self.providers.get_quotes(symbols)
@@ -121,14 +189,15 @@ class PriceCommand(BaseCommand):
                     if symbol in quotes:
                         q = quotes[symbol]
                         sign = "+" if q.change >= 0 else ""
-                        emoji = "🟢" if q.change >= 0 else "🔴"
+                        indicator = Symbols.GREEN if q.change >= 0 else Symbols.RED
                         lines.append(
-                            f"{emoji} {q.symbol}: {format_price(q.price)} "
+                            f"{indicator} {q.symbol}: {format_price(q.price)} "
                             f"({sign}{q.change_percent:.2f}%)"
                         )
                     else:
-                        lines.append(f"⚪ {symbol}: Not found")
+                        lines.append(f"{Symbols.GRAY} {symbol}: Not found")
                 
+                lines.append(f"\n{format_timestamp()}")
                 return CommandResult.ok("\n".join(lines))
                 
         except SymbolNotFoundError:

@@ -76,11 +76,11 @@ def create_provider_manager(config: Config) -> ProviderManager:
             else:
                 logging.warning("Alpha Vantage configured but no API key provided")
         
-        elif provider_config.name == "massive":
+        elif provider_config.name in ("massive", "polygon"):
             if provider_config.api_key:
                 manager.add_provider(MassiveProvider(provider_config.api_key))
             else:
-                logging.warning("Massive configured but no API key provided")
+                logging.warning("Massive/Polygon configured but no API key provided")
     
     if not manager.providers:
         logging.warning("No providers configured! Adding Yahoo Finance as fallback.")
