@@ -66,7 +66,8 @@ class SignalHandler:
         self,
         recipient: str,
         message: str,
-        group_id: Optional[str] = None
+        group_id: Optional[str] = None,
+        attachments: Optional[list[str]] = None
     ):
         """
         Send a message to a recipient or group.
@@ -75,6 +76,7 @@ class SignalHandler:
             recipient: Phone number or group ID
             message: Message text
             group_id: If set, sends to this group instead of recipient
+            attachments: Optional list of base64-encoded images
         """
         session = await self._get_session()
         
@@ -89,6 +91,14 @@ class SignalHandler:
             payload["recipients"] = [group_id]
         else:
             payload["recipients"] = [recipient]
+        
+        # Add base64 attachments if provided
+        if attachments:
+            # Signal API format: "data:<mime>;filename=<name>;base64,<data>"
+            payload["base64_attachments"] = [
+                f"data:image/png;filename=chart.png;base64,{att}"
+                for att in attachments
+            ]
         
         url = f"{self.config.api_url}/v2/send"
         
@@ -181,6 +191,7 @@ class SignalHandler:
                     recipient=sender,
                     message=result.text,
                     group_id=group_id,
+                    attachments=result.attachments,
                 )
             except Exception as e:
                 logger.error(f"Failed to send response: {e}")

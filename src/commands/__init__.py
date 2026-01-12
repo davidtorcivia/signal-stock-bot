@@ -14,6 +14,8 @@ from .stock_commands import (
     ForexCommand,
     FuturesCommand,
     EconomyCommand,
+    ProRequiredCommand,
+    ChartCommand,
 )
 
 __all__ = [
@@ -32,5 +34,8 @@ __all__ = [
     "ForexCommand",
     "FuturesCommand",
     "EconomyCommand",
+    "ProRequiredCommand",
+    "ChartCommand",
 ]
+
 

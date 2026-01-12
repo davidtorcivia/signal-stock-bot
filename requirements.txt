@@ -5,6 +5,9 @@ yfinance>=0.2.40
 pyyaml>=6.0
 websockets>=12.0
 
+# Charts
+matplotlib>=3.8
+
 # Production server
 gunicorn>=21.0
 

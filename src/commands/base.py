@@ -26,14 +26,20 @@ class CommandResult:
     """Result from command execution"""
     text: str
     success: bool = True
+    attachments: Optional[list[str]] = None  # Base64-encoded images
     
     @classmethod
     def error(cls, message: str) -> "CommandResult":
-        return cls(text=f"❌ {message}", success=False)
+        return cls(text=f"◇ {message}", success=False)
     
     @classmethod
     def ok(cls, message: str) -> "CommandResult":
         return cls(text=message, success=True)
+    
+    @classmethod
+    def with_chart(cls, message: str, chart_base64: str) -> "CommandResult":
+        """Create result with chart attachment."""
+        return cls(text=message, success=True, attachments=[chart_base64])
 
 
 class BaseCommand(ABC):

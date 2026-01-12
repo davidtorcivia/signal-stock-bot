@@ -33,6 +33,8 @@ from .commands import (
     ForexCommand,
     FuturesCommand,
     EconomyCommand,
+    ProRequiredCommand,
+    ChartCommand,
 )
 from .signal import SignalHandler, SignalConfig
 from .server import create_app
@@ -89,9 +91,9 @@ def create_provider_manager(config: Config) -> ProviderManager:
     return manager
 
 
-def create_dispatcher(provider_manager: ProviderManager, prefix: str) -> CommandDispatcher:
+def create_dispatcher(provider_manager: ProviderManager, config: Config) -> CommandDispatcher:
     """Create and configure command dispatcher"""
-    dispatcher = CommandDispatcher(prefix=prefix)
+    dispatcher = CommandDispatcher(prefix=config.command_prefix, bot_name=config.bot_name)
     
     # Create commands
     price_cmd = PriceCommand(provider_manager)
@@ -100,28 +102,43 @@ def create_dispatcher(provider_manager: ProviderManager, prefix: str) -> Command
     market_cmd = MarketCommand(provider_manager)
     status_cmd = StatusCommand(provider_manager)
     crypto_cmd = CryptoCommand(provider_manager)
-    opt_cmd = OptionCommand(provider_manager)
     fx_cmd = ForexCommand(provider_manager)
     fut_cmd = FuturesCommand(provider_manager)
-    eco_cmd = EconomyCommand(provider_manager)
     
-    # Register commands
+    # Register core commands
     dispatcher.register(price_cmd)
     dispatcher.register(quote_cmd)
     dispatcher.register(info_cmd)
     dispatcher.register(market_cmd)
     dispatcher.register(status_cmd)
     dispatcher.register(crypto_cmd)
-    dispatcher.register(opt_cmd)
     dispatcher.register(fx_cmd)
     dispatcher.register(fut_cmd)
-    dispatcher.register(eco_cmd)
     
-    # Help command needs list of all other commands
-    help_cmd = HelpCommand([
-        price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd,
-        opt_cmd, fx_cmd, fut_cmd, eco_cmd
-    ])
+    # Build command list for help
+    help_commands = [price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd, fx_cmd, fut_cmd]
+    
+    # Options and Economy commands require Massive Pro plan
+    if config.massive_pro:
+        opt_cmd = OptionCommand(provider_manager)
+        eco_cmd = EconomyCommand(provider_manager)
+        dispatcher.register(opt_cmd)
+        dispatcher.register(eco_cmd)
+        help_commands.extend([opt_cmd, eco_cmd])
+    else:
+        # Register stub commands that return helpful message
+        opt_stub = ProRequiredCommand("option", ["opt", "o"], "Get option quote", "!opt TSLA230120C00150000")
+        eco_stub = ProRequiredCommand("economy", ["eco", "macro"], "Get economic data", "!eco CPI")
+        dispatcher.register(opt_stub)
+        dispatcher.register(eco_stub)
+    
+    # Chart command - always available
+    chart_cmd = ChartCommand(provider_manager, config.bot_name)
+    dispatcher.register(chart_cmd)
+    help_commands.append(chart_cmd)
+    
+    # Help command needs list of all visible commands
+    help_cmd = HelpCommand(help_commands, config.bot_name)
     dispatcher.register(help_cmd)
     
     return dispatcher
@@ -151,7 +168,7 @@ def main():
     logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
     
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config.command_prefix)
+    dispatcher = create_dispatcher(provider_manager, config)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler
@@ -197,7 +214,7 @@ def create_gunicorn_app():
     logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
     
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config.command_prefix)
+    dispatcher = create_dispatcher(provider_manager, config)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler

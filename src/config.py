@@ -33,7 +33,11 @@ class Config:
     
     # Bot settings
     command_prefix: str = "!"
+    bot_name: str = "Stock Bot"
     log_level: str = "INFO"
+    
+    # Polygon/Massive settings
+    massive_pro: bool = False  # True if user has paid Polygon plan (enables options/economy)
     
     # Server settings
     host: str = "0.0.0.0"
@@ -83,7 +87,9 @@ class Config:
             signal_api_url=os.getenv("SIGNAL_API_URL", "http://localhost:8080"),
             signal_phone_number=os.getenv("SIGNAL_PHONE_NUMBER", ""),
             command_prefix=os.getenv("COMMAND_PREFIX", "!"),
+            bot_name=os.getenv("BOT_NAME", "Stock Bot"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            massive_pro=os.getenv("MASSIVE_PRO", "false").lower() == "true",
             host=os.getenv("HOST", "0.0.0.0"),
             port=int(os.getenv("PORT", "5000")),
             providers=providers,

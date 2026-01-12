@@ -122,7 +122,7 @@ def format_change(change: float, pct: float) -> str:
     """Format price change with unicode indicator"""
     arrow = Symbols.UP if change >= 0 else Symbols.DOWN
     sign = "+" if change >= 0 else ""
-    return f"{arrow} {sign}{change:.2f} ({sign}{pct:.2f}%)"
+    return f"{arrow} {sign}{change:.2f} ({sign}{pct:.2f}% 1d)"
 
 
 def format_price(price: float) -> str:
@@ -148,7 +148,7 @@ class PriceCommand(BaseCommand):
         if not ctx.args:
             return CommandResult.error(
                 f"Usage: {self.usage}\n"
-                f"💡 Tip: You can also just type $AAPL in any message"
+                f"› Tip: You can also just type $AAPL in any message"
             )
         
         # Validate and sanitize symbols
@@ -192,7 +192,7 @@ class PriceCommand(BaseCommand):
                         indicator = Symbols.GREEN if q.change >= 0 else Symbols.RED
                         lines.append(
                             f"{indicator} {q.symbol}: {format_price(q.price)} "
-                            f"({sign}{q.change_percent:.2f}%)"
+                            f"({sign}{q.change_percent:.2f}% 1d)"
                         )
                     else:
                         lines.append(f"{Symbols.GRAY} {symbol}: Not found")
@@ -205,7 +205,7 @@ class PriceCommand(BaseCommand):
             sym = symbols[0]
             # Suggest crypto format if it looks like crypto
             if sym in ("BTC", "ETH", "SOL", "DOGE", "XRP"):
-                hint = f"\n💡 Try {sym}-USD for crypto"
+                hint = f"\n› Try {sym}-USD for crypto"
             return CommandResult.error(f"Symbol not found: {sym}{hint}")
         except ProviderError as e:
             return CommandResult.error(f"Data unavailable: {e}")
@@ -231,7 +231,7 @@ class QuoteCommand(BaseCommand):
             name_display = quote.name or symbol
             
             lines = [
-                f"📊 {name_display} ({quote.symbol})",
+                f"⊞ {name_display} ({quote.symbol})",
                 "",
                 f"Price: {format_price(quote.price)}",
                 format_change(quote.change, quote.change_percent),
@@ -279,7 +279,7 @@ class FundamentalsCommand(BaseCommand):
             fund = await self.providers.get_fundamentals(symbol)
             
             lines = [
-                f"📋 {fund.name} ({fund.symbol})",
+                f"⊟ {fund.name} ({fund.symbol})",
                 "",
             ]
             
@@ -342,21 +342,21 @@ class MarketCommand(BaseCommand):
         try:
             quotes = await self.providers.get_quotes(list(self.INDICES.keys()))
             
-            lines = ["📈 Market Overview", ""]
+            lines = ["⊞ Market Overview", ""]
             
             for symbol, name in self.INDICES.items():
                 if symbol in quotes:
                     q = quotes[symbol]
-                    emoji = "🟢" if q.change >= 0 else "🔴"
+                    indicator = "●" if q.change >= 0 else "○"
                     sign = "+" if q.change >= 0 else ""
                     
                     # VIX is typically displayed differently
                     if symbol == "^VIX":
-                        lines.append(f"😰 {name}: {q.price:.2f} ({sign}{q.change_percent:.2f}%)")
+                        lines.append(f"⚡ {name}: {q.price:.2f} ({sign}{q.change_percent:.2f}% 1d)")
                     else:
-                        lines.append(f"{emoji} {name}: {q.price:,.2f} ({sign}{q.change_percent:.2f}%)")
+                        lines.append(f"{indicator} {name}: {q.price:,.2f} ({sign}{q.change_percent:.2f}% 1d)")
                 else:
-                    lines.append(f"⚪ {name}: N/A")
+                    lines.append(f"◇ {name}: N/A")
             
             return CommandResult.ok("\n".join(lines))
             
@@ -370,8 +370,9 @@ class HelpCommand(BaseCommand):
     description = "Show available commands"
     usage = "!help [command]"
     
-    def __init__(self, commands: list[BaseCommand]):
+    def __init__(self, commands: list[BaseCommand], bot_name: str = "Stock Bot"):
         self._commands = {cmd.name: cmd for cmd in commands}
+        self.bot_name = bot_name
     
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if ctx.args:
@@ -382,7 +383,7 @@ class HelpCommand(BaseCommand):
                 if cmd.matches(cmd_name):
                     aliases = f"\nAliases: {', '.join(cmd.aliases)}" if cmd.aliases else ""
                     return CommandResult.ok(
-                        f"📖 !{cmd.name}{aliases}\n\n"
+                        f"⌘ !{cmd.name}{aliases}\n\n"
                         f"{cmd.description}\n\n"
                         f"Usage: {cmd.usage}"
                     )
@@ -390,7 +391,7 @@ class HelpCommand(BaseCommand):
             return CommandResult.error(f"Unknown command: {cmd_name}")
         
         # General help
-        lines = ["📖 Stock Bot Commands", ""]
+        lines = [f"⌘ {self.bot_name} Commands", ""]
         
         for cmd in self._commands.values():
             if cmd.name != "help":
@@ -398,7 +399,7 @@ class HelpCommand(BaseCommand):
         
         lines.append(f"!help - {self.description}")
         lines.append("")
-        lines.append("💡 Tip: Type $AAPL in any message for quick lookup")
+        lines.append("› Tip: Type $AAPL in any message for quick lookup")
         lines.append("Type !help <command> for detailed usage")
         
         return CommandResult.ok("\n".join(lines))
@@ -417,17 +418,17 @@ class StatusCommand(BaseCommand):
         status = self.providers.get_status()
         health = await self.providers.health_check()
         
-        lines = ["🔧 Provider Status", ""]
+        lines = ["⚙ Provider Status", ""]
         
         for name, info in status.items():
             healthy = health.get(name, False)
-            health_emoji = "✅" if healthy else "❌"
+            health_indicator = "◆" if healthy else "◇"
             
             if info["rate_limited"]:
                 remaining = info["rate_limit_remaining_seconds"]
-                lines.append(f"{health_emoji} {name}: ⏳ Rate limited ({remaining}s)")
+                lines.append(f"{health_indicator} {name}: ↻ Rate limited ({remaining}s)")
             else:
-                lines.append(f"{health_emoji} {name}: Ready")
+                lines.append(f"{health_indicator} {name}: Ready")
         
         return CommandResult.ok("\n".join(lines))
 
@@ -455,19 +456,19 @@ class CryptoCommand(BaseCommand):
         try:
             quotes = await self.providers.get_quotes(list(self.CRYPTO_SYMBOLS.keys()))
             
-            lines = ["🪙 Crypto Overview", ""]
+            lines = ["◎ Crypto Overview", ""]
             
             for symbol, name in self.CRYPTO_SYMBOLS.items():
                 if symbol in quotes:
                     q = quotes[symbol]
-                    emoji = "🟢" if q.change >= 0 else "🔴"
+                    indicator = "●" if q.change >= 0 else "○"
                     sign = "+" if q.change >= 0 else ""
                     lines.append(
-                        f"{emoji} {name}: {format_price(q.price)} "
-                        f"({sign}{q.change_percent:.2f}%)"
+                        f"{indicator} {name}: {format_price(q.price)} "
+                        f"({sign}{q.change_percent:.2f}% 1d)"
                     )
                 else:
-                    lines.append(f"⚪ {name}: N/A")
+                    lines.append(f"◇ {name}: N/A")
             
             return CommandResult.ok("\n".join(lines))
             
@@ -502,7 +503,7 @@ class OptionCommand(BaseCommand):
             q = await self.providers.get_option_quote(symbol)
             
             lines = [
-                f"🎫 {q.symbol}",
+                f"⊡ {q.symbol}",
                 f"{q.type.capitalize()} on {q.underlying}",
                 f"Strike: ${q.strike:.2f} | Exp: {q.expiration.strftime('%Y-%m-%d')}",
                 "",
@@ -547,16 +548,16 @@ class FuturesCommand(BaseCommand):
         try:
             q = await self.providers.get_future_quote(symbol)
             
-            emoji = "📉"
+            indicator = "▼"
             sign = ""
             if q.change >= 0:
-                emoji = "📈"
+                indicator = "▲"
                 sign = "+"
             
             lines = [
-                f"🚜 {q.symbol}",
-                f"{emoji} {format_price(q.price)}",
-                f"{sign}{q.change:.2f} ({sign}{q.change_percent:.2f}%)",
+                f"⊠ {q.symbol}",
+                f"{indicator} {format_price(q.price)}",
+                f"{sign}{q.change:.2f} ({sign}{q.change_percent:.2f}% 1d)",
                 f"Vol: {format_number(q.volume)}"
             ]
             return CommandResult.ok("\n".join(lines))
@@ -586,7 +587,7 @@ class ForexCommand(BaseCommand):
             q = await self.providers.get_forex_quote(symbol)
             
             lines = [
-                f"💱 {q.symbol}",
+                f"⇆ {q.symbol}",
                 f"{format_price(q.rate)}",
                 f"{format_change(q.change, q.change_percent)}"
             ]
@@ -617,7 +618,7 @@ class EconomyCommand(BaseCommand):
             data = await self.providers.get_economy_data(indicator)
             
             lines = [
-                f"🏦 {data.name}",
+                f"⌂ {data.name}",
                 f"Value: {data.value}{data.unit}",
                 f"Date: {data.date.strftime('%Y-%m-%d')}"
             ]
@@ -628,3 +629,143 @@ class EconomyCommand(BaseCommand):
         except ProviderError as e:
              return CommandResult.error(f"Economy data unavailable: {e}")
 
+
+class ProRequiredCommand(BaseCommand):
+    """
+    Stub command for features requiring Polygon Pro plan.
+    Returns a helpful message directing users to upgrade.
+    """
+    
+    def __init__(self, name: str, aliases: list[str], description: str, usage: str):
+        self._name = name
+        self._aliases = aliases
+        self._description = description
+        self._usage = usage
+    
+    @property
+    def name(self) -> str:
+        return self._name
+    
+    @property
+    def aliases(self) -> list[str]:
+        return self._aliases
+    
+    @property
+    def description(self) -> str:
+        return self._description
+    
+    @property
+    def usage(self) -> str:
+        return self._usage
+    
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        return CommandResult.error(
+            f"The !{self._name} command requires a Polygon.io paid plan.\n\n"
+            f"› Upgrade at polygon.io/pricing\n"
+            f"› Set MASSIVE_PRO=true in your .env after upgrading"
+        )
+
+
+class ChartCommand(BaseCommand):
+    """
+    Command for generating stock price charts.
+    
+    Generates line charts with volume and sends as image attachments.
+    """
+    name = "chart"
+    aliases = ["ch", "graph"]
+    description = "Generate stock price chart"
+    usage = "!chart AAPL [1d|5d|1m|3m|6m|1y]"
+    
+    def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
+        self.providers = provider_manager
+        self.bot_name = bot_name
+        self._generator = None
+    
+    def _get_generator(self):
+        """Lazy-load chart generator to avoid matplotlib import at startup."""
+        if self._generator is None:
+            from ..charts import ChartGenerator
+            self._generator = ChartGenerator(
+                theme="dark",
+                width=800,
+                height=500,
+                bot_name=self.bot_name
+            )
+        return self._generator
+    
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(
+                f"Usage: {self.usage}\n"
+                f"Periods: 1d, 5d, 1m, 3m, 6m, 1y, ytd"
+            )
+        
+        symbol = ctx.args[0].upper()
+        period = ctx.args[1].lower() if len(ctx.args) > 1 else "1m"
+        
+        # Validate symbol
+        valid, result = validate_symbol(symbol)
+        if not valid:
+            return CommandResult.error(result)
+        
+        # Map period to provider parameters
+        from ..charts.generator import get_period_params
+        provider_period, interval = get_period_params(period)
+        
+        try:
+            # Get historical data
+            bars = await self.providers.get_historical(
+                symbol=symbol,
+                period=provider_period,
+                interval=interval
+            )
+            
+            if not bars:
+                return CommandResult.error(f"No chart data available for {symbol}")
+            
+            # Get current quote for title
+            try:
+                quote = await self.providers.get_quote(symbol)
+                current_price = quote.price
+                change_percent = quote.change_percent
+                name = quote.name or symbol
+            except Exception:
+                current_price = bars[-1].close
+                change_percent = ((bars[-1].close - bars[0].open) / bars[0].open) * 100
+                name = symbol
+            
+            # Generate chart
+            generator = self._get_generator()
+            chart_base64 = generator.generate(
+                symbol=symbol,
+                bars=bars,
+                period=period,
+                show_volume=True,
+                current_price=current_price,
+                change_percent=change_percent,
+            )
+            
+            # Build caption
+            sign = "+" if change_percent >= 0 else ""
+            indicator = "▲" if change_percent >= 0 else "▼"
+            caption = (
+                f"{name} ({symbol})\n"
+                f"{Symbols.PRICE} {format_price(current_price)} "
+                f"{indicator} {sign}{change_percent:.2f}% 1d\n"
+                f"{format_timestamp()}"
+            )
+            
+            return CommandResult.with_chart(caption, chart_base64)
+            
+        except SymbolNotFoundError:
+            return CommandResult.error(f"Symbol not found: {symbol}")
+        except ProviderError as e:
+            return CommandResult.error(f"Chart data unavailable: {e}")
+        except ImportError as e:
+            return CommandResult.error(
+                f"Charts require matplotlib. Install with: pip install matplotlib\n"
+                f"Error: {e}"
+            )
+        except Exception as e:
+            return CommandResult.error(f"Chart generation failed: {type(e).__name__}")

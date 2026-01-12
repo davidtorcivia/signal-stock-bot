@@ -4,14 +4,17 @@ A self-hosted Signal bot for real-time stock quotes, market data, and company fu
 
 ## Features
 
-- **Real-time stock quotes** via Yahoo Finance, Alpha Vantage, and Massive (Polygon)
-- **Options & Futures** support (via Massive)
+- **Real-time stock quotes** via Yahoo Finance, Alpha Vantage, and Polygon/Massive
+- **Options & Futures** support (via Polygon/Massive)
 - **Forex & Crypto** support
 - **Economy Indicators** (CPI, GDP, etc.)
 - **Batch symbol lookups** (e.g., `!price AAPL MSFT`)
 - **Inline symbol detection** (e.g., `Check $AAPL price`)
+- **@ mention support** (mention the bot to get help)
 - **Quote caching** to respect API limits
 - **Automatic retry logic** for robustness
+- **ET timestamps** on all responses
+- **Clean unicode output** (no emojis)
 
 ## Quick Start
 
@@ -66,6 +69,7 @@ Send `!price AAPL` to your Signal number. You should get a response within secon
 ### `!price` / `!p` — Get current price
 ### `!quote` / `!q` — Detailed quote
 ### `!info` / `!i` — Company fundamentals
+### `!chart` / `!ch` — Stock price chart (NEW!)
 ### `!options` / `!opt` — Option quotes
 ### `!future` / `!fut` — Futures quotes
 ### `!forex` / `!fx` — Forex rates
@@ -80,9 +84,10 @@ Send `!price AAPL` to your Signal number. You should get a response within secon
 ```
 ```
 Apple Inc. (AAPL)
-💵 $185.92
-📈 +2.34 (+1.27%)
-📊 Vol: 52.3M
+◈ $185.92
+▲ +2.34 (+1.27% 1d)
+⊡ Vol: 52.3M
+◷ as of 3:45 PM ET
 ```
 
 **Batch mode** — up to 10 symbols:
@@ -91,10 +96,12 @@ Apple Inc. (AAPL)
 !price AAPL MSFT GOOGL NVDA
 ```
 ```
-🟢 AAPL: $185.92 (+1.27%)
-🟢 MSFT: $378.91 (+0.89%)
-🔴 GOOGL: $141.80 (-0.32%)
-🟢 NVDA: $495.22 (+2.15%)
+▲ AAPL: $185.92 (+1.27% 1d)
+▲ MSFT: $378.91 (+0.89% 1d)
+▼ GOOGL: $141.80 (-0.32% 1d)
+▲ NVDA: $495.22 (+2.15% 1d)
+
+◷ as of 3:45 PM ET
 ```
 
 ### `!quote` / `!q` — Detailed quote
@@ -103,17 +110,16 @@ Apple Inc. (AAPL)
 !quote TSLA
 ```
 ```
-📊 Tesla, Inc. (TSLA)
+Tesla, Inc. (TSLA)
 
-Price: $248.50
-📈 +5.20 (+2.14%)
+◈ $248.50
+▲ +5.20 (+2.14% 1d)
 
-Open: $244.00
-High: $251.30
-Low: $243.50
-Prev Close: $243.30
-Volume: 98.2M
-Market Cap: $789.5B
+Open: $244.00 · High: $251.30
+Low: $243.50 · Prev: $243.30
+⊡ Vol: 98.2M · Cap: $789.5B
+
+◷ as of 3:45 PM ET
 ```
 
 ### `!info` / `!i` — Company fundamentals
@@ -122,7 +128,7 @@ Market Cap: $789.5B
 !info NVDA
 ```
 ```
-📋 NVIDIA Corporation (NVDA)
+⊟ NVIDIA Corporation (NVDA)
 
 Sector: Technology
 Industry: Semiconductors
@@ -142,13 +148,15 @@ Dividend Yield: 0.03%
 !market
 ```
 ```
-📈 Market Overview
+⊞ Market Overview
 
-🟢 S&P 500: 5,123.41 (+0.75%)
-🟢 Dow Jones: 38,654.42 (+0.51%)
-🟢 Nasdaq: 16,156.33 (+1.12%)
-🔴 Russell 2000: 2,012.75 (-0.23%)
-😰 VIX: 13.25 (-2.15%)
+● S&P 500: 5,123.41 (+0.75% 1d)
+● Dow Jones: 38,654.42 (+0.51% 1d)
+● Nasdaq: 16,156.33 (+1.12% 1d)
+○ Russell 2000: 2,012.75 (-0.23% 1d)
+◆ VIX: 13.25 (-2.15% 1d)
+
+◷ as of 3:45 PM ET
 ```
 
 ### `!crypto` / `!c` — Top cryptocurrencies
@@ -157,13 +165,15 @@ Dividend Yield: 0.03%
 !crypto
 ```
 ```
-🪙 Crypto Overview
+◎ Crypto Overview
 
-🟢 Bitcoin: $67,234.50 (+2.15%)
-🟢 Ethereum: $3,456.78 (+1.89%)
-🔴 Solana: $98.45 (-0.32%)
-🟢 XRP: $0.5234 (+3.21%)
-🟢 Dogecoin: $0.0821 (+1.45%)
+● Bitcoin: $67,234.50 (+2.15% 1d)
+● Ethereum: $3,456.78 (+1.89% 1d)
+○ Solana: $98.45 (-0.32% 1d)
+● XRP: $0.5234 (+3.21% 1d)
+● Dogecoin: $0.0821 (+1.45% 1d)
+
+◷ as of 3:45 PM ET
 ```
 
 ### `!status` — Provider health
@@ -172,19 +182,19 @@ Dividend Yield: 0.03%
 !status
 ```
 ```
-🔧 Provider Status
+⚙ Provider Status
 
-✅ yahoo: Ready
-✅ alphavantage: Ready
+◆ yahoo: Ready
+◆ alphavantage: Ready
 ```
 
 Or when rate-limited:
 
 ```
-🔧 Provider Status
+⚙ Provider Status
 
-✅ yahoo: Ready
-❌ alphavantage: ⏳ Rate limited (3420s)
+◆ yahoo: Ready
+◇ alphavantage: ↻ Rate limited (3420s)
 ```
 
 ### `!help` — Command help
@@ -193,7 +203,7 @@ Or when rate-limited:
 !help
 ```
 ```
-📖 Stock Bot Commands
+⌘ Stock Bot Commands
 
 !price - Get current stock price
 !quote - Get detailed stock quote
@@ -203,7 +213,7 @@ Or when rate-limited:
 !status - Show provider status
 !help - Show available commands
 
-💡 Tip: Type $AAPL in any message for quick lookup
+› Tip: Type $AAPL in any message for quick lookup
 Type !help <command> for detailed usage
 ```
 
@@ -213,7 +223,7 @@ Detailed help for a specific command:
 !help price
 ```
 ```
-📖 !price
+⌘ !price
 Aliases: p, pr, $
 
 Get current stock price
@@ -248,9 +258,9 @@ What do you think about $AAPL?
 ```
 ```
 Apple Inc. (AAPL)
-💵 $185.92
-📈 +2.34 (+1.27%)
-📊 Vol: 52.3M
+◈ $185.92
+▲ +2.34 (+1.27% 1d)
+⊡ Vol: 52.3M
 ```
 
 Multiple symbols work too:
@@ -259,8 +269,8 @@ Multiple symbols work too:
 Comparing $MSFT and $GOOGL today
 ```
 ```
-🟢 MSFT: $378.91 (+0.89%)
-🔴 GOOGL: $141.80 (-0.32%)
+● MSFT: $378.91 (+0.89% 1d)
+○ GOOGL: $141.80 (-0.32% 1d)
 ```
 
 ### @ Mentions
@@ -271,7 +281,7 @@ Tag the bot in a group chat to get help:
 @StockBot
 ```
 ```
-👋 Hey! I'm Stock Bot.
+» Hey! I'm Stock Bot.
 
 Try these:
 • !price AAPL - Get stock price
@@ -287,9 +297,9 @@ You can also include symbols when mentioning:
 ```
 ```
 Tesla, Inc. (TSLA)
-💵 $248.50
-📈 +5.20 (+2.14%)
-📊 Vol: 98.2M
+◈ $248.50
+▲ +5.20 (+2.14% 1d)
+⊡ Vol: 98.2M
 ```
 
 ## Configuration
@@ -301,9 +311,11 @@ Tesla, Inc. (TSLA)
 | `SIGNAL_PHONE_NUMBER` | Yes | — | Bot's Signal phone number (E.164 format) |
 | `SIGNAL_API_URL` | No | `http://localhost:8080` | signal-cli-rest-api URL |
 | `COMMAND_PREFIX` | No | `!` | Command prefix character |
+| `BOT_NAME` | No | `Stock Bot` | Bot display name (used in help and mentions) |
 | `LOG_LEVEL` | No | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `ALPHAVANTAGE_API_KEY` | No | — | Alpha Vantage API key for additional data |
 | `POLYGON_API_KEY` | No | — | Polygon.io API key |
+| `MASSIVE_PRO` | No | `false` | Set to `true` if you have paid Polygon plan (enables `!options` and `!economy`) |
 | `YAHOO_PRIORITY` | No | `0` | Yahoo Finance priority (lower = higher) |
 | `ALPHAVANTAGE_PRIORITY` | No | `10` | Alpha Vantage priority |
 | `POLYGON_PRIORITY` | No | `5` | Polygon priority |
@@ -323,9 +335,11 @@ Default order:
 1. Get key at https://www.alphavantage.co/support/#api-key
 2. Add to `.env`: `ALPHAVANTAGE_API_KEY=your_key_here`
 
-**Polygon.io** (free tier available):
+**Polygon.io** (free tier available, options/economy require paid plan):
 1. Sign up at https://polygon.io/
 2. Add to `.env`: `POLYGON_API_KEY=your_key_here`
+
+> **Note**: Options data (`!options`) and economy indicators (`!economy`) require a Polygon.io paid plan. The free tier supports stock quotes, crypto, and forex.
 
 ## Architecture
 

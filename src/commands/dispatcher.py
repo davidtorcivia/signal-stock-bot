@@ -29,9 +29,10 @@ class CommandDispatcher:
     - Unknown command handling
     """
     
-    def __init__(self, prefix: str = "!", enable_inline_symbols: bool = True):
+    def __init__(self, prefix: str = "!", enable_inline_symbols: bool = True, bot_name: str = "Stock Bot"):
         self.prefix = prefix
         self.enable_inline_symbols = enable_inline_symbols
+        self.bot_name = bot_name
         self.commands: dict[str, BaseCommand] = {}
         self._pattern = re.compile(
             rf"^{re.escape(prefix)}([\w?]+)(?:\s+(.*))?$",
@@ -119,7 +120,7 @@ class CommandDispatcher:
         if mentioned:
             logger.info("Bot mentioned without command, providing help intro")
             return CommandResult.ok(
-                "👋 Hey! I'm Stock Bot.\n\n"
+                f"» Hey! I'm {self.bot_name}.\n\n"
                 "Try these:\n"
                 "• !price AAPL - Get stock price\n"
                 "• !crypto - Top cryptocurrencies\n"

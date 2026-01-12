@@ -74,6 +74,11 @@ class MassiveProvider(BaseProvider):
                 
                 if resp.status != 200:
                     text = await resp.text()
+                    if resp.status == 403:
+                        raise ProviderError(
+                            "Feature requires Polygon.io paid plan. "
+                            "Visit polygon.io/pricing to upgrade."
+                        )
                     raise ProviderError(f"API Error {resp.status}: {text}")
                 
                 return await resp.json()
@@ -269,7 +274,11 @@ class MassiveProvider(BaseProvider):
         # e.g. I:SPX is index. Economy indicators might be tickers too?
         # Let's try fetching as ticker first maybe?
         
-        raise NotImplementedError("Economy data API path requires validation")
+        # Economy data not available on free Polygon.io tier
+        raise ProviderError(
+            "Economy data requires Polygon.io paid plan. "
+            "Visit polygon.io/pricing to upgrade."
+        )
 
     async def health_check(self) -> bool:
         try:
