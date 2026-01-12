@@ -1,20 +1,25 @@
 # Signal Stock Bot
 
-A self-hosted Signal bot for real-time stock quotes, market data, and company fundamentals. Built with a multi-provider architecture for reliability and extensibility.
+A self-hosted Signal bot for real-time stock quotes, market data, technical analysis, and company fundamentals. Built with a multi-provider architecture for reliability and extensibility.
 
 ## Features
 
-- **Real-time stock quotes** via Yahoo Finance, Alpha Vantage, and Polygon/Massive
-- **Options & Futures** support (via Polygon/Massive)
+- **Real-time stock quotes** via Yahoo Finance, Alpha Vantage, and Polygon
+- **Smart symbol resolution** — type `!price apple` or `!price gold` instead of tickers
+- **Professional charting** with candlesticks, indicators, and comparisons
+- **Technical analysis** with RSI, MACD, SMA, support/resistance
+- **Earnings & dividends** tracking
+- **News headlines** for any symbol
+- **Options & Futures** support (via Polygon)
 - **Forex & Crypto** support
 - **Economy Indicators** (CPI, GDP, etc.)
-- **Batch symbol lookups** (e.g., `!price AAPL MSFT`)
+- **Batch symbol lookups** (e.g., `!price AAPL MSFT GOOGL`)
 - **Inline symbol detection** (e.g., `Check $AAPL price`)
 - **@ mention support** (mention the bot to get help)
-- **Quote caching** to respect API limits
-- **Automatic retry logic** for robustness
-- **ET timestamps** on all responses
+- **Intelligent caching** with type-specific TTLs
 - **Clean unicode output** (no emojis)
+
+---
 
 ## Quick Start
 
@@ -22,25 +27,15 @@ A self-hosted Signal bot for real-time stock quotes, market data, and company fu
 
 - Ubuntu 22.04+ server (or any Docker-capable host)
 - Docker and Docker Compose
-- A phone number for Signal (can use your existing account)
+- A phone number for Signal
 
 ### 1. Clone and configure
 
 ```bash
 git clone https://github.com/davidtorcivia/signal-stock-bot.git
 cd signal-stock-bot
-
-# Create environment file
 cp .env.example .env
-
-# Edit with your phone number
-nano .env
-```
-
-Minimum `.env` configuration:
-
-```bash
-SIGNAL_PHONE_NUMBER=+15551234567  # Your Signal number
+nano .env  # Set your phone number
 ```
 
 ### 2. Start the stack
@@ -52,255 +47,214 @@ docker compose up -d
 ### 3. Link your Signal account
 
 ```bash
-# Generate QR code
 curl -s "http://localhost:8080/v1/qrcodelink?device_name=stockbot" | docker run -i --rm mtgto/qrencode -t ANSIUTF8
-
-# Or view in browser: http://your-server:8080/v1/qrcodelink?device_name=stockbot
 ```
 
-On your phone: **Signal → Settings → Linked Devices → Link New Device** → Scan QR
+On your phone: **Signal → Settings → Linked Devices → Link New Device → Scan QR**
 
 ### 4. Test it
 
-Send `!price AAPL` to your Signal number. You should get a response within seconds.
+Send `!price AAPL` to your Signal number.
 
-## Commands
+---
 
-### `!price` / `!p` — Get current price
-### `!quote` / `!q` — Detailed quote
-### `!info` / `!i` — Company fundamentals
-### `!chart` / `!ch` — Stock price chart (NEW!)
-### `!options` / `!opt` — Option quotes
-### `!future` / `!fut` — Futures quotes
-### `!forex` / `!fx` — Forex rates
-### `!economy` / `!eco` — Economic indicators
-### `!market` / `!m` — Major indices
-### `!crypto` / `!c` — Top cryptocurrencies
-### `!status` — Provider health
-### `!help` — Command help
+## Commands Reference
 
+### Price & Quote Commands
+
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `!price AAPL` | `!p` | Current price (supports batch: `!price AAPL MSFT GOOGL`) |
+| `!quote AAPL` | `!q` | Detailed quote with OHLC, volume, market cap |
+| `!info AAPL` | `!i`, `!fund` | Company fundamentals (P/E, EPS, 52W range) |
+
+**Smart symbol resolution** — use company names instead of tickers:
 ```
-!price AAPL
-```
-```
-Apple Inc. (AAPL)
-◈ $185.92
-▲ +2.34 (+1.27% 1d)
-⊡ Vol: 52.3M
-◷ as of 3:45 PM ET
+!price apple               → AAPL
+!price microsoft           → MSFT  
+!price bitcoin             → BTC-USD
+!price gold                → GC=F
+!price oil                 → CL=F
+!price 10 year treasury    → ^TNX
 ```
 
 **Batch mode** — up to 10 symbols:
-
 ```
 !price AAPL MSFT GOOGL NVDA
 ```
-```
-▲ AAPL: $185.92 (+1.27% 1d)
-▲ MSFT: $378.91 (+0.89% 1d)
-▼ GOOGL: $141.80 (-0.32% 1d)
-▲ NVDA: $495.22 (+2.15% 1d)
 
-◷ as of 3:45 PM ET
-```
+---
 
-### `!quote` / `!q` — Detailed quote
+### Chart Commands
 
 ```
-!quote TSLA
-```
-```
-Tesla, Inc. (TSLA)
-
-◈ $248.50
-▲ +5.20 (+2.14% 1d)
-
-Open: $244.00 · High: $251.30
-Low: $243.50 · Prev: $243.30
-⊡ Vol: 98.2M · Cap: $789.5B
-
-◷ as of 3:45 PM ET
+!chart AAPL [period] [options]
 ```
 
-### `!info` / `!i` — Company fundamentals
+**Periods**: `1d`, `5d`, `1w`, `1m`, `3m`, `6m`, `1y`, `ytd`, `5y`, `max`
 
+**Options**:
+| Flag | Description |
+|------|-------------|
+| `-c` | Candlestick chart (default is line) |
+| `-sma20`, `-sma50`, `-sma200` | Add SMA overlays |
+| `-bb` | Add Bollinger Bands |
+| `-rsi` | Add RSI panel below chart |
+| `-compare MSFT` | Overlay another symbol for comparison |
+
+**Examples**:
 ```
-!info NVDA
-```
-```
-⊟ NVIDIA Corporation (NVDA)
-
-Sector: Technology
-Industry: Semiconductors
-
-P/E Ratio: 65.32
-EPS: $7.59
-Market Cap: $1.22T
-Dividend Yield: 0.03%
-
-52W High: $505.48
-52W Low: $222.97
-```
-
-### `!market` / `!m` — Major indices
-
-```
-!market
-```
-```
-⊞ Market Overview
-
-● S&P 500: 5,123.41 (+0.75% 1d)
-● Dow Jones: 38,654.42 (+0.51% 1d)
-● Nasdaq: 16,156.33 (+1.12% 1d)
-○ Russell 2000: 2,012.75 (-0.23% 1d)
-◆ VIX: 13.25 (-2.15% 1d)
-
-◷ as of 3:45 PM ET
+!chart AAPL 1m                        # 1-month line chart
+!chart NVDA 3m -c                     # 3-month candlestick
+!chart TSLA 1y -sma50 -sma200         # With moving averages
+!chart AAPL 6m -c -bb -rsi            # Full technical chart
+!chart AAPL 1m -compare MSFT          # Compare AAPL vs MSFT
 ```
 
-### `!crypto` / `!c` — Top cryptocurrencies
+---
 
-```
-!crypto
-```
-```
-◎ Crypto Overview
+### Technical Analysis Commands
 
-● Bitcoin: $67,234.50 (+2.15% 1d)
-● Ethereum: $3,456.78 (+1.89% 1d)
-○ Solana: $98.45 (-0.32% 1d)
-● XRP: $0.5234 (+3.21% 1d)
-● Dogecoin: $0.0821 (+1.45% 1d)
+| Command | Description |
+|---------|-------------|
+| `!ta AAPL` | Quick technical summary (trend, RSI, MACD, S/R, signal) |
+| `!ta AAPL -full` | **Comprehensive analysis** with all indicators |
+| `!rsi AAPL` | RSI(14) with visual bar and interpretation |
+| `!sma AAPL 20 50 200` | Moving averages with % difference from price |
+| `!macd AAPL` | MACD line, signal, histogram, momentum |
+| `!support AAPL` | Pivot-based support/resistance levels (S1, S2, R1, R2) |
 
-◷ as of 3:45 PM ET
+**Example `!ta AAPL -full` output**:
 ```
+⊞ AAPL Full Technical Analysis
 
-### `!status` — Provider health
+━━━ Price & Trend ━━━
+Current: $185.92
+Trend: ▲ Bullish (above 50/200 SMA)
 
-```
-!status
-```
-```
-⚙ Provider Status
+━━━ Moving Averages ━━━
+SMA20: $183.50 (▲ +1.3%)
+SMA50: $178.25 (▲ +4.3%)
+SMA200: $165.00 (▲ +12.7%)
 
-◆ yahoo: Ready
-◆ alphavantage: Ready
-```
+━━━ Oscillators ━━━
+RSI(14): 62.3 [██████████░░░░░]
+  → Moderately High
+MACD: Bullish ▲
+  Line: 2.450 | Signal: 1.890
+  Histogram: 0.560 (Increasing ↑)
 
-Or when rate-limited:
+━━━ Support/Resistance ━━━
+R2: $195.50
+R1: $190.00
+Pivot: $185.25
+S1: $180.50
+S2: $175.00
 
-```
-⚙ Provider Status
-
-◆ yahoo: Ready
-◇ alphavantage: ↻ Rate limited (3420s)
-```
-
-### `!help` — Command help
-
-```
-!help
-```
-```
-⌘ Stock Bot Commands
-
-!price - Get current stock price
-!quote - Get detailed stock quote
-!info - Get company fundamentals
-!market - Get major market indices
-!crypto - Get top cryptocurrency prices
-!status - Show provider status
-!help - Show available commands
-
-› Tip: Type $AAPL in any message for quick lookup
-Type !help <command> for detailed usage
+━━━ Signal ━━━
+● BUY (3/4 bullish)
 ```
 
-Detailed help for a specific command:
+---
+
+### Earnings & Dividend Commands
+
+| Command | Description |
+|---------|-------------|
+| `!earnings AAPL` | Next earnings date, EPS, P/E, revenue, margins |
+| `!dividend AAPL` | Yield, annual rate, ex-date, payout ratio, history |
+
+---
+
+### News Command
 
 ```
-!help price
-```
-```
-⌘ !price
-Aliases: p, pr, $
-
-Get current stock price
-
-Usage: !price AAPL [MSFT GOOGL ...]
+!news AAPL [count]
 ```
 
-## Command Aliases
+| Example | Result |
+|---------|--------|
+| `!news AAPL` | 5 recent headlines |
+| `!news AAPL 10` | 10 headlines |
+| `!news` | Market-wide news (SPY) |
 
-All commands have short aliases for quick access:
+---
 
-| Command | Aliases |
-|---------|---------|
-| `!price` | `!p`, `!pr`, `!$` |
-| `!quote` | `!q`, `!detail` |
-| `!info` | `!i`, `!fundamentals`, `!fund` |
-| `!options` | `!opt`, `!o` |
-| `!future` | `!fut`, `!f` |
-| `!forex` | `!fx`, `!curr` |
-| `!economy` | `!eco`, `!macro` |
-| `!market` | `!m`, `!indices` |
-| `!crypto` | `!c`, `!coins` |
-| `!status` | `!providers`, `!health` |
-| `!help` | `!h`, `!?`, `!commands` |
+### Market Overview Commands
 
-### Inline Symbol Detection
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `!market` | `!m` | Major indices (S&P, Dow, Nasdaq, Russell, VIX) |
+| `!crypto` | `!c` | Top cryptocurrencies |
+| `!forex EURUSD` | `!fx` | Currency pairs |
+| `!future CL` | `!fut` | Futures quotes |
+| `!economy CPI` | `!eco` | Economic indicators (requires Polygon Pro) |
+| `!options AAPL` | `!opt` | Options chains (requires Polygon Pro) |
 
-You can mention stock symbols with `$` anywhere in a message:
+---
+
+### Admin Commands
+
+| Command | Description |
+|---------|-------------|
+| `!metrics` | Bot performance dashboard (uptime, req/min, cache hits, provider health) |
+| `!cache stats` | Detailed cache statistics by type |
+| `!cache clear` | Clear all caches |
+| `!status` | Provider health status |
+| `!help` | Command list |
+
+---
+
+## Supported Symbols
+
+### Stocks & ETFs
+- US stocks: `AAPL`, `MSFT`, `GOOGL`, `TSLA`, etc.
+- ETFs: `SPY`, `QQQ`, `VTI`, `ARKK`, etc.
+
+### Indices
+- S&P 500: `^GSPC` or `sp500`
+- Dow Jones: `^DJI` or `dow`
+- Nasdaq: `^IXIC` or `nasdaq`
+- VIX: `^VIX` or `vix`
+
+### Commodities & Futures
+- Gold: `GC=F` or `gold`
+- Silver: `SI=F` or `silver`
+- Oil/Crude: `CL=F` or `oil`
+- Natural Gas: `NG=F` or `gas`
+- Copper, Wheat, Corn, Coffee, etc.
+
+### Bonds & Treasuries
+- 10-Year: `^TNX` or `10y` or `treasury`
+- 30-Year: `^TYX` or `30y`
+- TLT ETF: `TLT`
+
+### Crypto
+- Bitcoin: `BTC-USD` or `btc` or `bitcoin`
+- Ethereum: `ETH-USD` or `eth`
+- Solana, Cardano, Dogecoin, XRP, etc.
+
+### Forex
+- Euro: `EURUSD=X` or `euro`
+- Pound: `GBPUSD=X` or `pound`
+- Dollar Index: `DX-Y.NYB` or `dxy`
+
+---
+
+## Inline Symbol Detection
+
+Mention symbols with `$` anywhere in a message:
 
 ```
 What do you think about $AAPL?
-```
-```
-Apple Inc. (AAPL)
-◈ $185.92
-▲ +2.34 (+1.27% 1d)
-⊡ Vol: 52.3M
-```
+→ Apple Inc. (AAPL) ◈ $185.92 ▲ +1.27%
 
-Multiple symbols work too:
-
-```
 Comparing $MSFT and $GOOGL today
-```
-```
-● MSFT: $378.91 (+0.89% 1d)
-○ GOOGL: $141.80 (-0.32% 1d)
+→ ● MSFT: $378.91 (+0.89%)
+  ○ GOOGL: $141.80 (-0.32%)
 ```
 
-### @ Mentions
-
-Tag the bot in a group chat to get help:
-
-```
-@StockBot
-```
-```
-» Hey! I'm Stock Bot.
-
-Try these:
-• !price AAPL - Get stock price
-• !crypto - Top cryptocurrencies
-• $AAPL - Quick lookup
-• !help - All commands
-```
-
-You can also include symbols when mentioning:
-
-```
-@StockBot what's $TSLA doing?
-```
-```
-Tesla, Inc. (TSLA)
-◈ $248.50
-▲ +5.20 (+2.14% 1d)
-⊡ Vol: 98.2M
-```
+---
 
 ## Configuration
 
@@ -308,38 +262,28 @@ Tesla, Inc. (TSLA)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `SIGNAL_PHONE_NUMBER` | Yes | — | Bot's Signal phone number (E.164 format) |
-| `SIGNAL_API_URL` | No | `http://localhost:8080` | signal-cli-rest-api URL |
-| `COMMAND_PREFIX` | No | `!` | Command prefix character |
-| `BOT_NAME` | No | `Stock Bot` | Bot display name (used in help and mentions) |
-| `LOG_LEVEL` | No | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
-| `ALPHAVANTAGE_API_KEY` | No | — | Alpha Vantage API key for additional data |
+| `SIGNAL_PHONE_NUMBER` | Yes | — | Bot's Signal phone number |
+| `SIGNAL_API_URL` | No | `http://localhost:8080` | Signal API URL |
+| `BOT_NAME` | No | `Stock Bot` | Bot name (shown on charts) |
+| `COMMAND_PREFIX` | No | `!` | Command prefix |
+| `LOG_LEVEL` | No | `INFO` | Logging level |
+| `ALPHAVANTAGE_API_KEY` | No | — | Alpha Vantage API key |
 | `POLYGON_API_KEY` | No | — | Polygon.io API key |
-| `MASSIVE_PRO` | No | `false` | Set to `true` if you have paid Polygon plan (enables `!options` and `!economy`) |
-| `YAHOO_PRIORITY` | No | `0` | Yahoo Finance priority (lower = higher) |
-| `ALPHAVANTAGE_PRIORITY` | No | `10` | Alpha Vantage priority |
-| `POLYGON_PRIORITY` | No | `5` | Polygon priority |
+| `MASSIVE_PRO` | No | `false` | Enable `!options` and `!economy` |
 
-### Provider Priority
+### Cache TTLs
 
-Providers are tried in priority order (lowest number first). When a provider fails or hits rate limits, the next provider is tried automatically.
+| Data Type | TTL |
+|-----------|-----|
+| Intraday quotes | 60 seconds |
+| Daily quotes | 5 minutes |
+| Charts | 5 minutes |
+| News | 10 minutes |
+| Fundamentals | 1 hour |
+| Earnings | 1 hour |
+| Historical data | 24 hours |
 
-Default order:
-1. Yahoo Finance (priority 0) — Free, no API key, unlimited
-2. Polygon.io (priority 5) — If configured
-3. Alpha Vantage (priority 10) — If configured
-
-### Adding API Keys
-
-**Alpha Vantage** (free tier: 25 requests/day):
-1. Get key at https://www.alphavantage.co/support/#api-key
-2. Add to `.env`: `ALPHAVANTAGE_API_KEY=your_key_here`
-
-**Polygon.io** (free tier available, options/economy require paid plan):
-1. Sign up at https://polygon.io/
-2. Add to `.env`: `POLYGON_API_KEY=your_key_here`
-
-> **Note**: Options data (`!options`) and economy indicators (`!economy`) require a Polygon.io paid plan. The free tier supports stock quotes, crypto, and forex.
+---
 
 ## Architecture
 
@@ -351,228 +295,55 @@ Default order:
                           ▼
 ┌──────────────────────────────────────────────────────────┐
 │              signal-cli-rest-api (Docker)                │
-│                                                          │
-│  • Handles Signal protocol                               │
-│  • Manages encryption keys                               │
-│  • Sends webhooks to stock-bot                          │
 └─────────────────────────┬────────────────────────────────┘
-                          │ HTTP webhook
+                          │ JSON-RPC
                           ▼
 ┌──────────────────────────────────────────────────────────┐
 │                   stock-bot (Docker)                     │
 │                                                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │   Webhook   │─▶│  Dispatcher  │─▶│   Commands    │  │
-│  │   Handler   │  │              │  │               │  │
-│  └─────────────┘  └──────────────┘  └───────┬───────┘  │
-│                                              │          │
-│                                              ▼          │
-│                                    ┌─────────────────┐  │
-│                                    │    Provider     │  │
-│                                    │    Manager      │  │
-│                                    └────────┬────────┘  │
-│                                              │          │
-│                    ┌─────────────────────────┼─────┐    │
-│                    ▼              ▼          ▼     │    │
-│              ┌─────────┐  ┌────────────┐  ┌─────┐ │    │
-│              │  Yahoo  │  │   Alpha    │  │ ... │ │    │
-│              │ Finance │  │  Vantage   │  │     │ │    │
-│              └─────────┘  └────────────┘  └─────┘ │    │
-│                                                   │    │
-└───────────────────────────────────────────────────┴────┘
+│  Commands: price, quote, chart, ta, rsi, macd,          │
+│            earnings, dividend, news, market, crypto...   │
+│                                                          │
+│  Providers: Yahoo Finance, Alpha Vantage, Polygon       │
+│                                                          │
+│  Features: Smart caching, rate limiting, circuit breaker│
+└──────────────────────────────────────────────────────────┘
 ```
 
-## Project Structure
-
-```
-signal-stock-bot/
-├── docker-compose.yml      # Full stack deployment
-├── Dockerfile              # Bot container
-├── .env.example            # Environment template
-├── requirements.txt        # Python dependencies
-├── requirements-test.txt   # Test dependencies
-├── pytest.ini              # Test configuration
-│
-├── docs/
-│   ├── INFRASTRUCTURE.md   # Server setup guide
-│   └── DESIGN.md           # Technical design doc
-│
-├── src/
-│   ├── __init__.py
-│   ├── main.py             # Entry point
-│   ├── config.py           # Configuration
-│   ├── server.py           # Flask webhook server
-│   │
-│   ├── providers/          # Financial data providers
-│   │   ├── __init__.py
-│   │   ├── base.py         # Provider interface
-│   │   ├── manager.py      # Fallback logic
-│   │   ├── yahoo.py        # Yahoo Finance
-│   │   └── alphavantage.py # Alpha Vantage
-│   │
-│   ├── commands/           # Bot commands
-│   │   ├── __init__.py
-│   │   ├── base.py         # Command interface
-│   │   ├── dispatcher.py   # Message routing
-│   │   └── stock_commands.py
-│   │
-│   └── signal/             # Signal integration
-│       ├── __init__.py
-│       └── handler.py
-│
-├── tests/
-│   ├── conftest.py
-│   ├── test_providers.py
-│   ├── test_commands.py
-│   └── test_integration.py
-│
-├── data/                   # Signal-cli data (created at runtime)
-│   └── signal-cli/
-│
-└── logs/                   # Application logs
-    └── bot.log
-```
+---
 
 ## Development
 
 ### Local setup
 
 ```bash
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 pip install -r requirements-test.txt
-
-# Run tests
 pytest
-
-# Run with coverage
-pytest --cov=src --cov-report=html
-
-# Run specific test file
-pytest tests/test_commands.py -v
-
-# Skip integration tests (require network)
-pytest -m "not integration"
 ```
 
-### Running locally without Docker
+### Running locally
 
 ```bash
-# Start signal-cli-rest-api separately (see docs/INFRASTRUCTURE.md)
-
-# Set environment
 export SIGNAL_API_URL=http://localhost:8080
 export SIGNAL_PHONE_NUMBER=+15551234567
-export LOG_LEVEL=DEBUG
-
-# Run bot
 python -m src.main
 ```
 
-### Adding a new provider
-
-1. Create `src/providers/newprovider.py`:
-
-```python
-from .base import BaseProvider, Quote, ProviderCapability
-
-class NewProvider(BaseProvider):
-    name = "newprovider"
-    capabilities = {ProviderCapability.QUOTE}
-    
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-    
-    async def get_quote(self, symbol: str) -> Quote:
-        # Implement API call
-        pass
-    
-    async def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
-        # Implement batch call
-        pass
-    
-    async def health_check(self) -> bool:
-        # Implement health check
-        pass
-```
-
-2. Register in `src/config.py`:
-
-```python
-# In Config.from_env()
-new_key = os.getenv("NEWPROVIDER_API_KEY")
-if new_key:
-    providers.append(ProviderConfig(
-        name="newprovider",
-        enabled=True,
-        api_key=new_key,
-        priority=int(os.getenv("NEWPROVIDER_PRIORITY", "5")),
-    ))
-```
-
-3. Add to `src/main.py`:
-
-```python
-from .providers import NewProvider
-
-# In create_provider_manager()
-elif provider_config.name == "newprovider":
-    manager.add_provider(NewProvider(provider_config.api_key))
-```
-
-### Adding a new command
-
-1. Create command class in `src/commands/stock_commands.py`:
-
-```python
-class NewCommand(BaseCommand):
-    name = "newcmd"
-    aliases = ["nc"]
-    description = "Does something new"
-    usage = "!newcmd <arg>"
-    
-    def __init__(self, provider_manager: ProviderManager):
-        self.providers = provider_manager
-    
-    async def execute(self, ctx: CommandContext) -> CommandResult:
-        if not ctx.args:
-            return CommandResult.error(f"Usage: {self.usage}")
-        
-        # Implement command logic
-        return CommandResult.ok("Response text")
-```
-
-2. Register in `src/main.py`:
-
-```python
-# In create_dispatcher()
-new_cmd = NewCommand(provider_manager)
-dispatcher.register(new_cmd)
-
-# Add to help command list
-help_cmd = HelpCommand([..., new_cmd])
-```
+---
 
 ## Maintenance
 
-### Update signal-cli (monthly recommended)
-
-Signal protocol changes require keeping signal-cli updated:
+### Update containers
 
 ```bash
-cd signal-stock-bot
 docker compose pull
 docker compose up -d
-docker compose logs -f signal-api  # Watch for errors
 ```
 
 ### Backup Signal credentials
-
-Your Signal identity is stored in `./data/signal-cli/`. Back this up securely:
 
 ```bash
 tar -czvf signal-backup-$(date +%Y%m%d).tar.gz ./data/signal-cli
@@ -581,74 +352,21 @@ tar -czvf signal-backup-$(date +%Y%m%d).tar.gz ./data/signal-cli
 ### View logs
 
 ```bash
-# All logs
-docker compose logs -f
-
-# Just bot logs
 docker compose logs -f stock-bot
-
-# Or directly
-tail -f logs/bot.log
 ```
 
-### Check health
-
-```bash
-# Signal API
-curl http://localhost:8080/v1/health
-
-# Stock bot
-curl http://localhost:5000/health
-```
+---
 
 ## Troubleshooting
 
-### Bot not responding
+| Issue | Solution |
+|-------|----------|
+| Bot not responding | Check `docker compose ps`, verify Signal API health |
+| Symbol not found | Use smart names (`apple`, `gold`) or full symbols (`BRK.B`) |
+| Rate limited | Add more providers, check `!status` |
+| Messages delayed | Ensure using `MODE=json-rpc` |
 
-1. Check containers are running: `docker compose ps`
-2. Check Signal API health: `curl http://localhost:8080/v1/health`
-3. Check webhook is configured: `docker compose logs signal-api | grep webhook`
-4. Check bot logs: `docker compose logs stock-bot`
-
-### "Account not found" error
-
-Your Signal account isn't linked. Re-run the QR code linking process.
-
-### Rate limit errors
-
-The bot handles rate limits automatically by switching providers. If you're seeing frequent rate limits:
-- Add more providers (Alpha Vantage, Polygon)
-- Reduce query frequency
-- Check `!status` to see which providers are rate-limited
-
-### Messages delayed
-
-If using `MODE=normal` instead of `MODE=json-rpc`, switch to json-rpc for faster responses (sub-second vs 3-5 seconds).
-
-### Symbol not found
-
-- Check the symbol is valid (US exchanges primarily)
-- Try the full symbol (e.g., `BRK.B` not `BRKB`)
-- Crypto uses different symbols (`BTC-USD`, `ETH-USD`)
-
-### Group messages not working
-
-Signal GroupV2 requires periodic sync. The `AUTO_RECEIVE_SCHEDULE` setting handles this, but you can force sync:
-
-```bash
-curl "http://localhost:8080/v1/receive/+15551234567"
-```
-
-## Supported Symbols
-
-The bot supports any symbol available through Yahoo Finance:
-
-- **US Stocks**: `AAPL`, `MSFT`, `GOOGL`, `TSLA`, etc.
-- **ETFs**: `SPY`, `QQQ`, `VTI`, `ARKK`, etc.
-- **Indices**: `^GSPC` (S&P 500), `^DJI` (Dow), `^IXIC` (Nasdaq)
-- **Crypto**: `BTC-USD`, `ETH-USD`, `SOL-USD`
-- **Forex**: `EURUSD=X`, `GBPUSD=X`
-- **International**: `TSM` (Taiwan Semi), `BABA` (Alibaba)
+---
 
 ## License
 
@@ -656,6 +374,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- [signal-cli](https://github.com/AsamK/signal-cli) — Signal protocol implementation
-- [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) — REST wrapper
+- [signal-cli](https://github.com/AsamK/signal-cli) — Signal protocol
 - [yfinance](https://github.com/ranaroussi/yfinance) — Yahoo Finance data
+- [mplfinance](https://github.com/matplotlib/mplfinance) — Professional charts
+
