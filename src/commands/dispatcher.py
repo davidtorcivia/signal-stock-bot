@@ -151,14 +151,39 @@ class CommandDispatcher:
                 # Route to price command
                 return await self._execute_command("price", symbols, sender, message, group_id)
         
-        # If bot was @mentioned but no command or symbols found, provide help
+        # If bot was @mentioned but no command or symbols found, try smart detection
         if mentioned:
+            # Try to detect stock names in the message (e.g., "@bot what about Apple?")
+            from ..utils.symbols import SYMBOL_ALIASES, resolve_alias
+            
+            message_lower = message.lower()
+            detected_symbols = []
+            detected_names = []
+            
+            # Check for known company names in the message
+            for alias, symbol in SYMBOL_ALIASES.items():
+                # Only match word boundaries to avoid partial matches
+                if f" {alias} " in f" {message_lower} " or \
+                   f" {alias}?" in f" {message_lower} " or \
+                   f" {alias}!" in f" {message_lower} " or \
+                   message_lower.startswith(f"{alias} ") or \
+                   message_lower.endswith(f" {alias}"):
+                    if symbol not in detected_symbols:
+                        detected_symbols.append(symbol)
+                        detected_names.append(alias.title())
+            
+            # If we found stock names, do a price lookup
+            if detected_symbols:
+                logger.info(f"Smart mention detected: {detected_names} → {detected_symbols}")
+                return await self._execute_command("price", detected_symbols[:5], sender, message, group_id)
+            
+            # Otherwise show intro
             logger.info("Bot mentioned without command, providing help intro")
             return CommandResult.ok(
                 f"» Hey! I'm {self.bot_name}.\n\n"
                 "Try these:\n"
                 "• !price AAPL - Get stock price\n"
-                "• !crypto - Top cryptocurrencies\n"
+                "• !watch - Your watchlist\n"
                 "• $AAPL - Quick lookup\n"
                 "• !help - All commands"
             )

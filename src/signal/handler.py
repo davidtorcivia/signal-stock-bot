@@ -55,6 +55,7 @@ class SignalHandler:
         self.config = config
         self.dispatcher = dispatcher
         self._session: Optional[aiohttp.ClientSession] = None
+        self._bot_uuid: Optional[str] = None  # Fetched on first use
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -166,30 +167,57 @@ class SignalHandler:
             logger.error(f"Failed to send response: {e}")
             raise
     
-    def _is_bot_mentioned(self, data_message: dict) -> bool:
+    async def fetch_bot_uuid(self) -> Optional[str]:
+        """Fetch and cache the bot's UUID from signal-cli API."""
+        if self._bot_uuid:
+            return self._bot_uuid
+        
+        try:
+            session = await self._get_session()
+            url = f"{self.config.api_url}/v1/about"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # Check if our phone's info is available
+                    for account in data if isinstance(data, list) else [data]:
+                        if account.get("number") == self.config.phone_number:
+                            self._bot_uuid = account.get("uuid")
+                            if self._bot_uuid:
+                                logger.info(f"Fetched bot UUID: {self._bot_uuid[:8]}...")
+                            return self._bot_uuid
+        except Exception as e:
+            logger.debug(f"Could not fetch bot UUID: {e}")
+        
+        return None
+    
+    async def _is_bot_mentioned(self, data_message: dict) -> bool:
         """
         Check if the bot is mentioned in the message.
         
         Signal mentions include the phone number or UUID of mentioned users.
-        We check if any mention matches our bot's phone number.
+        We check if any mention matches our bot's phone number or UUID.
         """
         mentions = data_message.get("mentions", [])
         if not mentions:
             return False
         
+        # Ensure we have our UUID for matching
+        if not self._bot_uuid:
+            await self.fetch_bot_uuid()
+        
         # Check each mention - signal-cli provides the mentioned number/uuid
         for mention in mentions:
-            # The mention might have a 'number' field matching our phone
+            # Check phone number match
             mentioned_number = mention.get("number", "")
             if mentioned_number == self.config.phone_number:
                 return True
             
-            # Check UUID if available (signal-cli may provide this)
+            # Check UUID match
             mentioned_uuid = mention.get("uuid", "")
-            # We'd need to store our own UUID to compare - for now skip
-            # TODO: Store bot's UUID on startup for more reliable matching
+            if self._bot_uuid and mentioned_uuid == self._bot_uuid:
+                return True
         
-        # No matching mention found - don't assume any mention is for us
+        # No matching mention found
         return False
     
     async def handle_webhook(self, data: dict):
@@ -218,7 +246,7 @@ class SignalHandler:
             group_id = group_info.get("groupId")
         
         # Check if bot is mentioned
-        is_mentioned = self._is_bot_mentioned(data_message)
+        is_mentioned = await self._is_bot_mentioned(data_message)
         
         logger.info(
             f"Received message from {sender[-4:]}: "
@@ -238,10 +266,12 @@ class SignalHandler:
         # Send response if command was processed
         if result:
             try:
+                # If dm_only, send directly to user regardless of group context
+                target_group = None if result.dm_only else group_id
                 await self.send_message(
                     recipient=sender,
                     message=result.text,
-                    group_id=group_id,
+                    group_id=target_group,
                     attachments=result.attachments,
                 )
             except Exception as e:

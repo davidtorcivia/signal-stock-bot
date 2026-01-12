@@ -27,6 +27,7 @@ class CommandResult:
     text: str
     success: bool = True
     attachments: Optional[list[str]] = None  # Base64-encoded images
+    dm_only: bool = False  # If True, send as DM even in group chat
     
     @classmethod
     def error(cls, message: str) -> "CommandResult":

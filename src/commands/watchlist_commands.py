@@ -1,7 +1,7 @@
 """
 Watchlist command for stock bot.
 
-Provides: !watch, !watch add, !watch remove, !watch clear
+Provides: !watch, !watch add, !watch remove, !watch clear, !watch sort, !watch export
 """
 
 from .base import BaseCommand, CommandContext, CommandResult
@@ -14,7 +14,7 @@ class WatchCommand(BaseCommand):
     name = "watch"
     aliases = ["w", "watchlist"]
     description = "Manage your watchlist"
-    usage = "!watch [add|remove|clear] [symbols]"
+    usage = "!watch [add|remove|clear|sort|export] [symbols]"
     help_explanation = """Track your favorite stocks with a personal watchlist.
 
 **Commands:**
@@ -22,6 +22,8 @@ class WatchCommand(BaseCommand):
 • !watch add AAPL MSFT — Add symbols to your list
 • !watch remove TSLA — Remove a symbol
 • !watch clear — Clear your entire watchlist
+• !watch sort [alpha|change] — Sort by name or % change
+• !watch export — Get list as CSV (sent as DM)
 
 **Pro Tips:**
 • Add stocks you're watching for entries or exits.
@@ -46,12 +48,16 @@ class WatchCommand(BaseCommand):
             return await self._remove_symbol(user_hash, ctx.args[1:])
         elif subcommand == "clear":
             return await self._clear_watchlist(user_hash)
+        elif subcommand == "sort":
+            return await self._show_watchlist(user_hash, sort_by=ctx.args[1] if len(ctx.args) > 1 else "change")
+        elif subcommand == "export":
+            return await self._export_watchlist(user_hash)
         else:
             # Treat as symbols to add if they look like symbols
             # e.g., "!watch AAPL" should add AAPL
             return await self._add_symbols(user_hash, ctx.args)
     
-    async def _show_watchlist(self, user_hash: str) -> CommandResult:
+    async def _show_watchlist(self, user_hash: str, sort_by: str = None) -> CommandResult:
         """Display watchlist with live prices."""
         symbols = await self.db.get_watchlist(user_hash)
         
@@ -67,24 +73,49 @@ class WatchCommand(BaseCommand):
         except Exception:
             quotes = {}
         
-        lines = ["◈ Your Watchlist", ""]
-        
+        # Build quote data for sorting
+        quote_data = []
         for symbol in symbols:
             if symbol in quotes:
                 q = quotes[symbol]
-                indicator = "▲" if q.change >= 0 else "▼"
-                sign = "+" if q.change >= 0 else ""
-                lines.append(
-                    f"{indicator} {symbol}: ${q.price:.2f} ({sign}{q.change_percent:.2f}%)"
-                )
+                quote_data.append((symbol, q.price, q.change_percent, True))
+            else:
+                quote_data.append((symbol, 0, 0, False))
+        
+        # Sort if requested
+        if sort_by:
+            sort_by = sort_by.lower()
+            if sort_by in ("alpha", "name", "a"):
+                quote_data.sort(key=lambda x: x[0])
+            elif sort_by in ("change", "percent", "pct", "%"):
+                quote_data.sort(key=lambda x: x[2], reverse=True)
+        
+        lines = ["◈ Your Watchlist", ""]
+        
+        up_count = 0
+        down_count = 0
+        
+        for symbol, price, change_pct, has_quote in quote_data:
+            if has_quote:
+                indicator = "▲" if change_pct >= 0 else "▼"
+                sign = "+" if change_pct >= 0 else ""
+                lines.append(f"{indicator} {symbol}: ${price:.2f} ({sign}{change_pct:.2f}%)")
+                if change_pct >= 0:
+                    up_count += 1
+                else:
+                    down_count += 1
             else:
                 lines.append(f"◇ {symbol}: N/A")
+        
+        # Add change summary
+        if up_count > 0 or down_count > 0:
+            lines.append(f"\n▲{up_count} ▼{down_count}")
         
         # Add timestamp
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
-        lines.append(f"\n◷ as of {now.strftime('%-I:%M %p ET')}")
+        lines.append(f"◷ as of {now.strftime('%-I:%M %p ET')}")
         
         return CommandResult.ok("\n".join(lines))
     
@@ -149,3 +180,19 @@ class WatchCommand(BaseCommand):
             return CommandResult.ok(f"Cleared {count} symbol(s) from watchlist")
         else:
             return CommandResult.ok("Watchlist already empty")
+    
+    async def _export_watchlist(self, user_hash: str) -> CommandResult:
+        """Export watchlist as CSV - sent as DM."""
+        symbols = await self.db.get_watchlist(user_hash)
+        
+        if not symbols:
+            return CommandResult.ok("No symbols to export")
+        
+        csv_list = ", ".join(symbols)
+        result = CommandResult.ok(
+            f"◈ Watchlist Export\n\n"
+            f"{csv_list}\n\n"
+            f"({len(symbols)} symbols)"
+        )
+        result.dm_only = True  # Send as DM, not to group
+        return result
