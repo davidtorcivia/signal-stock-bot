@@ -130,9 +130,17 @@ class ChartGenerator:
             solid_capstyle='round'
         )
         
+        # Auto-scale Y-axis to data range with padding (don't start at 0!)
+        price_min = min(closes)
+        price_max = max(closes)
+        price_range = price_max - price_min
+        padding = price_range * 0.10 if price_range > 0 else price_min * 0.05
+        ax_price.set_ylim(price_min - padding, price_max + padding)
+        
         # Fill area under curve (subtle gradient effect)
         ax_price.fill_between(
             dates, closes,
+            y2=price_min - padding,  # Fill to bottom of visible area
             alpha=0.1,
             color=line_color
         )
