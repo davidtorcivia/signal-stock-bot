@@ -107,10 +107,29 @@ class NewsCommand(BaseCommand):
                 else:
                     publisher = item.get('publisher') or item.get('source', '')
                 
+                # Get URL - prefer original article (clickThroughUrl) over Yahoo redirect
+                click_through = content.get('clickThroughUrl', {})
+                if isinstance(click_through, dict):
+                    url = click_through.get('url', '')
+                else:
+                    url = click_through or ''
+                
+                # Fallback to canonical/link if no original URL
+                if not url:
+                    canonical_url = content.get('canonicalUrl', {})
+                    if isinstance(canonical_url, dict):
+                        url = canonical_url.get('url', '')
+                    else:
+                        url = canonical_url or ''
+                if not url:
+                    url = item.get('link', '')
+                
                 # Format: 1. Title
                 lines.append(f"{i}. {title}")
                 if publisher:
                     lines.append(f"   ↳ {publisher}")
+                if url:
+                    lines.append(f"   → {url}")
                 
                 if i < len(news):
                     lines.append("")
