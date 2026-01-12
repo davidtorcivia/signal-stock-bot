@@ -9,6 +9,8 @@ from .base import (
     ProviderError,
     RateLimitError,
     SymbolNotFoundError,
+    CircuitBreaker,
+    SharedSession,
 )
 from .manager import ProviderManager
 from .yahoo import YahooFinanceProvider
@@ -26,6 +28,8 @@ __all__ = [
     "ProviderError",
     "RateLimitError",
     "SymbolNotFoundError",
+    "CircuitBreaker",
+    "SharedSession",
     "ProviderManager",
     "YahooFinanceProvider",
     "AlphaVantageProvider",

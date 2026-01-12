@@ -8,12 +8,88 @@ Supports:
 
 import logging
 import re
+import time
 from typing import Optional
+from collections import defaultdict
+from pathlib import Path
 
 from .base import BaseCommand, CommandContext, CommandResult
 from ..cache import get_metrics
 
 logger = logging.getLogger(__name__)
+
+# Audit logger - separate file
+_audit_logger: Optional[logging.Logger] = None
+
+def get_audit_logger() -> logging.Logger:
+    """Get or create audit logger."""
+    global _audit_logger
+    if _audit_logger is None:
+        _audit_logger = logging.getLogger("audit")
+        _audit_logger.setLevel(logging.INFO)
+        # Ensure logs directory exists
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        # File handler for audit log
+        handler = logging.FileHandler(log_dir / "audit.log")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        _audit_logger.addHandler(handler)
+    return _audit_logger
+
+
+class UserRateLimiter:
+    """Per-user rate limiting."""
+    
+    def __init__(self, limit: int = 30, window: int = 60):
+        self.limit = limit
+        self.window = window  # seconds
+        self._requests: dict[str, list[float]] = defaultdict(list)
+    
+    def check(self, user: str) -> tuple[bool, int]:
+        """
+        Check if user is within rate limit.
+        
+        Returns:
+            (allowed, retry_after_seconds)
+        """
+        now = time.time()
+        window_start = now - self.window
+        
+        # Clean old requests
+        self._requests[user] = [t for t in self._requests[user] if t > window_start]
+        
+        if len(self._requests[user]) >= self.limit:
+            # Calculate when oldest request expires
+            oldest = min(self._requests[user])
+            retry_after = int(oldest + self.window - now) + 1
+            return False, retry_after
+        
+        # Record this request
+        self._requests[user].append(now)
+        return True, 0
+
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Calculate Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    
+    prev_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
 
 # Pattern for inline symbol mentions like $AAPL, $BTC-USD
 SYMBOL_MENTION_PATTERN = re.compile(r'\$([A-Z]{1,5}(?:[-\.][A-Z]{1,5})?)', re.IGNORECASE)
@@ -30,11 +106,13 @@ class CommandDispatcher:
     - Unknown command handling
     """
     
-    def __init__(self, prefix: str = "!", enable_inline_symbols: bool = True, bot_name: str = "Stock Bot"):
+    def __init__(self, prefix: str = "!", enable_inline_symbols: bool = True, 
+                 bot_name: str = "Stock Bot", rate_limit: int = 30):
         self.prefix = prefix
         self.enable_inline_symbols = enable_inline_symbols
         self.bot_name = bot_name
         self.commands: dict[str, BaseCommand] = {}
+        self._rate_limiter = UserRateLimiter(limit=rate_limit)
         self._pattern = re.compile(
             rf"^{re.escape(prefix)}([\w?]+)(?:\s+(.*))?$",
             re.IGNORECASE | re.DOTALL
@@ -102,6 +180,13 @@ class CommandDispatcher:
             CommandResult if message was a command or contained inline symbols
             None if message was not a command
         """
+        # Check rate limit
+        allowed, retry_after = self._rate_limiter.check(sender)
+        if not allowed:
+            return CommandResult.error(
+                f"Slow down! Try again in {retry_after} seconds."
+            )
+        
         # Record request metric
         get_metrics().record_request()
         
@@ -151,44 +236,49 @@ class CommandDispatcher:
                 # Route to price command
                 return await self._execute_command("price", symbols, sender, message, group_id)
         
-        # If bot was @mentioned but no command or symbols found, try smart detection
-        if mentioned:
-            # Try to detect stock names in the message (e.g., "@bot what about Apple?")
-            from ..utils.symbols import SYMBOL_ALIASES, resolve_alias
+        # Try natural language intent parsing (for mentions or direct queries)
+        if mentioned or self._looks_like_query(message):
+            from .intent_parser import parse_intent
             
-            message_lower = message.lower()
-            detected_symbols = []
-            detected_names = []
+            intent = parse_intent(message)
+            if intent and intent.confidence >= 0.5:
+                logger.info(f"Intent parsed: {intent.command} {intent.symbols} (confidence: {intent.confidence:.2f})")
+                return await self._execute_command(intent.command, intent.args, sender, message, group_id)
             
-            # Check for known company names in the message
-            for alias, symbol in SYMBOL_ALIASES.items():
-                # Only match word boundaries to avoid partial matches
-                if f" {alias} " in f" {message_lower} " or \
-                   f" {alias}?" in f" {message_lower} " or \
-                   f" {alias}!" in f" {message_lower} " or \
-                   message_lower.startswith(f"{alias} ") or \
-                   message_lower.endswith(f" {alias}"):
-                    if symbol not in detected_symbols:
-                        detected_symbols.append(symbol)
-                        detected_names.append(alias.title())
-            
-            # If we found stock names, do a price lookup
-            if detected_symbols:
-                logger.info(f"Smart mention detected: {detected_names} → {detected_symbols}")
-                return await self._execute_command("price", detected_symbols[:5], sender, message, group_id)
-            
-            # Otherwise show intro
-            logger.info("Bot mentioned without command, providing help intro")
-            return CommandResult.ok(
-                f"» Hey! I'm {self.bot_name}.\n\n"
-                "Try these:\n"
-                "• !price AAPL - Get stock price\n"
-                "• !watch - Your watchlist\n"
-                "• $AAPL - Quick lookup\n"
-                "• !help - All commands"
-            )
+            # If mentioned but no intent, show intro
+            if mentioned:
+                logger.info("Bot mentioned without command, providing help intro")
+                return CommandResult.ok(
+                    f"» Hey! I'm {self.bot_name}.\n\n"
+                    "Try these:\n"
+                    "• !price AAPL - Get stock price\n"
+                    "• Chart Apple - Natural language\n"
+                    "• $AAPL - Quick lookup\n"
+                    "• !help - All commands"
+                )
         
         return None
+    
+    def _looks_like_query(self, text: str) -> bool:
+        """Check if text looks like a stock-related query."""
+        # Skip short messages
+        if len(text) < 5:
+            return False
+        
+        # Check for question indicators
+        question_words = ['what', 'how', 'show', 'get', 'tell', 'can', 'give']
+        text_lower = text.lower()
+        
+        for word in question_words:
+            if text_lower.startswith(word) or f" {word} " in text_lower:
+                return True
+        
+        # Check for finance keywords
+        finance_keywords = [
+            'chart', 'price', 'rsi', 'macd', 'earnings', 'dividend',
+            'news', 'rating', 'insider', 'short', 'correlation',
+        ]
+        return any(kw in text_lower for kw in finance_keywords)
     
     async def _execute_command(
         self,
@@ -201,14 +291,13 @@ class CommandDispatcher:
         """Execute a command with the given arguments."""
         handler = self.commands.get(command)
         if not handler:
-            available = ", ".join(
-                sorted(set(cmd.name for cmd in self.commands.values()))
-            )
-            return CommandResult.error(
-                f"Unknown command: {command}\n"
-                f"Available: {available}\n"
-                f"Type {self.prefix}help for help"
-            )
+            # Try to suggest closest match
+            suggestion = self._find_closest_command(command)
+            msg = f"Unknown command: {command}"
+            if suggestion:
+                msg += f"\n  Did you mean: {self.prefix}{suggestion}"
+            msg += f"\nType {self.prefix}help for commands"
+            return CommandResult.error(msg)
         
         ctx = CommandContext(
             sender=sender,
@@ -222,6 +311,10 @@ class CommandDispatcher:
         if handler.has_help_flag(ctx):
              return handler.get_help_result()
         
+        # Audit log
+        audit = get_audit_logger()
+        audit.info(f"{sender[-4:]} | {command} {' '.join(args)}")
+        
         try:
             logger.info(f"Executing {command} from {sender[-4:]}: args={args}")
             result = await handler.execute(ctx)
@@ -231,6 +324,20 @@ class CommandDispatcher:
         except Exception as e:
             logger.exception(f"Error executing command {command}")
             return CommandResult.error(f"Internal error: {type(e).__name__}")
+    
+    def _find_closest_command(self, typo: str) -> Optional[str]:
+        """Find closest command name using Levenshtein distance."""
+        unique_commands = set(cmd.name for cmd in self.commands.values())
+        best_match = None
+        best_distance = float('inf')
+        
+        for cmd_name in unique_commands:
+            distance = levenshtein_distance(typo.lower(), cmd_name.lower())
+            if distance < best_distance and distance <= 2:  # Max 2 edits
+                best_distance = distance
+                best_match = cmd_name
+        
+        return best_match
     
     def get_commands(self) -> list[BaseCommand]:
         """Get unique list of registered commands"""

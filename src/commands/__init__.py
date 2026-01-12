@@ -35,6 +35,16 @@ from .news_commands import (
 from .admin_commands import (
     MetricsCommand,
     CacheCommand,
+    AdminCommand,
+)
+from .analytics_commands import (
+    RatingCommand,
+    InsiderCommand,
+    ShortCommand,
+    CorrelationCommand,
+)
+from .alert_commands import (
+    AlertCommand,
 )
 from .watchlist_commands import (
     WatchCommand,
@@ -73,6 +83,14 @@ __all__ = [
     # Admin
     "MetricsCommand",
     "CacheCommand",
+    "AdminCommand",
+    # Analytics
+    "RatingCommand",
+    "InsiderCommand",
+    "ShortCommand",
+    "CorrelationCommand",
+    # Alerts
+    "AlertCommand",
     # Watchlist
     "WatchCommand",
 ]

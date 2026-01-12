@@ -50,6 +50,14 @@ from .commands import (
     # Admin
     MetricsCommand,
     CacheCommand,
+    AdminCommand,
+    # Analytics
+    RatingCommand,
+    InsiderCommand,
+    ShortCommand,
+    CorrelationCommand,
+    # Alerts
+    AlertCommand,
     # Watchlist
     WatchCommand,
 )
@@ -122,9 +130,13 @@ def create_provider_manager(config: Config) -> ProviderManager:
     return manager
 
 
-def create_dispatcher(provider_manager: ProviderManager, config: Config, watchlist_db=None) -> CommandDispatcher:
+def create_dispatcher(provider_manager: ProviderManager, config: Config, watchlist_db=None, alerts_db=None) -> CommandDispatcher:
     """Create and configure command dispatcher"""
-    dispatcher = CommandDispatcher(prefix=config.command_prefix, bot_name=config.bot_name)
+    dispatcher = CommandDispatcher(
+        prefix=config.command_prefix, 
+        bot_name=config.bot_name,
+        rate_limit=config.user_rate_limit,
+    )
     
     # Create commands
     price_cmd = PriceCommand(provider_manager)
@@ -197,11 +209,34 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config, watchli
         dispatcher.register(watch_cmd)
         help_commands.append(watch_cmd)
     
-    # Admin commands (available to everyone, can restrict via admin_numbers)
-    metrics_cmd = MetricsCommand()
-    cache_cmd = CacheCommand()
+    # Analytics commands
+    rating_cmd = RatingCommand(provider_manager)
+    insider_cmd = InsiderCommand(provider_manager)
+    short_cmd = ShortCommand(provider_manager)
+    corr_cmd = CorrelationCommand(provider_manager)
+    dispatcher.register(rating_cmd)
+    dispatcher.register(insider_cmd)
+    dispatcher.register(short_cmd)
+    dispatcher.register(corr_cmd)
+    help_commands.extend([rating_cmd, insider_cmd, short_cmd, corr_cmd])
+    
+    # Alert command
+    if alerts_db:
+        alert_cmd = AlertCommand(provider_manager, alerts_db)
+        dispatcher.register(alert_cmd)
+        help_commands.append(alert_cmd)
+    
+    # Admin commands (restrict via admin_numbers if configured)
+    admin_numbers = config.admin_numbers
+    metrics_cmd = MetricsCommand(admin_numbers=admin_numbers)
+    cache_cmd = CacheCommand(admin_numbers=admin_numbers)
+    admin_cmd = AdminCommand(
+        admin_numbers=admin_numbers,
+        watchlist_db=watchlist_db,
+    )
     dispatcher.register(metrics_cmd)
     dispatcher.register(cache_cmd)
+    dispatcher.register(admin_cmd)
     # Don't add to help_commands - these are admin-only
     
     # Help command needs list of all visible commands
@@ -235,12 +270,13 @@ def main():
     logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
     
     # Set up database
-    from .database import WatchlistDB
+    from .database import WatchlistDB, AlertsDB
     watchlist_db = WatchlistDB(config.watchlist_db_path)
-    logger.info(f"Watchlist database: {config.watchlist_db_path}")
+    alerts_db = AlertsDB(config.watchlist_db_path)  # Uses same DB file
+    logger.info(f"Database: {config.watchlist_db_path}")
     
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config, watchlist_db)
+    dispatcher = create_dispatcher(provider_manager, config, watchlist_db, alerts_db)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler
@@ -250,6 +286,88 @@ def main():
     )
     signal_handler = SignalHandler(signal_config, dispatcher)
     logger.info(f"Signal handler configured for {config.signal_phone_number[-4:]}")
+    
+    # Start background alert worker
+    if alerts_db:
+        import threading
+        import asyncio
+        import time
+        
+        def run_alert_worker():
+            logger.info("Starting background alert worker")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def check_alerts():
+                while True:
+                    try:
+                        alerts = await alerts_db.get_all_active_alerts()
+                        if not alerts:
+                            await asyncio.sleep(60)
+                            continue
+                            
+                        logger.debug(f"Checking {len(alerts)} active alerts...")
+                        
+                        # Group by symbol to batch requests
+                        by_symbol = {}
+                        for alert in alerts:
+                            sym = alert['symbol']
+                            if sym not in by_symbol:
+                                by_symbol[sym] = []
+                            by_symbol[sym].append(alert)
+                        
+                        # Check each symbol
+                        for symbol, symbol_alerts in by_symbol.items():
+                            try:
+                                quote = await provider_manager.get_quote(symbol)
+                                current_price = quote.price
+                                
+                                for alert in symbol_alerts:
+                                    triggered = False
+                                    condition = alert['condition']
+                                    target = alert['target_value']
+                                    
+                                    if condition == 'above' and current_price > target:
+                                        triggered = True
+                                        msg = f"🔔 ALERT: {symbol} is above ${target:.2f} (Current: ${current_price:.2f})"
+                                    elif condition == 'below' and current_price < target:
+                                        triggered = True
+                                        msg = f"🔔 ALERT: {symbol} is below ${target:.2f} (Current: ${current_price:.2f})"
+                                    elif condition == 'change_pct' and abs(quote.change_percent) >= target:
+                                        triggered = True
+                                        msg = f"🔔 ALERT: {symbol} moved {quote.change_percent:+.2f}% (Target: {target}%)"
+                                    
+                                    if triggered:
+                                        logger.info(f"Alert triggered: {alert['id']} for {symbol}")
+                                        # Deactivate alert first
+                                        await alerts_db.trigger_alert(alert['id'])
+                                        
+                                        # Send notification
+                                        group_id = alert.get('group_id')
+                                        recipient = alert['user_phone']
+                                        
+                                        if group_id:
+                                            # Send to group. We still pass recipient (source) but it's ignored for group sends usually
+                                            # or needed for some logic. send_message signature requires recipient.
+                                            await signal_handler.send_message(recipient=recipient, message=msg, group_id=group_id)
+                                        else:
+                                            # DM - send directly to user
+                                            await signal_handler.send_message(recipient=recipient, message=msg, group_id=None)
+                                            
+                            except Exception as e:
+                                logger.error(f"Error checking {symbol}: {e}")
+                                
+                        await asyncio.sleep(60)
+                        
+                    except Exception as e:
+                        logger.error(f"Alert worker error: {e}")
+                        await asyncio.sleep(60)
+
+            loop.run_until_complete(check_alerts())
+
+        # Start thread
+        t = threading.Thread(target=run_alert_worker, daemon=True)
+        t.start()
     
     # Create and run Flask app
     app = create_app(signal_handler)

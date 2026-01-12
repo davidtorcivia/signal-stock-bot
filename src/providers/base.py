@@ -213,3 +213,113 @@ class BaseProvider(ABC):
     async def health_check(self) -> bool:
         """Check if provider is operational"""
         pass
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker pattern for provider failover.
+    
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Too many failures, requests fail fast
+    - HALF_OPEN: Testing if provider recovered
+    
+    Usage:
+        breaker = CircuitBreaker()
+        if breaker.is_available():
+            try:
+                result = await provider.get_quote(symbol)
+                breaker.record_success()
+            except Exception as e:
+                breaker.record_failure()
+                raise
+    """
+    
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 30):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.consecutive_failures = 0
+        self.last_failure_time: Optional[float] = None
+        self.state = "closed"  # closed, open, half_open
+    
+    def is_available(self) -> bool:
+        """Check if circuit allows requests."""
+        if self.state == "closed":
+            return True
+        
+        if self.state == "open":
+            # Check if recovery timeout has passed
+            if self.last_failure_time and \
+               (time.time() - self.last_failure_time) > self.recovery_timeout:
+                self.state = "half_open"
+                return True
+            return False
+        
+        # half_open - allow one test request
+        return True
+    
+    def record_success(self):
+        """Record a successful request."""
+        self.consecutive_failures = 0
+        if self.state == "half_open":
+            self.state = "closed"
+    
+    def record_failure(self):
+        """Record a failed request."""
+        import time
+        self.consecutive_failures += 1
+        self.last_failure_time = time.time()
+        
+        if self.consecutive_failures >= self.failure_threshold:
+            self.state = "open"
+
+
+class SharedSession:
+    """
+    Shared aiohttp session with connection pooling.
+    
+    Benefits:
+    - Connection reuse (keepalive)
+    - Limits per host to prevent overload
+    - Automatic cleanup
+    
+    Usage:
+        session = SharedSession.get()
+        async with session.get(url) as resp:
+            ...
+    """
+    
+    _instance: Optional['SharedSession'] = None
+    _session: Optional['aiohttp.ClientSession'] = None
+    
+    @classmethod
+    def get(cls) -> 'aiohttp.ClientSession':
+        """Get or create shared session."""
+        import aiohttp
+        
+        if cls._session is None or cls._session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=50,           # Total connection limit
+                limit_per_host=10,  # Per-host limit
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+            )
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            cls._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            )
+        
+        return cls._session
+    
+    @classmethod
+    async def close(cls):
+        """Close the shared session."""
+        if cls._session and not cls._session.closed:
+            await cls._session.close()
+            cls._session = None
+
+
+# Import time for CircuitBreaker
+import time
+

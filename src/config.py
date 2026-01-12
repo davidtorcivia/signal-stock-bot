@@ -49,6 +49,10 @@ class Config:
     # Database settings
     watchlist_db_path: str = "data/watchlist.db"
     
+    # Admin settings
+    admin_numbers: list[str] = field(default_factory=list)  # Phone numbers for admin access
+    user_rate_limit: int = 30  # Max requests per minute per user
+    
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables"""
@@ -117,6 +121,8 @@ class Config:
             port=int(os.getenv("PORT", "5000")),
             providers=providers,
             watchlist_db_path=os.getenv("WATCHLIST_DB_PATH", "data/watchlist.db"),
+            admin_numbers=[n.strip() for n in os.getenv("ADMIN_NUMBERS", "").split(",") if n.strip()],
+            user_rate_limit=int(os.getenv("USER_RATE_LIMIT", "30")),
         )
         
         logger.info(f"Loaded config: {len(providers)} providers configured")

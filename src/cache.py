@@ -9,6 +9,7 @@ Provides:
 """
 
 import time
+import asyncio
 import threading
 import logging
 from typing import Optional, TypeVar, Generic, Dict, Any
@@ -407,4 +408,70 @@ def get_cache_manager() -> CacheManager:
 def get_metrics() -> MetricsCollector:
     """Get the global metrics collector."""
     return MetricsCollector()
+
+
+class RequestDeduplicator:
+    """
+    Coalesces identical concurrent requests to avoid duplicate API calls.
+    
+    If multiple requests for the same key arrive within the window,
+    only the first actually executes - others await the same result.
+    
+    Usage:
+        dedup = RequestDeduplicator()
+        result = await dedup.execute("AAPL:quote", fetch_quote, "AAPL")
+    """
+    
+    def __init__(self, window_ms: int = 100):
+        self.window_ms = window_ms
+        self._pending: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+    
+    async def execute(self, key: str, func, *args, **kwargs):
+        """
+        Execute func if no pending request for key, else return pending result.
+        
+        Args:
+            key: Unique identifier for this request type
+            func: Async function to call
+            *args, **kwargs: Arguments for func
+        """
+        async with self._lock:
+            # If there's already a pending request for this key, wait for it
+            if key in self._pending:
+                logger.debug(f"Dedup hit for {key}")
+                return await self._pending[key]
+            
+            # Create a new future for this request
+            future = asyncio.get_event_loop().create_future()
+            self._pending[key] = future
+        
+        try:
+            # Execute the actual request
+            result = await func(*args, **kwargs)
+            future.set_result(result)
+            return result
+        except Exception as e:
+            future.set_exception(e)
+            raise
+        finally:
+            # Clean up after a short delay to catch near-simultaneous requests
+            async def cleanup():
+                await asyncio.sleep(self.window_ms / 1000)
+                async with self._lock:
+                    if key in self._pending and self._pending[key] is future:
+                        del self._pending[key]
+            
+            asyncio.create_task(cleanup())
+
+
+# Global deduplicator instance
+_deduplicator: Optional[RequestDeduplicator] = None
+
+def get_deduplicator() -> RequestDeduplicator:
+    """Get the global request deduplicator."""
+    global _deduplicator
+    if _deduplicator is None:
+        _deduplicator = RequestDeduplicator()
+    return _deduplicator
 

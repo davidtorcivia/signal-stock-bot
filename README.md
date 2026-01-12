@@ -248,11 +248,69 @@ Help text explains:
 
 | Command | Description |
 |---------|-------------|
-| `!metrics` | Bot performance dashboard (uptime, req/min, cache hits, provider health) |
-| `!cache stats` | Detailed cache statistics by type |
-| `!cache clear` | Clear all caches |
-| `!status` | Provider health status |
-| `!help` | Command list |
+
+---
+
+## Natural Language Support
+
+Speak to the bot naturally! It understands your intent:
+
+| **You say** | **Bot does** |
+|:---|:---|
+| "Chart Apple" | `!chart AAPL` |
+| "What's the price of Tesla?" | `!price TSLA` |
+| "Show me RSI for Microsoft" | `!rsi MSFT` |
+| "Any news on Google?" | `!news GOOGL` |
+| "What are analysts saying about NVDA?" | `!rating NVDA` |
+| "Insider trading for Amazon" | `!insider AMZN` |
+
+---
+
+## Pro Features
+
+### Price Alerts
+Notify you when stocks hit specific targets. Alerts trigger in the same chat (DM or Group) where they were set.
+
+`!alert AAPL above 200`
+`!alert TSLA below 150`
+`!alert BTC change 5` (notify on 5% move)
+
+- `!alerts` - List active alerts
+- `!alert remove [ID]` - Delete an alert
+- `!alert clear` - Delete all alerts
+
+### Advanced Analytics
+- `!rating [SYMBOL]` - Analyst consensus & price targets
+- `!insider [SYMBOL]` - Recent insider buying/selling
+- `!short [SYMBOL]` - Short interest data & squeeze risk
+- `!corr [SYM1] [SYM2]` - 30-day price correlation
+
+---
+
+## Admin Management
+
+To enable admin features, set `ADMIN_NUMBERS` in `.env`.
+
+### Commands
+- `!admin backup` - Export all user watchlists (JSON)
+- `!admin alerts` - View global alert stats
+- `!admin users` - User activity stats
+- `!metrics` - System health, uptime, request rates
+- `!cache stats` - View cache hit rates
+- `!cache clear` - Flush all caches
+
+### Configuration
+New `.env` options:
+```bash
+# Admin phone numbers (comma-separated)
+ADMIN_NUMBERS=+15551234567,+15559876543
+
+# Rate limit per user (requests/minute)
+USER_RATE_LIMIT=30
+```
+
+---
+
 
 ---
 
