@@ -17,6 +17,20 @@ from .stock_commands import (
     ProRequiredCommand,
     ChartCommand,
 )
+from .ta_commands import (
+    TechnicalAnalysisCommand,
+    RSICommand,
+    SMACommand,
+    MACDCommand,
+    SupportResistanceCommand,
+)
+from .earnings_commands import (
+    EarningsCommand,
+    DividendCommand,
+)
+from .news_commands import (
+    NewsCommand,
+)
 
 __all__ = [
     "BaseCommand",
@@ -36,6 +50,15 @@ __all__ = [
     "EconomyCommand",
     "ProRequiredCommand",
     "ChartCommand",
+    # TA commands
+    "TechnicalAnalysisCommand",
+    "RSICommand",
+    "SMACommand",
+    "MACDCommand",
+    "SupportResistanceCommand",
+    # Earnings/Dividend
+    "EarningsCommand",
+    "DividendCommand",
+    # News
+    "NewsCommand",
 ]
-
-

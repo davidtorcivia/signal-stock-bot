@@ -35,6 +35,17 @@ from .commands import (
     EconomyCommand,
     ProRequiredCommand,
     ChartCommand,
+    # TA commands
+    TechnicalAnalysisCommand,
+    RSICommand,
+    SMACommand,
+    MACDCommand,
+    SupportResistanceCommand,
+    # Earnings/Dividend
+    EarningsCommand,
+    DividendCommand,
+    # News
+    NewsCommand,
 )
 from .signal import SignalHandler, SignalConfig
 from .server import create_app
@@ -136,6 +147,28 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config) -> Comm
     chart_cmd = ChartCommand(provider_manager, config.bot_name)
     dispatcher.register(chart_cmd)
     help_commands.append(chart_cmd)
+    
+    # Technical Analysis commands
+    ta_cmd = TechnicalAnalysisCommand(provider_manager)
+    rsi_cmd = RSICommand(provider_manager)
+    sma_cmd = SMACommand(provider_manager)
+    macd_cmd = MACDCommand(provider_manager)
+    support_cmd = SupportResistanceCommand(provider_manager)
+    for cmd in [ta_cmd, rsi_cmd, sma_cmd, macd_cmd, support_cmd]:
+        dispatcher.register(cmd)
+    help_commands.extend([ta_cmd, rsi_cmd, sma_cmd, macd_cmd, support_cmd])
+    
+    # Earnings and Dividend commands
+    earnings_cmd = EarningsCommand(provider_manager)
+    dividend_cmd = DividendCommand(provider_manager)
+    dispatcher.register(earnings_cmd)
+    dispatcher.register(dividend_cmd)
+    help_commands.extend([earnings_cmd, dividend_cmd])
+    
+    # News command
+    news_cmd = NewsCommand(provider_manager)
+    dispatcher.register(news_cmd)
+    help_commands.append(news_cmd)
     
     # Help command needs list of all visible commands
     help_cmd = HelpCommand(help_commands, config.bot_name)
