@@ -80,6 +80,36 @@ class Config:
                 priority=int(os.getenv("POLYGON_PRIORITY", "5")),
             ))
         
+        # Finnhub (requires API key, 60 calls/min free)
+        finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
+        if finnhub_key:
+            providers.append(ProviderConfig(
+                name="finnhub",
+                enabled=True,
+                api_key=finnhub_key,
+                priority=int(os.getenv("FINNHUB_PRIORITY", "15")),
+            ))
+        
+        # Twelve Data (requires API key, 800 calls/day free)
+        twelvedata_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+        if twelvedata_key:
+            providers.append(ProviderConfig(
+                name="twelvedata",
+                enabled=True,
+                api_key=twelvedata_key,
+                priority=int(os.getenv("TWELVEDATA_PRIORITY", "20")),
+            ))
+        
+        # IEX Cloud (requires API key, 50k credits/month free)
+        iexcloud_key = os.getenv("IEXCLOUD_API_KEY", "").strip()
+        if iexcloud_key:
+            providers.append(ProviderConfig(
+                name="iexcloud",
+                enabled=True,
+                api_key=iexcloud_key,
+                priority=int(os.getenv("IEXCLOUD_PRIORITY", "25")),
+            ))
+        
         # Sort by priority
         providers.sort(key=lambda p: p.priority)
         

@@ -268,8 +268,11 @@ Comparing $MSFT and $GOOGL today
 | `BOT_NAME` | No | `Stock Bot` | Bot name (shown on charts) |
 | `COMMAND_PREFIX` | No | `!` | Command prefix |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
-| `ALPHAVANTAGE_API_KEY` | No | — | Alpha Vantage API key |
+| `ALPHAVANTAGE_API_KEY` | No | — | Alpha Vantage API key (25/day free) |
 | `POLYGON_API_KEY` | No | — | Polygon.io API key |
+| `FINNHUB_API_KEY` | No | — | Finnhub API key (60/min free) |
+| `TWELVEDATA_API_KEY` | No | — | Twelve Data API key (800/day free) |
+| `IEXCLOUD_API_KEY` | No | — | IEX Cloud API key (50k credits/mo free) |
 | `MASSIVE_PRO` | No | `false` | Enable `!options` and `!economy` |
 
 ### Cache TTLs

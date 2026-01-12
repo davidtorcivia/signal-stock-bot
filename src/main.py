@@ -78,6 +78,8 @@ def setup_logging(level: str):
 
 def create_provider_manager(config: Config) -> ProviderManager:
     """Create and configure provider manager"""
+    from .providers import FinnhubProvider, TwelveDataProvider, IEXCloudProvider
+    
     manager = ProviderManager()
     
     for provider_config in config.providers:
@@ -98,6 +100,24 @@ def create_provider_manager(config: Config) -> ProviderManager:
                 manager.add_provider(MassiveProvider(provider_config.api_key))
             else:
                 logging.warning("Massive/Polygon configured but no API key provided")
+        
+        elif provider_config.name == "finnhub":
+            if provider_config.api_key:
+                manager.add_provider(FinnhubProvider(provider_config.api_key))
+            else:
+                logging.warning("Finnhub configured but no API key provided")
+        
+        elif provider_config.name == "twelvedata":
+            if provider_config.api_key:
+                manager.add_provider(TwelveDataProvider(provider_config.api_key))
+            else:
+                logging.warning("Twelve Data configured but no API key provided")
+        
+        elif provider_config.name == "iexcloud":
+            if provider_config.api_key:
+                manager.add_provider(IEXCloudProvider(provider_config.api_key))
+            else:
+                logging.warning("IEX Cloud configured but no API key provided")
     
     if not manager.providers:
         logging.warning("No providers configured! Adding Yahoo Finance as fallback.")
