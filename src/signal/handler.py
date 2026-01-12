@@ -62,6 +62,50 @@ class SignalHandler:
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
     
+    async def _resolve_group_id(self, group_id: str) -> str:
+        """
+        Resolve internal group ID to V2 group ID (required for sending).
+        """
+        # If it already looks like a V2 ID (starts with group.), return it
+        if group_id.startswith("group."):
+            return group_id
+            
+        # Check cache
+        if hasattr(self, "_group_id_map") and group_id in self._group_id_map:
+            return self._group_id_map[group_id]
+            
+        # Fetch groups to update map
+        await self._refresh_group_map()
+        
+        # Check cache again
+        if hasattr(self, "_group_id_map") and group_id in self._group_id_map:
+            return self._group_id_map[group_id]
+            
+        # Fallback: return original (maybe it's valid?)
+        return group_id
+
+    async def _refresh_group_map(self):
+        """Fetch groups from API and update ID map."""
+        if not hasattr(self, "_group_id_map"):
+            self._group_id_map = {}
+            
+        try:
+            session = await self._get_session()
+            url = f"{self.config.api_url}/v1/groups/{self.config.phone_number}"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    groups = await resp.json()
+                    for group in groups:
+                        internal_id = group.get("internal_id")
+                        v2_id = group.get("id")
+                        if internal_id and v2_id:
+                            self._group_id_map[internal_id] = v2_id
+                    logger.info(f"Updated group ID map with {len(groups)} groups")
+                else:
+                    logger.error(f"Failed to fetch groups: {resp.status}")
+        except Exception as e:
+            logger.error(f"Error refreshing group map: {e}")
+
     async def send_message(
         self,
         recipient: str,
@@ -87,8 +131,9 @@ class SignalHandler:
         }
         
         if group_id:
-            # For groups, use group_id directly
-            payload["recipients"] = [group_id]
+            # Resolve group ID to V2 ID
+            resolved_id = await self._resolve_group_id(group_id)
+            payload["recipients"] = [resolved_id]
         else:
             payload["recipients"] = [recipient]
         
@@ -117,8 +162,8 @@ class SignalHandler:
                 
                 logger.debug(f"Message sent successfully to {recipient[-4:] if recipient else group_id}")
                 
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP error sending message: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send response: {e}")
             raise
     
     def _is_bot_mentioned(self, data_message: dict) -> bool:
