@@ -104,6 +104,37 @@ class CommandDispatcher:
         """
         # Record request metric
         get_metrics().record_request()
+        
+        # Check for command chaining (multiple commands in one message)
+        # e.g., "!price AAPL !ta AAPL"
+        # We need to be careful not to split inside quoted strings (though simplified splitting is likely okay for now)
+        if message.count(self.prefix) > 1 and message.strip().startswith(self.prefix):
+            # Split by prefix, but filter empty strings (e.g. leading prefix)
+            commands = [f"{self.prefix}{cmd.strip()}" for cmd in message.split(self.prefix) if cmd.strip()]
+            
+            if len(commands) > 1:
+                results = []
+                for cmd_str in commands:
+                    parsed = self.parse_message(cmd_str)
+                    if parsed:
+                        command, args = parsed
+                        result = await self._execute_command(command, args, sender, message, group_id)
+                        if result:
+                            results.append(result)
+                
+                if results:
+                    # Merge results
+                    merged_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join([r.text for r in results if r])
+                    merged_attachments = []
+                    for r in results:
+                        if r and r.attachments:
+                            merged_attachments.extend(r.attachments)
+                    
+                    return CommandResult(
+                        text=merged_text,
+                        success=all(r.success for r in results if r),
+                        attachments=merged_attachments
+                    )
 
         # First try standard command parsing
         parsed = self.parse_message(message)
@@ -161,6 +192,10 @@ class CommandDispatcher:
             command=command,
             args=args,
         )
+        
+        # universal -help flag check
+        if handler.has_help_flag(ctx):
+             return handler.get_help_result()
         
         try:
             logger.info(f"Executing {command} from {sender[-4:]}: args={args}")

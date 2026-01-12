@@ -39,6 +39,7 @@ class EarningsCommand(BaseCommand):
     aliases = ["earn", "er"]
     description = "Earnings date and estimates"
     usage = "!earnings AAPL"
+    help_explanation = "Shows the next reported earnings date, EPS estimates (Trailing/Forward), Revenue, and Profit Margins."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -135,6 +136,7 @@ class DividendCommand(BaseCommand):
     aliases = ["div", "yield"]
     description = "Dividend information"
     usage = "!dividend AAPL"
+    help_explanation = "Shows dividend Yield, Payout Ratio, Ex-Dividend Date, and recent payment history."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager

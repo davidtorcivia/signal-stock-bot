@@ -365,6 +365,7 @@ docker compose logs -f stock-bot
 | Symbol not found | Use smart names (`apple`, `gold`) or full symbols (`BRK.B`) |
 | Rate limited | Add more providers, check `!status` |
 | Messages delayed | Ensure using `MODE=json-rpc` |
+| Group Chat Fails | Bot uses fallback DM. Run `docker exec -it --user 1000 signal-api signal-cli -u <PHONE> listGroups` to force sync. |
 
 ---
 

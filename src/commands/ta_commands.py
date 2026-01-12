@@ -156,12 +156,76 @@ def format_price(price: float) -> str:
         return f"${price:.4f}"
 
 
+def calculate_verdict(closes: list, sma20, sma50, sma200, rsi, macd) -> dict:
+    """Calculate bullish/bearish score and verdict."""
+    bullish_signals = 0
+    total_signals = 0
+    current = closes[-1]
+    
+    # 1. Trend (MA crossover + price position)
+    if sma50 and sma200:
+        total_signals += 1
+        if sma50 > sma200:
+            bullish_signals += 1
+    
+    if sma20 and sma50:
+        total_signals += 1
+        if current > sma20:
+            bullish_signals += 1
+    
+    # 2. RSI (Momentum)
+    if rsi:
+        total_signals += 1
+        if 40 <= rsi <= 60:
+            bullish_signals += 0.5
+        elif rsi < 30:
+            bullish_signals += 1  # Oversold = buy
+        elif rsi > 70:
+            pass  # Overbought = sell
+        else:
+            bullish_signals += 0.5
+    
+    # 3. MACD (Trend Strength)
+    if macd:
+        total_signals += 1
+        if macd["bullish"]:
+            bullish_signals += 1
+    
+    # Verdict text
+    ratio = 0
+    if total_signals > 0:
+        ratio = bullish_signals / total_signals
+        
+    if ratio >= 0.6:
+        verdict = "BUY"
+        reason = "Strong Trend" if (sma50 and sma200 and sma50 > sma200) else "Positive Momentum"
+        indicator = "●"
+    elif ratio <= 0.4:
+        verdict = "SELL"
+        reason = "Downtrend" if (sma50 and sma200 and sma50 < sma200) else "Weakness"
+        indicator = "○"
+    else:
+        verdict = "HOLD"
+        reason = "Mixed Signals"
+        indicator = "◐"
+        
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "indicator": indicator,
+        "bullish_signals": bullish_signals,
+        "total_signals": total_signals,
+        "ratio": ratio
+    }
+
+
 class TechnicalAnalysisCommand(BaseCommand):
     """Technical analysis summary for a symbol."""
     name = "ta"
     aliases = ["technical", "analysis"]
     description = "Technical analysis summary"
     usage = "!ta AAPL [-full]"
+    help_explanation = "Provides a technical summary including trend direction, RSI momentum, and key support/resistance levels. Use -full for a deep dive."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -199,37 +263,12 @@ class TechnicalAnalysisCommand(BaseCommand):
             macd = calculate_macd(closes)
             levels = calculate_support_resistance(highs, lows, closes)
             
-            # Determine trend
-            bullish_signals = 0
-            total_signals = 0
+            # Use shared logic for verdict
+            analysis = calculate_verdict(closes, sma20, sma50, sma200, rsi, macd)
+            bullish_signals = analysis["bullish_signals"]
+            total_signals = analysis["total_signals"]
             
-            if sma20 and sma50:
-                total_signals += 1
-                if current > sma50:
-                    bullish_signals += 1
-            
-            if sma50 and sma200:
-                total_signals += 1
-                if sma50 > sma200:
-                    bullish_signals += 1
-            
-            if rsi:
-                total_signals += 1
-                if 40 <= rsi <= 60:
-                    bullish_signals += 0.5
-                elif rsi < 30:
-                    bullish_signals += 1  # Oversold = buy signal
-                elif rsi > 70:
-                    pass  # Overbought = sell signal
-                else:
-                    bullish_signals += 0.5
-            
-            if macd:
-                total_signals += 1
-                if macd["bullish"]:
-                    bullish_signals += 1
-            
-            # Build output
+            # Determine trend text
             if sma50 and sma200:
                 if current > sma50 > sma200:
                     trend = "▲ Bullish (above 50/200 SMA)"
@@ -293,16 +332,9 @@ class TechnicalAnalysisCommand(BaseCommand):
                 
                 # Overall signal
                 if total_signals > 0:
-                    ratio = bullish_signals / total_signals
-                    if ratio >= 0.6:
-                        signal = f"● BUY ({int(bullish_signals)}/{total_signals} bullish)"
-                    elif ratio <= 0.4:
-                        signal = f"○ SELL ({int(bullish_signals)}/{total_signals} bullish)"
-                    else:
-                        signal = f"◐ HOLD ({int(bullish_signals)}/{total_signals} bullish)"
                     lines.append("")
                     lines.append("━━━ Signal ━━━")
-                    lines.append(signal)
+                    lines.append(f"{analysis['indicator']} {analysis['verdict']} ({analysis['bullish_signals']}/{analysis['total_signals']} bullish)")
                 
             else:
                 # STANDARD MODE - brief summary
@@ -328,15 +360,8 @@ class TechnicalAnalysisCommand(BaseCommand):
                 
                 # Overall signal
                 if total_signals > 0:
-                    ratio = bullish_signals / total_signals
-                    if ratio >= 0.6:
-                        signal = f"● Buy ({int(bullish_signals)}/{total_signals} bullish)"
-                    elif ratio <= 0.4:
-                        signal = f"○ Sell ({int(bullish_signals)}/{total_signals} bullish)"
-                    else:
-                        signal = f"◐ Hold ({int(bullish_signals)}/{total_signals} bullish)"
                     lines.append("")
-                    lines.append(f"Signal: {signal}")
+                    lines.append(f"Signal: {analysis['indicator']} {analysis['verdict']} ({analysis['bullish_signals']}/{analysis['total_signals']} bullish)")
                 
                 lines.append("")
                 lines.append("Tip: Use !ta AAPL -full for complete analysis")
@@ -351,12 +376,60 @@ class TechnicalAnalysisCommand(BaseCommand):
             return CommandResult.error(f"Analysis failed: {type(e).__name__}")
 
 
+class TLDRCommand(BaseCommand):
+    """Simple Buy/Sell/Hold verdict."""
+    name = "tldr"
+    aliases = []
+    description = "Simple investment verdict (Buy/Sell/Hold)"
+    usage = "!tldr AAPL"
+    help_explanation = "Gives you a simple Bottom Line: Buy, Sell, or Hold, based on a weighted analysis of trend, momentum, and strength indicators."
+    
+    def __init__(self, provider_manager: ProviderManager):
+        self.providers = provider_manager
+    
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(f"Usage: {self.usage}")
+        
+        from ..utils import resolve_symbol
+        symbol, _ = await resolve_symbol(ctx.args[0])
+        
+        try:
+            # Need enough data for SMA200
+            bars = await self.providers.get_historical(symbol, "1y", "1d")
+            if not bars or len(bars) < 50:
+                return CommandResult.error(f"Insufficient data for {symbol}")
+            
+            closes = [b.close for b in bars]
+            
+            # Calculate indicators
+            sma20 = calculate_sma(closes, 20)
+            sma50 = calculate_sma(closes, 50)
+            sma200 = calculate_sma(closes, 200)
+            rsi = calculate_rsi(closes)
+            macd = calculate_macd(closes)
+            
+            # Get verdict
+            res = calculate_verdict(closes, sma20, sma50, sma200, rsi, macd)
+            
+            return CommandResult.ok(
+                f"{res['indicator']} {res['verdict']} {symbol}\n"
+                f"Reason: {res['reason']}"
+            )
+            
+        except SymbolNotFoundError:
+            return CommandResult.error(f"Symbol not found: {symbol}")
+        except Exception as e:
+            return CommandResult.error(f"TLDR failed: {type(e).__name__}")
+
+
 class RSICommand(BaseCommand):
     """RSI indicator with interpretation."""
     name = "rsi"
     aliases = []
     description = "RSI indicator"
     usage = "!rsi AAPL"
+    help_explanation = "The Relative Strength Index (RSI) measures speed of price changes. High (>70) means expensive/overbought. Low (<30) means cheap/oversold."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -411,6 +484,7 @@ class SMACommand(BaseCommand):
     aliases = ["ma", "moving"]
     description = "Simple Moving Averages"
     usage = "!sma AAPL [20 50 200]"
+    help_explanation = "Moving Averages smooth out price action. Price above the average is generally bullish (uptrend); price below is bearish (downtrend)."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -470,6 +544,7 @@ class MACDCommand(BaseCommand):
     aliases = []
     description = "MACD indicator"
     usage = "!macd AAPL"
+    help_explanation = "The MACD tracks trend momentum. When the MACD line crosses above the Signal line, it's a bullish (buy) signal. Below is bearish (sell)."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -523,6 +598,7 @@ class SupportResistanceCommand(BaseCommand):
     aliases = ["levels", "sr"]
     description = "Support/Resistance levels"
     usage = "!support AAPL"
+    help_explanation = "Calculates key price levels where the stock might bounce (Support) or face selling pressure (Resistance), based on recent trading range."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager

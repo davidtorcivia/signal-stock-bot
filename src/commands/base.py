@@ -60,6 +60,8 @@ class BaseCommand(ABC):
     description: str
     usage: str
     
+    help_explanation: str = "No simplified explanation available."
+
     @abstractmethod
     async def execute(self, ctx: CommandContext) -> CommandResult:
         """Execute the command and return a result"""
@@ -69,3 +71,15 @@ class BaseCommand(ABC):
         """Check if this handler matches the command"""
         command = command.lower()
         return command == self.name.lower() or command in [a.lower() for a in self.aliases]
+
+    def has_help_flag(self, ctx: CommandContext) -> bool:
+        """Check if -help argument is present"""
+        return "-help" in [a.lower() for a in ctx.args] or "--help" in [a.lower() for a in ctx.args]
+
+    def get_help_result(self) -> CommandResult:
+        """Return simplified help message"""
+        return CommandResult.ok(
+            f"💡 **Simple Explanation: !{self.name}**\n\n"
+            f"{self.help_explanation}\n\n"
+            f"Usage: {self.usage}"
+        )

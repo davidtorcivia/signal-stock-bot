@@ -16,6 +16,7 @@ class NewsCommand(BaseCommand):
     aliases = ["headlines", "n"]
     description = "Recent news headlines"
     usage = "!news AAPL [count]"
+    help_explanation = "Fetches the latest news headlines for a stock. Default is 5 stories, but you can ask for more (e.g. !news AAPL 10)."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager

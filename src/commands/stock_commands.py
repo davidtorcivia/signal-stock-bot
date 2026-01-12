@@ -138,8 +138,9 @@ def format_price(price: float) -> str:
 class PriceCommand(BaseCommand):
     name = "price"
     aliases = ["p", "pr", "$"]
-    description = "Get current stock price"
-    usage = "!price AAPL [MSFT GOOGL ...]"
+    description = "Get real-time stock price"
+    usage = "!price AAPL [MSFT GOOGL]"
+    help_explanation = "Shows the current trading price and daily change for one or more stocks. You can list up to 10 symbols."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -220,6 +221,7 @@ class QuoteCommand(BaseCommand):
     aliases = ["q", "detail"]
     description = "Get detailed stock quote"
     usage = "!quote AAPL"
+    help_explanation = "Shows detailed market data including Open, High, Low, Previous Close, Volume, and Market Cap."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -271,6 +273,7 @@ class FundamentalsCommand(BaseCommand):
     aliases = ["i", "fundamentals", "fund"]
     description = "Get company fundamentals"
     usage = "!info AAPL"
+    help_explanation = "Shows fundamental data like P/E Ratio, EPS (Earnings Per Share), Market Cap, and Dividend Yield."
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -332,6 +335,7 @@ class MarketCommand(BaseCommand):
     aliases = ["m", "indices"]
     description = "Get major market indices"
     usage = "!market"
+    help_explanation = "Shows an overview of major US indices (S&P 500, Dow, Nasdaq) and the VIX (Volatility Index)."
     
     INDICES = {
         "^GSPC": "S&P 500",
@@ -687,6 +691,7 @@ class ChartCommand(BaseCommand):
     aliases = ["ch", "graph"]
     description = "Generate stock price chart"
     usage = "!chart AAPL [1m] [-c] [-sma20] [-bb] [-rsi] [-compare MSFT]"
+    help_explanation = "Generates a price chart. You can customize the period (1d, 1m, 1y) and add features like Candlesticks (-c), Moving Averages (-sma50), or RSI (-rsi)."
     
     def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
         self.providers = provider_manager

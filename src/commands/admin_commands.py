@@ -15,6 +15,7 @@ class MetricsCommand(BaseCommand):
     aliases = ["stats", "perf"]
     description = "Bot performance metrics (admin)"
     usage = "!metrics"
+    help_explanation = "Shows system health stats like Uptime, Requests Per Minute, Cache Hit Rate, and API Provider Status."
     
     def __init__(self, admin_numbers: list[str] = None):
         """
@@ -81,6 +82,7 @@ class CacheCommand(BaseCommand):
     aliases = []
     description = "Cache management (admin)"
     usage = "!cache [clear|stats]"
+    help_explanation = "Manage the internal data cache. View statistics with !cache stats or wipe all data with !cache clear."
     
     def __init__(self, admin_numbers: list[str] = None):
         self.admin_numbers = admin_numbers or []
