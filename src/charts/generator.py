@@ -48,6 +48,9 @@ class ChartOptions:
     bollinger: bool = False   # Add Bollinger Bands
     rsi: bool = False         # Add RSI panel
     show_volume: bool = True
+    # Comparison symbol overlay
+    comparison_symbol: Optional[str] = None
+    comparison_bars: Optional[list] = None  # HistoricalBar list
 
 
 # SMA line colors
@@ -224,6 +227,32 @@ class ChartGenerator:
             addplots.append(mpf.make_addplot(rsi_70, panel=2, color='#FF5252', width=0.5, linestyle='--'))
             addplots.append(mpf.make_addplot(rsi_30, panel=2, color='#69F0AE', width=0.5, linestyle='--'))
             panel_ratios = [4, 1, 1.5]  # Price, Volume, RSI
+        
+        # Comparison symbol overlay (normalized percent returns)
+        if options.comparison_bars and options.comparison_symbol:
+            comp_df = pd.DataFrame([
+                {'Date': bar.timestamp, 'Close': bar.close}
+                for bar in options.comparison_bars
+            ])
+            comp_df.set_index('Date', inplace=True)
+            comp_df.index = pd.DatetimeIndex(comp_df.index)
+            
+            # Align to main dataframe dates
+            comp_df = comp_df.reindex(df.index, method='ffill')
+            
+            # Normalize both to percent return from start
+            main_normalized = (df['Close'] / df['Close'].iloc[0] - 1) * 100
+            comp_normalized = (comp_df['Close'] / comp_df['Close'].iloc[0] - 1) * 100
+            
+            # Add comparison as secondary y-axis with bright color
+            addplots.append(mpf.make_addplot(
+                comp_normalized,
+                color='#00E5FF',  # Cyan
+                width=1.5,
+                linestyle='--',
+                secondary_y=True,
+                ylabel=f'{options.comparison_symbol} %',
+            ))
         
         # Build title
         title = self._build_title(symbol, current_price, change_percent, period)

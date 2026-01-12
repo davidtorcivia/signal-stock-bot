@@ -671,15 +671,16 @@ class ChartCommand(BaseCommand):
     Command for generating stock price charts.
     
     Supports flags:
-      -c            Candlestick chart
-      -sma20/50/200 Add SMA overlay
-      -bb           Add Bollinger Bands
-      -rsi          Add RSI panel
+      -c             Candlestick chart
+      -sma20/50/200  Add SMA overlay
+      -bb            Add Bollinger Bands
+      -rsi           Add RSI panel
+      -compare MSFT  Overlay comparison symbol
     """
     name = "chart"
     aliases = ["ch", "graph"]
     description = "Generate stock price chart"
-    usage = "!chart AAPL [1m] [-c] [-sma20] [-bb] [-rsi]"
+    usage = "!chart AAPL [1m] [-c] [-sma20] [-bb] [-rsi] [-compare MSFT]"
     
     def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
         self.providers = provider_manager
@@ -712,11 +713,14 @@ class ChartCommand(BaseCommand):
             "sma_periods": [],
             "bollinger": False,
             "rsi": False,
+            "compare": None,  # Comparison symbol
         }
         
         valid_periods = {"1d", "5d", "1w", "1m", "3m", "6m", "1y", "ytd", "5y", "max"}
         
-        for arg in args:
+        i = 0
+        while i < len(args):
+            arg = args[i]
             arg_lower = arg.lower()
             
             # Flags
@@ -734,12 +738,19 @@ class ChartCommand(BaseCommand):
                 options["bollinger"] = True
             elif arg_lower == "-rsi":
                 options["rsi"] = True
+            elif arg_lower == "-compare" or arg_lower == "--compare":
+                # Next arg is the comparison symbol
+                if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    options["compare"] = args[i + 1].upper()
+                    i += 1
             # Period
             elif arg_lower in valid_periods:
                 period = arg_lower
             # Symbol (first non-flag, non-period argument)
             elif symbol is None and not arg.startswith("-"):
                 symbol = arg.upper()
+            
+            i += 1
         
         return symbol, period, options
     
@@ -774,6 +785,7 @@ class ChartCommand(BaseCommand):
             bollinger=opts["bollinger"],
             rsi=opts["rsi"],
             show_volume=True,
+            comparison_symbol=opts["compare"],
         )
         
         try:
@@ -786,6 +798,19 @@ class ChartCommand(BaseCommand):
             
             if not bars:
                 return CommandResult.error(f"No chart data available for {symbol}")
+            
+            # Fetch comparison data if requested
+            if opts["compare"]:
+                try:
+                    comp_bars = await self.providers.get_historical(
+                        symbol=opts["compare"],
+                        period=provider_period,
+                        interval=interval
+                    )
+                    chart_options.comparison_bars = comp_bars
+                except Exception as e:
+                    # Continue without comparison if fetch fails
+                    chart_options.comparison_symbol = None
             
             # Get current quote for title
             try:
@@ -832,6 +857,8 @@ class ChartCommand(BaseCommand):
                 indicator_labels.append("BB")
             if chart_options.rsi:
                 indicator_labels.append("RSI")
+            if chart_options.comparison_symbol and chart_options.comparison_bars:
+                indicator_labels.append(f"vs {chart_options.comparison_symbol}")
             
             indicator_str = f" [{', '.join(indicator_labels)}]" if indicator_labels else ""
             
@@ -855,4 +882,5 @@ class ChartCommand(BaseCommand):
             )
         except Exception as e:
             return CommandResult.error(f"Chart generation failed: {type(e).__name__}")
+
 
