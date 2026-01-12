@@ -122,13 +122,66 @@ SYMBOL_ALIASES = {
     "litecoin": "LTC-USD",
     "ltc": "LTC-USD",
     
-    # Indices (for reference)
+    # Commodities & Futures
+    "gold": "GC=F",
+    "silver": "SI=F",
+    "oil": "CL=F",
+    "crude": "CL=F",
+    "crude oil": "CL=F",
+    "wti": "CL=F",
+    "brent": "BZ=F",
+    "natural gas": "NG=F",
+    "natgas": "NG=F",
+    "gas": "NG=F",
+    "copper": "HG=F",
+    "platinum": "PL=F",
+    "palladium": "PA=F",
+    "corn": "ZC=F",
+    "wheat": "ZW=F",
+    "soybeans": "ZS=F",
+    "coffee": "KC=F",
+    "sugar": "SB=F",
+    "cotton": "CT=F",
+    
+    # Bonds & Treasuries
+    "bonds": "^TNX",
+    "10 year": "^TNX",
+    "10y": "^TNX",
+    "tnotes": "^TNX",
+    "t-notes": "^TNX",
+    "treasury": "^TNX",
+    "2 year": "^IRX",
+    "2y": "^IRX",
+    "30 year": "^TYX",
+    "30y": "^TYX",
+    "tlt": "TLT",
+    
+    # Indices & ETFs
     "spy": "SPY",
     "qqq": "QQQ",
     "dia": "DIA",
     "iwm": "IWM",
     "voo": "VOO",
     "vti": "VTI",
+    "sp500": "^GSPC",
+    "s&p": "^GSPC",
+    "s&p 500": "^GSPC",
+    "dow": "^DJI",
+    "dow jones": "^DJI",
+    "nasdaq": "^IXIC",
+    "russell": "^RUT",
+    "russell 2000": "^RUT",
+    "vix": "^VIX",
+    "volatility": "^VIX",
+    "fear": "^VIX",
+    
+    # Currencies
+    "euro": "EURUSD=X",
+    "yen": "JPYUSD=X",
+    "pound": "GBPUSD=X",
+    "dollar": "DX-Y.NYB",
+    "usd": "DX-Y.NYB",
+    "dxy": "DX-Y.NYB",
 }
 
 
