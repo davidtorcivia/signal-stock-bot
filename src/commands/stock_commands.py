@@ -670,12 +670,16 @@ class ChartCommand(BaseCommand):
     """
     Command for generating stock price charts.
     
-    Generates line charts with volume and sends as image attachments.
+    Supports flags:
+      -c            Candlestick chart
+      -sma20/50/200 Add SMA overlay
+      -bb           Add Bollinger Bands
+      -rsi          Add RSI panel
     """
     name = "chart"
     aliases = ["ch", "graph"]
     description = "Generate stock price chart"
-    usage = "!chart AAPL [1d|5d|1m|3m|6m|1y]"
+    usage = "!chart AAPL [1m] [-c] [-sma20] [-bb] [-rsi]"
     
     def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
         self.providers = provider_manager
@@ -694,15 +698,64 @@ class ChartCommand(BaseCommand):
             )
         return self._generator
     
+    def _parse_args(self, args: list[str]) -> tuple[str, str, dict]:
+        """
+        Parse command arguments into symbol, period, and options.
+        
+        Returns:
+            (symbol, period, options_dict)
+        """
+        symbol = None
+        period = "1m"  # Default
+        options = {
+            "chart_type": "line",
+            "sma_periods": [],
+            "bollinger": False,
+            "rsi": False,
+        }
+        
+        valid_periods = {"1d", "5d", "1w", "1m", "3m", "6m", "1y", "ytd", "5y", "max"}
+        
+        for arg in args:
+            arg_lower = arg.lower()
+            
+            # Flags
+            if arg_lower == "-c" or arg_lower == "--candle":
+                options["chart_type"] = "candle"
+            elif arg_lower.startswith("-sma"):
+                # Parse SMA period: -sma20, -sma50, -sma200
+                try:
+                    period_num = int(arg_lower.replace("-sma", ""))
+                    if period_num > 0:
+                        options["sma_periods"].append(period_num)
+                except ValueError:
+                    pass
+            elif arg_lower == "-bb" or arg_lower == "--bollinger":
+                options["bollinger"] = True
+            elif arg_lower == "-rsi":
+                options["rsi"] = True
+            # Period
+            elif arg_lower in valid_periods:
+                period = arg_lower
+            # Symbol (first non-flag, non-period argument)
+            elif symbol is None and not arg.startswith("-"):
+                symbol = arg.upper()
+        
+        return symbol, period, options
+    
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
             return CommandResult.error(
                 f"Usage: {self.usage}\n"
-                f"Periods: 1d, 5d, 1m, 3m, 6m, 1y, ytd"
+                f"Periods: 1d, 5d, 1m, 3m, 6m, 1y, ytd\n"
+                f"Flags: -c (candle), -sma20/50/200, -bb, -rsi"
             )
         
-        symbol = ctx.args[0].upper()
-        period = ctx.args[1].lower() if len(ctx.args) > 1 else "1m"
+        # Parse arguments
+        symbol, period, opts = self._parse_args(ctx.args)
+        
+        if not symbol:
+            return CommandResult.error("Symbol required. Example: !chart AAPL 1m -c")
         
         # Validate symbol
         valid, result = validate_symbol(symbol)
@@ -711,7 +764,17 @@ class ChartCommand(BaseCommand):
         
         # Map period to provider parameters
         from ..charts.generator import get_period_params
+        from ..charts import ChartOptions
         provider_period, interval = get_period_params(period)
+        
+        # Build ChartOptions
+        chart_options = ChartOptions(
+            chart_type=opts["chart_type"],
+            sma_periods=opts["sma_periods"],
+            bollinger=opts["bollinger"],
+            rsi=opts["rsi"],
+            show_volume=True,
+        )
         
         try:
             # Get historical data
@@ -733,10 +796,10 @@ class ChartCommand(BaseCommand):
                 current_price = bars[-1].close
                 name = symbol
             
-            # Calculate period change from chart data (first bar to last bar)
+            # Calculate period change from chart data
             period_change_pct = ((bars[-1].close - bars[0].open) / bars[0].open) * 100
             
-            # Period label for display
+            # Period label
             period_labels = {
                 "1d": "1d", "5d": "5d", "1w": "1w", "1m": "1m",
                 "3m": "3m", "6m": "6m", "1y": "1y", "ytd": "ytd",
@@ -750,16 +813,30 @@ class ChartCommand(BaseCommand):
                 symbol=symbol,
                 bars=bars,
                 period=period,
-                show_volume=True,
                 current_price=current_price,
                 change_percent=period_change_pct,
+                options=chart_options,
             )
             
-            # Build caption with period-specific change
+            # Build caption
             sign = "+" if period_change_pct >= 0 else ""
             indicator = "▲" if period_change_pct >= 0 else "▼"
+            
+            # Add indicator labels
+            indicator_labels = []
+            if chart_options.chart_type == "candle":
+                indicator_labels.append("candle")
+            if chart_options.sma_periods:
+                indicator_labels.append(f"SMA{'/'.join(map(str, chart_options.sma_periods))}")
+            if chart_options.bollinger:
+                indicator_labels.append("BB")
+            if chart_options.rsi:
+                indicator_labels.append("RSI")
+            
+            indicator_str = f" [{', '.join(indicator_labels)}]" if indicator_labels else ""
+            
             caption = (
-                f"{name} ({symbol})\n"
+                f"{name} ({symbol}){indicator_str}\n"
                 f"{Symbols.PRICE} {format_price(current_price)} "
                 f"{indicator} {sign}{period_change_pct:.2f}% {period_label}\n"
                 f"{format_timestamp()}"
@@ -773,8 +850,9 @@ class ChartCommand(BaseCommand):
             return CommandResult.error(f"Chart data unavailable: {e}")
         except ImportError as e:
             return CommandResult.error(
-                f"Charts require matplotlib. Install with: pip install matplotlib\n"
+                f"Charts require dependencies. Install: pip install matplotlib mplfinance pandas\n"
                 f"Error: {e}"
             )
         except Exception as e:
             return CommandResult.error(f"Chart generation failed: {type(e).__name__}")
+

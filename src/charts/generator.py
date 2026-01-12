@@ -3,17 +3,20 @@ Chart generator for stock price visualizations.
 
 Uses mplfinance for professional-grade financial charts.
 Automatically handles market hour gaps (no weekend/overnight jumps).
+Supports technical indicators: SMA, Bollinger Bands, RSI.
 """
 
 import io
 import base64
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import matplotlib
 matplotlib.use('Agg')  # Headless backend
 
+import numpy as np
 import pandas as pd
 import mplfinance as mpf
 
@@ -37,10 +40,27 @@ PERIOD_MAPPINGS = {
 }
 
 
-def create_dark_style(bot_name: str = "Stock Bot"):
+@dataclass
+class ChartOptions:
+    """Options for chart generation."""
+    chart_type: str = "line"  # "line" or "candle"
+    sma_periods: list[int] = field(default_factory=list)  # e.g., [20, 50, 200]
+    bollinger: bool = False   # Add Bollinger Bands
+    rsi: bool = False         # Add RSI panel
+    show_volume: bool = True
+
+
+# SMA line colors
+SMA_COLORS = {
+    20: '#FFD700',   # Gold
+    50: '#00BFFF',   # Deep Sky Blue
+    200: '#FF69B4',  # Hot Pink
+}
+
+
+def create_dark_style():
     """Create professional dark theme for mplfinance."""
     
-    # Market colors
     mc = mpf.make_marketcolors(
         up='#00C853',      # Green for up
         down='#FF1744',    # Red for down
@@ -49,7 +69,6 @@ def create_dark_style(bot_name: str = "Stock Bot"):
         volume='inherit',
     )
     
-    # Chart style
     style = mpf.make_mpf_style(
         base_mpf_style='nightclouds',
         marketcolors=mc,
@@ -72,6 +91,32 @@ def create_dark_style(bot_name: str = "Stock Bot"):
     return style
 
 
+def calculate_sma(closes: pd.Series, period: int) -> pd.Series:
+    """Calculate Simple Moving Average."""
+    return closes.rolling(window=period, min_periods=1).mean()
+
+
+def calculate_bollinger_bands(closes: pd.Series, period: int = 20, std_dev: float = 2.0):
+    """Calculate Bollinger Bands (middle, upper, lower)."""
+    sma = closes.rolling(window=period, min_periods=1).mean()
+    std = closes.rolling(window=period, min_periods=1).std()
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    return sma, upper, lower
+
+
+def calculate_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
+    """Calculate Relative Strength Index."""
+    delta = closes.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period, min_periods=1).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=1).mean()
+    
+    # Avoid division by zero
+    rs = gain / loss.replace(0, np.inf)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)  # Default to neutral
+
+
 class ChartGenerator:
     """
     Generates stock charts as base64-encoded PNG images.
@@ -80,6 +125,7 @@ class ChartGenerator:
     - Properly handle market hour gaps (no weekend/overnight jumps)
     - Support candlestick and line chart styles
     - Include volume overlay
+    - Support technical indicators (SMA, Bollinger, RSI)
     """
     
     def __init__(
@@ -94,17 +140,16 @@ class ChartGenerator:
         self.height = height
         self.bot_name = bot_name
         self.dpi = 100
-        self._style = create_dark_style(bot_name)
+        self._style = create_dark_style()
     
     def generate(
         self,
         symbol: str,
         bars: list[HistoricalBar],
         period: str = "1d",
-        show_volume: bool = True,
         current_price: Optional[float] = None,
         change_percent: Optional[float] = None,
-        chart_type: str = "line",  # "line" or "candle"
+        options: Optional[ChartOptions] = None,
     ) -> str:
         """
         Generate a chart and return as base64-encoded PNG.
@@ -113,10 +158,9 @@ class ChartGenerator:
             symbol: Stock symbol (e.g., "AAPL")
             bars: Historical OHLCV data
             period: Time period label (e.g., "1d", "1m")
-            show_volume: Whether to show volume bars
             current_price: Current price for title
             change_percent: Percent change for title
-            chart_type: "line" for line chart, "candle" for candlestick
+            options: Chart options (indicators, chart type, etc.)
         
         Returns:
             Base64-encoded PNG string for Signal attachment
@@ -124,7 +168,10 @@ class ChartGenerator:
         if not bars:
             raise ValueError("No data to chart")
         
-        # Convert bars to pandas DataFrame (required by mplfinance)
+        if options is None:
+            options = ChartOptions()
+        
+        # Convert bars to pandas DataFrame
         df = pd.DataFrame([
             {
                 'Date': bar.timestamp,
@@ -139,35 +186,77 @@ class ChartGenerator:
         df.set_index('Date', inplace=True)
         df.index = pd.DatetimeIndex(df.index)
         
+        # Build addplots for indicators
+        addplots = []
+        
+        # SMA overlays
+        for sma_period in options.sma_periods:
+            sma = calculate_sma(df['Close'], sma_period)
+            color = SMA_COLORS.get(sma_period, '#AAAAAA')
+            addplots.append(mpf.make_addplot(
+                sma,
+                color=color,
+                width=1.2,
+                label=f'SMA{sma_period}'
+            ))
+        
+        # Bollinger Bands
+        if options.bollinger:
+            bb_mid, bb_upper, bb_lower = calculate_bollinger_bands(df['Close'])
+            addplots.append(mpf.make_addplot(bb_upper, color='#666666', width=0.8, linestyle='--'))
+            addplots.append(mpf.make_addplot(bb_mid, color='#888888', width=0.8))
+            addplots.append(mpf.make_addplot(bb_lower, color='#666666', width=0.8, linestyle='--'))
+        
+        # RSI panel
+        panel_ratios = [4, 1]  # Price, Volume
+        if options.rsi:
+            rsi = calculate_rsi(df['Close'])
+            addplots.append(mpf.make_addplot(
+                rsi,
+                panel=2,
+                color='#9C27B0',
+                ylabel='RSI',
+                ylim=(0, 100),
+            ))
+            # RSI overbought/oversold lines
+            rsi_70 = pd.Series([70] * len(df), index=df.index)
+            rsi_30 = pd.Series([30] * len(df), index=df.index)
+            addplots.append(mpf.make_addplot(rsi_70, panel=2, color='#FF5252', width=0.5, linestyle='--'))
+            addplots.append(mpf.make_addplot(rsi_30, panel=2, color='#69F0AE', width=0.5, linestyle='--'))
+            panel_ratios = [4, 1, 1.5]  # Price, Volume, RSI
+        
         # Build title
         title = self._build_title(symbol, current_price, change_percent, period)
         
-        # Figure size
+        # Figure size - increase height if RSI panel
         fig_width = self.width / self.dpi
-        fig_height = self.height / self.dpi
+        fig_height = (self.height + (100 if options.rsi else 0)) / self.dpi
         
-        # Determine chart type
-        if chart_type == "candle":
-            mpf_type = "candle"
-        else:
-            mpf_type = "line"
+        # Chart type
+        mpf_type = "candle" if options.chart_type == "candle" else "line"
         
         # Create the plot
         buf = io.BytesIO()
         
-        # mplfinance automatically handles gaps with show_nontrading=False (default)
-        fig, axes = mpf.plot(
-            df,
-            type=mpf_type,
-            style=self._style,
-            title=title,
-            volume=show_volume,
-            figsize=(fig_width, fig_height),
-            returnfig=True,
-            show_nontrading=False,  # Skip weekends/holidays (industry standard)
-            tight_layout=True,
-            scale_padding={'left': 0.1, 'right': 0.8, 'top': 0.6, 'bottom': 0.5},
-        )
+        plot_kwargs = {
+            'type': mpf_type,
+            'style': self._style,
+            'title': title,
+            'volume': options.show_volume,
+            'figsize': (fig_width, fig_height),
+            'returnfig': True,
+            'show_nontrading': False,
+            'tight_layout': True,
+            'scale_padding': {'left': 0.1, 'right': 0.8, 'top': 0.6, 'bottom': 0.5},
+        }
+        
+        if addplots:
+            plot_kwargs['addplot'] = addplots
+        
+        if options.rsi:
+            plot_kwargs['panel_ratios'] = panel_ratios
+        
+        fig, axes = mpf.plot(df, **plot_kwargs)
         
         # Add watermark
         fig.text(
