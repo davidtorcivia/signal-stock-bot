@@ -184,6 +184,21 @@ S2: $175.00
 
 ---
 
+### Watchlist Commands
+
+Persistent per-user watchlist for tracking your favorite symbols:
+
+```
+!watch                     # View your watchlist with live prices
+!watch add AAPL MSFT       # Add symbols
+!watch remove TSLA         # Remove a symbol
+!watch clear               # Clear entire watchlist
+```
+
+Watchlists are stored locally and persist across sessions. Limit: 50 symbols per user.
+
+---
+
 ### Market Overview Commands
 
 | Command | Aliases | Description |

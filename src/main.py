@@ -50,6 +50,8 @@ from .commands import (
     # Admin
     MetricsCommand,
     CacheCommand,
+    # Watchlist
+    WatchCommand,
 )
 from .signal import SignalHandler, SignalConfig
 from .server import create_app
@@ -120,7 +122,7 @@ def create_provider_manager(config: Config) -> ProviderManager:
     return manager
 
 
-def create_dispatcher(provider_manager: ProviderManager, config: Config) -> CommandDispatcher:
+def create_dispatcher(provider_manager: ProviderManager, config: Config, watchlist_db=None) -> CommandDispatcher:
     """Create and configure command dispatcher"""
     dispatcher = CommandDispatcher(prefix=config.command_prefix, bot_name=config.bot_name)
     
@@ -189,6 +191,12 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config) -> Comm
     dispatcher.register(news_cmd)
     help_commands.append(news_cmd)
     
+    # Watchlist command
+    if watchlist_db:
+        watch_cmd = WatchCommand(provider_manager, watchlist_db)
+        dispatcher.register(watch_cmd)
+        help_commands.append(watch_cmd)
+    
     # Admin commands (available to everyone, can restrict via admin_numbers)
     metrics_cmd = MetricsCommand()
     cache_cmd = CacheCommand()
@@ -226,8 +234,13 @@ def main():
     provider_manager = create_provider_manager(config)
     logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
     
+    # Set up database
+    from .database import WatchlistDB
+    watchlist_db = WatchlistDB(config.watchlist_db_path)
+    logger.info(f"Watchlist database: {config.watchlist_db_path}")
+    
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config)
+    dispatcher = create_dispatcher(provider_manager, config, watchlist_db)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler
@@ -272,8 +285,13 @@ def create_gunicorn_app():
     provider_manager = create_provider_manager(config)
     logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
     
+    # Set up database
+    from .database import WatchlistDB
+    watchlist_db = WatchlistDB(config.watchlist_db_path)
+    logger.info(f"Watchlist database: {config.watchlist_db_path}")
+    
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config)
+    dispatcher = create_dispatcher(provider_manager, config, watchlist_db)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler

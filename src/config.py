@@ -46,6 +46,9 @@ class Config:
     # Provider settings
     providers: list[ProviderConfig] = field(default_factory=list)
     
+    # Database settings
+    watchlist_db_path: str = "data/watchlist.db"
+    
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables"""
@@ -113,6 +116,7 @@ class Config:
             host=os.getenv("HOST", "0.0.0.0"),
             port=int(os.getenv("PORT", "5000")),
             providers=providers,
+            watchlist_db_path=os.getenv("WATCHLIST_DB_PATH", "data/watchlist.db"),
         )
         
         logger.info(f"Loaded config: {len(providers)} providers configured")

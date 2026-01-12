@@ -36,6 +36,9 @@ from .admin_commands import (
     MetricsCommand,
     CacheCommand,
 )
+from .watchlist_commands import (
+    WatchCommand,
+)
 
 __all__ = [
     "BaseCommand",
@@ -70,4 +73,6 @@ __all__ = [
     # Admin
     "MetricsCommand",
     "CacheCommand",
+    # Watchlist
+    "WatchCommand",
 ]
