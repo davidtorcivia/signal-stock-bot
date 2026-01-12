@@ -184,13 +184,13 @@ class SignalHandler:
             if mentioned_number == self.config.phone_number:
                 return True
             
-            # Also check by UUID if we have one stored (future enhancement)
-            # For now, any mention in a group triggers if we can't identify
-            # This is a simple heuristic - in practice, you'd want to verify
+            # Check UUID if available (signal-cli may provide this)
+            mentioned_uuid = mention.get("uuid", "")
+            # We'd need to store our own UUID to compare - for now skip
+            # TODO: Store bot's UUID on startup for more reliable matching
         
-        # If there are mentions but we can't verify, check if message
-        # starts with @ followed by text (common pattern)
-        return len(mentions) > 0
+        # No matching mention found - don't assume any mention is for us
+        return False
     
     async def handle_webhook(self, data: dict):
         """
