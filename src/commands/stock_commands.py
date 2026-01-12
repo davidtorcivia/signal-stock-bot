@@ -151,20 +151,24 @@ class PriceCommand(BaseCommand):
                 f"› Tip: You can also just type $AAPL in any message"
             )
         
-        # Validate and sanitize symbols
+        # Import symbol resolver
+        from ..utils import resolve_symbol
+        
+        # Resolve and validate symbols
         symbols = []
-        invalid = []
+        resolved_names = {}  # Track what was resolved
         for s in ctx.args[:10]:  # Limit to 10
-            valid, result = validate_symbol(s)
+            resolved, name = await resolve_symbol(s)
+            valid, result = validate_symbol(resolved)
             if valid:
                 symbols.append(result)
-            else:
-                invalid.append(s)
+                if name:
+                    resolved_names[result] = name
         
         if not symbols:
             return CommandResult.error(
                 f"No valid symbols provided.\n"
-                f"Valid formats: AAPL, BRK.B, BTC-USD, ^GSPC"
+                f"Valid formats: AAPL, apple, btc, BTC-USD, ^GSPC"
             )
         
         try:
@@ -224,11 +228,13 @@ class QuoteCommand(BaseCommand):
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
         
-        symbol = ctx.args[0].upper()
+        # Resolve symbol (e.g., "apple" → "AAPL")
+        from ..utils import resolve_symbol
+        symbol, resolved_name = await resolve_symbol(ctx.args[0])
         
         try:
             quote = await self.providers.get_quote(symbol)
-            name_display = quote.name or symbol
+            name_display = quote.name or resolved_name or symbol
             
             lines = [
                 f"⊞ {name_display} ({quote.symbol})",
@@ -767,6 +773,14 @@ class ChartCommand(BaseCommand):
         
         if not symbol:
             return CommandResult.error("Symbol required. Example: !chart AAPL 1m -c")
+        
+        # Resolve symbol (e.g., "apple" → "AAPL")
+        from ..utils import resolve_symbol
+        symbol, _ = await resolve_symbol(symbol)
+        
+        # Also resolve comparison symbol if provided
+        if opts["compare"]:
+            opts["compare"], _ = await resolve_symbol(opts["compare"])
         
         # Validate symbol
         valid, result = validate_symbol(symbol)
