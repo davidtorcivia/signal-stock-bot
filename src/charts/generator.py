@@ -254,8 +254,11 @@ class ChartGenerator:
                 ylabel=f'{options.comparison_symbol} %',
             ))
         
-        # Build title
-        title = self._build_title(symbol, current_price, change_percent, period)
+        # Build title (will be placed above chart)
+        title = self._build_title(
+            symbol, current_price, change_percent, period,
+            comparison_symbol=options.comparison_symbol if options.comparison_bars else None
+        )
         
         # Figure size - increase height if RSI panel
         fig_width = self.width / self.dpi
@@ -270,13 +273,12 @@ class ChartGenerator:
         plot_kwargs = {
             'type': mpf_type,
             'style': self._style,
-            'title': title,
             'volume': options.show_volume,
             'figsize': (fig_width, fig_height),
             'returnfig': True,
             'show_nontrading': False,
             'tight_layout': True,
-            'scale_padding': {'left': 0.1, 'right': 0.8, 'top': 0.6, 'bottom': 0.5},
+            'scale_padding': {'left': 0.1, 'right': 0.8, 'top': 0.8, 'bottom': 0.5},
         }
         
         if addplots:
@@ -286,6 +288,15 @@ class ChartGenerator:
             plot_kwargs['panel_ratios'] = panel_ratios
         
         fig, axes = mpf.plot(df, **plot_kwargs)
+        
+        # Add title above chart (not inside)
+        fig.suptitle(
+            title,
+            color='#FFFFFF',
+            fontsize=12,
+            fontweight='bold',
+            y=0.98,
+        )
         
         # Add watermark
         fig.text(
@@ -323,10 +334,15 @@ class ChartGenerator:
         symbol: str,
         price: Optional[float],
         change_percent: Optional[float],
-        period: str
+        period: str,
+        comparison_symbol: Optional[str] = None
     ) -> str:
         """Build chart title string."""
         parts = [symbol.upper()]
+        
+        # Add comparison symbol if present
+        if comparison_symbol:
+            parts[0] = f"{symbol.upper()} vs {comparison_symbol.upper()}"
         
         if price is not None:
             parts.append(f"${price:,.2f}" if price >= 1 else f"${price:.4f}")

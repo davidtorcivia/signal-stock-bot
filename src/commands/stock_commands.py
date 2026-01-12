@@ -747,14 +747,14 @@ class ChartCommand(BaseCommand):
             elif arg_lower == "-compare" or arg_lower == "--compare":
                 # Next arg is the comparison symbol
                 if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                    options["compare"] = args[i + 1].upper()
+                    options["compare"] = args[i + 1]  # Don't uppercase - resolver handles it
                     i += 1
             # Period
             elif arg_lower in valid_periods:
                 period = arg_lower
             # Symbol (first non-flag, non-period argument)
             elif symbol is None and not arg.startswith("-"):
-                symbol = arg.upper()
+                symbol = arg  # Don't uppercase - resolver handles it
             
             i += 1
         
