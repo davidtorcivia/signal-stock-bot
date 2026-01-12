@@ -225,7 +225,18 @@ class TechnicalAnalysisCommand(BaseCommand):
     aliases = ["technical", "analysis"]
     description = "Technical analysis summary"
     usage = "!ta AAPL [-full]"
-    help_explanation = "Provides a technical summary including trend direction, RSI momentum, and key support/resistance levels. Use -full for a deep dive."
+    help_explanation = """TECHNICAL ANALYSIS (TA) looks at price patterns and indicators to forecast future price movements.
+
+**What You Get:**
+• Trend Direction: Is the stock in an uptrend or downtrend?
+• RSI: Is it overbought (expensive) or oversold (cheap)?
+• MACD: Is momentum building or fading?
+• Support/Resistance: Key price levels to watch.
+
+**What to Watch For:**
+• BUY signals when RSI < 30 AND MACD is bullish AND price is above 50-day SMA.
+• SELL signals when RSI > 70 AND MACD is bearish AND price is below 50-day SMA.
+• Use -full for a complete breakdown of all indicators."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -382,7 +393,20 @@ class TLDRCommand(BaseCommand):
     aliases = []
     description = "Simple investment verdict (Buy/Sell/Hold)"
     usage = "!tldr AAPL"
-    help_explanation = "Gives you a simple Bottom Line: Buy, Sell, or Hold, based on a weighted analysis of trend, momentum, and strength indicators."
+    help_explanation = """A quick bottom-line recommendation based on 4 technical signals:
+
+**How It Works:**
+1. Trend: Is the 50-day SMA above the 200-day SMA? (Golden Cross = Bullish)
+2. Price Position: Is the stock above its 20-day average? (Strength)
+3. RSI: Is momentum not exhausted? (<70 is healthy)
+4. MACD: Is the MACD line above the Signal line? (Positive momentum)
+
+**What You Get:**
+• BUY: 3-4 bullish signals. Strong trend, good entry.
+• SELL: 0-1 bullish signals. Weak trend, consider exiting.
+• HOLD: 2 signals. Mixed — wait for clarity.
+
+**Limitations:** This is NOT financial advice. Always do your own research."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -429,7 +453,17 @@ class RSICommand(BaseCommand):
     aliases = []
     description = "RSI indicator"
     usage = "!rsi AAPL"
-    help_explanation = "The Relative Strength Index (RSI) measures speed of price changes. High (>70) means expensive/overbought. Low (<30) means cheap/oversold."
+    help_explanation = """The RELATIVE STRENGTH INDEX (RSI) measures how fast and how much a stock's price has changed recently.
+
+**Reading RSI (Scale: 0-100):**
+• RSI > 70 = OVERBOUGHT. The stock has risen fast. It may be "expensive" and due for a pullback.
+• RSI < 30 = OVERSOLD. The stock has dropped fast. It may be "cheap" and due for a bounce.
+• RSI 40-60 = NEUTRAL. No strong signal.
+
+**Strategy Tips:**
+• Don't buy just because RSI is low — check the trend first.
+• Overbought doesn't mean "sell immediately" — strong stocks stay overbought.
+• RSI divergence (price makes new high, RSI doesn't) is a powerful reversal signal."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -484,7 +518,20 @@ class SMACommand(BaseCommand):
     aliases = ["ma", "moving"]
     description = "Simple Moving Averages"
     usage = "!sma AAPL [20 50 200]"
-    help_explanation = "Moving Averages smooth out price action. Price above the average is generally bullish (uptrend); price below is bearish (downtrend)."
+    help_explanation = """MOVING AVERAGES smooth out price noise to show the underlying trend.
+
+**Common SMAs:**
+• SMA20: Short-term trend (1 month).
+• SMA50: Medium-term trend (2-3 months). Institutional traders watch this.
+• SMA200: Long-term trend (1 year). THE most important level.
+
+**What to Watch For:**
+• Price ABOVE SMA = Bullish (uptrend).
+• Price BELOW SMA = Bearish (downtrend).
+• GOLDEN CROSS: SMA50 crosses above SMA200. Strong BUY signal.
+• DEATH CROSS: SMA50 crosses below SMA200. Strong SELL signal.
+
+**Pro Tip:** If price is above all 3 SMAs (20, 50, 200), the stock is in a strong uptrend."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -544,7 +591,20 @@ class MACDCommand(BaseCommand):
     aliases = []
     description = "MACD indicator"
     usage = "!macd AAPL"
-    help_explanation = "The MACD tracks trend momentum. When the MACD line crosses above the Signal line, it's a bullish (buy) signal. Below is bearish (sell)."
+    help_explanation = """MACD (Moving Average Convergence Divergence) shows trend direction AND momentum strength.
+
+**Components:**
+• MACD Line: Difference between 12-day and 26-day EMAs.
+• Signal Line: 9-day EMA of the MACD Line.
+• Histogram: Difference between MACD and Signal. Shows momentum.
+
+**What to Watch For:**
+• MACD crosses ABOVE Signal = BUY signal. Momentum is turning positive.
+• MACD crosses BELOW Signal = SELL signal. Momentum is fading.
+• Histogram INCREASING = Trend is strengthening.
+• Histogram DECREASING = Trend is weakening (even if still positive).
+
+**Pro Tip:** MACD works best in trending markets. In sideways markets, expect false signals."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -598,7 +658,22 @@ class SupportResistanceCommand(BaseCommand):
     aliases = ["levels", "sr"]
     description = "Support/Resistance levels"
     usage = "!support AAPL"
-    help_explanation = "Calculates key price levels where the stock might bounce (Support) or face selling pressure (Resistance), based on recent trading range."
+    help_explanation = """SUPPORT & RESISTANCE are key price levels where buying/selling pressure concentrates.
+
+**Support (S1, S2):**
+• Floors where buyers step in.
+• If price drops to support and bounces, it's a good entry point.
+• If price BREAKS support, expect further downside.
+
+**Resistance (R1, R2):**
+• Ceilings where sellers appear.
+• If price rises to resistance and stalls, expect a pullback.
+• If price BREAKS resistance, expect further upside (breakout).
+
+**Pivot Point:**
+• The central level. Above pivot = bullish bias. Below = bearish bias.
+
+**Pro Tip:** Set alerts at support/resistance levels. Breakouts and bounces are the best trading opportunities."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager

@@ -19,6 +19,7 @@ from .stock_commands import (
 )
 from .ta_commands import (
     TechnicalAnalysisCommand,
+    TLDRCommand,
     RSICommand,
     SMACommand,
     MACDCommand,
@@ -56,6 +57,7 @@ __all__ = [
     "ChartCommand",
     # TA commands
     "TechnicalAnalysisCommand",
+    "TLDRCommand",
     "RSICommand",
     "SMACommand",
     "MACDCommand",

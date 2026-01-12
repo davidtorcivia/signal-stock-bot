@@ -140,7 +140,17 @@ class PriceCommand(BaseCommand):
     aliases = ["p", "pr", "$"]
     description = "Get real-time stock price"
     usage = "!price AAPL [MSFT GOOGL]"
-    help_explanation = "Shows the current trading price and daily change for one or more stocks. You can list up to 10 symbols."
+    help_explanation = """Shows the current trading price and daily change for one or more stocks.
+
+**What You See:**
+• Current Price: The last traded price.
+• Change: How much the price moved today ($ and %).
+• Volume: Number of shares traded. High volume = high interest.
+
+**Pro Tips:**
+• Green (▲) means the stock is up today.
+• Red (▼) means the stock is down today.
+• Use smart names: "!price apple" or "!price gold" works!"""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -221,7 +231,19 @@ class QuoteCommand(BaseCommand):
     aliases = ["q", "detail"]
     description = "Get detailed stock quote"
     usage = "!quote AAPL"
-    help_explanation = "Shows detailed market data including Open, High, Low, Previous Close, Volume, and Market Cap."
+    help_explanation = """A detailed market snapshot with more context than !price.
+
+**What You See:**
+• Open: Price at market open (9:30 AM ET).
+• High/Low: Today's trading range.
+• Previous Close: Yesterday's closing price.
+• Volume: Shares traded today.
+• Market Cap: Total company value (shares × price).
+
+**What It Tells You:**
+• If High/Low range is wide, it's a volatile day.
+• If Volume is much higher than average, something is happening.
+• Market Cap helps compare companies by size."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -273,7 +295,19 @@ class FundamentalsCommand(BaseCommand):
     aliases = ["i", "fundamentals", "fund"]
     description = "Get company fundamentals"
     usage = "!info AAPL"
-    help_explanation = "Shows fundamental data like P/E Ratio, EPS (Earnings Per Share), Market Cap, and Dividend Yield."
+    help_explanation = """Fundamental data about the company's financial health.
+
+**Key Metrics:**
+• P/E Ratio: Price ÷ Earnings. Lower = cheaper relative to profits.
+  - Under 15: Possibly undervalued.
+  - Over 30: Expensive, or high growth expected.
+• EPS: Earnings Per Share. How much profit per share.
+• Dividend Yield: Annual dividend ÷ stock price. Income investors love this.
+• 52-Week High/Low: Shows how the stock has traded over the past year.
+
+**What to Watch For:**
+• A stock near its 52-week low may be oversold (or in trouble).
+• A stock near its 52-week high is showing strength (or may be overbought)."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -691,7 +725,23 @@ class ChartCommand(BaseCommand):
     aliases = ["ch", "graph"]
     description = "Generate stock price chart"
     usage = "!chart AAPL [1m] [-c] [-sma20] [-bb] [-rsi] [-compare MSFT]"
-    help_explanation = "Generates a price chart. You can customize the period (1d, 1m, 1y) and add features like Candlesticks (-c), Moving Averages (-sma50), or RSI (-rsi)."
+    help_explanation = """Generates a visual price chart with optional technical indicators.
+
+**Periods:** 1d (intraday), 5d, 1m, 3m, 6m, 1y, 5y, max.
+
+**Options:**
+• -c: Candlestick chart. Shows open/high/low/close per bar.
+• -sma20/50/200: Overlay moving averages to see trends.
+• -bb: Bollinger Bands. Shows volatility and potential reversals.
+• -rsi: Add RSI indicator below the chart.
+• -compare MSFT: Overlay another stock to compare performance.
+
+**Reading Candlesticks:**
+• Green candle: Closed higher than open (bullish).
+• Red candle: Closed lower than open (bearish).
+• Long wicks: Rejection of prices (reversal signs).
+
+**Pro Tip:** Use "!chart AAPL 1y -sma50 -sma200" to see Golden/Death Cross signals."""
     
     def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
         self.providers = provider_manager

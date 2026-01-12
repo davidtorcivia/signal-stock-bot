@@ -37,6 +37,7 @@ from .commands import (
     ChartCommand,
     # TA commands
     TechnicalAnalysisCommand,
+    TLDRCommand,
     RSICommand,
     SMACommand,
     MACDCommand,
@@ -153,13 +154,14 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config) -> Comm
     
     # Technical Analysis commands
     ta_cmd = TechnicalAnalysisCommand(provider_manager)
+    tldr_cmd = TLDRCommand(provider_manager)
     rsi_cmd = RSICommand(provider_manager)
     sma_cmd = SMACommand(provider_manager)
     macd_cmd = MACDCommand(provider_manager)
     support_cmd = SupportResistanceCommand(provider_manager)
-    for cmd in [ta_cmd, rsi_cmd, sma_cmd, macd_cmd, support_cmd]:
+    for cmd in [ta_cmd, tldr_cmd, rsi_cmd, sma_cmd, macd_cmd, support_cmd]:
         dispatcher.register(cmd)
-    help_commands.extend([ta_cmd, rsi_cmd, sma_cmd, macd_cmd, support_cmd])
+    help_commands.extend([ta_cmd, tldr_cmd, rsi_cmd, sma_cmd, macd_cmd, support_cmd])
     
     # Earnings and Dividend commands
     earnings_cmd = EarningsCommand(provider_manager)

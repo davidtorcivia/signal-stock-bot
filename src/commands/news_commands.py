@@ -16,7 +16,18 @@ class NewsCommand(BaseCommand):
     aliases = ["headlines", "n"]
     description = "Recent news headlines"
     usage = "!news AAPL [count]"
-    help_explanation = "Fetches the latest news headlines for a stock. Default is 5 stories, but you can ask for more (e.g. !news AAPL 10)."
+    help_explanation = """Fetches recent news headlines for a stock.
+
+**What You See:**
+• Headline: The title of the news article.
+• Publisher: The source (Reuters, Yahoo Finance, etc.).
+
+**How News Affects Stocks:**
+• Positive news (earnings beat, new product) usually pushes price UP.
+• Negative news (lawsuit, missed earnings) usually pushes price DOWN.
+• "Buy the rumor, sell the news" — prices often move BEFORE news is official.
+
+**Pro Tip:** If a stock drops on good news, institutions may be selling. Be careful."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager

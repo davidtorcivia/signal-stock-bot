@@ -39,7 +39,21 @@ class EarningsCommand(BaseCommand):
     aliases = ["earn", "er"]
     description = "Earnings date and estimates"
     usage = "!earnings AAPL"
-    help_explanation = "Shows the next reported earnings date, EPS estimates (Trailing/Forward), Revenue, and Profit Margins."
+    help_explanation = """Shows when the company reports earnings and key estimates.
+
+**What You See:**
+• Next Earnings Date: When the quarterly report comes out.
+• Trailing EPS: Last 12 months' profit per share.
+• Forward EPS: Analysts' estimate for next year.
+• P/E Ratio: Price ÷ Earnings. Valuation metric.
+
+**Why Earnings Matter:**
+• Stocks often move 5-20% after earnings reports.
+• If EPS BEATS estimates, stock usually rises.
+• If EPS MISSES estimates, stock usually falls.
+• Guidance (future outlook) matters more than the numbers.
+
+**Pro Tip:** Avoid holding options through earnings — volatility crush kills premiums."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -136,7 +150,20 @@ class DividendCommand(BaseCommand):
     aliases = ["div", "yield"]
     description = "Dividend information"
     usage = "!dividend AAPL"
-    help_explanation = "Shows dividend Yield, Payout Ratio, Ex-Dividend Date, and recent payment history."
+    help_explanation = """Shows dividend payment information for income investors.
+
+**What You See:**
+• Yield: Annual dividend ÷ stock price. Higher = more income.
+• Annual Rate: Total dividends paid per share per year.
+• Ex-Dividend Date: Must own BEFORE this date to get the dividend.
+• Payout Ratio: % of earnings paid as dividends.
+
+**What to Watch For:**
+• Yield > 5%: Attractive income, but check if it's sustainable.
+• Payout Ratio > 100%: Company is paying more than it earns. Risky.
+• Dividend Growth: Companies that RAISE dividends yearly are ideal.
+
+**Pro Tip:** REITs and utilities typically have the highest yields."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
