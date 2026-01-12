@@ -248,16 +248,23 @@ class ProviderManager:
             except RateLimitError as e:
                 self._mark_rate_limited(provider, e.retry_after or 60)
                 last_error = e
+                logger.info(f"Rate limited by {provider.name}, trying next provider...")
+                continue  # Explicitly continue to next provider
                 
             except ProviderError as e:
                 logger.warning(f"Provider {provider.name} failed historical for {symbol}: {e}")
                 last_error = e
+                continue  # Explicitly continue to next provider
                 
             except Exception as e:
-                logger.exception(f"Unexpected error from {provider.name}")
+                logger.warning(f"Error from {provider.name} for {symbol}: {e} - trying next provider")
                 last_error = e
+                continue  # Explicitly continue to next provider
         
-        raise last_error or ProviderError("All providers failed")
+        # All providers failed - raise a clear error
+        if last_error:
+            raise last_error
+        raise ProviderError("All providers failed")
     
     async def get_fundamentals(self, symbol: str) -> Fundamentals:
         """Get fundamentals with fallback"""
