@@ -5,8 +5,10 @@ yfinance>=0.2.40
 pyyaml>=6.0
 websockets>=12.0
 
-# Charts
+# Charts (professional financial charting)
 matplotlib>=3.8
+mplfinance>=0.12.10
+pandas>=2.0
 
 # Production server
 gunicorn>=21.0

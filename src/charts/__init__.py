@@ -1,12 +1,12 @@
 """
 Chart generation module for stock visualizations.
+Uses mplfinance for professional financial charts.
 """
 
-from .generator import ChartGenerator
-from .themes import DarkTheme, LightTheme
+from .generator import ChartGenerator, get_period_params
 
 __all__ = [
     "ChartGenerator",
-    "DarkTheme",
-    "LightTheme",
+    "get_period_params",
 ]
+
