@@ -137,7 +137,7 @@ class SignalPoller:
             return
         
         text = data_msg.get("message", "")
-        source = envelope.get("source", "")[-4:]
+        source = (envelope.get("source") or "")[-4:]
         
         logger.info(f"Received message from ...{source}: {text[:50]}")
         

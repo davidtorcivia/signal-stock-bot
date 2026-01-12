@@ -106,7 +106,13 @@ class SignalHandler:
             async with session.post(url, json=payload) as resp:
                 if resp.status not in (200, 201):
                     error = await resp.text()
-                    logger.error(f"Failed to send message: {resp.status} - {error}")
+                    # Log payload for debugging (truncate attachments)
+                    debug_payload = payload.copy()
+                    if "base64_attachments" in debug_payload:
+                        debug_payload["base64_attachments"] = [
+                            f"{att[:30]}..." for att in debug_payload["base64_attachments"]
+                        ]
+                    logger.error(f"Failed to send message: {resp.status} - {error} - Payload: {debug_payload}")
                     raise Exception(f"Send failed: {resp.status}")
                 
                 logger.debug(f"Message sent successfully to {recipient[-4:] if recipient else group_id}")
@@ -195,6 +201,18 @@ class SignalHandler:
                 )
             except Exception as e:
                 logger.error(f"Failed to send response: {e}")
+                # Fallback: try sending directly to user if group send failed
+                if group_id:
+                    try:
+                        logger.info(f"Attempting fallback DM to {sender[-4:]}")
+                        await self.send_message(
+                            recipient=sender,
+                            message=f"{result.text}\n\n(Replied privately due to group send error)",
+                            group_id=None,
+                            attachments=result.attachments,
+                        )
+                    except Exception as fallback_e:
+                        logger.error(f"Fallback DM failed: {fallback_e}")
     
     async def close(self):
         """Close the HTTP session"""
