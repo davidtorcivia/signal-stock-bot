@@ -4,10 +4,13 @@ A self-hosted Signal bot for real-time stock quotes, market data, technical anal
 
 ## Features
 
-- **Real-time stock quotes** via Yahoo Finance, Alpha Vantage, and Polygon
+- **Real-time stock quotes** via Yahoo Finance, Finnhub, Twelve Data, IEX Cloud, Alpha Vantage, and Polygon
+- **Multi-provider failover** — automatic fallback when rate limited
 - **Smart symbol resolution** — type `!price apple` or `!price gold` instead of tickers
 - **Professional charting** with candlesticks, indicators, and comparisons
 - **Technical analysis** with RSI, MACD, SMA, support/resistance
+- **Command chaining** — run multiple commands at once: `!price AAPL !tldr AAPL !news AAPL`
+- **Universal -help flag** — add `-help` to any command for detailed explanations
 - **Earnings & dividends** tracking
 - **News headlines** for any symbol
 - **Options & Futures** support (via Polygon)
@@ -194,6 +197,38 @@ S2: $175.00
 
 ---
 
+### Command Chaining
+
+Run multiple commands in a single message:
+
+```
+!price AAPL !tldr AAPL !news AAPL 3
+```
+
+Results are separated by a visual divider. Great for quick research!
+
+---
+
+### Universal Help Flag
+
+Add `-help` to any command for a detailed, educational explanation:
+
+```
+!ta -help              # Basic TA explanation
+!ta -full -help        # Detailed breakdown of all indicators
+!chart -c -help        # Candlestick and indicator explanations
+!rsi -help             # RSI interpretation guide
+!macd -help            # MACD signal reading
+```
+
+Help text explains:
+- What each metric means
+- How to interpret values
+- Trading signals to watch for
+- Pro tips for retail investors
+
+---
+
 ### Admin Commands
 
 | Command | Description |
@@ -274,6 +309,21 @@ Comparing $MSFT and $GOOGL today
 | `TWELVEDATA_API_KEY` | No | — | Twelve Data API key (800/day free) |
 | `IEXCLOUD_API_KEY` | No | — | IEX Cloud API key (50k credits/mo free) |
 | `MASSIVE_PRO` | No | `false` | Enable `!options` and `!economy` |
+
+### Data Providers
+
+The bot supports multiple data providers with automatic failover. Add more providers for better rate limit capacity:
+
+| Provider | Free Tier | Signup |
+|----------|-----------|--------|
+| **Yahoo Finance** | Unlimited (unofficial) | No key needed |
+| **Finnhub** | 60 calls/min | [finnhub.io](https://finnhub.io) |
+| **Twelve Data** | 800 calls/day | [twelvedata.com](https://twelvedata.com) |
+| **IEX Cloud** | 50k credits/month | [iexcloud.io](https://iexcloud.io) |
+| **Alpha Vantage** | 25 calls/day | [alphavantage.co](https://www.alphavantage.co/support/#api-key) |
+| **Polygon.io** | 5 calls/min | [polygon.io](https://polygon.io) |
+
+Providers are tried in priority order. When one is rate-limited, the next is used automatically.
 
 ### Cache TTLs
 
