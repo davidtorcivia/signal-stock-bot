@@ -83,12 +83,16 @@ class NewsCommand(BaseCommand):
                 lines = [f"◈ {name} ({symbol}) News", ""]
             
             for i, item in enumerate(news, 1):
-                # Handle different yfinance versions/structures
-                # Try multiple possible keys for title
+                # Handle yfinance's nested content structure (changed in recent versions)
+                # New structure: item['content']['title'], item['content']['provider']
+                content = item.get('content', item)  # Fallback to item itself for old format
+                
+                # Get title from various possible locations
                 title = (
-                    item.get('title') or 
-                    item.get('headline') or 
-                    item.get('summary', '')[:100] or 
+                    content.get('title') or 
+                    content.get('headline') or 
+                    item.get('title') or  # Old format fallback
+                    content.get('summary', '')[:100] or 
                     'Untitled'
                 )
                 
@@ -96,7 +100,12 @@ class NewsCommand(BaseCommand):
                 if title and len(title) > 100:
                     title = title[:97] + "..."
                 
-                publisher = item.get('publisher') or item.get('source', '')
+                # Get publisher - new format uses nested provider object
+                provider = content.get('provider', {})
+                if isinstance(provider, dict):
+                    publisher = provider.get('displayName') or provider.get('name', '')
+                else:
+                    publisher = item.get('publisher') or item.get('source', '')
                 
                 # Format: 1. Title
                 lines.append(f"{i}. {title}")
