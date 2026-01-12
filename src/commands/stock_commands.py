@@ -728,12 +728,21 @@ class ChartCommand(BaseCommand):
             try:
                 quote = await self.providers.get_quote(symbol)
                 current_price = quote.price
-                change_percent = quote.change_percent
                 name = quote.name or symbol
             except Exception:
                 current_price = bars[-1].close
-                change_percent = ((bars[-1].close - bars[0].open) / bars[0].open) * 100
                 name = symbol
+            
+            # Calculate period change from chart data (first bar to last bar)
+            period_change_pct = ((bars[-1].close - bars[0].open) / bars[0].open) * 100
+            
+            # Period label for display
+            period_labels = {
+                "1d": "1d", "5d": "5d", "1w": "1w", "1m": "1m",
+                "3m": "3m", "6m": "6m", "1y": "1y", "ytd": "ytd",
+                "5y": "5y", "max": "all"
+            }
+            period_label = period_labels.get(period, period)
             
             # Generate chart
             generator = self._get_generator()
@@ -743,16 +752,16 @@ class ChartCommand(BaseCommand):
                 period=period,
                 show_volume=True,
                 current_price=current_price,
-                change_percent=change_percent,
+                change_percent=period_change_pct,
             )
             
-            # Build caption
-            sign = "+" if change_percent >= 0 else ""
-            indicator = "▲" if change_percent >= 0 else "▼"
+            # Build caption with period-specific change
+            sign = "+" if period_change_pct >= 0 else ""
+            indicator = "▲" if period_change_pct >= 0 else "▼"
             caption = (
                 f"{name} ({symbol})\n"
                 f"{Symbols.PRICE} {format_price(current_price)} "
-                f"{indicator} {sign}{change_percent:.2f}% 1d\n"
+                f"{indicator} {sign}{period_change_pct:.2f}% {period_label}\n"
                 f"{format_timestamp()}"
             )
             
