@@ -88,6 +88,9 @@ class SignalHandler:
         
         if group_id:
             # For groups, use group_id directly
+            # Ensure group ID has 'group.' prefix as required by signal-cli-rest-api v2
+            if not group_id.startswith("group."):
+                group_id = f"group.{group_id}"
             payload["recipients"] = [group_id]
         else:
             payload["recipients"] = [recipient]
