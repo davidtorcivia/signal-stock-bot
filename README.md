@@ -4,7 +4,7 @@ A self-hosted Signal bot for real-time stock quotes, market data, technical anal
 
 ## Features
 
-- **Real-time stock quotes** via Yahoo Finance, Finnhub, Twelve Data, IEX Cloud, Alpha Vantage, and Polygon
+- **Real-time stock quotes** via Yahoo Finance, Finnhub, Twelve Data, Alpha Vantage, and Polygon
 - **Multi-provider failover** — automatic fallback when rate limited
 - **Smart symbol resolution** — type `!price apple` or `!price gold` instead of tickers
 - **Professional charting** with candlesticks, indicators, and comparisons
@@ -307,7 +307,6 @@ Comparing $MSFT and $GOOGL today
 | `POLYGON_API_KEY` | No | — | Polygon.io API key |
 | `FINNHUB_API_KEY` | No | — | Finnhub API key (60/min free) |
 | `TWELVEDATA_API_KEY` | No | — | Twelve Data API key (800/day free) |
-| `IEXCLOUD_API_KEY` | No | — | IEX Cloud API key (50k credits/mo free) |
 | `MASSIVE_PRO` | No | `false` | Enable `!options` and `!economy` |
 
 ### Data Providers
@@ -319,7 +318,6 @@ The bot supports multiple data providers with automatic failover. Add more provi
 | **Yahoo Finance** | Unlimited (unofficial) | No key needed |
 | **Finnhub** | 60 calls/min | [finnhub.io](https://finnhub.io) |
 | **Twelve Data** | 800 calls/day | [twelvedata.com](https://twelvedata.com) |
-| **IEX Cloud** | 50k credits/month | [iexcloud.io](https://iexcloud.io) |
 | **Alpha Vantage** | 25 calls/day | [alphavantage.co](https://www.alphavantage.co/support/#api-key) |
 | **Polygon.io** | 5 calls/min | [polygon.io](https://polygon.io) |
 

@@ -16,7 +16,6 @@ from .alphavantage import AlphaVantageProvider
 from .massive import MassiveProvider
 from .finnhub import FinnhubProvider
 from .twelvedata import TwelveDataProvider
-from .iexcloud import IEXCloudProvider
 
 __all__ = [
     "BaseProvider",
@@ -33,6 +32,6 @@ __all__ = [
     "MassiveProvider",
     "FinnhubProvider",
     "TwelveDataProvider",
-    "IEXCloudProvider",
 ]
+
 

@@ -100,16 +100,6 @@ class Config:
                 priority=int(os.getenv("TWELVEDATA_PRIORITY", "20")),
             ))
         
-        # IEX Cloud (requires API key, 50k credits/month free)
-        iexcloud_key = os.getenv("IEXCLOUD_API_KEY", "").strip()
-        if iexcloud_key:
-            providers.append(ProviderConfig(
-                name="iexcloud",
-                enabled=True,
-                api_key=iexcloud_key,
-                priority=int(os.getenv("IEXCLOUD_PRIORITY", "25")),
-            ))
-        
         # Sort by priority
         providers.sort(key=lambda p: p.priority)
         
