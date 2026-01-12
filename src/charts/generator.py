@@ -289,13 +289,13 @@ class ChartGenerator:
         
         fig, axes = mpf.plot(df, **plot_kwargs)
         
-        # Add title above chart (not inside)
+        # Add title above chart (not inside) - use high y value to ensure it's above
         fig.suptitle(
             title,
             color='#FFFFFF',
             fontsize=12,
             fontweight='bold',
-            y=0.98,
+            y=1.02,  # Higher than 1.0 puts it outside the figure area
         )
         
         # Add watermark

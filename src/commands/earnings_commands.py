@@ -59,7 +59,11 @@ class EarningsCommand(BaseCommand):
             def fetch_earnings():
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
-                calendar = ticker.calendar
+                # calendar can be dict or DataFrame depending on yfinance version
+                try:
+                    calendar = ticker.calendar
+                except Exception:
+                    calendar = None
                 return info, calendar
             
             info, calendar = await loop.run_in_executor(None, fetch_earnings)
@@ -74,13 +78,25 @@ class EarningsCommand(BaseCommand):
                 ""
             ]
             
-            # Next earnings date
-            if calendar is not None and not calendar.empty:
-                if 'Earnings Date' in calendar.columns:
-                    earnings_dates = calendar['Earnings Date']
-                    if len(earnings_dates) > 0:
-                        next_date = earnings_dates.iloc[0]
-                        lines.append(f"Next Earnings: {format_date(next_date)}")
+            # Next earnings date - handle dict or DataFrame
+            if calendar is not None:
+                try:
+                    # Try dict format (newer yfinance)
+                    if isinstance(calendar, dict):
+                        earnings_date = calendar.get('Earnings Date')
+                        if earnings_date:
+                            if isinstance(earnings_date, list) and len(earnings_date) > 0:
+                                lines.append(f"Next Earnings: {format_date(earnings_date[0])}")
+                            else:
+                                lines.append(f"Next Earnings: {format_date(earnings_date)}")
+                    # Try DataFrame format (older yfinance)
+                    elif hasattr(calendar, 'empty') and not calendar.empty:
+                        if 'Earnings Date' in calendar.columns:
+                            earnings_dates = calendar['Earnings Date']
+                            if len(earnings_dates) > 0:
+                                lines.append(f"Next Earnings: {format_date(earnings_dates.iloc[0])}")
+                except Exception:
+                    pass  # Skip if calendar parsing fails
             
             # EPS estimates
             if 'trailingEps' in info and info['trailingEps']:
@@ -110,7 +126,7 @@ class EarningsCommand(BaseCommand):
             return CommandResult.ok("\n".join(lines))
             
         except Exception as e:
-            return CommandResult.error(f"Earnings lookup failed: {type(e).__name__}")
+            return CommandResult.error(f"Earnings lookup failed: {type(e).__name__}: {str(e)[:50]}")
 
 
 class DividendCommand(BaseCommand):

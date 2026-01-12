@@ -75,9 +75,9 @@ def format_timestamp() -> str:
     return f"{Symbols.TIME} as of {get_timestamp()}"
 
 
-# Valid symbol pattern: alphanumeric, dots, hyphens, carets (for indices)
-# Examples: AAPL, BRK.B, BTC-USD, ^GSPC
-SYMBOL_PATTERN = re.compile(r'^[\^]?[A-Z0-9]{1,10}(?:[.-][A-Z0-9]{1,5})?$', re.IGNORECASE)
+# Valid symbol pattern: alphanumeric, dots, hyphens, carets (for indices), = (for futures/currencies)
+# Examples: AAPL, BRK.B, BTC-USD, ^GSPC, GC=F, EURUSD=X
+SYMBOL_PATTERN = re.compile(r'^[\^]?[A-Z0-9]{1,10}(?:[.\-=][A-Z0-9]{1,5})?$', re.IGNORECASE)
 
 
 def validate_symbol(symbol: str) -> tuple[bool, str]:

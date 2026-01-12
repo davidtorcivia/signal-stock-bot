@@ -161,7 +161,7 @@ class TechnicalAnalysisCommand(BaseCommand):
     name = "ta"
     aliases = ["technical", "analysis"]
     description = "Technical analysis summary"
-    usage = "!ta AAPL"
+    usage = "!ta AAPL [-full]"
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
@@ -170,8 +170,15 @@ class TechnicalAnalysisCommand(BaseCommand):
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
         
+        # Parse args for -full flag
+        full_mode = "-full" in [a.lower() for a in ctx.args]
+        symbol_arg = [a for a in ctx.args if not a.startswith("-")][0] if ctx.args else None
+        
+        if not symbol_arg:
+            return CommandResult.error(f"Usage: {self.usage}")
+        
         from ..utils import resolve_symbol
-        symbol, _ = await resolve_symbol(ctx.args[0])
+        symbol, _ = await resolve_symbol(symbol_arg)
         
         try:
             # Get 200 days of data for calculations
@@ -233,37 +240,106 @@ class TechnicalAnalysisCommand(BaseCommand):
             else:
                 trend = "◇ Insufficient data"
             
-            lines = [
-                f"⊞ {symbol} Technical Analysis",
-                "",
-                f"Trend: {trend}",
-            ]
-            
-            if rsi:
-                lines.append(f"RSI(14): {rsi:.1f} — {interpret_rsi(rsi)}")
-            
-            if macd:
-                macd_signal = "Bullish" if macd["bullish"] else "Bearish"
-                lines.append(f"MACD: {macd_signal} (hist: {macd['histogram']:.3f})")
-            
-            if levels:
-                s_str = " | ".join(format_price(s) for s in levels["support"])
-                r_str = " | ".join(format_price(r) for r in levels["resistance"])
+            if full_mode:
+                # FULL MODE - comprehensive analysis
+                lines = [
+                    f"⊞ {symbol} Full Technical Analysis",
+                    "",
+                    f"━━━ Price & Trend ━━━",
+                    f"Current: {format_price(current)}",
+                    f"Trend: {trend}",
+                    "",
+                    f"━━━ Moving Averages ━━━",
+                ]
+                
+                if sma20:
+                    diff = ((current - sma20) / sma20) * 100
+                    arrow = "▲" if current > sma20 else "▼"
+                    lines.append(f"SMA20: {format_price(sma20)} ({arrow} {diff:+.1f}%)")
+                if sma50:
+                    diff = ((current - sma50) / sma50) * 100
+                    arrow = "▲" if current > sma50 else "▼"
+                    lines.append(f"SMA50: {format_price(sma50)} ({arrow} {diff:+.1f}%)")
+                if sma200:
+                    diff = ((current - sma200) / sma200) * 100
+                    arrow = "▲" if current > sma200 else "▼"
+                    lines.append(f"SMA200: {format_price(sma200)} ({arrow} {diff:+.1f}%)")
+                
                 lines.append("")
-                lines.append(f"Support: {s_str}")
-                lines.append(f"Resistance: {r_str}")
-            
-            # Overall signal
-            if total_signals > 0:
-                ratio = bullish_signals / total_signals
-                if ratio >= 0.6:
-                    signal = f"● Buy ({int(bullish_signals)}/{total_signals} bullish)"
-                elif ratio <= 0.4:
-                    signal = f"○ Sell ({int(bullish_signals)}/{total_signals} bullish)"
-                else:
-                    signal = f"◐ Hold ({int(bullish_signals)}/{total_signals} bullish)"
+                lines.append("━━━ Oscillators ━━━")
+                
+                if rsi:
+                    bar_width = 15
+                    filled = int(rsi / 100 * bar_width)
+                    bar = "█" * filled + "░" * (bar_width - filled)
+                    lines.append(f"RSI(14): {rsi:.1f} [{bar}]")
+                    lines.append(f"  → {interpret_rsi(rsi)}")
+                
+                if macd:
+                    macd_signal = "Bullish ▲" if macd["bullish"] else "Bearish ▼"
+                    momentum = "Increasing ↑" if macd["histogram"] > 0 else "Decreasing ↓"
+                    lines.append(f"MACD: {macd_signal}")
+                    lines.append(f"  Line: {macd['macd']:.3f} | Signal: {macd['signal']:.3f}")
+                    lines.append(f"  Histogram: {macd['histogram']:.3f} ({momentum})")
+                
+                if levels:
+                    lines.append("")
+                    lines.append("━━━ Support/Resistance ━━━")
+                    lines.append(f"R2: {format_price(levels['resistance'][1])}")
+                    lines.append(f"R1: {format_price(levels['resistance'][0])}")
+                    lines.append(f"Pivot: {format_price(levels['pivot'])}")
+                    lines.append(f"S1: {format_price(levels['support'][0])}")
+                    lines.append(f"S2: {format_price(levels['support'][1])}")
+                
+                # Overall signal
+                if total_signals > 0:
+                    ratio = bullish_signals / total_signals
+                    if ratio >= 0.6:
+                        signal = f"● BUY ({int(bullish_signals)}/{total_signals} bullish)"
+                    elif ratio <= 0.4:
+                        signal = f"○ SELL ({int(bullish_signals)}/{total_signals} bullish)"
+                    else:
+                        signal = f"◐ HOLD ({int(bullish_signals)}/{total_signals} bullish)"
+                    lines.append("")
+                    lines.append("━━━ Signal ━━━")
+                    lines.append(signal)
+                
+            else:
+                # STANDARD MODE - brief summary
+                lines = [
+                    f"⊞ {symbol} Technical Analysis",
+                    "",
+                    f"Trend: {trend}",
+                ]
+                
+                if rsi:
+                    lines.append(f"RSI(14): {rsi:.1f} — {interpret_rsi(rsi)}")
+                
+                if macd:
+                    macd_signal = "Bullish" if macd["bullish"] else "Bearish"
+                    lines.append(f"MACD: {macd_signal} (hist: {macd['histogram']:.3f})")
+                
+                if levels:
+                    s_str = " | ".join(format_price(s) for s in levels["support"])
+                    r_str = " | ".join(format_price(r) for r in levels["resistance"])
+                    lines.append("")
+                    lines.append(f"Support: {s_str}")
+                    lines.append(f"Resistance: {r_str}")
+                
+                # Overall signal
+                if total_signals > 0:
+                    ratio = bullish_signals / total_signals
+                    if ratio >= 0.6:
+                        signal = f"● Buy ({int(bullish_signals)}/{total_signals} bullish)"
+                    elif ratio <= 0.4:
+                        signal = f"○ Sell ({int(bullish_signals)}/{total_signals} bullish)"
+                    else:
+                        signal = f"◐ Hold ({int(bullish_signals)}/{total_signals} bullish)"
+                    lines.append("")
+                    lines.append(f"Signal: {signal}")
+                
                 lines.append("")
-                lines.append(f"Signal: {signal}")
+                lines.append("Tip: Use !ta AAPL -full for complete analysis")
             
             return CommandResult.ok("\n".join(lines))
             

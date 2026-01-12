@@ -36,7 +36,7 @@ class NewsCommand(BaseCommand):
         
         if not symbol:
             # Market-wide news
-            symbol = "^GSPC"  # S&P 500 as proxy
+            symbol = "SPY"  # Use SPY instead of ^GSPC for better news
             is_market = True
         else:
             is_market = False
@@ -71,20 +71,25 @@ class NewsCommand(BaseCommand):
                 lines = [f"◈ {name} ({symbol}) News", ""]
             
             for i, item in enumerate(news, 1):
-                title = item.get('title', 'No title')
-                publisher = item.get('publisher', '')
+                # Handle different yfinance versions/structures
+                # Try multiple possible keys for title
+                title = (
+                    item.get('title') or 
+                    item.get('headline') or 
+                    item.get('summary', '')[:100] or 
+                    'Untitled'
+                )
                 
-                # Format: 1. Title (Publisher)
+                # Clean title
+                if title and len(title) > 100:
+                    title = title[:97] + "..."
+                
+                publisher = item.get('publisher') or item.get('source', '')
+                
+                # Format: 1. Title
+                lines.append(f"{i}. {title}")
                 if publisher:
-                    lines.append(f"{i}. {title}")
                     lines.append(f"   ↳ {publisher}")
-                else:
-                    lines.append(f"{i}. {title}")
-                
-                # Add link if available
-                link = item.get('link', '')
-                if link and len(link) < 60:
-                    lines.append(f"   {link}")
                 
                 if i < len(news):
                     lines.append("")
@@ -92,4 +97,6 @@ class NewsCommand(BaseCommand):
             return CommandResult.ok("\n".join(lines))
             
         except Exception as e:
-            return CommandResult.error(f"News lookup failed: {type(e).__name__}")
+            import traceback
+            return CommandResult.error(f"News lookup failed: {type(e).__name__}: {str(e)[:50]}")
+
