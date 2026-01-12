@@ -40,6 +40,7 @@ services:
       - POLYGON_API_KEY=${POLYGON_API_KEY:-}
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     dns:
       - 8.8.8.8
       - 1.1.1.1
