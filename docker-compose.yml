@@ -34,6 +34,7 @@ services:
     environment:
       - SIGNAL_API_URL=http://signal-api:8080
       - SIGNAL_PHONE_NUMBER=${SIGNAL_PHONE_NUMBER}
+      - BOT_NAME=${BOT_NAME:-Stock Bot}
       - COMMAND_PREFIX=${COMMAND_PREFIX:-!}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY:-}
