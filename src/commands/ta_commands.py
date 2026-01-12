@@ -237,16 +237,60 @@ class TechnicalAnalysisCommand(BaseCommand):
 • BUY signals when RSI < 30 AND MACD is bullish AND price is above 50-day SMA.
 • SELL signals when RSI > 70 AND MACD is bearish AND price is below 50-day SMA.
 • Use -full for a complete breakdown of all indicators."""
+    # Extended help for -full mode
+    help_full = """!ta -full DETAILED BREAKDOWN
+
+This gives you a comprehensive analysis with ALL indicators explained:
+
+━━━ PRICE & TREND ━━━
+• Current Price: Latest trading price.
+• Trend: Based on SMA50 vs SMA200 (Golden Cross = Bullish, Death Cross = Bearish).
+
+━━━ MOVING AVERAGES ━━━
+• SMA20/50/200: Shows if price is above or below key averages.
+• Percentage: How far price is from each average.
+• ALL GREEN (above all SMAs) = Strong uptrend.
+• ALL RED (below all SMAs) = Strong downtrend.
+
+━━━ OSCILLATORS ━━━
+• RSI(14): Momentum gauge.
+  - >70: Overbought (expensive, may pullback).
+  - <30: Oversold (cheap, may bounce).
+  - Visual bar shows position in range.
+• MACD: Trend strength and direction.
+  - Line vs Signal: Crossovers are trade signals.
+  - Histogram: Momentum intensity. Increasing = strengthening.
+
+━━━ SUPPORT/RESISTANCE ━━━
+• R2/R1: Resistance levels (ceilings where selling appears).
+• Pivot: Central level. Above = bullish bias.
+• S1/S2: Support levels (floors where buying appears).
+
+━━━ SIGNAL ━━━
+Combined verdict based on all indicators:
+• BUY (3-4 bullish signals): Strong trend, consider entry.
+• HOLD (2 signals): Mixed, wait for clarity.
+• SELL (0-1 signals): Weak trend, consider exit."""
     
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
     
     async def execute(self, ctx: CommandContext) -> CommandResult:
+        # Check for -help flag first
+        has_help = self.has_help_flag(ctx)
+        has_full = "-full" in [a.lower() for a in ctx.args]
+        
+        if has_help:
+            if has_full:
+                return CommandResult.ok(f"◈ HELP: !ta -full\n\n{self.help_full}")
+            else:
+                return self.get_help_result()
+        
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
         
         # Parse args for -full flag
-        full_mode = "-full" in [a.lower() for a in ctx.args]
+        full_mode = has_full
         symbol_arg = [a for a in ctx.args if not a.startswith("-")][0] if ctx.args else None
         
         if not symbol_arg:
@@ -444,7 +488,13 @@ class TLDRCommand(BaseCommand):
         except SymbolNotFoundError:
             return CommandResult.error(f"Symbol not found: {symbol}")
         except Exception as e:
-            return CommandResult.error(f"TLDR failed: {type(e).__name__}")
+            error_name = type(e).__name__
+            if "RateLimit" in error_name or "rate" in str(e).lower():
+                return CommandResult.error(
+                    f"Rate limited. Try again in a minute.\n"
+                    f"Tip: Use !status to check provider health."
+                )
+            return CommandResult.error(f"TLDR failed: {error_name}")
 
 
 class RSICommand(BaseCommand):

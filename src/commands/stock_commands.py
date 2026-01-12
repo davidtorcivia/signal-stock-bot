@@ -742,6 +742,39 @@ class ChartCommand(BaseCommand):
 • Long wicks: Rejection of prices (reversal signs).
 
 **Pro Tip:** Use "!chart AAPL 1y -sma50 -sma200" to see Golden/Death Cross signals."""
+
+    # Extended help for specific flags
+    help_flags = """◈ CHART OPTIONS EXPLAINED
+
+━━━ -c (CANDLESTICK) ━━━
+Each bar shows:
+• Body: Open to Close price.
+• Wicks: High and Low of the period.
+• Green = Bullish (close > open). Red = Bearish (close < open).
+• Patterns to watch: Doji (indecision), Hammer (reversal), Engulfing (momentum).
+
+━━━ -sma (MOVING AVERAGES) ━━━
+• SMA20: Short-term trend (1 month).
+• SMA50: Medium-term. Institutions watch this.
+• SMA200: Long-term. THE most important level.
+• GOLDEN CROSS: SMA50 crosses ABOVE SMA200. Major BUY signal.
+• DEATH CROSS: SMA50 crosses BELOW SMA200. Major SELL signal.
+
+━━━ -bb (BOLLINGER BANDS) ━━━
+• Upper/Lower bands show 2 standard deviations from 20-SMA.
+• Price near UPPER band = potentially overbought.
+• Price near LOWER band = potentially oversold.
+• Band SQUEEZE (narrow) = volatility coming. Breakout expected.
+
+━━━ -rsi (RSI PANEL) ━━━
+• RSI > 70: Overbought. May be expensive.
+• RSI < 30: Oversold. May be cheap.
+• RSI divergence from price = potential reversal.
+
+━━━ -compare (COMPARISON) ━━━
+• Overlays another symbol to compare performance.
+• Shows relative strength between two stocks.
+• Example: !chart AAPL 1y -compare SPY (AAPL vs market)."""
     
     def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
         self.providers = provider_manager
@@ -816,6 +849,15 @@ class ChartCommand(BaseCommand):
         return symbol, period, options
     
     async def execute(self, ctx: CommandContext) -> CommandResult:
+        # Check for -help flag first
+        if self.has_help_flag(ctx):
+            # Check if any specific flags are present to give detailed help
+            args_lower = [a.lower() for a in ctx.args]
+            has_specific = any(f in args_lower for f in ["-c", "-sma", "-bb", "-rsi", "-compare"])
+            if has_specific or any(a.startswith("-sma") for a in args_lower):
+                return CommandResult.ok(self.help_flags)
+            return self.get_help_result()
+        
         if not ctx.args:
             return CommandResult.error(
                 f"Usage: {self.usage}\n"

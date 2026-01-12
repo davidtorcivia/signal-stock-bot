@@ -119,6 +119,7 @@ Send `!price AAPL` to your Signal number.
 |---------|-------------|
 | `!ta AAPL` | Quick technical summary (trend, RSI, MACD, S/R, signal) |
 | `!ta AAPL -full` | **Comprehensive analysis** with all indicators |
+| `!tldr AAPL` | **Simple verdict**: Buy, Sell, or Hold |
 | `!rsi AAPL` | RSI(14) with visual bar and interpretation |
 | `!sma AAPL 20 50 200` | Moving averages with % difference from price |
 | `!macd AAPL` | MACD line, signal, histogram, momentum |

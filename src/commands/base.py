@@ -79,7 +79,7 @@ class BaseCommand(ABC):
     def get_help_result(self) -> CommandResult:
         """Return simplified help message"""
         return CommandResult.ok(
-            f"💡 **Simple Explanation: !{self.name}**\n\n"
+            f"◈ HELP: !{self.name}\n\n"
             f"{self.help_explanation}\n\n"
             f"Usage: {self.usage}"
         )
