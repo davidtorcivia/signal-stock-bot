@@ -24,7 +24,7 @@ from .base import (
     ProviderError,
     RateLimitError,
 )
-from ..cache import get_quote_cache, TTLCache
+from ..cache import get_cache_manager, get_metrics, TTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ class ProviderManager:
         self.providers: list[BaseProvider] = []
         self._rate_limited: dict[str, float] = {}  # provider_name -> retry_after_timestamp
         self._enable_cache = enable_cache
-        self._cache: TTLCache[Quote] = get_quote_cache(cache_ttl) if enable_cache else None
+        self._cache = get_cache_manager() if enable_cache else None
     
     def add_provider(self, provider: BaseProvider):
         """Add a provider to the fallback chain"""
@@ -88,6 +88,26 @@ class ProviderManager:
         """Clear rate limit for a provider"""
         if provider.name in self._rate_limited:
             del self._rate_limited[provider.name]
+
+    async def _call_provider(self, provider: BaseProvider, method: str, *args, **kwargs):
+        """Call provider method with metrics recording"""
+        metrics = get_metrics().get_provider_metrics(provider.name)
+        start_time = time.time()
+        
+        try:
+            func = getattr(provider, method)
+            result = await func(*args, **kwargs)
+            
+            # Record success
+            latency_ms = (time.time() - start_time) * 1000
+            metrics.record_success(latency_ms)
+            
+            return result
+            
+        except Exception as e:
+            # Record error
+            metrics.record_error(str(e))
+            raise
     
     async def get_quote(self, symbol: str) -> Quote:
         """Get quote with caching, retry logic, and automatic fallback"""
@@ -95,7 +115,7 @@ class ProviderManager:
         
         # Check cache first
         if self._enable_cache and self._cache:
-            cached = self._cache.get(symbol)
+            cached = self._cache.quotes.get(symbol)
             if cached:
                 logger.debug(f"Cache hit for {symbol}")
                 return cached
@@ -112,12 +132,12 @@ class ProviderManager:
             for attempt in range(MAX_RETRIES + 1):
                 try:
                     logger.debug(f"Trying {provider.name} for quote: {symbol} (attempt {attempt + 1})")
-                    quote = await provider.get_quote(symbol)
+                    quote = await self._call_provider(provider, 'get_quote', symbol)
                     self._clear_rate_limit(provider)
                     
                     # Cache successful result
                     if self._enable_cache and self._cache:
-                        self._cache.set(symbol, quote)
+                        self._cache.quotes.set(symbol, quote)
                     
                     return quote
                     
@@ -150,7 +170,7 @@ class ProviderManager:
         
         # Check cache first
         if self._enable_cache and self._cache:
-            cached = self._cache.get_multi(list(remaining))
+            cached = self._cache.quotes.get_multi(list(remaining))
             results.update(cached)
             remaining -= set(cached.keys())
             if cached:
@@ -172,14 +192,14 @@ class ProviderManager:
             
             try:
                 logger.debug(f"Trying {provider.name} for batch quotes: {remaining}")
-                batch_results = await provider.get_quotes(list(remaining))
+                batch_results = await self._call_provider(provider, 'get_quotes', list(remaining))
                 results.update(batch_results)
                 remaining -= set(batch_results.keys())
                 self._clear_rate_limit(provider)
                 
                 # Cache successful results
                 if self._enable_cache and self._cache:
-                    self._cache.set_multi(batch_results)
+                    self._cache.quotes.set_multi(batch_results)
                 
             except RateLimitError as e:
                 self._mark_rate_limited(provider, e.retry_after or 60)
@@ -196,6 +216,16 @@ class ProviderManager:
         interval: str = "1d"
     ) -> list[HistoricalBar]:
         """Get historical data with fallback"""
+        # Create cache key
+        cache_key = f"{symbol}:{period}:{interval}"
+        
+        # Check cache
+        if self._enable_cache and self._cache:
+            cached = self._cache.historical.get(cache_key)
+            if cached:
+                logger.debug(f"Cache hit for historical: {cache_key}")
+                return cached
+        
         providers = self._get_available_providers(ProviderCapability.HISTORICAL)
         
         if not providers:
@@ -206,8 +236,13 @@ class ProviderManager:
         for provider in providers:
             try:
                 logger.debug(f"Trying {provider.name} for historical: {symbol}")
-                bars = await provider.get_historical(symbol, period, interval)
+                bars = await self._call_provider(provider, 'get_historical', symbol, period, interval)
                 self._clear_rate_limit(provider)
+                
+                # Cache successful result
+                if self._enable_cache and self._cache:
+                    self._cache.historical.set(cache_key, bars)
+                
                 return bars
                 
             except RateLimitError as e:
@@ -226,6 +261,13 @@ class ProviderManager:
     
     async def get_fundamentals(self, symbol: str) -> Fundamentals:
         """Get fundamentals with fallback"""
+        # Check cache
+        if self._enable_cache and self._cache:
+            cached = self._cache.fundamentals.get(symbol)
+            if cached:
+                logger.debug(f"Cache hit for fundamentals: {symbol}")
+                return cached
+        
         providers = self._get_available_providers(ProviderCapability.FUNDAMENTALS)
         
         if not providers:
@@ -236,8 +278,13 @@ class ProviderManager:
         for provider in providers:
             try:
                 logger.debug(f"Trying {provider.name} for fundamentals: {symbol}")
-                fund = await provider.get_fundamentals(symbol)
+                fund = await self._call_provider(provider, 'get_fundamentals', symbol)
                 self._clear_rate_limit(provider)
+                
+                # Cache successful result
+                if self._enable_cache and self._cache:
+                    self._cache.fundamentals.set(symbol, fund)
+                
                 return fund
                 
             except RateLimitError as e:
@@ -263,7 +310,7 @@ class ProviderManager:
         last_error = None
         for provider in providers:
             try:
-                return await provider.get_option_quote(symbol)
+                return await self._call_provider(provider, 'get_option_quote', symbol)
             except RateLimitError as e:
                 self._mark_rate_limited(provider, e.retry_after or 60)
                 last_error = e
@@ -281,7 +328,7 @@ class ProviderManager:
         last_error = None
         for provider in providers:
             try:
-                return await provider.get_forex_quote(symbol)
+                return await self._call_provider(provider, 'get_forex_quote', symbol)
             except RateLimitError as e:
                  self._mark_rate_limited(provider, e.retry_after or 60)
                  last_error = e
@@ -299,7 +346,7 @@ class ProviderManager:
         last_error = None
         for provider in providers:
             try:
-                return await provider.get_future_quote(symbol)
+                return await self._call_provider(provider, 'get_future_quote', symbol)
             except RateLimitError as e:
                  self._mark_rate_limited(provider, e.retry_after or 60)
                  last_error = e
@@ -317,7 +364,7 @@ class ProviderManager:
         last_error = None
         for provider in providers:
             try:
-                return await provider.get_economy_data(indicator)
+                return await self._call_provider(provider, 'get_economy_data', indicator)
             except RateLimitError as e:
                  self._mark_rate_limited(provider, e.retry_after or 60)
                  last_error = e
@@ -331,6 +378,7 @@ class ProviderManager:
         results = {}
         for provider in self.providers:
             try:
+                # Health check not wrapped in metrics to avoid skewing stats
                 results[provider.name] = await provider.health_check()
             except Exception as e:
                 logger.error(f"Health check failed for {provider.name}: {e}")

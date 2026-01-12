@@ -11,6 +11,7 @@ import re
 from typing import Optional
 
 from .base import BaseCommand, CommandContext, CommandResult
+from ..cache import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,9 @@ class CommandDispatcher:
             CommandResult if message was a command or contained inline symbols
             None if message was not a command
         """
+        # Record request metric
+        get_metrics().record_request()
+
         # First try standard command parsing
         parsed = self.parse_message(message)
         
@@ -177,4 +181,3 @@ class CommandDispatcher:
                 seen.add(cmd.name)
                 commands.append(cmd)
         return commands
-
