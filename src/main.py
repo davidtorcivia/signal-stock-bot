@@ -46,6 +46,9 @@ from .commands import (
     DividendCommand,
     # News
     NewsCommand,
+    # Admin
+    MetricsCommand,
+    CacheCommand,
 )
 from .signal import SignalHandler, SignalConfig
 from .server import create_app
@@ -169,6 +172,13 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config) -> Comm
     news_cmd = NewsCommand(provider_manager)
     dispatcher.register(news_cmd)
     help_commands.append(news_cmd)
+    
+    # Admin commands (available to everyone, can restrict via admin_numbers)
+    metrics_cmd = MetricsCommand()
+    cache_cmd = CacheCommand()
+    dispatcher.register(metrics_cmd)
+    dispatcher.register(cache_cmd)
+    # Don't add to help_commands - these are admin-only
     
     # Help command needs list of all visible commands
     help_cmd = HelpCommand(help_commands, config.bot_name)

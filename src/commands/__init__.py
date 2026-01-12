@@ -31,6 +31,10 @@ from .earnings_commands import (
 from .news_commands import (
     NewsCommand,
 )
+from .admin_commands import (
+    MetricsCommand,
+    CacheCommand,
+)
 
 __all__ = [
     "BaseCommand",
@@ -61,4 +65,7 @@ __all__ = [
     "DividendCommand",
     # News
     "NewsCommand",
+    # Admin
+    "MetricsCommand",
+    "CacheCommand",
 ]
