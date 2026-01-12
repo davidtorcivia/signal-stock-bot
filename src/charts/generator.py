@@ -25,14 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 # Period/interval mappings for user-friendly input
+# Using higher resolution for smoother charts
 PERIOD_MAPPINGS = {
-    "1d": ("1d", "5m"),      # 1 day, 5-min bars
-    "5d": ("5d", "15m"),     # 5 days, 15-min bars
+    "1d": ("1d", "5m"),      # 1 day, 5-min bars (~78 points)
+    "5d": ("5d", "15m"),     # 5 days, 15-min bars (~130 points)
     "1w": ("5d", "15m"),     # 1 week (alias)
-    "1m": ("1mo", "1d"),     # 1 month, daily bars
-    "3m": ("3mo", "1d"),     # 3 months, daily
+    "1m": ("1mo", "60m"),    # 1 month, hourly bars (~500 points)
+    "3m": ("3mo", "60m"),    # 3 months, hourly (~1500 points)
     "6m": ("6mo", "1d"),     # 6 months, daily
-    "1y": ("1y", "1d"),      # 1 year, daily
+    "1y": ("1y", "1d"),      # 1 year, daily (~252 points)
     "ytd": ("ytd", "1d"),    # Year to date
     "5y": ("5y", "1wk"),     # 5 years, weekly
     "max": ("max", "1mo"),   # All time, monthly
