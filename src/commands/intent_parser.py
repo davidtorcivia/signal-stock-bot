@@ -253,17 +253,25 @@ def parse_intent(text: str) -> Optional[Intent]:
                 negated_terms.append(next_word.upper())
         
     # 3. Chart options parsing (skip negated flags)
+    # Special handling for SMA - find ALL occurrences
+    sma_pattern = re.compile(r'\bsma\s*(\d+)\b', re.IGNORECASE)
+    sma_matches = sma_pattern.findall(text_lower)
+    for sma_val in sma_matches:
+        flag = f"-sma{sma_val}"
+        if flag not in negated_terms and 'sma' not in [t.lstrip('-') for t in negated_terms]:
+            if flag not in args:
+                args.append(flag)
+    
+    # Handle other chart params (excluding SMA since we handled it above)
     for pattern, flag in CHART_PARAMS:
+        if flag == "-sma":
+            continue  # Already handled above
         match = pattern.search(text_lower)
         if match:
             # Check if this flag is negated
             if flag in negated_terms or flag.lstrip('-') in [t.lstrip('-') for t in negated_terms]:
                 continue
-            if flag == "-sma" and match.group(2):
-                args.append(f"-sma{match.group(2)}")
-            elif flag == "-sma":
-                args.append("-sma50") # Default
-            else:
+            if flag not in args:
                 args.append(flag)
     
     # 4. Sentiment extraction - detect buy/sell/hold questions
@@ -290,6 +298,17 @@ def parse_intent(text: str) -> Optional[Intent]:
             negated_terms=negated_terms if negated_terms else None,
         )
     
+    # 6. Sentiment query -> route to rating command (BEFORE pattern matching)
+    # This ensures "should I buy bitcoin?" routes to rating, not crypto
+    if is_sentiment_query and symbols:
+        return Intent(
+            command='rating',
+            symbols=symbols,
+            args=args,
+            confidence=0.8,  # High confidence for explicit sentiment queries
+            negated_terms=negated_terms if negated_terms else None,
+        )
+    
     # Try each intent pattern
     for pattern, command, requires_symbol in INTENT_PATTERNS:
         if re.search(pattern, text_lower, re.IGNORECASE):
@@ -311,16 +330,6 @@ def parse_intent(text: str) -> Optional[Intent]:
                 confidence=confidence,
                 negated_terms=negated_terms if negated_terms else None,
             )
-    
-    # Sentiment query -> route to rating command
-    if is_sentiment_query and symbols:
-        return Intent(
-            command='rating',
-            symbols=symbols,
-            args=args,
-            confidence=0.75,
-            negated_terms=negated_terms if negated_terms else None,
-        )
     
     # Check if we found chart-specific args (infer chart command)
     chart_flags = {"-c", "-rsi", "-bb"}

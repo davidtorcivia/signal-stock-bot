@@ -82,9 +82,11 @@ class RatingCommand(BaseCommand):
                 lines.append("━━━ Recent Actions ━━━")
                 recent = recs.tail(5)
                 for idx, row in recent.iterrows():
-                    firm = row.get("Firm", "Unknown")[:15]
-                    grade = row.get("To Grade", row.get("toGrade", ""))
-                    lines.append(f"  {firm}: {grade}")
+                    # Handle different yfinance versions (column names vary)
+                    firm = row.get("Firm") or row.get("firm") or "Analyst"
+                    grade = row.get("To Grade") or row.get("toGrade") or row.get("strongBuy") or ""
+                    if firm and grade:
+                        lines.append(f"  {str(firm)[:15]}: {grade}")
             
             return CommandResult.ok("\n".join(lines))
             

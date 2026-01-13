@@ -241,8 +241,22 @@ class CommandDispatcher:
                     cleaned = cleaned.replace(abbr, placeholder)
                     abbrev_placeholders[placeholder] = abbr
             
-            # Normalize " and " to a unique separator
-            cleaned = re.sub(r'\s+and\s+', ' <SEP> ', cleaned, flags=re.IGNORECASE)
+            # Smart splitting on " and " - only split if it separates commands, not parameters
+            # Heuristic: split on " and " only if what follows looks like a command
+            # (contains a verb like 'show', 'chart', 'get', 'what', etc.)
+            command_verbs = {'show', 'chart', 'get', 'what', 'give', 'tell', 'price', 'check', 'find', 'do'}
+            
+            def should_split_on_and(text):
+                """Determine if ' and ' should split this text."""
+                parts = re.split(r'\s+and\s+', text, maxsplit=1, flags=re.IGNORECASE)
+                if len(parts) < 2:
+                    return False
+                after_and = parts[1].lower().split()[0] if parts[1].split() else ""
+                # Split if what follows starts with a command verb or looks like new content
+                return after_and in command_verbs or any(c.isupper() for c in after_and)
+            
+            if should_split_on_and(cleaned):
+                cleaned = re.sub(r'\s+and\s+', ' <SEP> ', cleaned, flags=re.IGNORECASE)
             
             # Split regex: Matches .?! NOT followed by a digit (to protect 1.5)
             split_pattern = r'[.?!]+(?!\d)'
