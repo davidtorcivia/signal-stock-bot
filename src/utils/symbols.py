@@ -51,6 +51,13 @@ SYMBOL_ALIASES = {
     "coinbase": "COIN",
     "robinhood": "HOOD",
     "palantir": "PLTR",
+    "broadcom": "AVGO",
+    "arm": "ARM",
+    "supermicro": "SMCI",
+    "gamestop": "GME",
+    "gme": "GME",
+    "amc": "AMC",
+    "blackberry": "BB",
     
     # Finance
     "jpmorgan": "JPM",
@@ -121,6 +128,11 @@ SYMBOL_ALIASES = {
     "matic": "MATIC-USD",
     "litecoin": "LTC-USD",
     "ltc": "LTC-USD",
+    "sui": "SUI-USD",
+    "pepe": "PEPE-USD",
+    "shiba": "SHIB-USD",
+    "shib": "SHIB-USD",
+    "bonk": "BONK-USD",
     
     # Commodities & Futures
     "gold": "GC=F",

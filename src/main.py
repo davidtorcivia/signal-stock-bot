@@ -130,12 +130,13 @@ def create_provider_manager(config: Config) -> ProviderManager:
     return manager
 
 
-def create_dispatcher(provider_manager: ProviderManager, config: Config, watchlist_db=None, alerts_db=None) -> CommandDispatcher:
+def create_dispatcher(provider_manager: ProviderManager, config: Config, watchlist_db=None, alerts_db=None, context_manager=None) -> CommandDispatcher:
     """Create and configure command dispatcher"""
     dispatcher = CommandDispatcher(
         prefix=config.command_prefix, 
         bot_name=config.bot_name,
         rate_limit=config.user_rate_limit,
+        context_manager=context_manager,
     )
     
     # Create commands
@@ -271,12 +272,16 @@ def main():
     
     # Set up database
     from .database import WatchlistDB, AlertsDB
+    from .context import ContextManager
+    
     watchlist_db = WatchlistDB(config.watchlist_db_path)
-    alerts_db = AlertsDB(config.watchlist_db_path)  # Uses same DB file
+    alerts_db = AlertsDB(config.watchlist_db_path)
+    context_manager = ContextManager(config.watchlist_db_path)
+    
     logger.info(f"Database: {config.watchlist_db_path}")
     
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config, watchlist_db, alerts_db)
+    dispatcher = create_dispatcher(provider_manager, config, watchlist_db, alerts_db, context_manager)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler

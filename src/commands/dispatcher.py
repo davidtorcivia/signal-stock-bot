@@ -4,6 +4,8 @@ Command dispatcher - routes messages to appropriate handlers.
 Supports:
 - Standard command prefix (e.g., !price AAPL)
 - Inline symbol mentions (e.g., $AAPL in natural text)
+- Context awareness (pronouns)
+- Multi-intent parsing ("Chart Apple and show RSI")
 """
 
 import logging
@@ -104,13 +106,15 @@ class CommandDispatcher:
     - Command aliases
     - Inline symbol mentions ($AAPL)
     - Unknown command handling
+    - Context awareness
     """
     
     def __init__(self, prefix: str = "!", enable_inline_symbols: bool = True, 
-                 bot_name: str = "Stock Bot", rate_limit: int = 30):
+                 bot_name: str = "Stock Bot", rate_limit: int = 30, context_manager=None):
         self.prefix = prefix
         self.enable_inline_symbols = enable_inline_symbols
         self.bot_name = bot_name
+        self.context_manager = context_manager
         self.commands: dict[str, BaseCommand] = {}
         self._rate_limiter = UserRateLimiter(limit=rate_limit)
         self._pattern = re.compile(
@@ -169,16 +173,6 @@ class CommandDispatcher:
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
-        
-        Args:
-            sender: Phone number of sender
-            message: Message text
-            group_id: Group ID if in group chat
-            mentioned: True if bot was @mentioned
-        
-        Returns:
-            CommandResult if message was a command or contained inline symbols
-            None if message was not a command
         """
         # Check rate limit
         allowed, retry_after = self._rate_limiter.check(sender)
@@ -191,10 +185,7 @@ class CommandDispatcher:
         get_metrics().record_request()
         
         # Check for command chaining (multiple commands in one message)
-        # e.g., "!price AAPL !ta AAPL"
-        # We need to be careful not to split inside quoted strings (though simplified splitting is likely okay for now)
         if message.count(self.prefix) > 1 and message.strip().startswith(self.prefix):
-            # Split by prefix, but filter empty strings (e.g. leading prefix)
             commands = [f"{self.prefix}{cmd.strip()}" for cmd in message.split(self.prefix) if cmd.strip()]
             
             if len(commands) > 1:
@@ -208,18 +199,7 @@ class CommandDispatcher:
                             results.append(result)
                 
                 if results:
-                    # Merge results
-                    merged_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join([r.text for r in results if r])
-                    merged_attachments = []
-                    for r in results:
-                        if r and r.attachments:
-                            merged_attachments.extend(r.attachments)
-                    
-                    return CommandResult(
-                        text=merged_text,
-                        success=all(r.success for r in results if r),
-                        attachments=merged_attachments
-                    )
+                    return self._merge_results(results)
 
         # First try standard command parsing
         parsed = self.parse_message(message)
@@ -240,13 +220,82 @@ class CommandDispatcher:
         if mentioned or self._looks_like_query(message):
             from .intent_parser import parse_intent
             
-            intent = parse_intent(message)
-            if intent and intent.confidence >= 0.5:
-                logger.info(f"Intent parsed: {intent.command} {intent.symbols} (confidence: {intent.confidence:.2f})")
-                return await self._execute_command(intent.command, intent.args, sender, message, group_id)
+            # Strip bot mentions before NLP parsing (e.g., "@Sigil chart AAPL" -> "chart AAPL")
+            cleaned = message
+            if mentioned:
+                # Remove @mentions (Signal format) and bot name references
+                cleaned = re.sub(r'@\S+\s*', '', cleaned, count=1)  # Remove first @mention
+                # Also remove standalone bot name references
+                cleaned = re.sub(rf'\b{re.escape(self.bot_name)}\b', '', cleaned, flags=re.IGNORECASE)
+                cleaned = cleaned.strip()
+            
+            # Multi-intent support: Split by punctuation or "and"
+            # e.g., "Chart Apple. Show me its RSI" or "Chart AAPL and RSI"
+            
+            # Protect common abbreviations from being split
+            ABBREVIATIONS = ['U.S.', 'U.K.', 'e.g.', 'i.e.', 'Inc.', 'Corp.', 'Ltd.', 'Dr.', 'Mr.', 'Mrs.', 'vs.']
+            abbrev_placeholders = {}
+            for i, abbr in enumerate(ABBREVIATIONS):
+                placeholder = f"__ABBR{i}__"
+                if abbr in cleaned:
+                    cleaned = cleaned.replace(abbr, placeholder)
+                    abbrev_placeholders[placeholder] = abbr
+            
+            # Normalize " and " to a unique separator
+            cleaned = re.sub(r'\s+and\s+', ' <SEP> ', cleaned, flags=re.IGNORECASE)
+            
+            # Split regex: Matches .?! NOT followed by a digit (to protect 1.5)
+            split_pattern = r'[.?!]+(?!\d)'
+            raw_segments = re.split(split_pattern, cleaned)
+            
+            segments = []
+            for s in raw_segments:
+                # Handle <SEP> from "and" normalization
+                parts = s.split(' <SEP> ')
+                for p in parts:
+                    # Restore abbreviations
+                    for placeholder, abbr in abbrev_placeholders.items():
+                        p = p.replace(placeholder, abbr)
+                    if p.strip():
+                        segments.append(p.strip())
+            
+            logger.debug(f"Dispatch segments: {segments}")
+            
+            results = []
+            # Context chaining: track symbol from previous segment for pronoun resolution
+            chained_symbol = None
+            
+            for i, segment in enumerate(segments):
+                intent = parse_intent(segment)
+                
+                # Apply confidence decay for later segments (less certain)
+                if intent and i > 0:
+                    intent.confidence *= 0.95  # 5% decay per segment
+                
+                if intent and intent.confidence >= 0.5:
+                    # Context chaining: if intent has no symbols but uses pronouns, inject chained symbol
+                    if not intent.symbols and chained_symbol:
+                        # Check if intent args contain pronouns
+                        if any(p in intent.args for p in ('it', 'that', 'this', 'its')):
+                            intent.args = [chained_symbol if a in ('it', 'that', 'this', 'its') else a for a in intent.args]
+                            intent.symbols = [chained_symbol]
+                    
+                    # Update chained symbol for next segment
+                    if intent.symbols:
+                        chained_symbol = intent.symbols[0]
+                    
+                    logger.info(f"Intent parsed: {intent.command} {intent.symbols} (confidence: {intent.confidence:.2f})")
+                    result = await self._execute_command(intent.command, intent.args, sender, message, group_id)
+                    if result:
+                        results.append(result)
+            
+            if results:
+                if len(results) == 1:
+                    return results[0]
+                return self._merge_results(results)
             
             # If mentioned but no intent, show intro
-            if mentioned:
+            if mentioned and not results:
                 logger.info("Bot mentioned without command, providing help intro")
                 return CommandResult.ok(
                     f"» Hey! I'm {self.bot_name}.\n\n"
@@ -259,26 +308,78 @@ class CommandDispatcher:
         
         return None
     
+    def _merge_results(self, results: list[CommandResult]) -> CommandResult:
+        """Merge multiple command results into one."""
+        merged_text = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join([r.text for r in results if r])
+        merged_attachments = []
+        for r in results:
+            if r and r.attachments:
+                merged_attachments.extend(r.attachments)
+        
+        return CommandResult(
+            text=merged_text,
+            success=all(r.success for r in results if r),
+            attachments=merged_attachments
+        )
+
     def _looks_like_query(self, text: str) -> bool:
         """Check if text looks like a stock-related query."""
-        # Skip short messages
-        if len(text) < 5:
+        if len(text) < 3:
             return False
-        
-        # Check for question indicators
-        question_words = ['what', 'how', 'show', 'get', 'tell', 'can', 'give']
+            
         text_lower = text.lower()
         
+        # Question starters
+        question_words = ['what', 'how', 'show', 'get', 'tell', 'can', 'give', 'is', 'should', 'would', 'could', 'do', 'does', 'will']
         for word in question_words:
             if text_lower.startswith(word) or f" {word} " in text_lower:
                 return True
         
-        # Check for finance keywords
+        # Sentiment/advice patterns
+        if any(p in text_lower for p in ['buy', 'sell', 'hold', 'invest', 'bullish', 'bearish', 'good investment', 'bad investment']):
+            return True
+        
+        # Finance keywords
         finance_keywords = [
             'chart', 'price', 'rsi', 'macd', 'earnings', 'dividend',
             'news', 'rating', 'insider', 'short', 'correlation',
+            'stock', 'share', 'market', 'crypto', 'bitcoin', 'analysis',
+            'candlestick', 'candlesticks', 'bollinger', 'sma', 'ema',
         ]
         return any(kw in text_lower for kw in finance_keywords)
+
+    async def _resolve_context(self, sender: str, args: list[str]) -> list[str]:
+        """Resolve context-dependent arguments."""
+        if not self.context_manager or not args:
+            return args
+        
+        first_arg = args[0].lower()
+        if first_arg in ('it', 'that', 'this', 'its'):
+            import hashlib
+            user_hash = hashlib.sha256(sender.encode()).hexdigest()
+            ctx = await self.context_manager.get_context(user_hash)
+            
+            if ctx.last_symbol:
+                logger.info(f"Resolved pronoun '{first_arg}' to '{ctx.last_symbol}' for {sender[-4:]}")
+                args[0] = ctx.last_symbol
+                
+        return args
+
+    async def _update_context(self, sender: str, command: str, args: list[str], success: bool):
+        """Update context after command execution."""
+        if not self.context_manager or not success:
+            return
+            
+        symbol = None
+        if args:
+            candidate = args[0].upper()
+            if candidate.isalpha() and 2 <= len(candidate) <= 6:
+                symbol = candidate
+        
+        if symbol:
+            import hashlib
+            user_hash = hashlib.sha256(sender.encode()).hexdigest()
+            await self.context_manager.update_context(user_hash, symbol=symbol, intent=command)
     
     async def _execute_command(
         self,
@@ -289,9 +390,11 @@ class CommandDispatcher:
         group_id: Optional[str]
     ) -> CommandResult:
         """Execute a command with the given arguments."""
+        # Resolve context (pronouns)
+        args = await self._resolve_context(sender, args)
+
         handler = self.commands.get(command)
         if not handler:
-            # Try to suggest closest match
             suggestion = self._find_closest_command(command)
             msg = f"Unknown command: {command}"
             if suggestion:
@@ -307,11 +410,9 @@ class CommandDispatcher:
             args=args,
         )
         
-        # universal -help flag check
         if handler.has_help_flag(ctx):
              return handler.get_help_result()
         
-        # Audit log
         audit = get_audit_logger()
         audit.info(f"{sender[-4:]} | {command} {' '.join(args)}")
         
@@ -319,6 +420,10 @@ class CommandDispatcher:
             logger.info(f"Executing {command} from {sender[-4:]}: args={args}")
             result = await handler.execute(ctx)
             logger.debug(f"Command {command} completed: success={result.success}")
+            
+            # Update context if successful
+            await self._update_context(sender, command, args, result.success)
+            
             return result
             
         except Exception as e:

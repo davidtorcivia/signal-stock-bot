@@ -251,18 +251,34 @@ Help text explains:
 
 ---
 
-## Natural Language Support
+## 🧠 Natural Language (NLP 2.0)
 
-Speak to the bot naturally! It understands your intent:
+The bot understands conversational language, context, and complex queries.
+
+### Context Awareness
+- **"Chart Apple"** → *Shows AAPL chart*
+- **"What is it trading at?"** → *Remembers AAPL context → Shows Price*
+- **"Show its RSI"** → *Remembers AAPL context → Shows RSI*
+
+### Smart Matching
+- **Typos**: "Price of **Nvidea**" → *Corrects to NVIDIA (NVDA)*
+- **Lowercase**: "chart apple" → *Understands lowercase tickers safely*
+
+### Advanced Queries
+- **Timeframes**: "Chart TSLA for **6 months**" or "Price of BTC **1y**"
+- **Multi-Intent**: "Chart Apple **and** show me the RSI" (Splits into two commands)
+- **Parameters**: "Give me the RSI for AAPL"
+
+### Examples
 
 | **You say** | **Bot does** |
 |:---|:---|
 | "Chart Apple" | `!chart AAPL` |
 | "What's the price of Tesla?" | `!price TSLA` |
-| "Show me RSI for Microsoft" | `!rsi MSFT` |
 | "Any news on Google?" | `!news GOOGL` |
-| "What are analysts saying about NVDA?" | `!rating NVDA` |
 | "Insider trading for Amazon" | `!insider AMZN` |
+| "Chart it for 6 months" | `!chart [LastSymbol] 6m` |
+| "Price of Nvidea" | `!price NVDA` (Typo fix) |
 
 ---
 
