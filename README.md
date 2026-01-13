@@ -251,7 +251,7 @@ Help text explains:
 
 ---
 
-## 🧠 Natural Language (NLP 2.0)
+## Natural Language
 
 The bot understands conversational language, context, and complex queries.
 
@@ -265,8 +265,10 @@ The bot understands conversational language, context, and complex queries.
 - **Lowercase**: "chart apple" → *Understands lowercase tickers safely*
 
 ### Advanced Queries
-- **Timeframes**: "Chart TSLA for **6 months**" or "Price of BTC **1y**"
+- **Timeframes**: "Chart TSLA for **6 months**", "Since 2023", "Last 30 days"
 - **Multi-Intent**: "Chart Apple **and** show me the RSI" (Splits into two commands)
+- **Comparisons**: "Chart Apple **vs** Microsoft" or "Compare AAPL to TSLA"
+- **Sentiment**: "Is Apple a **buy**?", "Should I sell Tesla?" (Analyst ratings)
 - **Parameters**: "Give me the RSI for AAPL"
 
 ### Examples
@@ -276,7 +278,8 @@ The bot understands conversational language, context, and complex queries.
 | "Chart Apple" | `!chart AAPL` |
 | "What's the price of Tesla?" | `!price TSLA` |
 | "Any news on Google?" | `!news GOOGL` |
-| "Insider trading for Amazon" | `!insider AMZN` |
+| "Is Microsoft a buy?" | `!rating MSFT` (Sentiment) |
+| "Chart Apple vs Tesla" | `!chart AAPL -compare TSLA` |
 | "Chart it for 6 months" | `!chart [LastSymbol] 6m` |
 | "Price of Nvidea" | `!price NVDA` (Typo fix) |
 
