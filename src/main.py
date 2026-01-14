@@ -18,6 +18,11 @@ import logging
 import sys
 import os
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 from .config import Config
 from .providers import ProviderManager, YahooFinanceProvider, AlphaVantageProvider, MassiveProvider
 from .commands import (
