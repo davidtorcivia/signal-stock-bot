@@ -225,8 +225,11 @@ class CommandDispatcher:
                 # Route to price command
                 return await self._execute_command("price", symbols, sender, message, group_id)
         
-        # Try natural language intent parsing (for mentions or direct queries)
-        if mentioned or self._looks_like_query(message):
+        # Try natural language intent parsing
+        # In groups: Only triggers if explicitly mentioned
+        # In DMs: Can trigger passively if it looks like a query
+        is_dm = group_id is None
+        if mentioned or (is_dm and self._looks_like_query(message)):
             from .intent_parser import parse_intent
             
             # Strip bot mentions before NLP parsing (e.g., "@Sigil chart AAPL" -> "chart AAPL")

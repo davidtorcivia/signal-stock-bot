@@ -32,7 +32,7 @@ NEGATION_WORDS = {'not', "don't", "dont", 'without', 'no', 'except', 'excluding'
 
 # Ticker collision list - common English words that are also tickers
 # These require explicit $SYMBOL notation or strong context
-AMBIGUOUS_TICKERS = {'NOW', 'OPEN', 'GO', 'ON', 'IT', 'ALL', 'ARE', 'BE', 'CAN', 'FOR', 'HAS', 'NEW', 'ONE', 'OUT', 'SEE', 'TWO', 'WAY', 'BIG', 'KEY', 'CAT', 'DOG', 'FUN', 'RUN', 'SUN', 'DAY'}
+AMBIGUOUS_TICKERS = {'NOW', 'OPEN', 'GO', 'ON', 'IT', 'ALL', 'ARE', 'BE', 'CAN', 'FOR', 'HAS', 'NEW', 'ONE', 'OUT', 'SEE', 'TWO', 'WAY', 'BIG', 'KEY', 'CAT', 'DOG', 'FUN', 'RUN', 'SUN', 'DAY', 'ITD', 'TRULY', 'AWFUL', 'LATE', 'HARD', 'FAST', 'LOST', 'LOW', 'HIGH', 'MAN', 'BOY', 'ART', 'EAT', 'RED', 'SEE', 'SKY', 'TOP', 'WIN', 'YES', 'ZIP'}
 
 
 # Command patterns: (regex pattern, command name, requires_symbol)
@@ -173,6 +173,10 @@ def extract_symbols_from_text(text: str) -> List[str]:
     # Always check this to catch mixed queries like "Apple and MSFT"
     words = text.split()
     for word in words:
+        # Skip words with apostrophes (it'd, don't, etc.)
+        if "'" in word or "’" in word:
+            continue
+            
         # Clean punctuation
         clean = re.sub(r'[^\w-]', '', word)
         clean_lower = clean.lower()
