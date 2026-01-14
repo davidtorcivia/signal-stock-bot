@@ -255,14 +255,34 @@ class CommandDispatcher:
             # (contains a verb like 'show', 'chart', 'get', 'what', etc.)
             command_verbs = {'show', 'chart', 'get', 'what', 'give', 'tell', 'price', 'check', 'find', 'do'}
             
+            # Load economy keywords for splitting logic
+            from ..providers.fred import INDICATOR_MAPPING
+            economy_keywords = {k.lower() for k in INDICATOR_MAPPING.keys()}
+            economy_keywords.add('economy')
+            economy_keywords.add('macro')
+            
             def should_split_on_and(text):
                 """Determine if ' and ' should split this text."""
                 parts = re.split(r'\s+and\s+', text, maxsplit=1, flags=re.IGNORECASE)
                 if len(parts) < 2:
                     return False
-                after_and = parts[1].lower().split()[0] if parts[1].split() else ""
-                # Split if what follows starts with a command verb or looks like new content
-                return after_and in command_verbs or any(c.isupper() for c in after_and)
+                
+                after_and = parts[1].strip()
+                if not after_and:
+                    return False
+                
+                # We need original case for ticker detection
+                # and lower case for keyword matching
+                first_word_original = after_and.split()[0]
+                first_word_lower = first_word_original.lower()
+                
+                # Split if what follows:
+                # 1. Starts with a command verb
+                # 2. Is capitalised (likely a ticker) - Check ORIGINAL case
+                # 3. Is an economy keyword (e.g. "cpi", "unemployment")
+                return (first_word_lower in command_verbs or 
+                        any(c.isupper() for c in first_word_original) or
+                        first_word_lower in economy_keywords)
             
             if should_split_on_and(cleaned):
                 cleaned = re.sub(r'\s+and\s+', ' <SEP> ', cleaned, flags=re.IGNORECASE)
