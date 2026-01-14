@@ -96,6 +96,9 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 # Pattern for inline symbol mentions like $AAPL, $BTC-USD
 SYMBOL_MENTION_PATTERN = re.compile(r'\$([A-Z]{1,5}(?:[-\.][A-Z]{1,5})?)', re.IGNORECASE)
 
+# Pattern for "corn" easter egg (Bitcoin insider joke) - whole word only
+CORN_PATTERN = re.compile(r'\bcorn\b', re.IGNORECASE)
+
 
 class CommandDispatcher:
     """
@@ -183,6 +186,12 @@ class CommandDispatcher:
         
         # Record request metric
         get_metrics().record_request()
+        
+        # Easter egg: Check for "corn" (Bitcoin inside joke)
+        if CORN_PATTERN.search(message):
+            corn_result = await self._handle_corn_easter_egg()
+            if corn_result:
+                return corn_result
         
         # Check for command chaining (multiple commands in one message)
         if message.count(self.prefix) > 1 and message.strip().startswith(self.prefix):
@@ -467,3 +476,101 @@ class CommandDispatcher:
                 seen.add(cmd.name)
                 commands.append(cmd)
         return commands
+    
+    async def _handle_corn_easter_egg(self) -> Optional[CommandResult]:
+        """
+        Handle 'corn' easter egg - return Bitcoin price and chart.
+        
+        Inside joke: 'corn' = Bitcoin in the group chat.
+        """
+        try:
+            # Get the chart command to access providers and chart generator
+            chart_cmd = self.commands.get("chart")
+            if not chart_cmd:
+                # Fallback to price command if chart not available
+                price_cmd = self.commands.get("price")
+                if price_cmd:
+                    from .base import CommandContext
+                    ctx = CommandContext(
+                        sender="corn_easter_egg",
+                        group_id=None,
+                        raw_message="corn",
+                        command="price",
+                        args=["BTC-USD"],
+                    )
+                    return await price_cmd.execute(ctx)
+                return None
+            
+            # Get BTC quote
+            quote = await chart_cmd.providers.get_quote("BTC-USD")
+            
+            # Get historical bars for 1d candlestick chart
+            from ..charts import get_period_params
+            period, interval = get_period_params("1d")
+            bars = await chart_cmd.providers.get_historical("BTC-USD", period=period, interval=interval)
+            
+            # Generate candlestick chart
+            from ..charts import ChartOptions
+            options = ChartOptions(
+                chart_type="candle",
+                show_volume=True,
+            )
+            
+            generator = chart_cmd._get_generator()
+            chart_b64 = generator.generate(
+                symbol="BTC-USD",
+                bars=bars,
+                period="1d",
+                current_price=quote.price,
+                change_percent=quote.change_percent,
+                options=options,
+            )
+            
+            # Calculate fun stats
+            sats_per_dollar = int(100_000_000 / quote.price) if quote.price > 0 else 0
+            
+            # Price direction indicator
+            if quote.change_percent > 3:
+                mood = "Absolutely SHUCKING it"
+                indicator = ">>>"
+            elif quote.change_percent > 0:
+                mood = "Growing nicely"
+                indicator = ">"
+            elif quote.change_percent > -3:
+                mood = "Bit wilted"
+                indicator = "v"
+            else:
+                mood = "Getting harvested"
+                indicator = "vvv"
+            
+            # Format response with fun stats (no emojis, only unicode)
+            lines = [
+                "* * * CORN REPORT * * *",
+                "",
+                f"{indicator} ${quote.price:,.2f}",
+                f"   {'+' if quote.change >= 0 else ''}{quote.change:,.2f} ({quote.change_percent:+.2f}%)",
+                "",
+                f"Mood: {mood}",
+                f"Sats per dollar: {sats_per_dollar:,}",
+            ]
+            
+            # Add volume if available
+            if quote.volume:
+                vol_billions = quote.volume * quote.price / 1_000_000_000
+                lines.append(f"24h Volume: ${vol_billions:.1f}B")
+            
+            lines.append("")
+            lines.append("~~ stack sats ~~")
+            
+            logger.info("Corn easter egg triggered - returning BTC price and chart")
+            
+            return CommandResult(
+                text="\n".join(lines),
+                success=True,
+                attachments=[chart_b64] if chart_b64 else None,
+            )
+            
+        except Exception as e:
+            logger.error(f"Corn easter egg error: {e}")
+            # Silent failure - don't spam the chat with errors
+            return None

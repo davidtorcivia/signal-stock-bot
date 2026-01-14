@@ -105,7 +105,7 @@ class TestPriceCommand:
         assert result.success
         assert "Apple Inc." in result.text
         assert "$185.92" in result.text
-        assert "📈" in result.text  # Positive change
+        assert "▲" in result.text  # Positive change (unicode triangle)
     
     @pytest.mark.asyncio
     async def test_multiple_symbols(self, mock_provider_manager, sample_quotes):
@@ -191,7 +191,7 @@ class TestPriceCommand:
         result = await cmd.execute(ctx)
         
         assert result.success
-        assert "📉" in result.text  # Negative change indicator
+        assert "▼" in result.text  # Negative change indicator (unicode triangle)
 
 
 class TestQuoteCommand:

@@ -409,12 +409,16 @@ def create_gunicorn_app():
     logger.info(f"Configured {len(provider_manager.providers)} provider(s)")
     
     # Set up database
-    from .database import WatchlistDB
+    from .database import WatchlistDB, AlertsDB
+    from .context import ContextManager
+    
     watchlist_db = WatchlistDB(config.watchlist_db_path)
-    logger.info(f"Watchlist database: {config.watchlist_db_path}")
+    alerts_db = AlertsDB(config.watchlist_db_path)
+    context_manager = ContextManager(config.watchlist_db_path)
+    logger.info(f"Database: {config.watchlist_db_path}")
     
     # Set up commands
-    dispatcher = create_dispatcher(provider_manager, config, watchlist_db)
+    dispatcher = create_dispatcher(provider_manager, config, watchlist_db, alerts_db, context_manager)
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
     
     # Set up Signal handler
@@ -424,6 +428,85 @@ def create_gunicorn_app():
     )
     signal_handler = SignalHandler(signal_config, dispatcher)
     logger.info(f"Signal handler configured for {config.signal_phone_number[-4:]}")
+    
+    # Start background alert worker
+    if alerts_db:
+        import threading
+        import asyncio
+        
+        def run_alert_worker():
+            logger.info("Starting background alert worker")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def check_alerts():
+                while True:
+                    try:
+                        alerts = await alerts_db.get_all_active_alerts()
+                        if not alerts:
+                            await asyncio.sleep(60)
+                            continue
+                            
+                        logger.debug(f"Checking {len(alerts)} active alerts...")
+                        
+                        # Group by symbol to batch requests
+                        by_symbol = {}
+                        for alert in alerts:
+                            sym = alert['symbol']
+                            if sym not in by_symbol:
+                                by_symbol[sym] = []
+                            by_symbol[sym].append(alert)
+                        
+                        # Check each symbol
+                        for symbol, symbol_alerts in by_symbol.items():
+                            try:
+                                quote = await provider_manager.get_quote(symbol)
+                                current_price = quote.price
+                                
+                                for alert in symbol_alerts:
+                                    triggered = False
+                                    condition = alert['condition']
+                                    target = alert['target_value']
+                                    
+                                    if condition == 'above' and current_price > target:
+                                        triggered = True
+                                        msg = f">>> ALERT: {symbol} is above ${target:.2f} (Current: ${current_price:.2f})"
+                                    elif condition == 'below' and current_price < target:
+                                        triggered = True
+                                        msg = f">>> ALERT: {symbol} is below ${target:.2f} (Current: ${current_price:.2f})"
+                                    elif condition == 'change_pct' and abs(quote.change_percent) >= target:
+                                        triggered = True
+                                        msg = f">>> ALERT: {symbol} moved {quote.change_percent:+.2f}% (Target: {target}%)"
+                                    
+                                    if triggered:
+                                        logger.info(f"Alert triggered: {alert['id']} for {symbol}")
+                                        # Deactivate alert first
+                                        await alerts_db.trigger_alert(alert['id'])
+                                        
+                                        # Send notification
+                                        group_id = alert.get('group_id')
+                                        recipient = alert['user_phone']
+                                        
+                                        if group_id:
+                                            await signal_handler.send_message(recipient=recipient, message=msg, group_id=group_id)
+                                        else:
+                                            await signal_handler.send_message(recipient=recipient, message=msg, group_id=None)
+                                            
+                            except Exception as e:
+                                logger.error(f"Error checking {symbol}: {e}")
+                                
+                        await asyncio.sleep(60)
+                        
+                    except Exception as e:
+                        logger.error(f"Alert worker error: {e}")
+                        await asyncio.sleep(60)
+
+            loop.run_until_complete(check_alerts())
+
+        # Start thread
+        t = threading.Thread(target=run_alert_worker, daemon=True)
+        t.start()
+        logger.info("Background alert worker started")
     
     # Start message poller as fallback for webhooks
     # This actively polls signal-api since RECEIVE_WEBHOOK_URL is broken

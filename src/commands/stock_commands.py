@@ -67,7 +67,10 @@ def get_timestamp() -> str:
     """Get current timestamp in ET timezone with market-appropriate format."""
     now = datetime.now(ET)
     # Format: "3:45 PM ET" or "10:30 AM ET"
-    return now.strftime("%-I:%M %p ET").replace(" 0", " ")
+    # Use %I (12-hour with leading zero) and manually strip the leading zero
+    # This is cross-platform (%-I is Unix-only, %#I is Windows-only)
+    hour = now.strftime("%I").lstrip("0") or "12"  # Handle midnight edge case
+    return f"{hour}:{now.strftime('%M %p')} ET"
 
 
 def format_timestamp() -> str:
