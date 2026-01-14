@@ -54,6 +54,8 @@ class ChartOptions:
     # Formatting
     value_format: str = "${:,.2f}"  # Format string for price/value
     y_label: Optional[str] = None   # Custom Y-axis label (e.g. "Percent", "Billions")
+    fill_area: bool = False         # Fill area under line (aesthetic)
+    line_color: Optional[str] = None # Custom line color
 
 
 # SMA line colors
@@ -286,6 +288,23 @@ class ChartGenerator:
         
         if options.y_label:
             plot_kwargs['ylabel'] = options.y_label
+            
+        if options.line_color:
+            plot_kwargs['linecolor'] = options.line_color
+            
+        if options.fill_area and mpf_type == 'line':
+            # Create a fill from the bottom of the data range (or slightly lower) to the close price
+            # We use the line color with alpha for the fill
+            fill_color = options.line_color if options.line_color else '#00BFFF'
+            
+            # fill_between requires a dict or list of dicts
+            # y1 is the data (Close), y2 can be a scalar (min value)
+            plot_kwargs['fill_between'] = dict(
+                y1=df['Close'].values,
+                y2=df['Close'].min(),
+                alpha=0.15,
+                color=fill_color
+            )
         
         if addplots:
             plot_kwargs['addplot'] = addplots

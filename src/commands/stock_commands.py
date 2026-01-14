@@ -727,7 +727,9 @@ class EconomyCommand(BaseCommand):
                     chart_type="line",
                     show_volume=False,
                     value_format=value_format,
-                    y_label=y_label
+                    y_label=y_label,
+                    fill_area=True,
+                    line_color="#00E5FF", # Cyan/Electric Blue for techy look
                 )
                 
                 generator = ChartGenerator(bot_name=self.bot_name)
