@@ -209,6 +209,17 @@ class BaseProvider(ABC):
         """Get economic data. Override if supported."""
         raise NotImplementedError(f"{self.name} doesn't support economy data")
     
+    async def get_economy_historical(
+        self,
+        indicator: str,
+        period: str = "5y"
+    ) -> tuple[list[tuple[datetime, float]], str, str]:
+        """
+        Get historical economic data. Override if supported.
+        Returns: (data_points, series_name, unit)
+        """
+        raise NotImplementedError(f"{self.name} doesn't support historical economy data")
+    
     @abstractmethod
     async def health_check(self) -> bool:
         """Check if provider is operational"""

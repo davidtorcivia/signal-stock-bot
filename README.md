@@ -243,6 +243,14 @@ Get economic indicators from FRED (Federal Reserve Economic Data). Free with 120
 !eco 10Y          # 10-Year Treasury yield
 ```
 
+**Charts**:
+Add `chart` or a time period (`1y`, `5y`, `max`) to see a trend graph:
+```
+!eco CPI chart    # 5-year trend (default)
+!eco GDP 10y      # 10-year growth chart
+!eco JOBS max     # All-time history
+```
+
 Requires `FRED_API_KEY` - get free key at [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html)
 
 ---

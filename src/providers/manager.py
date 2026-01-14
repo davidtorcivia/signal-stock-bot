@@ -379,6 +379,34 @@ class ProviderManager:
                 logger.warning(f"Error fetching economy data from {provider.name}: {e}")
                 last_error = e
         raise last_error or ProviderError("All providers failed to return economy data")
+
+    async def get_economy_historical(
+        self,
+        indicator: str,
+        period: str = "5y"
+    ) -> tuple[list[tuple[datetime, float]], str, str]:
+        """Get historical economic data with fallback"""
+        # Note: Currently only FRED supports this, but logic allows for others
+        providers = self._get_available_providers(ProviderCapability.ECONOMY)
+        if not providers:
+             raise ProviderError("No providers available for economy data")
+        
+        last_error = None
+        for provider in providers:
+            try:
+                # Check if provider actually implementation this method (avoid NotImplementedError)
+                # This is a bit of a hack since capabilities don't distinguish between current/historical economy
+                # But typically if it supports ECONOMY it currently maps to Fred which supports both.
+                return await self._call_provider(provider, 'get_economy_historical', indicator, period)
+            except NotImplementedError:
+                continue
+            except RateLimitError as e:
+                 self._mark_rate_limited(provider, e.retry_after or 60)
+                 last_error = e
+            except Exception as e:
+                logger.warning(f"Error fetching historical economy data from {provider.name}: {e}")
+                last_error = e
+        raise last_error or ProviderError("All providers failed to return historical economy data")
     
     async def health_check(self) -> dict[str, bool]:
         """Check health of all providers"""

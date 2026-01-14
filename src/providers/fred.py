@@ -206,18 +206,18 @@ class FredProvider(BaseProvider):
             logger.error(f"FRED error for {indicator}: {e}")
             raise ProviderError(f"Failed to fetch {indicator}: {e}")
     
-    async def _fetch_series(self, series_id: str) -> dict:
+    async def _fetch_series(self, series_id: str, limit: int = 5) -> dict:
         """Fetch series data from FRED API."""
         session = SharedSession.get()
         
-        # Fetch observations (latest 5)
+        # Fetch observations (latest N)
         obs_url = f"{self.BASE_URL}/series/observations"
         params = {
             "series_id": series_id,
             "api_key": self.api_key,
             "file_type": "json",
             "sort_order": "desc",
-            "limit": 5,
+            "limit": limit,
         }
         
         async with session.get(obs_url, params=params) as resp:
@@ -234,6 +234,71 @@ class FredProvider(BaseProvider):
                 raise ProviderError(f"FRED API returned {resp.status}")
             
             return await resp.json()
+    
+    async def get_economy_historical(
+        self,
+        indicator: str,
+        period: str = "5y"
+    ) -> tuple[list[tuple[datetime, float]], str, str]:
+        """
+        Get historical time series for an economic indicator.
+        
+        Args:
+            indicator: User-friendly name (CPI, UNEMPLOYMENT, etc.) or FRED series ID
+            period: Time period - 1y, 2y, 5y, 10y, max
+        
+        Returns:
+            Tuple of (data_points, series_name, unit)
+            where data_points is list of (datetime, value) tuples
+        """
+        indicator = indicator.upper()
+        series_id = INDICATOR_MAPPING.get(indicator, indicator)
+        
+        # Map period to number of observations to fetch
+        # Most FRED series are monthly, so 12 points per year
+        period_map = {
+            "1y": 15,      # ~1 year of monthly data
+            "2y": 30,      # ~2 years
+            "5y": 65,      # ~5 years
+            "10y": 125,    # ~10 years
+            "max": 500,    # Max available
+        }
+        limit = period_map.get(period.lower(), 65)
+        
+        try:
+            data = await self._fetch_series(series_id, limit=limit)
+            
+            if not data.get("observations"):
+                raise ProviderError(f"No historical data for {indicator}")
+            
+            # Parse observations into (date, value) tuples
+            points = []
+            for obs in data["observations"]:
+                if obs.get("value") and obs["value"] != ".":
+                    try:
+                        date = datetime.strptime(obs["date"], "%Y-%m-%d")
+                        value = float(obs["value"])
+                        points.append((date, value))
+                    except (ValueError, KeyError):
+                        continue
+            
+            if not points:
+                raise ProviderError(f"No valid data points for {indicator}")
+            
+            # Sort by date (ascending for charting)
+            points.sort(key=lambda x: x[0])
+            
+            # Get series name
+            name = indicator
+            unit = UNIT_MAP.get(series_id, "")
+            
+            return points, name, unit
+            
+        except ProviderError:
+            raise
+        except Exception as e:
+            logger.error(f"FRED historical error for {indicator}: {e}")
+            raise ProviderError(f"Failed to fetch historical data: {e}")
     
     async def health_check(self) -> bool:
         """Check if FRED API is accessible."""
@@ -252,3 +317,4 @@ class FredProvider(BaseProvider):
         except Exception as e:
             logger.error(f"FRED health check failed: {e}")
             return False
+

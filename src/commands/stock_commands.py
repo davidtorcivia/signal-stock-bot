@@ -659,20 +659,85 @@ class EconomyCommand(BaseCommand):
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
         
-        indicator = ctx.args[0].upper()
+        # Parse arguments
+        args = [a.upper() for a in ctx.args]
+        indicator = args[0]
+        
+        # Check for chart request
+        # valid periods: 1y, 2y, 5y, 10y, max
+        valid_periods = {"1Y", "2Y", "5Y", "10Y", "MAX"}
+        period = "5Y"  # default
+        show_chart = False
+        
+        if len(args) > 1:
+            if "CHART" in args:
+                show_chart = True
+                args.remove("CHART")
+            
+            # Check for period in remaining args
+            for arg in args[1:]:
+                if arg in valid_periods:
+                    period = arg
+                    show_chart = True
+                    break
         
         try:
-            data = await self.providers.get_economy_data(indicator)
+            if show_chart:
+                # Get historical data
+                points, name, unit = await self.providers.get_economy_historical(indicator, period)
+                
+                # Convert to HistoricalBar objects for ChartGenerator
+                from ..providers.base import HistoricalBar
+                from ..charts import ChartGenerator, ChartOptions
+                
+                bars = []
+                for date, value in points:
+                    bars.append(HistoricalBar(
+                        timestamp=date,
+                        open=value,
+                        high=value,
+                        low=value,
+                        close=value,
+                        volume=0
+                    ))
+                
+                # Generate chart
+                options = ChartOptions(
+                    chart_type="line",
+                    show_volume=False,
+                )
+                
+                generator = ChartGenerator(bot_name="Stock Bot")
+                # Hack: Use a custom title generator or just rely on symbol name
+                chart_b64 = generator.generate(
+                    symbol=f"{name}",
+                    bars=bars,
+                    period=period,
+                    current_price=points[-1][1],
+                    change_percent=None,  # No % change for economy stats usually
+                    options=options,
+                )
+                
+                return CommandResult(
+                    text=f"⌂ {name} ({points[-1][0].strftime('%Y-%m-%d')})\nValue: {points[-1][1]}{unit}",
+                    success=True,
+                    attachments=[chart_b64]
+                )
             
-            lines = [
-                f"⌂ {data.name}",
-                f"Value: {data.value}{data.unit}",
-                f"Date: {data.date.strftime('%Y-%m-%d')}"
-            ]
-            if data.previous:
-                 lines.append(f"Prev: {data.previous}{data.unit}")
-            
-            return CommandResult.ok("\n".join(lines))
+            else:
+                # Standard data request
+                data = await self.providers.get_economy_data(indicator)
+                
+                lines = [
+                    f"⌂ {data.name}",
+                    f"Value: {data.value}{data.unit}",
+                    f"Date: {data.date.strftime('%Y-%m-%d')}"
+                ]
+                if data.previous:
+                     lines.append(f"Prev: {data.previous}{data.unit}")
+                
+                return CommandResult.ok("\n".join(lines))
+                
         except ProviderError as e:
              return CommandResult.error(f"Economy data unavailable: {e}")
 
