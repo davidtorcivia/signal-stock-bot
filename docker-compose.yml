@@ -39,6 +39,12 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY:-}
       - POLYGON_API_KEY=${POLYGON_API_KEY:-}
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
+      - TWELVEDATA_API_KEY=${TWELVEDATA_API_KEY:-}
+      - MASSIVE_PRO=${MASSIVE_PRO:-false}
+      - ADMIN_NUMBERS=${ADMIN_NUMBERS:-}
+      - USER_RATE_LIMIT=${USER_RATE_LIMIT:-30}
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
