@@ -79,7 +79,26 @@ INTENT_PATTERNS = [
     
     # Help
     (r'\b(help|commands|what\s+can\s+you)\b', 'help', False),
+    
+    # Economy
+    (r'\b(economy|economic|macro|fed|indicator)\b', 'economy', False),
 ]
+
+# Build economy keyword map (lowercase keyword -> indicator key)
+# Detects: "cpi", "unemployment", "gdp", "inflation", etc.
+from ..providers.fred import INDICATOR_MAPPING
+ECONOMY_KEYWORDS = {}
+for key in INDICATOR_MAPPING:
+    ECONOMY_KEYWORDS[key.lower()] = key
+    # Add common variations if needed, e.g. "unemployment rate" -> UNEMPLOYMENT
+    if key == "UNEMPLOYMENT":
+        ECONOMY_KEYWORDS["unemployment rate"] = key
+    elif key == "FEDFUNDS":
+        ECONOMY_KEYWORDS["fed funds"] = key
+        ECONOMY_KEYWORDS["interest rates"] = key
+    elif key == "INFLATION":
+        ECONOMY_KEYWORDS["inflation rate"] = key
+
 
 # Symbol extraction patterns
 STOCK_SYMBOL_PATTERN = re.compile(r'\$([A-Z]{1,5})', re.IGNORECASE)
@@ -274,11 +293,49 @@ def parse_intent(text: str) -> Optional[Intent]:
             if flag not in args:
                 args.append(flag)
     
-    # 4. Sentiment extraction - detect buy/sell/hold questions
+    # 4. Economy / Indicator detection
+    # Check if any economy keyword is present in the text
+    found_indicator = None
+    for keyword, indicator in ECONOMY_KEYWORDS.items():
+        # Match as whole word/phrase
+        if re.search(rf'\b{re.escape(keyword)}\b', text_lower):
+            found_indicator = indicator
+            break
+            
+    if found_indicator:
+        # Detected an economy query like "chart cpi" or "unemployment rate"
+        # We need to construct args: [INDICATOR, optional_chart_flag, optional_period]
+        
+        eco_args = [found_indicator]
+        
+        # Check if they want a chart
+        is_chart_request = re.search(r'\b(chart|graph|plot)\b', text_lower)
+        if is_chart_request:
+            eco_args.append("CHART")
+            
+        # Add period if found (parsed in step 1 or 1b)
+        # We check if any args[1:] look like a period/date range
+        # Periods are typically at the end of args list from previous steps
+        for arg in args:
+            # Check for standard periods (5y, 10y) or date flags (--since)
+            if (isinstance(arg, str) and 
+                (re.match(r'^\d+[dwmy]$', arg) or arg.startswith('--'))):
+                eco_args.append(arg)
+                break
+            
+        return Intent(
+            command='economy',
+            symbols=[],
+            args=eco_args,
+            confidence=0.9,
+            negated_terms=None
+        )
+
+    # 5. Sentiment extraction - detect buy/sell/hold questions
     sentiment_pattern = re.search(r'\b(is|should|would)\s+\w+\s+(a\s+)?(buy|sell|hold|bullish|bearish)\b', text_lower)
     is_sentiment_query = sentiment_pattern is not None
 
-    # 5. Comparison parsing (vs/compare) -> returns chart command directly
+    # 6. Comparison parsing (vs/compare) -> returns chart command directly
     is_comparison = re.search(r'\b(vs|versus|compare|compared)\b', text_lower)
     if is_comparison and len(symbols) >= 2:
         # Comparison intent detected
@@ -298,7 +355,7 @@ def parse_intent(text: str) -> Optional[Intent]:
             negated_terms=negated_terms if negated_terms else None,
         )
     
-    # 6. Sentiment query -> route to rating command (BEFORE pattern matching)
+    # 7. Sentiment query -> route to rating command (BEFORE pattern matching)
     # This ensures "should I buy bitcoin?" routes to rating, not crypto
     if is_sentiment_query and symbols:
         return Intent(
@@ -366,6 +423,7 @@ def is_question_about_stocks(text: str) -> bool:
         'news', 'market', 'trade', 'trading', 'buy', 'sell', 'invest',
         'rsi', 'macd', 'technical', 'analysis', 'fundamentals',
         'pe', 'eps', 'revenue', 'profit', 'quarter',
+        'economy', 'gdp', 'inflation', 'cpi', 'unemployment',  # Added economy keywords
     ]
     text_lower = text.lower()
     return any(kw in text_lower for kw in keywords)
