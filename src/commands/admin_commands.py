@@ -36,7 +36,11 @@ class MetricsCommand(BaseCommand):
     
     async def execute(self, ctx: CommandContext) -> CommandResult:
         # Check admin access (if configured)
+        # Check admin access (if configured)
         if not self._is_admin(ctx.sender):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Admin access denied for {ctx.sender}. Allowed: {self.admin_numbers}")
             return CommandResult.error("This command requires admin access.")
         
         metrics = get_metrics()

@@ -17,11 +17,35 @@ Environment variables:
 import logging
 import sys
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Robustly find .env file
+# Try current directory first, then project root (up one level from src/)
+current_dir = Path(os.getcwd())
+root_env = current_dir / ".env"
+src_env = Path(__file__).parent.parent / ".env"
+
+if root_env.exists():
+    load_dotenv(root_env)
+    print(f"Loaded configuration from {root_env}")
+elif src_env.exists():
+    load_dotenv(src_env)
+    print(f"Loaded configuration from {src_env}")
+else:
+    print("WARNING: No .env file found! Configuration will rely on system environment variables.")
+
+# Debug loaded variables
+if os.getenv("FRED_API_KEY"):
+    print("FRED_API_KEY: Found")
+else:
+    print("FRED_API_KEY: NOT FOUND")
+
+if os.getenv("ADMIN_NUMBERS"):
+    print(f"ADMIN_NUMBERS: Found ({len(os.getenv('ADMIN_NUMBERS').split(','))} numbers)")
+else:
+    print("ADMIN_NUMBERS: NOT FOUND")
 
 from .config import Config
 from .providers import ProviderManager, YahooFinanceProvider, AlphaVantageProvider, MassiveProvider
