@@ -645,6 +645,122 @@ class ForexCommand(BaseCommand):
              return CommandResult.error(f"Forex data unavailable: {e}")
 
 
+# Educational explanations for economic indicators
+ECONOMY_EXPLANATIONS = {
+    # Inflation
+    "CPI": (
+        "Consumer Price Index (CPI)",
+        "Measures the average change in prices paid by consumers for a basket of goods/services.\n"
+        "• **High CPI:** Inflation is rising; purchasing power is falling.\n"
+        "• **Impact:** Fed raises rates to cool inflation, which can hurt stocks."
+    ),
+    "CORECPI": (
+        "Core CPI",
+        "CPI excluding volatile food and energy prices.\n"
+        "• **Why it matters:** The Fed prefers this as a truer measure of inflation trends."
+    ),
+    "PCE": (
+        "PCE Price Index",
+        "Personal Consumption Expenditures. The Fed's *favorite* inflation gauge.\n"
+        "• **Vs CPI:** Tracks what people *actually* buy (substitution), not just a fixed basket."
+    ),
+    "INFLATION": (
+        "10-Year Breakeven Inflation Rate",
+        "What the market expects inflation to average over the next 10 years.\n"
+        "• **Derived from:** Yield difference between Treasury Bonds and TIPS."
+    ),
+    
+    # Employment
+    "UNEMPLOYMENT": (
+        "Unemployment Rate",
+        "Percentage of the labor force that is jobless and looking for work.\n"
+        "• **Low:** Strong economy, but risks wage inflation.\n"
+        "• **High:** Recession signal; Fed may cut rates to stimulate."
+    ),
+    "JOBS": (
+        "Nonfarm Payrolls (Jobs)",
+        "Number of jobs added (or lost) in the US economy last month, excluding farm workers.\n"
+        "• **Key Report:** Released first Friday of the month. Massive market mover."
+    ),
+    "JOBLESS": (
+        "Initial Jobless Claims",
+        "Number of people filing for unemployment benefits for the first time *last week*.\n"
+        "• **Frequency:** Weekly (leading indicator).\n"
+        "• **Rising:** Layoffs are starting; economy likely cooling."
+    ),
+    "LABORFORCE": (
+        "Labor Force Participation Rate",
+        "Percentage of working-age population that is working or looking for work.\n"
+        "• **Gwth:** More workers = higher potential GDP."
+    ),
+
+    # Growth / GDP
+    "GDP": (
+        "Gross Domestic Product (GDP)",
+        "Total market value of all finished goods and services produced within the US.\n"
+        "• **The Scorecard:** The ultimate measure of economic size and health."
+    ),
+    "REALGDP": (
+        "Real GDP",
+        "GDP adjusted for inflation.\n"
+        "• **Why:** If GDP is up 5% but inflation is 6%, the economy actually shrank. Real GDP reveals this."
+    ),
+    "GDPGROWTH": (
+        "Real GDP Growth Rate",
+        "Annualized percentage change in Real GDP from the previous quarter.\n"
+        "• **> 3%:** Strong growth.\n"
+        "• **Negative:** Contraction. Two negative quarters ≈ Recession."
+    ),
+
+    # Rates
+    "FEDFUNDS": (
+        "Federal Funds Rate",
+        "The interest rate banks charge each other for overnight loans. Set by the Fed.\n"
+        "• **The Base Rate:** This drives *everything*—mortgages, savings, credit cards."
+    ),
+    "10Y": (
+        "10-Year Treasury Yield",
+        "The yield on the benchmark US government bond.\n"
+        "• **The Gravity:** Higher yields pull money out of stocks (especially tech). Tracks growth/inflation outlook."
+    ),
+    "MORTGAGE": (
+        "30-Year Fixed Mortgage Rate",
+        "Average interest rate for a 30-year fixed home loan.\n"
+        "• **Housing Impact:** High rates crush affordability and cool the housing market."
+    ),
+
+    # Fiscal
+    "DEBT": (
+        "Federal Public Debt",
+        "Total amount of money the US government owes to creditors.\n"
+        "• **Trend:** Always up. Concerns arise if it grows significantly faster than GDP."
+    ),
+    "DEFICIT": (
+        "Federal Budget Deficit",
+        "The difference between what the US Govt spent vs. earned (taxes) in a year.\n"
+        "• **Deficit:** Spending > Revenue (needs borrowing).\n"
+        "• **Surplus:** Revenue > Spending (pays down debt)."
+    ),
+
+    # Other
+    "RETAIL": (
+        "Retail Sales",
+        "Total sales at retail stores and food services.\n"
+        "• **Consumer Health:** Consumer spending is ~70% of US GDP. If this drops, recession looms."
+    ),
+    "CONSUMER": (
+        "Consumer Sentiment (UMich)",
+        "Survey of how optimistic consumers feel about their finances and the economy.\n"
+        "• **Predictive:** Optimistic people spend money; pessimistic people save."
+    ),
+    "HOUSING": (
+        "Housing Starts",
+        "Number of new residential construction projects that have begun.\n"
+        "• **Leading Indicator:** Builders don't start homes if they don't think they can sell them."
+    ),
+}
+
+
 class EconomyCommand(BaseCommand):
     """Command for economic indicators"""
     name = "economy"
@@ -689,9 +805,41 @@ class EconomyCommand(BaseCommand):
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
         
-        # Parse arguments
+        # Check if help flag is present
+        want_help = any(arg.lower() in ("-h", "-help", "--help", "help") for arg in ctx.args)
         
-        # Parse arguments
+        # Parse arguments (try to identify indicator even if help flag is present)
+        # Filter out help flags to find the indicator
+        clean_args = [a.upper() for a in ctx.args if a.lower() not in ("-h", "-help", "--help", "help")]
+        
+        if want_help:
+            # If we have an indicator argument, try to show specific help
+            if clean_args:
+                indicator_arg = clean_args[0]
+                # resolve mapping to keys in explanations
+                # Check directly in explanations or use INDICATOR_MAPPING to normalize
+                from ..providers.fred import INDICATOR_MAPPING, FredProvider
+                
+                # Check if it's a known indicator key (e.g. CPI, GDP)
+                if indicator_arg in ECONOMY_EXPLANATIONS:
+                    title, desc = ECONOMY_EXPLANATIONS[indicator_arg]
+                    return CommandResult.ok(f"⌘ {title}\n\n{desc}")
+                
+                # Try finding via mapping (handle aliases/fuzzy inputs if mapped)
+                # Reverse mapping search or key search
+                # Simple check: Is it a key in INDICATOR_MAPPING?
+                if indicator_arg in INDICATOR_MAPPING:
+                    # It's a key like "CPI", so it should have been in explanations
+                    # If missing from explanations, fallback
+                    pass
+                
+                # If we couldn't find specific help, fallback to main help
+                return self._send_help()
+            else:
+                # No indicator provided, show general help
+                return self._send_help()
+        
+        # Standard execution (no help flag)
         args = [a.upper() for a in ctx.args]
         indicator = args[0]
         
