@@ -7,6 +7,9 @@ Provides: !watch, !watch add, !watch remove, !watch clear, !watch sort, !watch e
 from .base import BaseCommand, CommandContext, CommandResult
 from ..providers import ProviderManager
 from ..database import WatchlistDB, hash_phone
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class WatchCommand(BaseCommand):
@@ -68,9 +71,14 @@ class WatchCommand(BaseCommand):
                 "Add with: !watch add AAPL MSFT"
             )
         
+        # Log retrieval count for debugging
+        logger.info(f"Retrieved {len(symbols)} symbols for user {user_hash[:8]}")
+        
         try:
             quotes = await self.providers.get_quotes(symbols)
-        except Exception:
+            logger.info(f"Fetched {len(quotes)} quotes")
+        except Exception as e:
+            logger.error(f"Error fetching quotes: {e}")
             quotes = {}
         
         # Build quote data for sorting
@@ -90,7 +98,7 @@ class WatchCommand(BaseCommand):
             elif sort_by in ("change", "percent", "pct", "%"):
                 quote_data.sort(key=lambda x: x[2], reverse=True)
         
-        lines = ["◈ Your Watchlist", ""]
+        lines = [f"◈ Your Watchlist ({len(symbols)} items)", ""]
         
         up_count = 0
         down_count = 0
@@ -107,6 +115,9 @@ class WatchCommand(BaseCommand):
             else:
                 lines.append(f"◇ {symbol}: N/A")
         
+        # Log final line count
+        logger.info(f"Generated {len(lines)} lines of output")
+
         # Add change summary
         if up_count > 0 or down_count > 0:
             lines.append(f"\n▲{up_count} ▼{down_count}")
@@ -115,7 +126,8 @@ class WatchCommand(BaseCommand):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
-        lines.append(f"◷ as of {now.strftime('%-I:%M %p ET')}")
+        # Use %I (padded) instead of %-I (Linux only) for cross-platform support
+        lines.append(f"◷ as of {now.strftime('%I:%M %p ET')}")
         
         return CommandResult.ok("\n".join(lines))
     
