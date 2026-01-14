@@ -750,34 +750,25 @@ class EconomyCommand(BaseCommand):
                      y_label = "Index Value"
                 
                 # Trillions/Billions (Debt is M USD, GDP is B USD)
+                # Trillions/Billions (Debt is M USD, GDP is B USD)
                 elif "M USD" in unit.upper():
                     # Check if value is large enough for Trillions (1,000,000 M = 1 T)
-                    if points[-1][1] > 900000:
-                         # Divide by 1,000,000 for display
-                         # We need to hack this since ChartGenerator uses format() on raw value
-                         # But ChartGenerator formatting string logic is limited.
-                         # BETTER: Let ChartGenerator handle raw value, we just update y_label.
-                         # Actually, ChartGenerator format string "{:.2f}T" expects raw value to be scaled already?
-                         # No, python format string can't scale.
-                         # We should scale the DATA if we change the unit label.
-                         pass 
-                         
-                    # For now, just handle formatting assuming raw data
-                    # If data is in Millions, 35,000,000 is 35T.
-                    # We can't scale data easily inside this logic block without modifying 'bars'.
+                    # Use abs() to handle deficits (negative values)
                     
                     # SCALING LOGIC:
                     scaling_factor = 1.0
-                    wrapper_format = "${:,.2f}"
                     
-                    if points[-1][1] > 900000: # > 900B (since input is M) -> Trillions
+                    if abs(points[-1][1]) > 900000: # > 900B (since input is M) -> Trillions
                         scaling_factor = 1_000_000
                         value_format = "${:,.2f} T"
                         y_label = "Trillions of Dollars"
-                    else: # Billions
+                    elif abs(points[-1][1]) > 900: # > 900M (since input is M) -> Billions
                         scaling_factor = 1_000
                         value_format = "${:,.2f} B"
                         y_label = "Billions of Dollars"
+                    else:
+                         value_format = "${:,.0f} M"
+                         y_label = "Millions of Dollars"
                         
                     # Apply scaling to bars
                     for bar in bars:
