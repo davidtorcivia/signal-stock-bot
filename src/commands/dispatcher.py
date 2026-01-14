@@ -504,10 +504,12 @@ class CommandDispatcher:
             # Get BTC quote
             quote = await chart_cmd.providers.get_quote("BTC-USD")
             
-            # Get historical bars for 1d candlestick chart
-            from ..charts import get_period_params
-            period, interval = get_period_params("1d")
-            bars = await chart_cmd.providers.get_historical("BTC-USD", period=period, interval=interval)
+            # Get historical bars for last 24h candlestick chart
+            # Crypto trades 24/7, so use "5d" period with 15m bars and slice to ~24h
+            # (96 bars × 15min = 24 hours)
+            bars = await chart_cmd.providers.get_historical("BTC-USD", period="5d", interval="15m")
+            if len(bars) > 96:
+                bars = bars[-96:]  # Last 24 hours
             
             # Generate candlestick chart
             from ..charts import ChartOptions
@@ -520,7 +522,7 @@ class CommandDispatcher:
             chart_b64 = generator.generate(
                 symbol="BTC-USD",
                 bars=bars,
-                period="1d",
+                period="24h",
                 current_price=quote.price,
                 change_percent=quote.change_percent,
                 options=options,
