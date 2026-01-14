@@ -265,21 +265,29 @@ class FredProvider(BaseProvider):
         period = period.lower()
         
         # Calculate start date based on period
+        # Calculate start date based on period
         from datetime import timedelta
+        import re
+        
         today = datetime.now()
         start_date = None
         
-        if period == "1y":
-            start_date = today - timedelta(days=365)
-        elif period == "2y":
-            start_date = today - timedelta(days=365*2)
-        elif period == "5y":
-            start_date = today - timedelta(days=365*5)
-        elif period == "10y":
-            start_date = today - timedelta(days=365*10)
-        elif period == "max":
-            start_date = datetime(1900, 1, 1) # Far past
-            
+        # Parse period
+        if period == "max":
+            start_date = datetime(1900, 1, 1)
+        elif period == "ytd":
+             start_date = datetime(today.year, 1, 1)
+        else:
+             # Try matching "Ny" pattern
+             match = re.match(r"(\d+)y", period)
+             if match:
+                 years = int(match.group(1))
+                 start_date = today - timedelta(days=365 * years)
+             else:
+                 # Default logic/fallback
+                 # Try specific map for weeks/months if needed, but 5y default is safe
+                 start_date = today - timedelta(days=365 * 5)
+        
         start_str = start_date.strftime("%Y-%m-%d") if start_date else None
         
         try:
