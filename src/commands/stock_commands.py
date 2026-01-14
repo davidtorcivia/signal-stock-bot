@@ -656,7 +656,7 @@ class EconomyCommand(BaseCommand):
         self.providers = provider_manager
         self.bot_name = bot_name
 
-    async def _send_help(self) -> CommandResult:
+    def _send_help(self) -> CommandResult:
         lines = [
             "⌘ Economy Command Help",
             "",
@@ -682,13 +682,14 @@ class EconomyCommand(BaseCommand):
         ]
         return CommandResult.ok("\n".join(lines))
 
+    def get_help_result(self) -> CommandResult:
+        return self._send_help()
+
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
-
-        # Check for help flag
-        if any(arg.lower() in ("-h", "-help", "--help", "help") for arg in ctx.args):
-            return self._send_help()
+        
+        # Parse arguments
         
         # Parse arguments
         args = [a.upper() for a in ctx.args]
