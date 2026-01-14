@@ -159,7 +159,11 @@ class FredProvider(BaseProvider):
             # Find the most recent non-empty value
             latest = None
             previous = None
-            for i, obs in enumerate(reversed(observations)):
+            # Find the most recent non-empty value
+            # API returns desc (newest first), so iterate forward
+            latest = None
+            previous = None
+            for obs in observations:
                 if obs.get("value") and obs["value"] != ".":
                     if latest is None:
                         latest = obs
@@ -206,7 +210,7 @@ class FredProvider(BaseProvider):
             logger.error(f"FRED error for {indicator}: {e}")
             raise ProviderError(f"Failed to fetch {indicator}: {e}")
     
-    async def _fetch_series(self, series_id: str, limit: int = 5) -> dict:
+    async def _fetch_series(self, series_id: str, limit: int = 5, start_date: str = None) -> dict:
         """Fetch series data from FRED API."""
         session = SharedSession.get()
         
@@ -216,9 +220,14 @@ class FredProvider(BaseProvider):
             "series_id": series_id,
             "api_key": self.api_key,
             "file_type": "json",
-            "sort_order": "desc",
-            "limit": limit,
+            "sort_order": "desc", # Default to newest first
         }
+        
+        if start_date:
+            params["observation_start"] = start_date
+            params["sort_order"] = "asc" # Historical usually wants oldest first
+        else:
+            params["limit"] = limit
         
         async with session.get(obs_url, params=params) as resp:
             if resp.status == 429:
@@ -254,19 +263,27 @@ class FredProvider(BaseProvider):
         indicator = indicator.upper()
         series_id = INDICATOR_MAPPING.get(indicator, indicator)
         
-        # Map period to number of observations to fetch
-        # Most FRED series are monthly, so 12 points per year
-        period_map = {
-            "1y": 15,      # ~1 year of monthly data
-            "2y": 30,      # ~2 years
-            "5y": 65,      # ~5 years
-            "10y": 125,    # ~10 years
-            "max": 500,    # Max available
-        }
-        limit = period_map.get(period.lower(), 65)
+        # Calculate start date based on period
+        from datetime import timedelta
+        today = datetime.now()
+        start_date = None
+        
+        if period == "1y":
+            start_date = today - timedelta(days=365)
+        elif period == "2y":
+            start_date = today - timedelta(days=365*2)
+        elif period == "5y":
+            start_date = today - timedelta(days=365*5)
+        elif period == "10y":
+            start_date = today - timedelta(days=365*10)
+        elif period == "max":
+            start_date = datetime(1900, 1, 1) # Far past
+            
+        start_str = start_date.strftime("%Y-%m-%d") if start_date else None
         
         try:
-            data = await self._fetch_series(series_id, limit=limit)
+            # Pass start_date to fetch logic
+            data = await self._fetch_series(series_id, start_date=start_str)
             
             if not data.get("observations"):
                 raise ProviderError(f"No historical data for {indicator}")
