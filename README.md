@@ -207,8 +207,43 @@ Watchlists are stored locally and persist across sessions. Limit: 50 symbols per
 | `!crypto` | `!c` | Top cryptocurrencies |
 | `!forex EURUSD` | `!fx` | Currency pairs |
 | `!future CL` | `!fut` | Futures quotes |
-| `!economy CPI` | `!eco` | Economic indicators (requires Polygon Pro) |
+| `!economy CPI` | `!eco` | Economic indicators (free via FRED) |
 | `!options AAPL` | `!opt` | Options chains (requires Polygon Pro) |
+
+---
+
+### Economy Commands
+
+Get economic indicators from FRED (Federal Reserve Economic Data). Free with 120 requests/min.
+
+```
+!eco [indicator]
+```
+
+| Indicator | Description |
+|-----------|-------------|
+| `CPI` | Consumer Price Index |
+| `UNEMPLOYMENT` | Unemployment Rate |
+| `GDP` | Gross Domestic Product |
+| `FEDFUNDS` | Federal Funds Rate |
+| `DEBT` | Federal Debt |
+| `JOBS` | Nonfarm Payrolls |
+| `10Y` / `2Y` / `30Y` | Treasury Rates |
+| `RETAIL` | Retail Sales |
+| `HOUSING` | Housing Starts |
+| `MORTGAGE` | 30-Year Mortgage Rate |
+| `INFLATION` | Inflation Rate |
+| `CONSUMER` | Consumer Sentiment |
+
+**Examples**:
+```
+!eco CPI          # Latest CPI reading
+!eco UNEMPLOYMENT # Current unemployment rate
+!eco FEDFUNDS     # Federal Funds Rate
+!eco 10Y          # 10-Year Treasury yield
+```
+
+Requires `FRED_API_KEY` - get free key at [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html)
 
 ---
 
@@ -399,7 +434,8 @@ Comparing $MSFT and $GOOGL today
 | `POLYGON_API_KEY` | No | — | Polygon.io API key |
 | `FINNHUB_API_KEY` | No | — | Finnhub API key (60/min free) |
 | `TWELVEDATA_API_KEY` | No | — | Twelve Data API key (800/day free) |
-| `MASSIVE_PRO` | No | `false` | Enable `!options` and `!economy` |
+| `FRED_API_KEY` | No | — | FRED API key for `!eco` (120/min free) |
+| `MASSIVE_PRO` | No | `false` | Enable `!options` (Polygon Pro) |
 
 ### Data Providers
 
@@ -410,6 +446,7 @@ The bot supports multiple data providers with automatic failover. Add more provi
 | **Yahoo Finance** | Unlimited (unofficial) | No key needed |
 | **Finnhub** | 60 calls/min | [finnhub.io](https://finnhub.io) |
 | **Twelve Data** | 800 calls/day | [twelvedata.com](https://twelvedata.com) |
+| **FRED** | 120 calls/min | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) |
 | **Alpha Vantage** | 25 calls/day | [alphavantage.co](https://www.alphavantage.co/support/#api-key) |
 | **Polygon.io** | 5 calls/min | [polygon.io](https://polygon.io) |
 

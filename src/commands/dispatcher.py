@@ -511,7 +511,17 @@ class CommandDispatcher:
             if len(bars) > 96:
                 bars = bars[-96:]  # Last 24 hours
             
-            # Generate candlestick chart
+            # Calculate actual 24h change from historical bars
+            if bars and len(bars) >= 2:
+                start_price = bars[0].open
+                end_price = bars[-1].close
+                change_24h = end_price - start_price
+                change_24h_pct = ((end_price / start_price) - 1) * 100 if start_price > 0 else 0
+            else:
+                change_24h = quote.change
+                change_24h_pct = quote.change_percent
+            
+            # Generate candlestick chart with corrected 24h change
             from ..charts import ChartOptions
             options = ChartOptions(
                 chart_type="candle",
@@ -524,21 +534,21 @@ class CommandDispatcher:
                 bars=bars,
                 period="24h",
                 current_price=quote.price,
-                change_percent=quote.change_percent,
+                change_percent=change_24h_pct,  # Use calculated 24h change
                 options=options,
             )
             
             # Calculate fun stats
             sats_per_dollar = int(100_000_000 / quote.price) if quote.price > 0 else 0
             
-            # Price direction indicator
-            if quote.change_percent > 3:
+            # Price direction indicator (based on 24h change)
+            if change_24h_pct > 3:
                 mood = "Absolutely SHUCKING it"
                 indicator = ">>>"
-            elif quote.change_percent > 0:
+            elif change_24h_pct > 0:
                 mood = "Growing nicely"
                 indicator = ">"
-            elif quote.change_percent > -3:
+            elif change_24h_pct > -3:
                 mood = "Bit wilted"
                 indicator = "v"
             else:
@@ -550,7 +560,7 @@ class CommandDispatcher:
                 "* * * CORN REPORT * * *",
                 "",
                 f"{indicator} ${quote.price:,.2f}",
-                f"   {'+' if quote.change >= 0 else ''}{quote.change:,.2f} ({quote.change_percent:+.2f}%)",
+                f"   {'+' if change_24h >= 0 else ''}{change_24h:,.2f} ({change_24h_pct:+.2f}% 24h)",
                 "",
                 f"Mood: {mood}",
                 f"Sats per dollar: {sats_per_dollar:,}",
