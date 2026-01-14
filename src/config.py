@@ -107,6 +107,16 @@ class Config:
                 priority=int(os.getenv("TWELVEDATA_PRIORITY", "20")),
             ))
         
+        # FRED (requires API key, 120 calls/min free - for economic data)
+        fred_key = os.getenv("FRED_API_KEY", "").strip()
+        if fred_key:
+            providers.append(ProviderConfig(
+                name="fred",
+                enabled=True,
+                api_key=fred_key,
+                priority=int(os.getenv("FRED_PRIORITY", "1")),  # High priority for economy data
+            ))
+        
         # Sort by priority
         providers.sort(key=lambda p: p.priority)
         

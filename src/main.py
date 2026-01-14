@@ -88,7 +88,7 @@ def setup_logging(level: str):
 
 def create_provider_manager(config: Config) -> ProviderManager:
     """Create and configure provider manager"""
-    from .providers import FinnhubProvider, TwelveDataProvider
+    from .providers import FinnhubProvider, TwelveDataProvider, FredProvider
     
     manager = ProviderManager()
     
@@ -122,6 +122,12 @@ def create_provider_manager(config: Config) -> ProviderManager:
                 manager.add_provider(TwelveDataProvider(provider_config.api_key))
             else:
                 logging.warning("Twelve Data configured but no API key provided")
+        
+        elif provider_config.name == "fred":
+            if provider_config.api_key:
+                manager.add_provider(FredProvider(provider_config.api_key))
+            else:
+                logging.warning("FRED configured but no API key provided")
     
     if not manager.providers:
         logging.warning("No providers configured! Adding Yahoo Finance as fallback.")
@@ -162,19 +168,20 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config, watchli
     # Build command list for help
     help_commands = [price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd, fx_cmd, fut_cmd]
     
-    # Options and Economy commands require Massive Pro plan
+    # Options command requires Massive Pro plan (not available via free providers)
     if config.massive_pro:
         opt_cmd = OptionCommand(provider_manager)
-        eco_cmd = EconomyCommand(provider_manager)
         dispatcher.register(opt_cmd)
-        dispatcher.register(eco_cmd)
-        help_commands.extend([opt_cmd, eco_cmd])
+        help_commands.append(opt_cmd)
     else:
-        # Register stub commands that return helpful message
+        # Register stub command that returns helpful message
         opt_stub = ProRequiredCommand("option", ["opt", "o"], "Get option quote", "!opt TSLA230120C00150000")
-        eco_stub = ProRequiredCommand("economy", ["eco", "macro"], "Get economic data", "!eco CPI")
         dispatcher.register(opt_stub)
-        dispatcher.register(eco_stub)
+    
+    # Economy command - now available to all via FRED (free) fallback
+    eco_cmd = EconomyCommand(provider_manager)
+    dispatcher.register(eco_cmd)
+    help_commands.append(eco_cmd)
     
     # Chart command - always available
     chart_cmd = ChartCommand(provider_manager, config.bot_name)
