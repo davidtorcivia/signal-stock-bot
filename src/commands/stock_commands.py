@@ -729,7 +729,7 @@ class EconomyCommand(BaseCommand):
                     value_format=value_format,
                     y_label=y_label,
                     fill_area=True,
-                    line_color="#00E5FF", # Cyan/Electric Blue for techy look
+                    line_color="#FF9800", # Bloomberg Terminal Amber
                 )
                 
                 generator = ChartGenerator(bot_name=self.bot_name)
