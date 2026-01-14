@@ -262,6 +262,7 @@ class FredProvider(BaseProvider):
         """
         indicator = indicator.upper()
         series_id = INDICATOR_MAPPING.get(indicator, indicator)
+        period = period.lower()
         
         # Calculate start date based on period
         from datetime import timedelta

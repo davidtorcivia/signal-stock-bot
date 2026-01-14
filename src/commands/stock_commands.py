@@ -718,7 +718,7 @@ class EconomyCommand(BaseCommand):
                      y_label = "Index Value"
                 
                 # Large currency cases (GDP)
-                elif "BILLION" in unit.upper():
+                elif "BILLION" in unit.upper() or "B USD" in unit.upper():
                     value_format = "${:,.0f} B"
                     y_label = "Billions of Dollars"
                 
