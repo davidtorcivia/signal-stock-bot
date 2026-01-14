@@ -656,9 +656,39 @@ class EconomyCommand(BaseCommand):
         self.providers = provider_manager
         self.bot_name = bot_name
 
+    async def _send_help(self) -> CommandResult:
+        lines = [
+            "⌘ Economy Command Help",
+            "",
+            "Usage: !eco <indicator> [chart] [period]",
+            "",
+            "Examples:",
+            "• !eco CPI",
+            "• !eco GDP chart (defaults to 5y)",
+            "• !eco debt chart 20y",
+            "",
+            "Supported Indicators:",
+            "• CPI, Core CPI, Inflation, PCE",
+            "• Unemployment, Jobs, Jobless Claims",
+            "• GDP, Real GDP, GDP Growth",
+            "• Fed Funds, 10Y/2Y Treasury, Mortgage",
+            "• Debt, Deficit",
+            "• Retail Sales, Consumer Sentiment, Housing",
+            "",
+            "Charts:",
+            "• Add 'chart' to visualize history.",
+            "• Dynamic periods: 1y, 5y, 10y, 25y... up to max.",
+            "• Defaults to 5y if not specified.",
+        ]
+        return CommandResult.ok("\n".join(lines))
+
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
             return CommandResult.error(f"Usage: {self.usage}")
+
+        # Check for help flag
+        if any(arg.lower() in ("-h", "-help", "--help", "help") for arg in ctx.args):
+            return self._send_help()
         
         # Parse arguments
         args = [a.upper() for a in ctx.args]
@@ -677,7 +707,8 @@ class EconomyCommand(BaseCommand):
             
             # Check for period in remaining args
             for arg in args[1:]:
-                if arg in valid_periods:
+                # Allow fixed periods, YTD, or any "NY" pattern (e.g. 15Y)
+                if arg in valid_periods or arg == "YTD" or re.match(r"^\d+Y$", arg):
                     period = arg
                     show_chart = True
                     break
@@ -776,11 +807,16 @@ class EconomyCommand(BaseCommand):
                 generator = ChartGenerator(bot_name=self.bot_name)
                 
                 # Use name provided by FredProvider (which is usually descriptive)
+                # Ensure current_price is scaled if we applied scaling
+                current_val = points[-1][1]
+                if "scaling_factor" in locals():
+                    current_val /= scaling_factor
+                
                 chart_b64 = generator.generate(
                     symbol=name.split(":")[0], # Truncate if too long? No, use full name if reasonable
                     bars=bars,
                     period=period,
-                    current_price=points[-1][1],
+                    current_price=current_val,
                     change_percent=None, 
                     options=options,
                 )
