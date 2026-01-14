@@ -772,7 +772,7 @@ class EconomyCommand(BaseCommand):
         self.providers = provider_manager
         self.bot_name = bot_name
 
-    def _send_help(self) -> CommandResult:
+    async def _send_help(self) -> CommandResult:
         lines = [
             "⌘ Economy Command Help",
             "",
@@ -798,6 +798,13 @@ class EconomyCommand(BaseCommand):
         ]
         return CommandResult.ok("\n".join(lines))
 
+    def has_help_flag(self, ctx: CommandContext) -> bool:
+        """
+        Return False to bypass the default help interception.
+        We handle help logic manually in execute() to support specific indicator help.
+        """
+        return False
+    
     def get_help_result(self) -> CommandResult:
         return self._send_help()
 
