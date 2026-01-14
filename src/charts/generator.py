@@ -51,6 +51,9 @@ class ChartOptions:
     # Comparison symbol overlay
     comparison_symbol: Optional[str] = None
     comparison_bars: Optional[list] = None  # HistoricalBar list
+    # Formatting
+    value_format: str = "${:,.2f}"  # Format string for price/value
+    y_label: Optional[str] = None   # Custom Y-axis label (e.g. "Percent", "Billions")
 
 
 # SMA line colors
@@ -257,7 +260,7 @@ class ChartGenerator:
         # Build title (will be placed above chart)
         title = self._build_title(
             symbol, current_price, change_percent, period,
-            comparison_symbol=options.comparison_symbol if options.comparison_bars else None
+            options=options
         )
         
         # Figure size - increase height if RSI panel
@@ -280,6 +283,9 @@ class ChartGenerator:
             'tight_layout': True,
             'scale_padding': {'left': 0.1, 'right': 0.8, 'top': 0.8, 'bottom': 0.5},
         }
+        
+        if options.y_label:
+            plot_kwargs['ylabel'] = options.y_label
         
         if addplots:
             plot_kwargs['addplot'] = addplots
@@ -335,17 +341,24 @@ class ChartGenerator:
         price: Optional[float],
         change_percent: Optional[float],
         period: str,
-        comparison_symbol: Optional[str] = None
+        options: ChartOptions
     ) -> str:
         """Build chart title string."""
         parts = [symbol.upper()]
         
         # Add comparison symbol if present
-        if comparison_symbol:
-            parts[0] = f"{symbol.upper()} vs {comparison_symbol.upper()}"
+        if options.comparison_symbol:
+            parts[0] = f"{symbol.upper()} vs {options.comparison_symbol.upper()}"
         
         if price is not None:
-            parts.append(f"${price:,.2f}" if price >= 1 else f"${price:.4f}")
+            # Use configured format
+            try:
+                # Handle cases where format might require float or other type
+                formatted_price = options.value_format.format(price)
+                parts.append(formatted_price)
+            except (ValueError, TypeError):
+                # Fallback
+                parts.append(f"{price}")
         
         if change_percent is not None:
             sign = "+" if change_percent >= 0 else ""

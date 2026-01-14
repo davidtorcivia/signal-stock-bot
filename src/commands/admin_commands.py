@@ -230,8 +230,35 @@ class AdminCommand(BaseCommand):
         if not self.alerts_db:
             return CommandResult.ok("◈ Alerts\n\nNo alerts configured.")
         
-        # TODO: Implement when AlertsDB is created
-        return CommandResult.ok("◈ Alerts\n\nAlert system not yet implemented.")
+        alerts = await self.alerts_db.get_all_active_alerts()
+        
+        if not alerts:
+             return CommandResult.ok("◈ Alerts\n\nNo active alerts system-wide.")
+             
+        lines = [f"◈ Active Alerts ({len(alerts)})", ""]
+        
+        for alert in alerts[:50]: # Limit output
+            symbol = alert["symbol"]
+            condition = alert["condition"]
+            target = alert["target_value"]
+            user_phone = alert["user_phone"]
+            
+            # Mask phone
+            masked_phone = f"{user_phone[:3]}***{user_phone[-4:]}"
+            
+            if condition == "above":
+                desc = f"> {target}"
+            elif condition == "below":
+                desc = f"< {target}"
+            else:
+                desc = f"move {target}%"
+                
+            lines.append(f"{symbol} {desc} [{masked_phone}]")
+            
+        if len(alerts) > 50:
+            lines.append(f"...and {len(alerts)-50} more")
+            
+        return CommandResult.ok("\n".join(lines))
     
     async def _user_stats(self, ctx: CommandContext) -> CommandResult:
         """Show user statistics."""
@@ -242,11 +269,11 @@ class AdminCommand(BaseCommand):
             import aiosqlite
             async with aiosqlite.connect(self.watchlist_db.db_path) as db:
                 # Count unique users
-                cursor = await db.execute("SELECT COUNT(DISTINCT user_hash) FROM watchlist")
+                cursor = await db.execute("SELECT COUNT(DISTINCT user_hash) FROM watchlists")
                 user_count = (await cursor.fetchone())[0]
                 
                 # Count total symbols
-                cursor = await db.execute("SELECT COUNT(*) FROM watchlist")
+                cursor = await db.execute("SELECT COUNT(*) FROM watchlists")
                 symbol_count = (await cursor.fetchone())[0]
                 
                 # Average symbols per user

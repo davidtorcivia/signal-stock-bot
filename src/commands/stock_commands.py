@@ -652,8 +652,9 @@ class EconomyCommand(BaseCommand):
     description = "Get economic data"
     usage = "!eco CPI"
     
-    def __init__(self, provider_manager: ProviderManager):
+    def __init__(self, provider_manager: ProviderManager, bot_name: str = "Stock Bot"):
         self.providers = provider_manager
+        self.bot_name = bot_name
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
@@ -701,20 +702,43 @@ class EconomyCommand(BaseCommand):
                         volume=0
                     ))
                 
+                # Determine formatting based on unit/indicator
+                # Default
+                value_format = "${:,.2f}"
+                y_label = "Value"
+                
+                # Percent cases
+                if "%" in unit or "RATE" in name.upper() or "PERCENT" in name.upper():
+                    value_format = "{:.2f}%"
+                    y_label = "Percent"
+                
+                # Index cases (CPI)
+                elif "INDEX" in name.upper() or "CPI" in name.upper():
+                     value_format = "{:,.1f}"
+                     y_label = "Index Value"
+                
+                # Large currency cases (GDP)
+                elif "BILLION" in unit.upper():
+                    value_format = "${:,.0f} B"
+                    y_label = "Billions of Dollars"
+                
                 # Generate chart
                 options = ChartOptions(
                     chart_type="line",
                     show_volume=False,
+                    value_format=value_format,
+                    y_label=y_label
                 )
                 
-                generator = ChartGenerator(bot_name="Stock Bot")
-                # Hack: Use a custom title generator or just rely on symbol name
+                generator = ChartGenerator(bot_name=self.bot_name)
+                
+                # Use name provided by FredProvider (which is usually descriptive)
                 chart_b64 = generator.generate(
-                    symbol=f"{name}",
+                    symbol=name.split(":")[0], # Truncate if too long? No, use full name if reasonable
                     bars=bars,
                     period=period,
                     current_price=points[-1][1],
-                    change_percent=None,  # No % change for economy stats usually
+                    change_percent=None, 
                     options=options,
                 )
                 

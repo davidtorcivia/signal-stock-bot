@@ -208,7 +208,7 @@ def create_dispatcher(provider_manager: ProviderManager, config: Config, watchli
         dispatcher.register(opt_stub)
     
     # Economy command - now available to all via FRED (free) fallback
-    eco_cmd = EconomyCommand(provider_manager)
+    eco_cmd = EconomyCommand(provider_manager, config.bot_name)
     dispatcher.register(eco_cmd)
     help_commands.append(eco_cmd)
     
