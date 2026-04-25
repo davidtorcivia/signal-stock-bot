@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New context{% else %}{{ policy.label or policy.key }}{% endif %}{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>{% if is_new %}New context{% else %}Edit context{% endif %}</h1>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    {% if not is_new %}
+        <p class="muted">
+            <strong>{{ policy.kind }}</strong> · <code>{{ policy.key }}</code>
+        </p>
+    {% endif %}
+
+    <form method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        {% if is_new %}
+            <label for="kind">Kind</label>
+            <select name="kind" id="kind"
+                    style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
+                <option value="group" {% if values.kind == 'group' %}selected{% endif %}>Group chat</option>
+                <option value="dm" {% if values.kind == 'dm' %}selected{% endif %}>Direct message (phone number)</option>
+            </select>
+
+            <label for="key">Key</label>
+            <input type="text" name="key" id="key" required
+                   value="{{ values.key }}"
+                   placeholder="abc123def... (group id)  OR  +15551234567 (phone)">
+            <p class="muted" style="font-size: 11px; margin-top: 4px;">
+                For groups, paste the Signal group_id (auto-registered rows show it in the list).
+                For DMs, use the sender's phone number in E.164 format.
+            </p>
+        {% endif %}
+
+        <label for="label">Label</label>
+        <input type="text" name="label" id="label"
+               value="{{ values.label }}" placeholder="e.g. Stock chat / Geopolitics group / My DMs">
+
+        <h2 style="margin-top: 32px;">Commands</h2>
+        <label for="command_mode">Access rule</label>
+        <select name="command_mode" id="command_mode"
+                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
+            <option value="allow_all" {% if values.command_mode == 'allow_all' %}selected{% endif %}>Allow all commands</option>
+            <option value="allow_list" {% if values.command_mode == 'allow_list' %}selected{% endif %}>Allow only selected</option>
+            <option value="deny_list" {% if values.command_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
+        </select>
+
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;">
+            {% for cmd in all_commands %}
+                <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                    <input type="checkbox" name="commands" value="{{ cmd }}"
+                           {% if cmd in values.commands %}checked{% endif %}>
+                    <span>!{{ cmd }}</span>
+                </label>
+            {% endfor %}
+        </div>
+
+        <h2 style="margin-top: 32px;">MCP servers</h2>
+        <label for="mcp_mode">Access rule</label>
+        <select name="mcp_mode" id="mcp_mode"
+                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
+            <option value="allow_all" {% if values.mcp_mode == 'allow_all' %}selected{% endif %}>Allow all servers</option>
+            <option value="allow_list" {% if values.mcp_mode == 'allow_list' %}selected{% endif %}>Allow only selected</option>
+            <option value="deny_list" {% if values.mcp_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
+        </select>
+
+        {% if all_servers %}
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;">
+            {% for s in all_servers %}
+                <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                    <input type="checkbox" name="mcp_servers" value="{{ s }}"
+                           {% if s in values.mcp_servers %}checked{% endif %}>
+                    <span>{{ s }}</span>
+                </label>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="muted" style="font-size: 12px;">No MCP servers configured yet. Add one at <a href="{{ url_for('admin.mcp_list') }}">MCP</a>.</p>
+        {% endif %}
+
+        <h2 style="margin-top: 32px;">System prompt</h2>
+        <label for="system_prompt">Override (leave empty to use the global LLM prompt)</label>
+        <textarea name="system_prompt" id="system_prompt" rows="6"
+                  placeholder="Optional. Specific instructions for the LLM in this chat.">{{ values.system_prompt }}</textarea>
+
+        <h2 style="margin-top: 32px;">LLM intent routing</h2>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="llm_intent" {% if values.llm_intent %}checked{% endif %}>
+            <span>Route non-command messages through the LLM (tool-calling)</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When enabled, any message in this chat that isn't a prefixed command
+            goes to the LLM with all allowed bot commands and MCP tools available.
+            Replaces the default NLP fallback. DMs trigger always; groups trigger
+            only when the bot is @mentioned.
+        </p>
+
+        <div style="margin-top: 24px; display:flex; gap:16px; align-items:center;">
+            <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
+            <a href="{{ url_for('admin.context_list') }}" class="muted">Cancel</a>
+            {% if not is_new and policy.kind != 'default' %}
+                <span style="flex:1"></span>
+            {% endif %}
+        </div>
+    </form>
+
+    {% if not is_new and policy.kind != 'default' %}
+    <form method="post" action="{{ url_for('admin.context_delete', context_id=policy.id) }}"
+          onsubmit="return confirm('Delete this context? (Default row protected.)');"
+          style="margin-top: 16px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete</button>
+    </form>
+    {% endif %}
+</div>
+
+{% endblock %}

@@ -15,7 +15,8 @@ class CommandContext:
     raw_message: str         # Original message text
     command: str             # The command (e.g., "price")
     args: list[str]          # Arguments after command
-    
+    policy: Optional[object] = None   # ContextPolicy resolved for this chat
+
     @property
     def is_group(self) -> bool:
         return self.group_id is not None

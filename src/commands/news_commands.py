@@ -129,15 +129,13 @@ class NewsCommand(BaseCommand):
         
         try:
             import yfinance as yf
-            import asyncio
-            
-            loop = asyncio.get_event_loop()
-            
+            from ..executor import run_blocking
+
             def fetch_news():
                 ticker = yf.Ticker(symbol)
                 return ticker.news
-            
-            news = await loop.run_in_executor(None, fetch_news)
+
+            news = await run_blocking(fetch_news)
             
             if not news:
                 if is_market:

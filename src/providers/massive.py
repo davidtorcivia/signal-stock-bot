@@ -51,8 +51,10 @@ class MassiveProvider(BaseProvider):
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=20, connect=5)
             self._session = aiohttp.ClientSession(
-                headers={"Authorization": f"Bearer {self.api_key}"}
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=timeout,
             )
         return self._session
     
@@ -86,49 +88,58 @@ class MassiveProvider(BaseProvider):
             raise ProviderError(f"Network error: {str(e)}")
 
     async def get_quote(self, symbol: str) -> Quote:
-        """Get stock quote. Also handles Crypto if symbol starts with 'X:'"""
-        # Auto-detect crypto pair format (e.g. BTC-USD -> X:BTCUSD)
+        """Get stock quote using the single-ticker snapshot endpoint."""
         ticker = symbol.upper()
-        
-        # Crypto handling (simple heuristic)
-        if "-" in ticker and ("BTC" in ticker or "ETH" in ticker):
-             # Convert generic BTC-USD to Polygon/Massive format X:BTCUSD
-             base, quote_curr = ticker.split("-")
-             ticker = f"X:{base}{quote_curr}"
-        
-        # Previous close endpoint is reliable for snapshot data
-        # /v2/aggs/ticker/{stocksTicker}/prev
-        endpoint = f"/v2/aggs/ticker/{ticker}/prev"
-        
+        is_crypto = "-" in ticker and ("BTC" in ticker or "ETH" in ticker)
+
+        if is_crypto:
+            base, quote_curr = ticker.split("-")
+            crypto_ticker = f"X:{base}{quote_curr}"
+            endpoint = f"/v2/snapshot/locale/global/markets/crypto/tickers/{crypto_ticker}"
+        else:
+            endpoint = f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+
         try:
             data = await self._request(endpoint)
         except SymbolNotFoundError:
-            # Try generic handling or re-raise
             raise SymbolNotFoundError(f"Symbol {symbol} not found")
 
-        if not data.get("results") or data.get("status") != "OK":
-             # Sometimes 'status' is OK but results empty if no trade today (unlikely for prev)
-            if data.get("resultsCount", 0) == 0:
-                 raise SymbolNotFoundError(f"No data for {symbol}")
-            raise ProviderError(f"Invalid response format: {data}")
+        ticker_data = data.get("ticker")
+        if not ticker_data:
+            raise SymbolNotFoundError(f"No data for {symbol}")
 
-        res = data["results"][0]
-        timestamp = datetime.fromtimestamp(res.get("t", 0) / 1000)
-        
+        last_trade = ticker_data.get("lastTrade") or {}
+        day = ticker_data.get("day") or {}
+        prev_day = ticker_data.get("prevDay") or {}
+
+        price = last_trade.get("p") or day.get("c") or prev_day.get("c") or 0.0
+        prev_close = prev_day.get("c") or 0.0
+
+        # Prefer server-provided change; fall back to computing vs prev close
+        change = ticker_data.get("todaysChange")
+        change_percent = ticker_data.get("todaysChangePerc")
+        if change is None and prev_close:
+            change = price - prev_close
+        if change_percent is None and prev_close:
+            change_percent = (change / prev_close) * 100 if change is not None else 0.0
+        change = change or 0.0
+        change_percent = change_percent or 0.0
+
+        ts_ns = last_trade.get("t") or 0
+        timestamp = datetime.fromtimestamp(ts_ns / 1e9) if ts_ns else datetime.now()
+
         return Quote(
-            symbol=symbol,
-            price=res.get("c", 0.0),
-            change=res.get("c", 0.0) - res.get("o", 0.0), # Close - Open (Approximation for 'change' if prev close not avail)
-            # Better calculation: Close - PrevDayClose. But this endpoint IS prev day.
-            # Start of day might be better. 
-            # Actually, for 'prev' endpoint, 'c' is close, 'o' is open. 
-            change_percent=((res.get("c", 0.0) - res.get("o", 0.0)) / res.get("o", 1.0)) * 100,
-            volume=int(res.get("v", 0)),
+            symbol=ticker,
+            price=price,
+            change=change,
+            change_percent=change_percent,
+            volume=int(day.get("v") or 0),
             timestamp=timestamp,
             provider="massive",
-            open=res.get("o"),
-            high=res.get("h"),
-            low=res.get("l"),
+            open=day.get("o"),
+            high=day.get("h"),
+            low=day.get("l"),
+            prev_close=prev_close or None,
         )
 
     async def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:

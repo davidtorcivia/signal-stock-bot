@@ -35,14 +35,13 @@ class MetricsCommand(BaseCommand):
         return sender in self.admin_numbers
     
     async def execute(self, ctx: CommandContext) -> CommandResult:
-        # Check admin access (if configured)
-        # Check admin access (if configured)
         if not self._is_admin(ctx.sender):
             import logging
             logger = logging.getLogger(__name__)
-            logger.warning(f"Admin access denied for {ctx.sender}. Allowed: {self.admin_numbers}")
+            tail = ctx.sender[-4:] if ctx.sender else "????"
+            logger.warning(f"Admin access denied for ...{tail}")
             return CommandResult.error("This command requires admin access.")
-        
+
         metrics = get_metrics()
         stats = metrics.get_all_stats()
         
@@ -194,13 +193,13 @@ class AdminCommand(BaseCommand):
             import aiosqlite
             async with aiosqlite.connect(self.watchlist_db.db_path) as db:
                 cursor = await db.execute(
-                    "SELECT user_hash, symbol, created_at FROM watchlist ORDER BY user_hash, symbol"
+                    "SELECT user_hash, symbol, added_at FROM watchlists ORDER BY user_hash, symbol"
                 )
                 rows = await cursor.fetchall()
-            
+
             # Group by user
             data = {}
-            for user_hash, symbol, created_at in rows:
+            for user_hash, symbol, _added_at in rows:
                 short_hash = user_hash[:8]  # Truncate for privacy
                 if short_hash not in data:
                     data[short_hash] = []

@@ -6,10 +6,11 @@ incoming messages in real-time.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional, Union
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -30,45 +31,57 @@ class SignalPoller:
         self,
         api_url: str,
         phone_number: str,
-        on_message: Callable[[dict], None],
+        on_message: Callable[[dict], Awaitable[None]],
         poll_interval: float = 5.0,
-        jsonrpc_port: int = 6001,  # Unused, kept for compatibility
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """
         Initialize the WebSocket listener.
-        
+
         Args:
             api_url: Base URL of signal-cli-rest-api (e.g., http://signal-api:8080)
             phone_number: Bot's phone number for receiving messages
             on_message: Async callback function to handle incoming messages
             poll_interval: Reconnect delay on failure
+            loop: External asyncio loop to run on. If provided, the poller
+                  schedules its listen loop on it instead of owning a thread.
         """
-        # Convert HTTP URL to WebSocket URL
         self.ws_url = api_url.replace("http://", "ws://").replace("https://", "wss://")
         self.phone_number = phone_number
         self.on_message = on_message
         self.poll_interval = poll_interval
         self._running = False
+        self._loop = loop
         self._thread: Optional[threading.Thread] = None
-    
+        self._task: Optional[concurrent.futures.Future] = None
+
     def start(self):
-        """Start the WebSocket listener in a background thread."""
+        """Start the WebSocket listener."""
         if self._running:
             logger.warning("Listener already running")
             return
-        
+
         self._running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        logger.info(f"Signal WebSocket listener started")
-    
+        if self._loop is not None:
+            # Schedule on the shared loop
+            self._task = asyncio.run_coroutine_threadsafe(
+                self._listen_loop(), self._loop
+            )
+            logger.info("Signal WebSocket listener scheduled on shared loop")
+        else:
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            logger.info("Signal WebSocket listener started on dedicated thread")
+
     def stop(self):
         """Stop the WebSocket listener."""
         self._running = False
+        if self._task is not None:
+            self._task.cancel()
         if self._thread:
             self._thread.join(timeout=5)
         logger.info("Signal WebSocket listener stopped")
-    
+
     def _run_loop(self):
         """Run the async event loop in the background thread."""
         loop = asyncio.new_event_loop()

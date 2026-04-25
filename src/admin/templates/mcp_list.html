@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}MCP servers{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>MCP servers</h1>
+    <p class="muted" style="font-size: 12px;">
+        Model Context Protocol servers. Tools discovered here are offered to
+        the LLM on every <code>!ask</code> call.
+    </p>
+    <p><a class="btn" href="{{ url_for('admin.mcp_new') }}" style="display:inline-block;text-decoration:none;">+ Add server</a></p>
+
+    {% if not servers %}
+        <p class="muted">No servers yet.</p>
+    {% else %}
+    <table>
+        <tr>
+            <th>Name</th>
+            <th>Transport</th>
+            <th>Enabled</th>
+            <th>Status</th>
+            <th>Tools</th>
+            <th></th>
+        </tr>
+        {% for s in servers %}
+            {% set st = status.get(s.id) %}
+            <tr>
+                <td><a href="{{ url_for('admin.mcp_edit', server_id=s.id) }}">{{ s.name }}</a></td>
+                <td class="muted">{{ s.transport }}</td>
+                <td>{{ 'yes' if s.enabled else 'no' }}</td>
+                <td>
+                    {% if st and st.running %}
+                        <span class="dot-ok">●</span> running
+                    {% elif st and st.last_error %}
+                        <span class="dot-bad">○</span> <span class="muted">{{ st.last_error|truncate(60) }}</span>
+                    {% else %}
+                        <span class="muted">○ stopped</span>
+                    {% endif %}
+                </td>
+                <td>{{ st.tool_count if st else 0 }}</td>
+                <td style="white-space:nowrap;">
+                    {% if st and st.running %}
+                        <form method="post" action="{{ url_for('admin.mcp_stop', server_id=s.id) }}" class="inline">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button class="secondary" type="submit">Stop</button>
+                        </form>
+                    {% else %}
+                        <form method="post" action="{{ url_for('admin.mcp_start', server_id=s.id) }}" class="inline">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit">Start</button>
+                        </form>
+                    {% endif %}
+                    <form method="post" action="{{ url_for('admin.mcp_delete', server_id=s.id) }}" class="inline"
+                          onsubmit="return confirm('Delete {{ s.name }}?');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete</button>
+                    </form>
+                </td>
+            </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+</div>
+
+{% endblock %}

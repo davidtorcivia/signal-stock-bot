@@ -53,6 +53,9 @@ logs/
 # Signal data (contains sensitive keys)
 data/
 
+# Admin password hash
+admin_password.hash
+
 # OS files
 .DS_Store
 Thumbs.db

@@ -18,3 +18,12 @@ gunicorn>=21.0
 # For development
 python-dotenv>=1.0
 thefuzz>=0.19.0
+
+# Admin web UI
+bcrypt>=4.0
+
+# MCP client — connects to stdio/SSE/HTTP MCP servers
+mcp>=1.0
+
+# uv / uvx for launching Python-based MCP servers from wheels/URLs
+uv>=0.4

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Verify{% endblock %}
+{% block content %}
+<div class="panel" style="max-width: 420px; margin: 60px auto;">
+    <h1>Enter 6-digit code</h1>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <p class="muted">Check your Signal messages for the code.</p>
+    <form method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="code">Code</label>
+        <input type="text" name="code" id="code" inputmode="numeric" pattern="[0-9]{6}"
+               maxlength="6" autofocus required>
+        <div style="margin-top: 20px;">
+            <button type="submit">Verify</button>
+        </div>
+    </form>
+    <p class="muted" style="margin-top: 20px; font-size: 12px;">
+        Code expires in 5 minutes. <a href="{{ url_for('admin.login') }}">Start over</a>
+    </p>
+</div>
+{% endblock %}

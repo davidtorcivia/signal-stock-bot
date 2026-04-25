@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Contexts{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>Chat contexts</h1>
+    <p class="muted" style="font-size: 12px;">
+        Scope which commands and MCP servers work in each chat, and assign
+        per-chat system prompts. Groups auto-register themselves on first
+        message; DMs only appear here if you add them explicitly.
+    </p>
+    <p><a class="btn" href="{{ url_for('admin.context_new') }}" style="display:inline-block;text-decoration:none;">+ Add context</a></p>
+
+    <table>
+        <tr>
+            <th>Kind</th>
+            <th>Label</th>
+            <th>Key</th>
+            <th>Commands</th>
+            <th>MCP</th>
+            <th>Prompt</th>
+        </tr>
+        {% for c in contexts %}
+        <tr>
+            <td class="muted">{{ c.kind }}</td>
+            <td><a href="{{ url_for('admin.context_edit', context_id=c.id) }}">{{ c.label or '(unnamed)' }}</a></td>
+            <td class="muted"><code>{{ c.key|truncate(32) }}</code></td>
+            <td>
+                {% if c.command_mode == 'allow_all' %}
+                    <span class="muted">all</span>
+                {% elif c.command_mode == 'allow_list' %}
+                    only {{ c.commands|length }}
+                {% else %}
+                    all except {{ c.commands|length }}
+                {% endif %}
+            </td>
+            <td>
+                {% if c.mcp_mode == 'allow_all' %}
+                    <span class="muted">all</span>
+                {% elif c.mcp_mode == 'allow_list' %}
+                    only {{ c.mcp_servers|length }}
+                {% else %}
+                    all except {{ c.mcp_servers|length }}
+                {% endif %}
+            </td>
+            <td>
+                {% if c.system_prompt %}
+                    <span class="dot-ok">●</span> custom
+                {% else %}
+                    <span class="muted">default</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+
+{% endblock %}

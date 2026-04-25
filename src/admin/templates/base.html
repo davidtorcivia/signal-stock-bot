@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>{% block title %}Admin{% endblock %} — Signal Stock Bot</title>
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --panel: #14181d;
+        --border: #222a33;
+        --text: #e6e9ee;
+        --muted: #8a95a2;
+        --accent: #ff9800;
+        --ok: #4caf50;
+        --bad: #e53935;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, "SF Mono", "Menlo", monospace;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      header {
+        border-bottom: 1px solid var(--border);
+        padding: 12px 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      header nav a { margin-right: 16px; }
+      main {
+        max-width: 920px;
+        margin: 24px auto;
+        padding: 0 20px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 20px;
+        margin-bottom: 20px;
+      }
+      h1, h2, h3 { margin-top: 0; color: var(--text); }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: normal; font-size: 12px; }
+      input[type="text"], input[type="password"], input[type="number"], textarea {
+        width: 100%;
+        padding: 8px 10px;
+        background: #0b0d10;
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: 14px;
+      }
+      input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+      label { display: block; margin-top: 14px; font-size: 13px; color: var(--muted); }
+      label span.note { color: var(--bad); margin-left: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+      button, .btn {
+        padding: 8px 16px;
+        background: var(--accent);
+        color: #000;
+        border: none;
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button.secondary { background: var(--border); color: var(--text); }
+      button:hover { opacity: 0.9; }
+      .error { color: var(--bad); padding: 10px; border: 1px solid var(--bad); border-radius: 4px; margin: 12px 0; }
+      .ok    { color: var(--ok);  padding: 10px; border: 1px solid var(--ok);  border-radius: 4px; margin: 12px 0; }
+      .muted { color: var(--muted); }
+      .dot-ok  { color: var(--ok); }
+      .dot-bad { color: var(--bad); }
+      form.inline { display: inline; }
+    </style>
+</head>
+<body>
+    <header>
+        <strong>◈ Signal Stock Bot</strong>
+        {% if session.get("authenticated") %}
+        <nav>
+            <a href="{{ url_for('admin.dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('admin.settings_page') }}">Settings</a>
+            <a href="{{ url_for('admin.llm_page') }}">LLM</a>
+            <a href="{{ url_for('admin.mcp_list') }}">MCP</a>
+            <a href="{{ url_for('admin.context_list') }}">Contexts</a>
+            <form method="post" action="{{ url_for('admin.logout') }}" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="secondary" type="submit">Logout</button>
+            </form>
+        </nav>
+        {% endif %}
+    </header>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

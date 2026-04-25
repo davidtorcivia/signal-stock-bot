@@ -217,29 +217,27 @@ async def search_yahoo(query: str) -> Optional[Tuple[str, str]]:
     """
     try:
         import yfinance as yf
-        
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        
+        from ..executor import run_blocking
+
         def do_search():
             try:
-                # yfinance search returns dict with 'quotes' key
                 results = yf.search(query)
                 if results and 'quotes' in results:
                     quotes = results['quotes']
                     if quotes:
-                        # Return first result
                         first = quotes[0]
                         return (first.get('symbol'), first.get('shortname') or first.get('longname'))
             except Exception as e:
                 logger.debug(f"Yahoo search failed for '{query}': {e}")
             return None
-        
-        result = await loop.run_in_executor(None, do_search)
-        return result
-        
+
+        return await run_blocking(do_search, timeout=10.0)
+
     except ImportError:
         logger.warning("yfinance not installed, Yahoo search unavailable")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning(f"Yahoo search timed out for '{query}'")
         return None
     except Exception as e:
         logger.debug(f"Yahoo search error: {e}")

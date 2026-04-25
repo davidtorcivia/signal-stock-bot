@@ -49,6 +49,7 @@ from .alert_commands import (
 from .watchlist_commands import (
     WatchCommand,
 )
+from .ask_command import AskCommand
 
 __all__ = [
     "BaseCommand",
@@ -93,4 +94,6 @@ __all__ = [
     "AlertCommand",
     # Watchlist
     "WatchCommand",
+    # LLM
+    "AskCommand",
 ]

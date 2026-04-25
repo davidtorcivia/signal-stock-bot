@@ -312,46 +312,44 @@ class ChartGenerator:
         if options.rsi:
             plot_kwargs['panel_ratios'] = panel_ratios
         
-        fig, axes = mpf.plot(df, **plot_kwargs)
-        
-        # Add title above chart (not inside) - use high y value to ensure it's above
-        fig.suptitle(
-            title,
-            color='#FFFFFF',
-            fontsize=12,
-            fontweight='bold',
-            y=1.02,  # Higher than 1.0 puts it outside the figure area
-        )
-        
-        # Add watermark
-        fig.text(
-            0.99, 0.01,
-            self.bot_name,
-            ha='right', va='bottom',
-            color='#444444',
-            fontsize=8,
-            alpha=0.7,
-        )
-        
-        # Save to buffer
-        fig.savefig(
-            buf,
-            format='png',
-            dpi=self.dpi,
-            facecolor='#000000',
-            edgecolor='none',
-            bbox_inches='tight',
-            pad_inches=0.1,
-        )
-        
         import matplotlib.pyplot as plt
-        plt.close(fig)
-        
+
+        fig, axes = mpf.plot(df, **plot_kwargs)
+        try:
+            fig.suptitle(
+                title,
+                color='#FFFFFF',
+                fontsize=12,
+                fontweight='bold',
+                y=1.02,
+            )
+
+            fig.text(
+                0.99, 0.01,
+                self.bot_name,
+                ha='right', va='bottom',
+                color='#444444',
+                fontsize=8,
+                alpha=0.7,
+            )
+
+            fig.savefig(
+                buf,
+                format='png',
+                dpi=self.dpi,
+                facecolor='#000000',
+                edgecolor='none',
+                bbox_inches='tight',
+                pad_inches=0.1,
+            )
+        finally:
+            plt.close(fig)
+
         buf.seek(0)
         base64_data = base64.b64encode(buf.read()).decode('utf-8')
-        
+
         logger.debug(f"Generated chart for {symbol}: {len(base64_data)} bytes")
-        
+
         return base64_data
     
     def _build_title(

@@ -952,20 +952,23 @@ class EconomyCommand(BaseCommand):
                 )
                 
                 generator = ChartGenerator(bot_name=self.bot_name)
-                
+
                 # Use name provided by FredProvider (which is usually descriptive)
                 # Ensure current_price is scaled if we applied scaling
                 current_val = points[-1][1]
                 if "scaling_factor" in locals():
                     current_val /= scaling_factor
-                
-                chart_b64 = generator.generate(
-                    symbol=name.split(":")[0], # Truncate if too long? No, use full name if reasonable
+
+                from ..executor import run_blocking
+                chart_b64 = await run_blocking(
+                    generator.generate,
+                    symbol=name.split(":")[0],
                     bars=bars,
                     period=period,
                     current_price=current_val,
-                    change_percent=None, 
+                    change_percent=None,
                     options=options,
+                    timeout=30.0,
                 )
                 
                 return CommandResult(
@@ -1261,15 +1264,18 @@ Each bar shows:
             }
             period_label = period_labels.get(period, period)
             
-            # Generate chart
+            # Generate chart (CPU-bound; run off the event loop)
+            from ..executor import run_blocking
             generator = self._get_generator()
-            chart_base64 = generator.generate(
+            chart_base64 = await run_blocking(
+                generator.generate,
                 symbol=symbol,
                 bars=bars,
                 period=period,
                 current_price=current_price,
                 change_percent=period_change_pct,
                 options=chart_options,
+                timeout=30.0,
             )
             
             # Build caption

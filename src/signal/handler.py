@@ -2,6 +2,7 @@
 Signal message handler - interfaces with signal-cli-rest-api.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -56,6 +57,8 @@ class SignalHandler:
         self.dispatcher = dispatcher
         self._session: Optional[aiohttp.ClientSession] = None
         self._bot_uuid: Optional[str] = None  # Fetched on first use
+        self._group_id_map: dict[str, str] = {}
+        self._group_map_lock = asyncio.Lock()
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -64,32 +67,23 @@ class SignalHandler:
         return self._session
     
     async def _resolve_group_id(self, group_id: str) -> str:
-        """
-        Resolve internal group ID to V2 group ID (required for sending).
-        """
-        # If it already looks like a V2 ID (starts with group.), return it
+        """Resolve internal group ID to V2 group ID (required for sending)."""
         if group_id.startswith("group."):
             return group_id
-            
-        # Check cache
-        if hasattr(self, "_group_id_map") and group_id in self._group_id_map:
-            return self._group_id_map[group_id]
-            
-        # Fetch groups to update map
-        await self._refresh_group_map()
-        
-        # Check cache again
-        if hasattr(self, "_group_id_map") and group_id in self._group_id_map:
-            return self._group_id_map[group_id]
-            
-        # Fallback: return original (maybe it's valid?)
-        return group_id
 
-    async def _refresh_group_map(self):
-        """Fetch groups from API and update ID map."""
-        if not hasattr(self, "_group_id_map"):
-            self._group_id_map = {}
-            
+        if group_id in self._group_id_map:
+            return self._group_id_map[group_id]
+
+        async with self._group_map_lock:
+            # Re-check after acquiring the lock
+            if group_id in self._group_id_map:
+                return self._group_id_map[group_id]
+            await self._refresh_group_map_locked()
+
+        return self._group_id_map.get(group_id, group_id)
+
+    async def _refresh_group_map_locked(self):
+        """Fetch groups from API and update ID map. Caller must hold the lock."""
         try:
             session = await self._get_session()
             url = f"{self.config.api_url}/v1/groups/{self.config.phone_number}"

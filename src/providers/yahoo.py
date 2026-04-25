@@ -6,11 +6,12 @@ Best for: development, fallback, users without API keys.
 Limitations: unofficial, may break if Yahoo changes their site.
 """
 
-import asyncio
 import logging
 from datetime import datetime
 
 import yfinance as yf
+
+from ..executor import run_blocking
 
 # Set yfinance cache path to avoid permission errors in Docker
 try:
@@ -39,9 +40,8 @@ class YahooFinanceProvider(BaseProvider):
     }
     
     async def get_quote(self, symbol: str) -> Quote:
-        """Fetch quote using yfinance (runs sync code in executor)"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_quote_sync, symbol)
+        """Fetch quote using yfinance (runs sync code in bounded executor)."""
+        return await run_blocking(self._get_quote_sync, symbol)
     
     def _get_quote_sync(self, symbol: str) -> Quote:
         ticker = yf.Ticker(symbol)
@@ -101,9 +101,8 @@ class YahooFinanceProvider(BaseProvider):
             raise SymbolNotFoundError(f"Symbol not found: {symbol}")
     
     async def get_quotes(self, symbols: list[str]) -> dict[str, Quote]:
-        """Batch fetch quotes"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_quotes_sync, symbols)
+        """Batch fetch quotes."""
+        return await run_blocking(self._get_quotes_sync, symbols, timeout=30.0)
     
     def _get_quotes_sync(self, symbols: list[str]) -> dict[str, Quote]:
         results = {}
@@ -139,9 +138,8 @@ class YahooFinanceProvider(BaseProvider):
         period: str = "1mo",
         interval: str = "1d"
     ) -> list[HistoricalBar]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._get_historical_sync, symbol, period, interval
+        return await run_blocking(
+            self._get_historical_sync, symbol, period, interval, timeout=25.0
         )
     
     def _get_historical_sync(
@@ -167,8 +165,7 @@ class YahooFinanceProvider(BaseProvider):
         return bars
     
     async def get_fundamentals(self, symbol: str) -> Fundamentals:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_fundamentals_sync, symbol)
+        return await run_blocking(self._get_fundamentals_sync, symbol)
     
     def _get_fundamentals_sync(self, symbol: str) -> Fundamentals:
         ticker = yf.Ticker(symbol)

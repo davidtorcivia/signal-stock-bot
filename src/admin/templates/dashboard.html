@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h2>Health</h2>
+    <table>
+        <tr>
+            <th>Uptime</th>
+            <td>{{ '%dh %dm'|format(metrics.uptime_seconds // 3600, (metrics.uptime_seconds % 3600) // 60) }}</td>
+        </tr>
+        <tr>
+            <th>Requests / min</th>
+            <td>{{ '%.0f'|format(metrics.requests_per_minute) }}</td>
+        </tr>
+        <tr>
+            <th>Cache hit rate</th>
+            <td>{{ metrics.cache.overall_hit_rate }}</td>
+        </tr>
+    </table>
+</div>
+
+<div class="panel">
+    <h2>Caches</h2>
+    <table>
+        <tr><th>Name</th><th>Size</th><th>Hits</th><th>Misses</th><th>Hit rate</th></tr>
+        {% for name, cache in metrics.cache.caches.items() %}
+        <tr>
+            <td>{{ name }}</td>
+            <td>{{ cache.size }}</td>
+            <td>{{ cache.hits }}</td>
+            <td>{{ cache.misses }}</td>
+            <td>{{ '%.1f%%'|format(cache.hit_rate) }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    <form method="post" action="{{ url_for('admin.cache_clear') }}" style="margin-top: 16px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="secondary" type="submit" onclick="return confirm('Clear all caches?')">Clear all caches</button>
+    </form>
+</div>
+
+<div class="panel">
+    <h2>Providers</h2>
+    <table>
+        <tr><th>Name</th><th>Status</th><th>Rate-limited</th><th>Capabilities</th></tr>
+        {% for name, prov in metrics.providers.items() %}
+        <tr>
+            <td>{{ name }}</td>
+            <td>
+                {% if prov.healthy %}<span class="dot-ok">●</span>{% else %}<span class="dot-bad">○</span>{% endif %}
+                {{ prov.success_rate }} ({{ prov.avg_latency_ms }})
+            </td>
+            <td>
+                {% set status = provider_status.get(name, {}) %}
+                {% if status.rate_limited %}{{ status.rate_limit_remaining_seconds }}s{% else %}—{% endif %}
+            </td>
+            <td class="muted">{{ status.capabilities | default([]) | join(', ') }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+
+{% endblock %}

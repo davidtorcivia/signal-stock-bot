@@ -9,9 +9,25 @@ Supports loading from:
 import os
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _load_admin_password_hash() -> str:
+    """Load bcrypt hash from file (preferred) or ADMIN_PASSWORD_HASH env.
+
+    File storage avoids docker-compose env interpolation mangling the '$'
+    characters in bcrypt hashes.
+    """
+    path = Path(os.getenv("ADMIN_PASSWORD_HASH_PATH", "data/admin_password.hash"))
+    if path.is_file():
+        try:
+            return path.read_text().strip()
+        except OSError as e:
+            logger.error(f"Failed to read {path}: {e}")
+    return os.getenv("ADMIN_PASSWORD_HASH", "").strip()
 
 
 @dataclass
@@ -52,6 +68,17 @@ class Config:
     # Admin settings
     admin_numbers: list[str] = field(default_factory=list)  # Phone numbers for admin access
     user_rate_limit: int = 30  # Max requests per minute per user
+
+    # Security
+    webhook_secret: str = ""  # If set, /webhook requires matching X-Webhook-Secret header
+    max_message_length: int = 4000  # Drop messages longer than this
+
+    # Admin web UI (optional). If password hash and secret key are both set,
+    # routes are mounted under /admin/*.
+    admin_password_hash: str = ""
+    admin_password_hash_path: str = "data/admin_password.hash"
+    flask_secret_key: str = ""
+    session_cookie_secure: bool = False  # Set True when behind HTTPS
     
     @classmethod
     def from_env(cls) -> "Config":
@@ -133,6 +160,11 @@ class Config:
             watchlist_db_path=os.getenv("WATCHLIST_DB_PATH", "data/watchlist.db"),
             admin_numbers=[n.strip() for n in os.getenv("ADMIN_NUMBERS", "").split(",") if n.strip()],
             user_rate_limit=int(os.getenv("USER_RATE_LIMIT", "30")),
+            webhook_secret=os.getenv("WEBHOOK_SECRET", "").strip(),
+            max_message_length=int(os.getenv("MAX_MESSAGE_LENGTH", "4000")),
+            admin_password_hash=_load_admin_password_hash(),
+            flask_secret_key=os.getenv("FLASK_SECRET_KEY", "").strip(),
+            session_cookie_secure=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
         )
         
         logger.info(f"Loaded config: {len(providers)} providers configured")

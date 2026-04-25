@@ -67,21 +67,18 @@ class EarningsCommand(BaseCommand):
         
         try:
             import yfinance as yf
-            import asyncio
-            
-            loop = asyncio.get_event_loop()
-            
+            from ..executor import run_blocking
+
             def fetch_earnings():
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
-                # calendar can be dict or DataFrame depending on yfinance version
                 try:
                     calendar = ticker.calendar
                 except Exception:
                     calendar = None
                 return info, calendar
-            
-            info, calendar = await loop.run_in_executor(None, fetch_earnings)
+
+            info, calendar = await run_blocking(fetch_earnings)
             
             if not info:
                 return CommandResult.error(f"No data for {symbol}")
@@ -177,17 +174,15 @@ class DividendCommand(BaseCommand):
         
         try:
             import yfinance as yf
-            import asyncio
-            
-            loop = asyncio.get_event_loop()
-            
+            from ..executor import run_blocking
+
             def fetch_dividend():
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
                 dividends = ticker.dividends
                 return info, dividends
-            
-            info, dividends = await loop.run_in_executor(None, fetch_dividend)
+
+            info, dividends = await run_blocking(fetch_dividend)
             
             if not info:
                 return CommandResult.error(f"No data for {symbol}")

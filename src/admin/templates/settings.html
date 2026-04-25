@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>Settings</h1>
+    {% if saved %}<div class="ok">Saved.</div>{% endif %}
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <h2>Live settings</h2>
+        <p class="muted" style="font-size: 12px;">Changes apply immediately.</p>
+
+        {% for key in live_keys %}
+            {% set value = values.get(key) %}
+            <label for="{{ key }}">{{ key }}</label>
+            {% if key == "admin_numbers" %}
+                <input type="text" name="{{ key }}" id="{{ key }}"
+                       value="{{ (value or []) | join(', ') }}"
+                       placeholder="+15551234567, +15559876543">
+            {% elif key in ("user_rate_limit", "max_message_length") %}
+                <input type="number" name="{{ key }}" id="{{ key }}" min="1" value="{{ value or '' }}">
+            {% else %}
+                <input type="text" name="{{ key }}" id="{{ key }}" value="{{ value or '' }}">
+            {% endif %}
+        {% endfor %}
+
+        <h2 style="margin-top: 32px;">Restart required</h2>
+        <p class="muted" style="font-size: 12px;">
+            Provider API keys and options — saved now, but the container must be restarted before they take effect.
+        </p>
+
+        {% for key in restart_keys %}
+            {% set value = values.get(key) %}
+            <label for="{{ key }}">
+                {{ key }}
+                <span class="note">restart</span>
+            </label>
+            {% if key == "MASSIVE_PRO" %}
+                <input type="text" name="{{ key }}" id="{{ key }}"
+                       value="{{ 'true' if value else 'false' }}"
+                       placeholder="true / false">
+            {% else %}
+                <input type="text" name="{{ key }}" id="{{ key }}" value="{{ value or '' }}">
+            {% endif %}
+        {% endfor %}
+
+        <div style="margin-top: 24px;">
+            <button type="submit">Save</button>
+        </div>
+    </form>
+</div>
+
+{% endblock %}

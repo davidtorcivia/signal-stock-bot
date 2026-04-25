@@ -5,10 +5,10 @@ Provides: !rating, !insider, !short, !corr
 Uses yfinance for data.
 """
 
-import asyncio
 from datetime import datetime
 from .base import BaseCommand, CommandContext, CommandResult
 from ..providers import ProviderManager
+from ..executor import run_blocking
 
 
 class RatingCommand(BaseCommand):
@@ -38,15 +38,14 @@ class RatingCommand(BaseCommand):
         
         try:
             import yfinance as yf
-            loop = asyncio.get_event_loop()
-            
+
             def fetch():
                 ticker = yf.Ticker(symbol)
                 info = ticker.info
                 recommendations = ticker.recommendations
                 return info, recommendations
-            
-            info, recs = await loop.run_in_executor(None, fetch)
+
+            info, recs = await run_blocking(fetch)
             
             lines = [f"◈ {name or symbol} ({symbol}) Analyst Ratings", ""]
             
@@ -121,13 +120,12 @@ class InsiderCommand(BaseCommand):
         
         try:
             import yfinance as yf
-            loop = asyncio.get_event_loop()
-            
+
             def fetch():
                 ticker = yf.Ticker(symbol)
                 return ticker.insider_transactions
-            
-            transactions = await loop.run_in_executor(None, fetch)
+
+            transactions = await run_blocking(fetch)
             
             lines = [f"◈ {name or symbol} ({symbol}) Insider Activity", ""]
             
@@ -201,13 +199,12 @@ class ShortCommand(BaseCommand):
         
         try:
             import yfinance as yf
-            loop = asyncio.get_event_loop()
-            
+
             def fetch():
                 ticker = yf.Ticker(symbol)
                 return ticker.info
-            
-            info = await loop.run_in_executor(None, fetch)
+
+            info = await run_blocking(fetch)
             
             lines = [f"◈ {name or symbol} ({symbol}) Short Interest", ""]
             
@@ -288,16 +285,15 @@ class CorrelationCommand(BaseCommand):
         try:
             import yfinance as yf
             import numpy as np
-            loop = asyncio.get_event_loop()
-            
+
             def fetch():
                 t1 = yf.Ticker(symbol1)
                 t2 = yf.Ticker(symbol2)
                 h1 = t1.history(period="1mo")
                 h2 = t2.history(period="1mo")
                 return h1, h2
-            
-            h1, h2 = await loop.run_in_executor(None, fetch)
+
+            h1, h2 = await run_blocking(fetch, timeout=25.0)
             
             if len(h1) < 5 or len(h2) < 5:
                 return CommandResult.error("Insufficient data for correlation")

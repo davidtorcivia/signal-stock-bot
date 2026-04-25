@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New MCP server{% else %}{{ server.name }}{% endif %}{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>{% if is_new %}New MCP server{% else %}{{ server.name }}{% endif %}</h1>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    {% if not is_new %}
+        <p>
+            {% if status and status.running %}
+                <span class="dot-ok">●</span> Running —
+                {{ status.tool_count }} tool(s)
+                {% if status.started_at %} · since
+                    <span class="muted">{{ status.started_at|int }}</span>
+                {% endif %}
+            {% elif status and status.last_error %}
+                <span class="muted">○ Stopped</span> —
+                <span class="muted">{{ status.last_error }}</span>
+            {% else %}
+                <span class="muted">○ Stopped</span>
+            {% endif %}
+        </p>
+
+        <div style="display:flex; gap:8px; margin-bottom:16px;">
+            {% if status and status.running %}
+                <form method="post" action="{{ url_for('admin.mcp_stop', server_id=server.id) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="secondary" type="submit">Stop</button>
+                </form>
+            {% else %}
+                <form method="post" action="{{ url_for('admin.mcp_start', server_id=server.id) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit">Start</button>
+                </form>
+            {% endif %}
+            <form method="post" action="{{ url_for('admin.mcp_delete', server_id=server.id) }}"
+                  onsubmit="return confirm('Delete {{ server.name }}? This removes the config and stops the server.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete</button>
+            </form>
+        </div>
+    {% endif %}
+
+    <form method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <label for="name">Name</label>
+        <input type="text" name="name" id="name" required
+               value="{{ values.name }}" placeholder="weather">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Used to namespace this server's tools as <code>{name}__{tool}</code>.
+        </p>
+
+        <label for="transport">Transport</label>
+        <select name="transport" id="transport"
+                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
+            {% for t in transports %}
+                <option value="{{ t }}" {% if values.transport == t %}selected{% endif %}>{{ t }}</option>
+            {% endfor %}
+        </select>
+
+        <label for="enabled">Auto-start on boot</label>
+        <input type="text" name="enabled" id="enabled"
+               value="{{ values.enabled }}" placeholder="true / false">
+
+        <h2 style="margin-top: 32px;">stdio</h2>
+
+        <label for="command">Command</label>
+        <input type="text" name="command" id="command"
+               value="{{ values.command }}" placeholder="npx  or  /usr/local/bin/mcp-server-foo">
+
+        <label for="args">Args (one per line)</label>
+        <textarea name="args" id="args" rows="4"
+                  placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/data/shared">{{ values.args }}</textarea>
+
+        <label for="env">Env (KEY=value, one per line)</label>
+        <textarea name="env" id="env" rows="4"
+                  placeholder="API_KEY=sk-...&#10;SOMETHING_ELSE=value">{{ values.env }}</textarea>
+
+        <h2 style="margin-top: 32px;">sse / http</h2>
+
+        <label for="url">URL</label>
+        <input type="text" name="url" id="url"
+               value="{{ values.url }}" placeholder="https://mcp.example.com/sse">
+
+        <label for="headers">Headers (KEY=value, one per line)</label>
+        <textarea name="headers" id="headers" rows="4"
+                  placeholder="Authorization=Bearer abc123">{{ values.headers }}</textarea>
+
+        <div style="margin-top: 24px;">
+            <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
+            <a href="{{ url_for('admin.mcp_list') }}" class="muted" style="margin-left: 16px;">Cancel</a>
+        </div>
+    </form>
+</div>
+
+{% if not is_new and tools %}
+<div class="panel">
+    <h2>Discovered tools ({{ tools|length }})</h2>
+    <table>
+        <tr><th>Name</th><th>Description</th></tr>
+        {% for t in tools %}
+        <tr>
+            <td><code>{{ t.qualified_name }}</code></td>
+            <td class="muted">{{ t.description|truncate(120) }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+{% endif %}
+
+{% endblock %}

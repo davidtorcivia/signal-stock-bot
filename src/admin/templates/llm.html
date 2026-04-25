@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}LLM{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>LLM configuration</h1>
+    <p class="muted" style="font-size: 12px;">
+        OpenAI-compatible endpoint. Works with OpenAI, OpenRouter, Groq, DeepSeek,
+        Ollama, llama.cpp, vLLM, etc. All values apply live — no restart needed.
+    </p>
+
+    {% if saved %}<div class="ok">Saved.</div>{% endif %}
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    <form method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <label for="llm_enabled">Enabled</label>
+        <input type="text" name="llm_enabled" id="llm_enabled"
+               value="{{ 'true' if values.llm_enabled else 'false' }}"
+               placeholder="true / false">
+
+        <label for="llm_base_url">Base URL</label>
+        <input type="text" name="llm_base_url" id="llm_base_url"
+               value="{{ values.llm_base_url or '' }}"
+               placeholder="https://api.openai.com/v1">
+
+        <label for="llm_model">Model</label>
+        <input type="text" name="llm_model" id="llm_model"
+               value="{{ values.llm_model or '' }}"
+               placeholder="gpt-4o-mini">
+
+        <label for="llm_api_key">
+            API key
+            {% if api_key_set %}<span class="muted" style="text-transform: none; font-size: 11px;">(configured — leave blank to keep)</span>{% endif %}
+        </label>
+        <input type="password" name="llm_api_key" id="llm_api_key"
+               value="" placeholder="{{ '•••••••• (already set)' if api_key_set else 'sk-...' }}">
+
+        <label for="llm_temperature">Temperature</label>
+        <input type="text" name="llm_temperature" id="llm_temperature"
+               value="{{ values.llm_temperature if values.llm_temperature is not none else '' }}"
+               placeholder="0.7">
+
+        <label for="llm_max_tokens">Max tokens</label>
+        <input type="number" name="llm_max_tokens" id="llm_max_tokens" min="1"
+               value="{{ values.llm_max_tokens or '' }}" placeholder="1000">
+
+        <label for="llm_timeout_seconds">Request timeout (seconds)</label>
+        <input type="number" name="llm_timeout_seconds" id="llm_timeout_seconds" min="1"
+               value="{{ values.llm_timeout_seconds or '' }}" placeholder="30">
+
+        <label for="llm_history_turns">Conversation turns kept per user</label>
+        <input type="number" name="llm_history_turns" id="llm_history_turns" min="0"
+               value="{{ values.llm_history_turns or '' }}" placeholder="6">
+
+        <label for="llm_retention_days">Retention days (auto-purge)</label>
+        <input type="number" name="llm_retention_days" id="llm_retention_days" min="1"
+               value="{{ values.llm_retention_days or '' }}" placeholder="7">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Conversation turns and group messages older than this are deleted on
+            the next write. Protects against unbounded growth and long-lived PII.
+        </p>
+
+        <label for="llm_max_tool_rounds">Max tool-call rounds per !ask</label>
+        <input type="number" name="llm_max_tool_rounds" id="llm_max_tool_rounds" min="1"
+               value="{{ values.llm_max_tool_rounds or '' }}" placeholder="25">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Hard ceiling on tool-call rounds the LLM may chain. Each round can
+            include multiple parallel tool calls. If the cap is hit, the bot
+            returns an honest "task incomplete" error with the tool history
+            instead of summarising from partial results — accuracy over
+            apparent helpfulness. Raise if your typical queries genuinely need
+            deeper exploration.
+        </p>
+
+        <label for="group_context_messages">Group chat context messages</label>
+        <input type="number" name="group_context_messages" id="group_context_messages" min="0"
+               value="{{ values.group_context_messages if values.group_context_messages is not none else '' }}"
+               placeholder="0">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When <code>!ask</code> is used inside a group chat, include this many of
+            the most recent messages from that group as context. Set <code>0</code>
+            to disable (also stops recording group messages).
+        </p>
+
+        <label for="ask_command_name">Ask command alias</label>
+        <input type="text" name="ask_command_name" id="ask_command_name"
+               value="{{ values.ask_command_name or '' }}" placeholder="ask">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            The built-in name <code>!ask</code> always works. This adds an extra alias
+            (e.g. <code>ai</code> → <code>!ai</code>).
+        </p>
+
+        <label for="llm_augment_commands">Augment these commands (comma-separated)</label>
+        <input type="text" name="llm_augment_commands" id="llm_augment_commands"
+               value="{{ values.llm_augment_commands or '' }}"
+               placeholder="ta, chart, rating, tldr">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When any listed command succeeds, the LLM will add a short
+            interpretation below the regular output. Leave empty to disable.
+            Per-context policy still applies.
+        </p>
+
+        <label for="llm_augment_prompt">Augmentation prompt</label>
+        <textarea name="llm_augment_prompt" id="llm_augment_prompt" rows="4"
+                  placeholder="Instruction for how the LLM should augment command output.">{{ values.llm_augment_prompt or '' }}</textarea>
+
+        <label for="llm_system_prompt">System prompt</label>
+        <textarea name="llm_system_prompt" id="llm_system_prompt" rows="6"
+                  placeholder="Defaults to a concise stock-market assistant prompt.">{{ values.llm_system_prompt or '' }}</textarea>
+
+        <label for="llm_extra_body">Extra request body (JSON)</label>
+        <textarea name="llm_extra_body" id="llm_extra_body" rows="6"
+                  placeholder='{"reasoning_effort": "medium"}  or  {"thinking": {"type": "enabled", "budget_tokens": 2048}}'>{{ values.llm_extra_body or '' }}</textarea>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Merged into the JSON body of every chat request. Use for provider-
+            specific knobs like <code>thinking</code>, <code>reasoning_effort</code>,
+            <code>top_p</code>, <code>presence_penalty</code>. Must be a JSON
+            object or empty. Overrides the built-in fields if keys collide.
+        </p>
+
+        <div style="margin-top: 24px;">
+            <button type="submit">Save</button>
+        </div>
+    </form>
+</div>
+
+{% endblock %}

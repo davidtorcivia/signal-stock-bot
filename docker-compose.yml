@@ -1,23 +1,23 @@
-version: "3.8"
-
 services:
   # Signal CLI REST API - handles Signal protocol
   signal-api:
     image: bbernhard/signal-cli-rest-api:latest
     container_name: signal-api
     restart: unless-stopped
+    ports:
+      - "8093:8080"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       - MODE=json-rpc
       - LOG_LEVEL=debug
     volumes:
       - ./data/signal-cli:/home/.local/share/signal-cli
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     networks:
       - bot-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8080/v1/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -31,30 +31,31 @@ services:
     depends_on:
       signal-api:
         condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    # env_file passes values through literally — avoids docker-compose's
+    # variable interpolation mangling secrets that contain '$' (e.g. bcrypt
+    # hashes). `environment:` below only sets values that must be overridden
+    # for the Docker network.
+    env_file:
+      - .env
     environment:
       - SIGNAL_API_URL=http://signal-api:8080
-      - SIGNAL_PHONE_NUMBER=${SIGNAL_PHONE_NUMBER}
-      - BOT_NAME=${BOT_NAME:-Stock Bot}
-      - COMMAND_PREFIX=${COMMAND_PREFIX:-!}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY:-}
-      - POLYGON_API_KEY=${POLYGON_API_KEY:-}
-      - FRED_API_KEY=${FRED_API_KEY:-}
-      - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
-      - TWELVEDATA_API_KEY=${TWELVEDATA_API_KEY:-}
-      - MASSIVE_PRO=${MASSIVE_PRO:-false}
-      - ADMIN_NUMBERS=${ADMIN_NUMBERS:-}
-      - USER_RATE_LIMIT=${USER_RATE_LIMIT:-30}
+      - ADMIN_PASSWORD_HASH_PATH=/app/admin_password.hash
+    ports:
+      # ADMIN_BIND_HOST controls which interface the admin UI listens on.
+      # Default 127.0.0.1 = loopback only. Set to 0.0.0.0 for LAN access
+      # (or a specific LAN IP like 192.168.1.131 to limit to one interface).
+      - "${ADMIN_BIND_HOST:-127.0.0.1}:5000:5000"
     volumes:
       - ./logs:/app/logs
-      - ./data:/app/data
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
+      - /nvme-mirror/apps/signal-stock-bot/data:/app/data
+      - ./admin_password.hash:/app/admin_password.hash:ro
     networks:
       - bot-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -62,3 +63,4 @@ services:
 networks:
   bot-network:
     driver: bridge
+

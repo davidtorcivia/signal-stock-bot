@@ -2,9 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# System deps:
+#   curl          — health checks
+#   git           — uvx needs this to fetch MCP servers from git+https URLs
+#   ca-certs/gnupg — NodeSource repo signing
+#   nodejs (20)   — npx-launched MCP servers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+        curl ca-certificates gnupg git \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
