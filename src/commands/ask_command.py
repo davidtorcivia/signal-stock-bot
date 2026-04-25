@@ -255,12 +255,6 @@ class AskCommand(BaseCommand):
             "content": content,
         })
 
-    def _context_key(self, ctx: CommandContext) -> str:
-        """Group chats share a thread via group_id. DMs use the hashed phone."""
-        if ctx.group_id:
-            return f"group:{ctx.group_id}"
-        return f"dm:{hash_phone(ctx.sender)}"
-
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
             return CommandResult.error(
@@ -269,7 +263,7 @@ class AskCommand(BaseCommand):
 
         user_hash = hash_phone(ctx.sender)
         sender_tail = (ctx.sender or "")[-4:]
-        context_key = self._context_key(ctx)
+        context_key = ctx.context_key()
         is_group = ctx.group_id is not None
 
         if ctx.args[0].lower() in ("reset", "clear", "forget"):

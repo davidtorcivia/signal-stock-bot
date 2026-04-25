@@ -65,6 +65,10 @@ from .commands import (
     WatchCommand,
     AskCommand,
     TarotCommand,
+    PredictCommand,
+    PredictionsCommand,
+    ResolveCommand,
+    LeaderboardCommand,
 )
 from .signal import SignalHandler, SignalConfig, SignalPoller
 from .server import create_app
@@ -162,6 +166,7 @@ def create_dispatcher(
     context_registry=None,
     llm_client=None,
     reactor=None,
+    name_registry=None,
 ) -> CommandDispatcher:
     """Create and configure command dispatcher."""
     dispatcher = CommandDispatcher(
@@ -271,6 +276,22 @@ def create_dispatcher(
     # command returns a friendly "still preparing" message until done.
     from .commands.tarot_command import ensure_deck_ready_async
     ensure_deck_ready_async()
+
+    # Predictions: log dated claims, follow up at the deadline, score them.
+    # The store is also exposed on the dispatcher so the background
+    # resolver worker (scheduled in build_app) can reuse the same instance.
+    from .predictions import PredictionStore
+    prediction_store = PredictionStore(config.watchlist_db_path)
+    dispatcher.prediction_store = prediction_store
+    predict_cmd = PredictCommand(
+        prediction_store, llm_client=llm_client, name_registry=name_registry,
+    )
+    predictions_cmd = PredictionsCommand(prediction_store, name_registry=name_registry)
+    resolve_cmd = ResolveCommand(prediction_store, name_registry=name_registry)
+    leaderboard_cmd = LeaderboardCommand(prediction_store, name_registry=name_registry)
+    for cmd in (predict_cmd, predictions_cmd, resolve_cmd, leaderboard_cmd):
+        dispatcher.register(cmd)
+        help_commands.append(cmd)
 
     admin_numbers = config.admin_numbers
     metrics_cmd = MetricsCommand(admin_numbers=admin_numbers)
@@ -554,6 +575,7 @@ def build_app(config: Config):
         context_registry=context_registry,
         llm_client=llm_client,
         reactor=reactor,
+        name_registry=name_registry,
     )
 
     from .commands.tools import BotCommandTools
@@ -619,6 +641,20 @@ def build_app(config: Config):
         f"Attachment cleanup scheduled (dir={attachments_dir}, "
         f"retention={retention_days}d)"
     )
+
+    # Prediction resolver: every 15 minutes, judge any due predictions and
+    # post the verdict. Structured (ticker+threshold) predictions get a
+    # live quote check; free-form claims go to the LLM. Failures keep the
+    # row pending for the next sweep.
+    from .predictions_resolver import PredictionResolver
+    prediction_resolver = PredictionResolver(
+        store=dispatcher.prediction_store,
+        provider_manager=provider_manager,
+        signal_handler=signal_handler,
+        llm_client=llm_client,
+    )
+    asyncio.run_coroutine_threadsafe(prediction_resolver.run_forever(), loop)
+    logger.info("Prediction resolver scheduled")
 
     # WebSocket message poller
     poller = SignalPoller(

@@ -26,6 +26,17 @@ class CommandContext:
     def is_group(self) -> bool:
         return self.group_id is not None
 
+    def context_key(self) -> str:
+        """Stable key identifying the conversation thread.
+
+        Group chats share a thread by group_id; DMs are scoped to the
+        hashed phone so phone-number changes don't fragment history.
+        """
+        from ..database import hash_phone
+        if self.group_id:
+            return f"group:{self.group_id}"
+        return f"dm:{hash_phone(self.sender)}"
+
 
 @dataclass
 class CommandResult:
