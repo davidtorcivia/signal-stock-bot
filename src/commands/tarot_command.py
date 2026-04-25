@@ -289,10 +289,16 @@ def ensure_deck_ready_async() -> None:
         _PREP_THREAD.start()
 
 
-SPREAD_ALIASES_THREE = {"3", "three", "ppf"}
-SPREAD_ALIASES_CELTIC = {"celtic", "cross", "celtic-cross", "celticcross", "10"}
-SPREAD_ALIASES_DAILY = {"daily", "today", "dotd", "day"}
-SPREAD_ALIASES_SINGLE = {"1", "one", "single", "draw"}
+# Word -> canonical spread name. The canonical names ("daily", "three",
+# "celtic", "single") are also accepted directly. Lookup is a single dict
+# get; previously had four parallel sets and four sequential `if x in ...`
+# checks.
+SPREAD_ALIAS_TO_KIND: dict[str, str] = {
+    **{w: "daily" for w in ("daily", "today", "dotd", "day")},
+    **{w: "three" for w in ("3", "three", "ppf")},
+    **{w: "celtic" for w in ("celtic", "cross", "celtic-cross", "celticcross", "10")},
+    **{w: "single" for w in ("1", "one", "single", "draw")},
+}
 
 
 class TarotCommand(BaseCommand):
@@ -332,18 +338,16 @@ class TarotCommand(BaseCommand):
                 return CommandResult.error("Couldn't reach the daily-card store.")
             draws = [Draw(card, reversed_, "Today")]
             spread_kind = "single"
-        elif spread == "three":
-            base = _draw_n(3)
-            draws = [Draw(d.card, d.reversed, p) for d, p in zip(base, THREE_CARD_POSITIONS)]
-            spread_kind = "three"
-        elif spread == "celtic":
-            base = _draw_n(10)
-            draws = [Draw(d.card, d.reversed, p) for d, p in zip(base, CELTIC_POSITIONS)]
-            spread_kind = "celtic"
-        else:  # single
-            d = _draw_n(1)[0]
-            draws = [Draw(d.card, d.reversed, None)]
-            spread_kind = "single"
+        else:
+            n_cards, positions, spread_kind = {
+                "three": (3, THREE_CARD_POSITIONS, "three"),
+                "celtic": (10, CELTIC_POSITIONS, "celtic"),
+                "single": (1, [None], "single"),
+            }[spread]
+            draws = [
+                Draw(d.card, d.reversed, p)
+                for d, p in zip(_draw_n(n_cards), positions)
+            ]
 
         # Compose the image off the event loop — PIL is blocking.
         try:
@@ -372,16 +376,11 @@ class TarotCommand(BaseCommand):
         if not args:
             return "single", None
         first = args[0].lower()
-        rest = args[1:]
-        if first in SPREAD_ALIASES_DAILY:
-            return "daily", " ".join(rest).strip() or None
-        if first in SPREAD_ALIASES_THREE:
-            return "three", " ".join(rest).strip() or None
-        if first in SPREAD_ALIASES_CELTIC:
-            return "celtic", " ".join(rest).strip() or None
-        if first in SPREAD_ALIASES_SINGLE:
-            return "single", " ".join(rest).strip() or None
-        # Otherwise treat the whole thing as a question on a single-card draw
+        kind = SPREAD_ALIAS_TO_KIND.get(first)
+        if kind is not None:
+            return kind, " ".join(args[1:]).strip() or None
+        # First word doesn't name a spread → treat the whole thing as a
+        # question on a single-card draw.
         return "single", " ".join(args).strip() or None
 
     @staticmethod

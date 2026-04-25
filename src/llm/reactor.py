@@ -102,13 +102,9 @@ class EmojiReactor:
         self._group_last: dict[str, float] = {}
 
     def _sender_label(self, phone: str) -> str:
-        tail = (phone or "")[-4:] or "????"
-        if self.name_registry is not None:
-            try:
-                return self.name_registry.display_name_sync(phone=phone, tail=tail)
-            except Exception:
-                pass
-        return f"...{tail}"
+        if self.name_registry is None:
+            return f"...{(phone or '')[-4:] or '????'}"
+        return self.name_registry.label_for(phone)
 
     def _config(self) -> dict:
         store = self.store

@@ -63,13 +63,9 @@ class PollVoter:
         self.bot_phone = bot_phone
 
     def _label(self, phone: Optional[str]) -> str:
-        tail = (phone or "")[-4:] or "????"
-        if self.name_registry is not None:
-            try:
-                return self.name_registry.display_name_sync(phone=phone, tail=tail)
-            except Exception:
-                pass
-        return f"...{tail}"
+        if self.name_registry is None:
+            return f"...{(phone or '')[-4:] or '????'}"
+        return self.name_registry.label_for(phone)
 
     async def _build_context_block(self, group_id: str, ctx_count: int = 12) -> str:
         if not self.group_log or ctx_count <= 0:

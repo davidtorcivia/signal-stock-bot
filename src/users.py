@@ -128,6 +128,20 @@ class NameRegistry:
             return f"...{phone[-4:]}"
         return "...?"
 
+    def label_for(self, phone: Optional[str]) -> str:
+        """Phone-only convenience wrapper: returns name or `...tail`.
+
+        Consolidates the same `(tail, registry.display_name_sync, fallback)`
+        pattern that ask, reactor, and poll-voter were each reimplementing.
+        Swallows lookup errors — there's no caller-meaningful difference
+        between "registry unavailable" and "no name registered".
+        """
+        tail = (phone or "")[-4:] or "????"
+        try:
+            return self.display_name_sync(phone=phone, tail=tail)
+        except Exception:
+            return f"...{tail}"
+
     async def display_name(
         self,
         *,

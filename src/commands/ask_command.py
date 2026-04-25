@@ -12,6 +12,7 @@ The command's registered name is always "ask"; an admin-chosen alias from
 `ask_command_name` is added at dispatch time so users can rename it live.
 """
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -117,25 +118,25 @@ class AskCommand(BaseCommand):
             header = "Recent group chat (oldest first; senders by name when known, last-4 otherwise):"
         else:
             header = "Recent group chat (oldest first, senders shown by last 4 digits):"
+
+        # Enrich messages concurrently. _enrich short-circuits on empty
+        # input so empty cells cost ~nothing; gathering avoids 30 sequential
+        # awaits stacking up on the LLM hot path.
+        raw_texts = [(m["text"] or "").strip() for m in msgs]
+        enriched = await asyncio.gather(*(self._enrich(t) for t in raw_texts))
+
         lines = [header]
-        for m in msgs:
-            label = self._sender_label(m["sender"])
-            text = (m["text"] or "").strip()
+        for m, text in zip(msgs, enriched):
             if not text:
                 continue
-            text = await self._enrich(text)
-            text = text.replace("\n", " ")
-            lines.append(f"  [{label}] {text}")
+            label = self._sender_label(m["sender"])
+            lines.append(f"  [{label}] {text.replace(chr(10), ' ')}")
         return "\n".join(lines)
 
-    def _sender_label(self, phone: str) -> str:
-        tail = (phone or "")[-4:] or "????"
-        if self.name_registry is not None:
-            try:
-                return self.name_registry.display_name_sync(phone=phone, tail=tail)
-            except Exception:
-                pass
-        return f"...{tail}"
+    def _sender_label(self, phone: Optional[str]) -> str:
+        if self.name_registry is None:
+            return f"...{(phone or '')[-4:] or '????'}"
+        return self.name_registry.label_for(phone)
 
     def _collect_tools(self, policy=None) -> Optional[list[dict]]:
         schemas: list[dict] = []
@@ -293,10 +294,16 @@ class AskCommand(BaseCommand):
             # Re-enrich each prior turn — bot/user messages stored before
             # the enricher existed (or stored with a failed enrichment)
             # would otherwise reach the LLM as bare URLs it can't open.
-            for msg in prior:
-                content = msg.get("content")
-                if isinstance(content, str):
-                    msg["content"] = await self._enrich(content)
+            # Gathered: with 30-turn history this matters on the LLM hot path.
+            text_msgs = [
+                m for m in prior if isinstance(m.get("content"), str)
+            ]
+            if text_msgs:
+                enriched = await asyncio.gather(
+                    *(self._enrich(m["content"]) for m in text_msgs)
+                )
+                for m, new_content in zip(text_msgs, enriched):
+                    m["content"] = new_content
 
             group_ctx = await self._build_group_context(ctx)
 

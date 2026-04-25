@@ -52,14 +52,24 @@ class Draw:
     position: Optional[str] = None  # e.g. "Past", "Crowning", "Outcome"
 
 
+# Resized PIL Image cache, keyed by (slug, reversed). Cards are static and
+# the deck is bounded at 78 × 2 = 156 entries (~25 MB at 240×402 RGB), so
+# we hold them all in memory once loaded. A celtic cross used to do 10
+# disk reads + 10 LANCZOS resizes per call; now they're a dict lookup.
+_CARD_CACHE: dict[tuple[str, bool], Image.Image] = {}
+
+
 def _load_card(card: Card, reversed: bool) -> Image.Image:
+    key = (card.slug, reversed)
+    cached = _CARD_CACHE.get(key)
+    if cached is not None:
+        return cached
     path = ASSETS_DIR / f"{card.slug}.jpg"
-    if not path.exists():
-        raise FileNotFoundError(f"Tarot asset missing: {path}")
     img = Image.open(path).convert("RGB")
     img = img.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
     if reversed:
         img = img.rotate(180)
+    _CARD_CACHE[key] = img
     return img
 
 
