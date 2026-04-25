@@ -2,6 +2,7 @@
 Stock-related command implementations.
 """
 
+import logging
 import re
 from datetime import datetime
 from typing import Optional
@@ -9,6 +10,8 @@ from zoneinfo import ZoneInfo
 
 from .base import BaseCommand, CommandContext, CommandResult
 from ..providers import ProviderManager, SymbolNotFoundError, ProviderError
+
+logger = logging.getLogger(__name__)
 
 
 # Eastern Time zone for US market hours
@@ -415,41 +418,177 @@ class HelpCommand(BaseCommand):
     name = "help"
     aliases = ["h", "?", "commands"]
     description = "Show available commands"
-    usage = "!help [command]"
-    
-    def __init__(self, commands: list[BaseCommand], bot_name: str = "Stock Bot"):
+    usage = "!help [command | question]"
+
+    # Logical groupings for the bare `!help` listing. Each command name is
+    # mapped to a category; unknown commands fall into "Other". Order here
+    # is the display order of categories.
+    CATEGORIES: list[tuple[str, list[str]]] = [
+        ("Markets", [
+            "price", "quote", "info", "market", "crypto", "forex", "futures",
+            "option", "status",
+        ]),
+        ("Charts & TA", [
+            "chart", "ta", "tldr", "rsi", "sma", "macd", "support",
+        ]),
+        ("Earnings & News", ["earnings", "dividend", "news"]),
+        ("Watchlist & Alerts", ["watch", "alert"]),
+        ("Analytics", ["rating", "insider", "short", "corr"]),
+        ("Economy", ["economy"]),
+        ("Woo", ["tarot"]),
+        ("AI", ["ask"]),
+        ("System", ["help", "metrics", "cache", "admin"]),
+    ]
+
+    def __init__(
+        self,
+        commands: list[BaseCommand],
+        bot_name: str = "Stock Bot",
+        llm_client=None,
+    ):
         self._commands = {cmd.name: cmd for cmd in commands}
         self.bot_name = bot_name
-    
+        self.llm = llm_client
+
+    def _visible_commands(self, policy) -> dict[str, BaseCommand]:
+        """Filter the registry by the chat's command policy.
+
+        Without a policy (e.g. internal tests, fully open default), all
+        commands are visible. With a policy, denied commands are dropped.
+        """
+        if policy is None:
+            return dict(self._commands)
+        return {
+            name: cmd
+            for name, cmd in self._commands.items()
+            if policy.allows_command(name)
+        }
+
     async def execute(self, ctx: CommandContext) -> CommandResult:
-        if ctx.args:
-            # Help for specific command
+        visible = self._visible_commands(ctx.policy)
+
+        if not ctx.args:
+            return self._render_overview(visible)
+
+        # Single-token arg that matches a visible command → detailed help
+        if len(ctx.args) == 1:
             cmd_name = ctx.args[0].lower()
-            
-            for cmd in self._commands.values():
+            for cmd in visible.values():
                 if cmd.matches(cmd_name):
-                    aliases = f"\nAliases: {', '.join(cmd.aliases)}" if cmd.aliases else ""
+                    aliases = (
+                        f"\nAliases: {', '.join(cmd.aliases)}"
+                        if cmd.aliases else ""
+                    )
                     return CommandResult.ok(
                         f"⌘ !{cmd.name}{aliases}\n\n"
                         f"{cmd.description}\n\n"
                         f"Usage: {cmd.usage}"
                     )
-            
-            return CommandResult.error(f"Unknown command: {cmd_name}")
-        
-        # General help
-        lines = [f"⌘ {self.bot_name} Commands", ""]
-        
-        for cmd in self._commands.values():
-            if cmd.name != "help":
-                lines.append(f"!{cmd.name} - {cmd.description}")
-        
-        lines.append(f"!help - {self.description}")
+            # Single-token arg that names a known-but-denied command
+            if cmd_name in self._commands:
+                return CommandResult.error(
+                    f"!{cmd_name} isn't available in this chat. "
+                    f"Try !help to see what is."
+                )
+
+        # Anything else — multi-word, or a single word that doesn't match a
+        # command — is treated as a natural-language help question. Route
+        # to the LLM if available; otherwise nudge the user toward !help.
+        return await self._answer_question(visible, " ".join(ctx.args))
+
+    def _render_overview(self, visible: dict[str, BaseCommand]) -> CommandResult:
+        """Group-by-category listing of every command visible in this chat."""
+        if not visible:
+            return CommandResult.ok(
+                f"⌘ {self.bot_name}\n\nNo commands available in this chat."
+            )
+
+        # Bucket commands by category; preserve declaration order within each.
+        seen: set[str] = set()
+        buckets: list[tuple[str, list[BaseCommand]]] = []
+        for category, names in self.CATEGORIES:
+            entries = []
+            for name in names:
+                if name in visible and name not in seen:
+                    entries.append(visible[name])
+                    seen.add(name)
+            if entries:
+                buckets.append((category, entries))
+
+        # Anything not categorized
+        leftovers = [c for n, c in visible.items() if n not in seen]
+        if leftovers:
+            buckets.append(("Other", leftovers))
+
+        lines = [f"⌘ {self.bot_name} — available here:"]
+        for category, entries in buckets:
+            lines.append("")
+            lines.append(f"› {category}")
+            for cmd in entries:
+                lines.append(f"  !{cmd.name} — {cmd.description}")
+
         lines.append("")
-        lines.append("› Tip: Type $AAPL in any message for quick lookup")
-        lines.append("Type !help <command> for detailed usage")
-        
+        lines.append("› Tips")
+        lines.append("  $AAPL in any message for a quick price")
+        lines.append("  !help <command> for detailed usage")
+        lines.append("  !help <question> to ask in plain language")
+
         return CommandResult.ok("\n".join(lines))
+
+    async def _answer_question(
+        self,
+        visible: dict[str, BaseCommand],
+        question: str,
+    ) -> CommandResult:
+        """LLM-backed natural-language help. Falls back when LLM is off."""
+        if self.llm is None:
+            return CommandResult.error(
+                f"I don't recognize that. Try !help to see what's available."
+            )
+        try:
+            ready = self.llm.status().get("ready")
+        except Exception:
+            ready = False
+        if not ready:
+            return CommandResult.error(
+                f"I don't recognize that. Try !help to see what's available."
+            )
+
+        catalog_lines = []
+        for cmd in visible.values():
+            aliases = f" (also: {', '.join('!' + a for a in cmd.aliases)})" if cmd.aliases else ""
+            catalog_lines.append(
+                f"- !{cmd.name}{aliases} — {cmd.description}\n  usage: {cmd.usage}"
+            )
+        catalog = "\n".join(catalog_lines)
+
+        system_prompt = (
+            f"You are the help assistant for {self.bot_name}, a Signal chat bot.\n"
+            f"The user is asking a question about how to use the bot.\n\n"
+            f"Rules:\n"
+            f"- ONLY recommend commands from the catalog below. They are the "
+            f"  ones permitted in this specific chat — do not invent or "
+            f"  reference commands outside this list.\n"
+            f"- If no listed command fits, say so plainly and suggest the "
+            f"  closest alternative or ask a clarifying question.\n"
+            f"- Be brief: this is a phone group chat. 1–3 short sentences. "
+            f"  Show the exact command syntax inline (e.g. `!price AAPL`).\n"
+            f"- No preamble, no restating the question.\n\n"
+            f"Available commands in this chat:\n{catalog}"
+        )
+        try:
+            answer = await self.llm.chat(
+                user_message=question,
+                system_override=system_prompt,
+            )
+            answer = (answer or "").strip()
+            if answer:
+                return CommandResult.ok(answer)
+        except Exception as e:
+            logger.warning(f"help: LLM answer failed: {e}")
+        return CommandResult.error(
+            f"I don't recognize that. Try !help to see what's available."
+        )
 
 
 class StatusCommand(BaseCommand):

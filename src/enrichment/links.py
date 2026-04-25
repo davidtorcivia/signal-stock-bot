@@ -236,7 +236,11 @@ class RichLinkExpander:
             *(self._fetch(u) for u in unique),
             return_exceptions=False,
         )
-        snippets = [r for r in results if r]
+        # Idempotency: drop snippets already inlined in `text`. Lets us
+        # re-run expand() on already-enriched messages without doubling
+        # the snippets — required for the "always enrich at LLM boundary"
+        # invariant.
+        snippets = [r for r in results if r and r not in text]
         if not snippets:
             return text
 

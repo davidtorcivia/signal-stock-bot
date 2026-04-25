@@ -64,6 +64,7 @@ from .commands import (
     AlertCommand,
     WatchCommand,
     AskCommand,
+    TarotCommand,
 )
 from .signal import SignalHandler, SignalConfig, SignalPoller
 from .server import create_app
@@ -257,6 +258,20 @@ def create_dispatcher(
         dispatcher.register(ask_command)
         help_commands.append(ask_command)
 
+    tarot_cmd = TarotCommand(
+        db_path=config.watchlist_db_path,
+        llm_client=llm_client,
+    )
+    dispatcher.register(tarot_cmd)
+    help_commands.append(tarot_cmd)
+
+    # Kick off a background download of the RWS deck if the persistent
+    # data/tarot/ volume is missing cards. First start on a fresh volume
+    # takes ~90s; subsequent starts are an instant no-op. The !tarot
+    # command returns a friendly "still preparing" message until done.
+    from .commands.tarot_command import ensure_deck_ready_async
+    ensure_deck_ready_async()
+
     admin_numbers = config.admin_numbers
     metrics_cmd = MetricsCommand(admin_numbers=admin_numbers)
     cache_cmd = CacheCommand(admin_numbers=admin_numbers)
@@ -269,10 +284,97 @@ def create_dispatcher(
     dispatcher.register(cache_cmd)
     dispatcher.register(admin_cmd)
 
-    help_cmd = HelpCommand(help_commands, config.bot_name)
+    help_cmd = HelpCommand(help_commands, config.bot_name, llm_client=llm_client)
     dispatcher.register(help_cmd)
 
     return dispatcher
+
+
+async def _attachment_cleanup_worker(
+    attachments_dir: str,
+    retention_days: int = 14,
+    sweep_interval_hours: int = 24,
+):
+    """Periodically delete attachments older than `retention_days`.
+
+    signal-cli writes every inbound and outbound attachment to its own data
+    directory and never garbage-collects them. With heavy use (charts,
+    tarot spreads, link previews) the dir grows without bound. We prune
+    files whose mtime is older than the retention window — old enough that
+    no in-flight message could plausibly still be referencing them.
+
+    Implementation notes:
+      * Sweep runs once at startup, then every `sweep_interval_hours`.
+      * Errors per-file (permission, race) are logged but don't stop the sweep.
+      * Errors per-iteration are logged and the worker keeps running on the
+        next interval — never crashes the loop.
+    """
+    log = logging.getLogger(__name__)
+    log.info(
+        f"Attachment cleanup worker started "
+        f"(dir={attachments_dir}, retention={retention_days}d, "
+        f"interval={sweep_interval_hours}h)"
+    )
+    interval_seconds = sweep_interval_hours * 3600
+
+    while True:
+        try:
+            await asyncio.to_thread(
+                _sweep_attachments_once, attachments_dir, retention_days, log
+            )
+        except asyncio.CancelledError:
+            log.info("Attachment cleanup worker cancelled")
+            raise
+        except Exception as e:
+            log.error(f"Attachment cleanup error: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
+def _sweep_attachments_once(
+    attachments_dir: str,
+    retention_days: int,
+    log: logging.Logger,
+) -> None:
+    """Single-shot sweep — runs in a thread because os.walk is blocking."""
+    import time
+
+    path = Path(attachments_dir)
+    if not path.is_dir():
+        log.debug(f"Attachment cleanup: {path} not present, skipping")
+        return
+
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    bytes_freed = 0
+    errors = 0
+
+    for entry in path.iterdir():
+        if not entry.is_file():
+            continue
+        try:
+            stat = entry.stat()
+        except OSError:
+            errors += 1
+            continue
+        if stat.st_mtime >= cutoff:
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+            bytes_freed += stat.st_size
+        except OSError as e:
+            errors += 1
+            log.debug(f"Could not remove {entry.name}: {e}")
+
+    if removed:
+        log.info(
+            f"Attachment cleanup: removed {removed} files "
+            f"({bytes_freed // 1024} KB), errors={errors}"
+        )
+    else:
+        log.debug(
+            f"Attachment cleanup: nothing to remove (errors={errors})"
+        )
 
 
 async def _alert_worker(alerts_db, provider_manager, signal_handler):
@@ -468,6 +570,18 @@ def build_app(config: Config):
     # Same late-binding trick: ask_command needs the handler to drive the
     # typing indicator while its tool loop runs.
     ask_command.signal_handler = signal_handler
+
+    # Auto-vote on inbound polls. Bot picks option(s) via the LLM using
+    # recent group context. No policy gate — per the user's request, every
+    # poll the bot sees gets a vote (skipping self-authored ones).
+    from .signal.poll_voter import PollVoter
+    signal_handler.poll_voter = PollVoter(
+        llm_client=llm_client,
+        signal_handler=signal_handler,
+        group_log=group_log,
+        name_registry=name_registry,
+        bot_phone=config.signal_phone_number,
+    )
     tail = config.signal_phone_number[-4:] if config.signal_phone_number else "????"
     logger.info(f"Signal handler configured for ...{tail}")
 
@@ -488,6 +602,23 @@ def build_app(config: Config):
         loop,
     )
     logger.info("Background alert worker scheduled")
+
+    # Periodic cleanup of signal-cli's attachment cache. The cache lives on
+    # the persistent volume and grows without bound (signal-cli never
+    # collects). Default: prune anything older than 14 days, sweep daily.
+    # Override via env (SIGNAL_ATTACHMENT_RETENTION_DAYS).
+    attachments_dir = str(
+        Path(config.watchlist_db_path).parent / "signal-cli" / "attachments"
+    )
+    retention_days = int(os.getenv("SIGNAL_ATTACHMENT_RETENTION_DAYS", "14"))
+    asyncio.run_coroutine_threadsafe(
+        _attachment_cleanup_worker(attachments_dir, retention_days=retention_days),
+        loop,
+    )
+    logger.info(
+        f"Attachment cleanup scheduled (dir={attachments_dir}, "
+        f"retention={retention_days}d)"
+    )
 
     # WebSocket message poller
     poller = SignalPoller(

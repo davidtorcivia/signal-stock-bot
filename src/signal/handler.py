@@ -61,6 +61,9 @@ class SignalHandler:
         self._bot_uuid: Optional[str] = None  # Fetched on first use
         self._group_id_map: dict[str, str] = {}
         self._group_map_lock = asyncio.Lock()
+        # PollVoter is injected post-construction (avoids circular deps with
+        # the LLM client / group log). When None, inbound polls are ignored.
+        self.poll_voter = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -241,6 +244,64 @@ class SignalHandler:
             logger.error(f"Reaction send error: {e}")
             return False
 
+    async def send_poll_vote(
+        self,
+        *,
+        poll_author: str,
+        poll_timestamp: int,
+        selected_answers: list[int],
+        group_id: Optional[str] = None,
+        recipient: Optional[str] = None,
+    ) -> bool:
+        """Cast a vote on a poll the bot has seen.
+
+        signal-cli-rest-api endpoint: POST /v1/polls/{number}/vote
+        Body shape:
+          {
+            "poll_author": "<phone or uuid>",
+            "poll_timestamp": "<stringified ms>",
+            "recipient": "<phone or group id>",
+            "selected_answers": [int, ...]
+          }
+
+        Note `poll_timestamp` is a STRING in the REST schema even though it
+        represents a millisecond integer; sending it as an int returns
+        "invalid request".
+        """
+        if not selected_answers:
+            return False
+        target = (
+            await self._resolve_group_id(group_id) if group_id else (recipient or "")
+        )
+        if not target:
+            logger.warning("send_poll_vote called with no recipient/group")
+            return False
+
+        session = await self._get_session()
+        payload = {
+            "poll_author": poll_author,
+            "poll_timestamp": str(int(poll_timestamp)),
+            "recipient": target,
+            "selected_answers": list(selected_answers),
+        }
+        url = f"{self.config.api_url}/v1/polls/{self.config.phone_number}/vote"
+        try:
+            async with session.post(url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status not in (200, 201, 204):
+                    logger.warning(
+                        f"Poll vote failed: {resp.status} {body[:200]} payload={payload}"
+                    )
+                    return False
+                logger.info(
+                    f"Poll vote sent: options={selected_answers} "
+                    f"author={poll_author[-6:]} ts={poll_timestamp}"
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Poll vote send error: {e}")
+            return False
+
     async def send_typing(
         self,
         recipient: str,
@@ -318,12 +379,19 @@ class SignalHandler:
         """
         Check if the bot is mentioned in the message.
 
-        Two paths count as a mention:
+        Three paths count as a mention:
           1. Signal's structured @-mention (matched by phone or UUID).
           2. The configured bot_name appearing as a whole word in the
              message text — e.g. "hey Sigil, what's AAPL?". Whole-word,
              case-insensitive so casual references like "Sigil!" or
              "Sigil," still match without grabbing substrings.
+          3. A quote-reply to one of the bot's own messages. If a user
+             swipes-to-reply on something the bot said, that's a direct
+             address even without an @-mention or name mention — treat
+             it as if the bot were mentioned so conversation flows
+             naturally. Without this, follow-ups like "expand on that"
+             or "are you sure?" would silently fall to the floor in a
+             group chat.
         """
         # 1) Structured @-mention
         mentions = data_message.get("mentions") or []
@@ -348,6 +416,18 @@ class SignalHandler:
             ):
                 return True
 
+        # 3) Quote-reply to a bot message
+        quote = data_message.get("quote") or {}
+        quote_author_number = quote.get("authorNumber") or ""
+        quote_author_uuid = quote.get("authorUuid") or quote.get("author") or ""
+        if quote_author_number or quote_author_uuid:
+            if not self._bot_uuid:
+                await self.fetch_bot_uuid()
+            if quote_author_number and quote_author_number == self.config.phone_number:
+                return True
+            if self._bot_uuid and quote_author_uuid == self._bot_uuid:
+                return True
+
         return False
     
     async def handle_webhook(self, data: dict):
@@ -367,6 +447,20 @@ class SignalHandler:
         # dataMessage.timestamp is the canonical "message id" — prefer it when
         # present; otherwise fall back to the envelope timestamp.
         message_ts = data_message.get("timestamp") or target_timestamp
+
+        # Polls arrive with `pollCreate` populated and `message` = null. The
+        # bot's normal command path can't reach them, so we branch off into a
+        # dedicated path that calls the LLM to choose option(s) and casts a
+        # vote. Don't return immediately though — a `pollCreate` envelope
+        # doesn't carry text to dispatch, so falling through to the normal
+        # path is fine (it'll be filtered by the empty-text check below).
+        if data_message.get("pollCreate") and self.poll_voter is not None:
+            try:
+                asyncio.create_task(
+                    self.poll_voter.handle_poll(envelope, data_message)
+                )
+            except Exception as e:
+                logger.error(f"Poll handler launch failed: {e}")
 
         # Skip empty messages or non-text messages
         if not sender or not message_text:

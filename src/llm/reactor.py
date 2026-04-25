@@ -53,20 +53,30 @@ REACT_TOOL = {
 DEFAULT_REACTOR_PROMPT = """\
 You decide whether to react to messages in a Signal group chat with a single emoji.
 
-React when the message:
-- Expresses strong sentiment (excitement, frustration, win, loss)
-- Shares a notable moment, milestone, or punchline
-- Asks for acknowledgement (a "good morning", a confession, a check-in)
-- Is an interesting link, source, or piece of information
-- Is a good point that was made
-- Is a question that can be answered with an emoji react
+React when the message clearly carries:
+- Strong sentiment (excitement, frustration, joy, grief, anger, awe)
+- A notable moment, milestone, or punchline worth acknowledging
+- A small social ritual that wants a nod ("good morning", a confession,
+  a check-in)
+- A question that can be honestly answered with a single emoji
+- A specific emotion you can name and match — surprise, disgust, love,
+  relief, schadenfreude, etc.
 
 Do NOT react when:
-- The message is short, transactional, or asks a question expecting a real reply
-- It's about logistics, scheduling, or routine updates
-- It's already being answered by the bot
+- The message is short, transactional, or expects a written reply
+- It's logistics, scheduling, or a routine update
+- The bot is already answering it
+- The only thing that fits is a generic "thinking" emoji. Reacting with
+  🤔 to a shared link or tweet is a tell that you didn't have a real
+  reaction — skip it.
 
-Call the emoji_react tool with a SINGLE emoji that fits. Otherwise, don't call any tool."""
+Match the emoji to the actual content, not its category. A tweet about a
+housing crash isn't 🤔, it's 🏚 or 😬 or 💀 depending on tone. A link to a
+recipe isn't 🤔, it's 🍳 or 😋. If nothing specific fits, don't react —
+silence is correct here far more often than a vague hum.
+
+Call the emoji_react tool with a SINGLE emoji that fits. Otherwise, don't
+call any tool."""
 
 
 class EmojiReactor:

@@ -14,6 +14,7 @@ hash function matches the one in `database.py` (sha256 of the phone).
 """
 
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
@@ -35,6 +36,40 @@ class NameRegistry:
         # avoids hitting sqlite for every history-replay attribution.
         self._cache: dict[str, str] = {}
         self._cache_loaded = False
+        # Eager sync warm-up. Without this, display_name_sync returns the
+        # `...tail` fallback until something async wakes the registry —
+        # but the consumers (ask, reactor, history) are all sync and
+        # never await display_name(), so the cache would stay cold for
+        # the whole bot lifetime under normal traffic. Sync sqlite is
+        # used here because __init__ can't be async; the table CREATE is
+        # idempotent and tiny so this is safe to do at boot.
+        self._warm_cache_sync()
+
+    def _warm_cache_sync(self) -> None:
+        """Load names into the cache via blocking sqlite3 — runs once at init."""
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_names (
+                        user_hash TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                rows = conn.execute(
+                    "SELECT user_hash, name FROM user_names"
+                ).fetchall()
+            self._cache = {r[0]: r[1] for r in rows}
+            self._cache_loaded = True
+            self._initialized = True  # async path can skip the table creation
+            logger.info(f"NameRegistry warm-up loaded {len(self._cache)} names")
+        except Exception as e:
+            # Don't fail bot startup if warm-up trips — async path will
+            # retry on first read/write.
+            logger.warning(f"NameRegistry warm-up failed: {e}")
 
     async def _ensure_initialized(self) -> None:
         if self._initialized:

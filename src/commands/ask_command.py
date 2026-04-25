@@ -88,6 +88,24 @@ class AskCommand(BaseCommand):
         except (TypeError, ValueError):
             return DEFAULT_MAX_TOOL_ROUNDS
 
+    async def _enrich(self, text: str) -> str:
+        """Best-effort, idempotent re-enrichment at LLM-feed boundaries.
+
+        We never want the model to receive a bare URL it can't open. Every
+        text fragment routed into the LLM context goes through this helper,
+        even fragments stored before the enricher existed or fragments
+        whose original write-time enrichment failed. The expanders are
+        idempotent (skip URLs whose snippet is already inline) and cached,
+        so repeated calls are cheap.
+        """
+        if self.enricher is None or not text:
+            return text
+        try:
+            return await self.enricher.expand(text)
+        except Exception as e:
+            logger.debug(f"Read-time enrichment failed: {e}")
+            return text
+
     async def _build_group_context(self, ctx) -> str:
         limit = self._live_group_ctx()
         if limit <= 0 or not ctx.is_group or self.group_log is None:
@@ -102,9 +120,12 @@ class AskCommand(BaseCommand):
         lines = [header]
         for m in msgs:
             label = self._sender_label(m["sender"])
-            text = (m["text"] or "").replace("\n", " ").strip()
-            if text:
-                lines.append(f"  [{label}] {text}")
+            text = (m["text"] or "").strip()
+            if not text:
+                continue
+            text = await self._enrich(text)
+            text = text.replace("\n", " ")
+            lines.append(f"  [{label}] {text}")
         return "\n".join(lines)
 
     def _sender_label(self, phone: str) -> str:
@@ -261,11 +282,7 @@ class AskCommand(BaseCommand):
 
         # Inline-expand any tweet/URL links the user pasted so the LLM
         # gets the substance, not just an opaque URL.
-        if self.enricher is not None:
-            try:
-                question = await self.enricher.expand(question)
-            except Exception as e:
-                logger.debug(f"Question enrichment failed: {e}")
+        question = await self._enrich(question)
 
         try:
             prior = await self.history.load(
@@ -273,6 +290,14 @@ class AskCommand(BaseCommand):
                 turns_per_user=self._live_turns(),
                 attribute_senders=is_group,
             )
+            # Re-enrich each prior turn — bot/user messages stored before
+            # the enricher existed (or stored with a failed enrichment)
+            # would otherwise reach the LLM as bare URLs it can't open.
+            for msg in prior:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = await self._enrich(content)
+
             group_ctx = await self._build_group_context(ctx)
 
             # Long-term rolling summary, if one exists. Prepended to the
@@ -283,14 +308,40 @@ class AskCommand(BaseCommand):
             try:
                 summary = await self.history.get_summary(context_key)
                 if summary and summary.get("summary"):
+                    summary_text = await self._enrich(summary["summary"])
                     summary_block = (
                         "Conversation memory (rolling summary of older "
-                        "turns):\n" + summary["summary"]
+                        "turns):\n" + summary_text
                     )
             except Exception as e:
                 logger.debug(f"Failed to load summary for ask: {e}")
 
-            system_suffix_parts = [p for p in (summary_block, group_ctx) if p]
+            # When real names are registered for this chat, tell the LLM
+            # explicitly. Without this, the model parrots earlier turns
+            # where it (correctly at the time) said it didn't know names —
+            # the registry was added later, so its own past output is
+            # stale and contradicts the current capability.
+            names_directive = ""
+            if (
+                is_group
+                and self.name_registry is not None
+                and self.name_registry._cache
+            ):
+                names_directive = (
+                    "Identity note: real names are now available for "
+                    "registered users in this chat. They appear in [Name] "
+                    "brackets in user messages and group context (e.g. "
+                    "[David], [Taylor]). Use those names when referring "
+                    "to people. If you see earlier turns where you "
+                    "claimed not to know names or referred to users by "
+                    "four-digit codes (...4137 etc.), disregard that — "
+                    "it reflects an old system limitation that has been "
+                    "resolved."
+                )
+
+            system_suffix_parts = [
+                p for p in (names_directive, summary_block, group_ctx) if p
+            ]
             system_suffix = "\n\n".join(system_suffix_parts) or None
 
             prompt_override = None
@@ -316,7 +367,7 @@ class AskCommand(BaseCommand):
                     if ctx.quote_author
                     else "earlier"
                 )
-                quoted = ctx.quote_text.replace("\n", " ").strip()
+                quoted = (await self._enrich(ctx.quote_text)).replace("\n", " ").strip()
                 if len(quoted) > 400:
                     quoted = quoted[:399].rstrip() + "…"
                 current_user_content = (

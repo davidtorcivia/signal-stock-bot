@@ -20,6 +20,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY src/ src/
 
+# Tarot deck downloader. The deck itself lives under ./data/tarot/ which is
+# bind-mounted from the host as a persistent volume, so a fresh clone
+# downloads once and rebuilds reuse the existing cards. The bot triggers
+# this script in a background thread on startup if any cards are missing.
+COPY scripts/download_tarot.py scripts/download_tarot.py
+
 # Create logs directory
 RUN mkdir -p logs
 

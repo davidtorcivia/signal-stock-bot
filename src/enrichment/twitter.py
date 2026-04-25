@@ -142,7 +142,12 @@ class TwitterExpander:
             *(self._fetch(tid) for tid in unique),
             return_exceptions=False,
         )
-        snippets = [r for r in results if r]
+        # Idempotency: drop snippets whose content is already inlined in
+        # `text` (because expand() was called on it previously). Without
+        # this, re-running expand() on stored, already-enriched messages
+        # — which happens at every LLM feed boundary — would double the
+        # snippets each pass.
+        snippets = [r for r in results if r and r not in text]
         if not snippets:
             return text
 

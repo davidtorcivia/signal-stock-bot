@@ -50,6 +50,7 @@ from .watchlist_commands import (
     WatchCommand,
 )
 from .ask_command import AskCommand
+from .tarot_command import TarotCommand
 
 __all__ = [
     "BaseCommand",
@@ -96,4 +97,6 @@ __all__ = [
     "WatchCommand",
     # LLM
     "AskCommand",
+    # Woo
+    "TarotCommand",
 ]

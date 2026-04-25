@@ -50,7 +50,9 @@ logs/
 .env.local
 .env.*.local
 
-# Signal data (contains sensitive keys)
+# Signal data (contains sensitive keys) and runtime assets
+# (tarot deck images live under data/tarot/, populated by
+# scripts/download_tarot.py on first startup)
 data/
 
 # Admin password hash
