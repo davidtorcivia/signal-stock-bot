@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}Live{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>Live activity</h1>
+    <p class="muted" style="font-size: 12px;">
+        Streaming events from the dispatcher, signal handler, and reactor.
+        Recent history is replayed on connect; new events arrive as they happen.
+    </p>
+    <p style="font-size: 12px;">
+        <label><input type="checkbox" id="autoscroll" checked> Auto-scroll</label>
+        &nbsp;
+        <label><input type="checkbox" data-filter="inbound" checked> inbound</label>
+        <label><input type="checkbox" data-filter="outbound" checked> outbound</label>
+        <label><input type="checkbox" data-filter="reactor" checked> reactor</label>
+        &nbsp;
+        <button class="btn" id="clear">Clear</button>
+        &nbsp;
+        <span id="conn" class="muted">connecting…</span>
+    </p>
+</div>
+
+<div class="panel" id="feed-panel">
+    <div id="feed" style="font-family: monospace; font-size: 13px; line-height: 1.5; max-height: 70vh; overflow-y: auto;"></div>
+</div>
+
+<style>
+    .ev { padding: 4px 8px; border-bottom: 1px solid #2a2a2a; }
+    .ev .ts { color: #777; font-size: 11px; margin-right: 8px; }
+    .ev .who { font-weight: bold; margin-right: 6px; }
+    .ev .body { white-space: pre-wrap; word-break: break-word; }
+    .ev .meta { color: #888; font-size: 11px; margin-left: 6px; }
+    .ev.inbound  .who { color: #6cc; }
+    .ev.outbound .who { color: #c8e; }
+    .ev.reactor  .who { color: #cc6; }
+    .ev.error    .who { color: #e66; }
+    .ev.hidden { display: none; }
+</style>
+
+<script>
+(function () {
+    const feed = document.getElementById('feed');
+    const conn = document.getElementById('conn');
+    const auto = document.getElementById('autoscroll');
+    const filters = {};
+    document.querySelectorAll('[data-filter]').forEach(cb => {
+        filters[cb.dataset.filter] = cb.checked;
+        cb.addEventListener('change', () => {
+            filters[cb.dataset.filter] = cb.checked;
+            document.querySelectorAll('.ev').forEach(el => {
+                if (filters[el.dataset.type] === false) el.classList.add('hidden');
+                else el.classList.remove('hidden');
+            });
+        });
+    });
+    document.getElementById('clear').addEventListener('click', () => {
+        feed.innerHTML = '';
+    });
+
+    function fmt(ev) {
+        const d = new Date(ev.ts * 1000);
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        const ss = String(d.getSeconds()).padStart(2, '0');
+        const ts = `${hh}:${mm}:${ss}`;
+
+        const row = document.createElement('div');
+        row.className = `ev ${ev.type}`;
+        row.dataset.type = ev.type;
+        if (filters[ev.type] === false) row.classList.add('hidden');
+
+        const tsSpan = document.createElement('span');
+        tsSpan.className = 'ts';
+        tsSpan.textContent = ts;
+        row.appendChild(tsSpan);
+
+        const who = document.createElement('span');
+        who.className = 'who';
+        if (ev.type === 'inbound') {
+            who.textContent = `← ${ev.sender_label || ('...'+(ev.sender_tail || '????'))}`;
+        } else if (ev.type === 'outbound') {
+            who.textContent = `→ ${ev.recipient_label || ('...'+(ev.recipient_tail || '????'))}`;
+        } else if (ev.type === 'reactor') {
+            who.textContent = `★ ${ev.sender_label || ('...'+(ev.sender_tail || '????'))}`;
+        } else {
+            who.textContent = `· ${ev.type}`;
+        }
+        row.appendChild(who);
+
+        const body = document.createElement('span');
+        body.className = 'body';
+        if (ev.type === 'reactor') {
+            body.textContent = ev.decision === 'react'
+                ? `reacted ${ev.emoji}`
+                : 'declined';
+        } else {
+            body.textContent = ev.text || '';
+        }
+        row.appendChild(body);
+
+        const meta = document.createElement('span');
+        meta.className = 'meta';
+        const bits = [];
+        if (ev.group_id) bits.push(`group ${(ev.group_id || '').slice(0, 12)}`);
+        if (ev.mentioned) bits.push('@mention');
+        if (ev.quoted) bits.push('reply');
+        if (ev.styled) bits.push('styled');
+        if (ev.attachments) bits.push(`${ev.attachments} att`);
+        if (bits.length) meta.textContent = ' [' + bits.join(', ') + ']';
+        row.appendChild(meta);
+
+        return row;
+    }
+
+    function append(ev) {
+        const row = fmt(ev);
+        feed.appendChild(row);
+        if (auto.checked) feed.scrollTop = feed.scrollHeight;
+    }
+
+    const src = new EventSource('{{ url_for("admin.live_stream") }}');
+    src.onopen = () => { conn.textContent = 'live'; conn.style.color = '#6c6'; };
+    src.onerror = () => { conn.textContent = 'reconnecting…'; conn.style.color = '#c66'; };
+    src.onmessage = (msg) => {
+        try { append(JSON.parse(msg.data)); }
+        catch (e) { console.error('bad event', e, msg.data); }
+    };
+})();
+</script>
+
+{% endblock %}

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .base import BaseCommand, CommandContext, CommandResult
 from ..cache import get_metrics
+from ..admin.events import get_bus
 
 logger = logging.getLogger(__name__)
 
@@ -216,11 +217,25 @@ class CommandDispatcher:
         group_id: Optional[str] = None,
         mentioned: bool = False,
         target_timestamp: Optional[int] = None,
+        quote_text: Optional[str] = None,
+        quote_author: Optional[str] = None,
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
         """
         self._refresh_live_settings()
+
+        # Stream a structured event to the live admin viewer. Cheap, lossy,
+        # never blocks. Sender name resolution lives in ask/reactor; here we
+        # just hand over the raw tail.
+        get_bus().publish(
+            "inbound",
+            sender_tail=(sender or "")[-4:],
+            group_id=group_id,
+            mentioned=mentioned,
+            quoted=bool(quote_text),
+            text=message[:240],
+        )
 
         # Cap oversized messages early — protects the regex/NLP path
         if len(message) > self.max_message_length:
@@ -302,27 +317,36 @@ class CommandDispatcher:
                     parsed = self.parse_message(cmd_str)
                     if parsed:
                         command, args = parsed
-                        result = await self._execute_command(command, args, sender, message, group_id, policy)
+                        result = await self._execute_command(
+                            command, args, sender, message, group_id, policy,
+                            quote_text=quote_text, quote_author=quote_author,
+                        )
                         if result:
                             results.append(result)
-                
+
                 if results:
                     return self._merge_results(results)
 
         # First try standard command parsing
         parsed = self.parse_message(message)
-        
+
         if parsed:
             command, args = parsed
-            return await self._execute_command(command, args, sender, message, group_id, policy)
-        
+            return await self._execute_command(
+                command, args, sender, message, group_id, policy,
+                quote_text=quote_text, quote_author=quote_author,
+            )
+
         # Try inline symbol detection if enabled
         if self.enable_inline_symbols:
             symbols = self.extract_inline_symbols(message)
             if symbols:
                 logger.info(f"Detected inline symbols: {symbols}")
                 # Route to price command
-                return await self._execute_command("price", symbols, sender, message, group_id, policy)
+                return await self._execute_command(
+                    "price", symbols, sender, message, group_id, policy,
+                    quote_text=quote_text, quote_author=quote_author,
+                )
         
         # Try natural language intent parsing
         # In groups: Only triggers if explicitly mentioned
@@ -352,6 +376,8 @@ class CommandDispatcher:
                     command="ask",
                     args=cleaned.split(),
                     policy=policy,
+                    quote_text=quote_text,
+                    quote_author=quote_author,
                 )
                 try:
                     return await self.ask_command.execute(synthetic_ctx)
@@ -565,6 +591,8 @@ class CommandDispatcher:
         raw_message: str,
         group_id: Optional[str],
         policy=None,
+        quote_text: Optional[str] = None,
+        quote_author: Optional[str] = None,
     ) -> CommandResult:
         """Execute a command with the given arguments."""
         # Resolve context (pronouns)
@@ -597,6 +625,8 @@ class CommandDispatcher:
             command=command,
             args=args,
             policy=policy,
+            quote_text=quote_text,
+            quote_author=quote_author,
         )
         
         if handler.has_help_flag(ctx):

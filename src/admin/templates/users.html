@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>Known users</h1>
+    <p class="muted" style="font-size: 12px;">
+        Map a sender to a display name. The bot will refer to them as
+        <code>[Name]</code> in LLM context instead of <code>[...4137]</code>.
+        Names are stored against the sha256 of the phone number — the raw
+        number never reaches this table.
+    </p>
+</div>
+
+{% if unnamed %}
+<div class="panel">
+    <h2>Recent senders awaiting a name</h2>
+    <p class="muted" style="font-size: 12px;">
+        Recent messages and groups shown to help you identify each sender.
+        Same last-4 across different groups likely = different people.
+    </p>
+    {% for u in unnamed %}
+    <div style="border-top: 1px solid #333; padding: 12px 0; margin-top: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 8px;">
+            <div>
+                <strong style="font-family: monospace;">...{{ u.sender_tail or '????' }}</strong>
+                <span class="muted" style="margin-left: 8px;">{{ u.turn_count }} turn{{ '' if u.turn_count == 1 else 's' }}</span>
+                {% if u.contexts %}
+                <span class="muted" style="margin-left: 8px;">
+                    in: {% for label in u.contexts %}<em>{{ label }}</em>{% if not loop.last %}, {% endif %}{% endfor %}
+                </span>
+                {% endif %}
+            </div>
+            <form method="POST" action="{{ url_for('admin.users_save') }}" style="display:flex;gap:6px; min-width: 320px;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="user_hash" value="{{ u.user_hash }}">
+                <input type="text" name="name" placeholder="e.g. David" required style="flex:1;">
+                <button type="submit" class="btn">Save</button>
+            </form>
+        </div>
+        {% if u.samples %}
+        <ul style="margin: 0 0 0 16px; padding: 0; list-style: '› '; font-size: 13px;">
+            {% for s in u.samples %}
+            <li style="margin-bottom: 4px;">
+                <span class="muted" style="font-size: 11px;">[{{ s.context_label|truncate(20) }}]</span>
+                {{ s.text|truncate(200) }}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="muted" style="font-size: 12px; margin: 0;">No recent messages from this sender.</p>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+<div class="panel">
+    <h2>Named users</h2>
+    {% if named %}
+    <table>
+        <tr>
+            <th>Name</th>
+            <th>Hash</th>
+            <th>Updated</th>
+            <th></th>
+        </tr>
+        {% for u in named %}
+        <tr>
+            <td>
+                <form method="POST" action="{{ url_for('admin.users_save') }}" style="display:flex;gap:6px;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="user_hash" value="{{ u.user_hash }}">
+                    <input type="text" name="name" value="{{ u.name }}" required style="flex:1;">
+                    <button type="submit" class="btn">Save</button>
+                </form>
+            </td>
+            <td class="muted"><code>{{ u.user_hash|truncate(12, true, '') }}</code></td>
+            <td class="muted">
+                {% if u.updated_at %}
+                {{ u.updated_at|int }}
+                {% endif %}
+            </td>
+            <td>
+                <form method="POST" action="{{ url_for('admin.users_delete') }}" style="display:inline;"
+                      onsubmit="return confirm('Remove the name for {{ u.name }}?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="user_hash" value="{{ u.user_hash }}">
+                    <button type="submit" class="btn" style="background:#aa3333;">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">No named users yet. Pick someone from the list above to start.</p>
+    {% endif %}
+</div>
+
+{% endblock %}

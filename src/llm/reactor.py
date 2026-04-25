@@ -21,6 +21,7 @@ import logging
 import time
 from typing import Optional
 
+from ..admin.events import get_bus
 from ..cache import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class EmojiReactor:
         signal_handler,
         group_log=None,
         enricher=None,
+        name_registry=None,
     ):
         self.store = settings_store
         self.llm = llm_client
@@ -85,8 +87,18 @@ class EmojiReactor:
         # content from x.com / twitter.com URLs so the reactor can decide on
         # the actual content rather than just an opaque link.
         self.enricher = enricher
+        self.name_registry = name_registry
         self._sender_last: dict[str, float] = {}
         self._group_last: dict[str, float] = {}
+
+    def _sender_label(self, phone: str) -> str:
+        tail = (phone or "")[-4:] or "????"
+        if self.name_registry is not None:
+            try:
+                return self.name_registry.display_name_sync(phone=phone, tail=tail)
+            except Exception:
+                pass
+        return f"...{tail}"
 
     def _config(self) -> dict:
         store = self.store
@@ -119,7 +131,7 @@ class EmojiReactor:
     async def _build_user_content(
         self, sender: str, message: str, group_id: str, ctx_count: int
     ) -> str:
-        sender_tail = (sender or "")[-4:] or "????"
+        sender_label = self._sender_label(sender)
         ctx_lines: list[str] = []
         if self.group_log is not None and ctx_count > 0:
             try:
@@ -127,21 +139,33 @@ class EmojiReactor:
                     group_id, limit=ctx_count, exclude_last=1
                 )
                 for m in msgs:
-                    tail = (m["sender"] or "")[-4:] or "????"
+                    label = self._sender_label(m["sender"])
                     text = (m["text"] or "").replace("\n", " ").strip()
                     if text:
-                        ctx_lines.append(f"[...{tail}] {text}")
+                        ctx_lines.append(f"[{label}] {text}")
             except Exception as e:
                 logger.debug(f"Reactor: failed to load group context: {e}")
 
+        # Make it explicit that lines beginning with `→` are link content
+        # that the bot inlined as context — NOT a bot response. Otherwise
+        # the "do not react when the bot is already answering" rule from
+        # most reactor prompts kicks in incorrectly on tweet/URL messages.
+        format_note = (
+            "(Format note: lines starting with `→` are link content the bot "
+            "inlined for context — they're part of the user's message, not "
+            "a bot reply.)"
+        )
         if ctx_lines:
             return (
                 "Recent group chat (oldest first):\n"
                 + "\n".join(ctx_lines)
-                + "\n\nNew message to evaluate:\n"
-                + f"[...{sender_tail}] {message}"
+                + f"\n\n{format_note}\n\nNew message to evaluate:\n"
+                + f"[{sender_label}] {message}"
             )
-        return f"New message to evaluate:\n[...{sender_tail}] {message}"
+        return (
+            f"{format_note}\n\nNew message to evaluate:\n"
+            f"[{sender_label}] {message}"
+        )
 
     async def maybe_react(
         self,
@@ -237,7 +261,56 @@ class EmojiReactor:
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
                 metrics.record_reactor_skip("no_tool")
-                logger.info(f"Reactor: declined ...{sender_tail}")
+                # Capture text from wherever the model put it. Different
+                # providers stash reasoning in different fields:
+                #   - OpenAI/Anthropic style → "content"
+                #   - DeepSeek → "reasoning_content" alongside "content"
+                #   - OpenRouter aggregator → sometimes "reasoning"
+                # Pull from each known location so we surface SOMETHING.
+                refusal = (assistant_msg.get("content") or "").strip()
+                reasoning = (
+                    assistant_msg.get("reasoning")
+                    or assistant_msg.get("reasoning_content")
+                    or ""
+                ).strip()
+                # Show both fields when both present, with reasoning fully
+                # untruncated — when the model's thinking pivots to "no" we
+                # need to see the pivot, not just the lead-up.
+                if refusal and reasoning:
+                    logger.info(
+                        f"Reactor: declined ...{sender_tail} — "
+                        f"reasoning: {reasoning.replace(chr(10), ' ')!r} "
+                        f"| content: {refusal.replace(chr(10), ' ')[:300]!r}"
+                    )
+                    shown_preview = (refusal or reasoning).replace("\n", " ")[:300]
+                elif reasoning:
+                    logger.info(
+                        f"Reactor: declined ...{sender_tail} — "
+                        f"reasoning: {reasoning.replace(chr(10), ' ')!r}"
+                    )
+                    shown_preview = reasoning.replace("\n", " ")[:300]
+                elif refusal:
+                    logger.info(
+                        f"Reactor: declined ...{sender_tail} — "
+                        f"content: {refusal.replace(chr(10), ' ')!r}"
+                    )
+                    shown_preview = refusal.replace("\n", " ")[:300]
+                else:
+                    shown_preview = ""
+                if not shown_preview:
+                    # Truly nothing — log the full assistant_msg keys so we
+                    # know if a future provider invents a new field.
+                    logger.info(
+                        f"Reactor: declined ...{sender_tail} (no text); "
+                        f"msg keys={sorted(assistant_msg.keys())}"
+                    )
+                get_bus().publish(
+                    "reactor",
+                    decision="decline",
+                    sender_tail=sender_tail,
+                    group_id=group_id,
+                    text=shown_preview or None,
+                )
                 return
 
             # First call wins; subsequent ones ignored
@@ -267,6 +340,13 @@ class EmojiReactor:
                     logger.info(
                         f"Reactor: {emoji} on ...{(sender or '')[-4:]} "
                         f"({len(text)}-char msg)"
+                    )
+                    get_bus().publish(
+                        "reactor",
+                        decision="react",
+                        emoji=emoji,
+                        sender_tail=sender_tail,
+                        group_id=group_id,
                     )
                 else:
                     metrics.record_reactor_error()

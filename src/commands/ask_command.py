@@ -44,6 +44,9 @@ class AskCommand(BaseCommand):
         mcp_manager=None,
         bot_tools=None,
         enricher=None,
+        signal_handler=None,
+        name_registry=None,
+        summarizer=None,
     ):
         self.llm = llm
         self.history = history
@@ -53,6 +56,18 @@ class AskCommand(BaseCommand):
         # Optional message-text enricher (e.g. TwitterExpander) — called on the
         # user's question so pasted links carry their content into the prompt.
         self.enricher = enricher
+        # Optional Signal handler — used only to drive the typing indicator
+        # while the LLM tool loop runs. None is fine; the indicator is a UX
+        # nicety, not a correctness requirement.
+        self.signal_handler = signal_handler
+        # Optional name registry — when set, group-context lines and the
+        # current user's message are prefixed with `[Name]` instead of
+        # `[...4137]` for known users.
+        self.name_registry = name_registry
+        # Optional rolling-summary writer. When set, each successful !ask
+        # fires a fire-and-forget call that may (re)compress older turns
+        # into a paragraph injected into future system prompts.
+        self.summarizer = summarizer
 
     def _live_turns(self) -> int:
         try:
@@ -80,13 +95,26 @@ class AskCommand(BaseCommand):
         msgs = await self.group_log.recent(ctx.group_id, limit=limit, exclude_last=1)
         if not msgs:
             return ""
-        lines = ["Recent group chat (oldest first, senders shown by last 4 digits):"]
+        if self.name_registry is not None and any(self.name_registry._cache):
+            header = "Recent group chat (oldest first; senders by name when known, last-4 otherwise):"
+        else:
+            header = "Recent group chat (oldest first, senders shown by last 4 digits):"
+        lines = [header]
         for m in msgs:
-            tail = (m["sender"] or "")[-4:] or "????"
+            label = self._sender_label(m["sender"])
             text = (m["text"] or "").replace("\n", " ").strip()
             if text:
-                lines.append(f"  [...{tail}] {text}")
+                lines.append(f"  [{label}] {text}")
         return "\n".join(lines)
+
+    def _sender_label(self, phone: str) -> str:
+        tail = (phone or "")[-4:] or "????"
+        if self.name_registry is not None:
+            try:
+                return self.name_registry.display_name_sync(phone=phone, tail=tail)
+            except Exception:
+                pass
+        return f"...{tail}"
 
     def _collect_tools(self, policy=None) -> Optional[list[dict]]:
         schemas: list[dict] = []
@@ -247,15 +275,54 @@ class AskCommand(BaseCommand):
             )
             group_ctx = await self._build_group_context(ctx)
 
+            # Long-term rolling summary, if one exists. Prepended to the
+            # group-context block so both end up in the system message in
+            # a sensible reading order: persona → long memory → recent
+            # group chat → current time → response style.
+            summary_block = ""
+            try:
+                summary = await self.history.get_summary(context_key)
+                if summary and summary.get("summary"):
+                    summary_block = (
+                        "Conversation memory (rolling summary of older "
+                        "turns):\n" + summary["summary"]
+                    )
+            except Exception as e:
+                logger.debug(f"Failed to load summary for ask: {e}")
+
+            system_suffix_parts = [p for p in (summary_block, group_ctx) if p]
+            system_suffix = "\n\n".join(system_suffix_parts) or None
+
             prompt_override = None
             if ctx.policy is not None and ctx.policy.system_prompt:
                 prompt_override = ctx.policy.system_prompt
-            system_prompt = self.llm._resolve_system_prompt(prompt_override, group_ctx or None)
+            system_prompt = self.llm._resolve_system_prompt(prompt_override, system_suffix)
 
-            # Current question gets the same attribution prefix in group mode
-            current_user_content = (
-                f"[...{sender_tail}] {question}" if is_group else question
-            )
+            # Current question gets the same attribution prefix in group mode.
+            # Use the resolved label so the LLM sees "[David]" instead of
+            # "[...4137]" when a name is registered.
+            if is_group:
+                label = self._sender_label(ctx.sender)
+                current_user_content = f"[{label}] {question}"
+            else:
+                current_user_content = question
+
+            # If the user replied to a specific message, surface that so the
+            # LLM knows what's being responded to. Without this, "expand on
+            # that" with no chronological neighbour would be unanswerable.
+            if ctx.quote_text:
+                quoted_label = (
+                    self._sender_label(ctx.quote_author)
+                    if ctx.quote_author
+                    else "earlier"
+                )
+                quoted = ctx.quote_text.replace("\n", " ").strip()
+                if len(quoted) > 400:
+                    quoted = quoted[:399].rstrip() + "…"
+                current_user_content = (
+                    f"(Replying to [{quoted_label}]: \"{quoted}\")\n"
+                    f"{current_user_content}"
+                )
 
             messages: list[dict] = [{"role": "system", "content": system_prompt}]
             messages.extend(prior)
@@ -263,7 +330,17 @@ class AskCommand(BaseCommand):
 
             tools = self._collect_tools(policy=ctx.policy)
             attachments: list = []
-            answer = await self._run_tool_loop(messages, tools, ctx, attachments)
+            # Show a typing indicator in the chat while the tool loop runs.
+            # The indicator auto-clears in ~15s, so the helper refreshes it.
+            if self.signal_handler is not None:
+                async with self.signal_handler.typing_indicator(
+                    ctx.sender, ctx.group_id
+                ):
+                    answer = await self._run_tool_loop(
+                        messages, tools, ctx, attachments
+                    )
+            else:
+                answer = await self._run_tool_loop(messages, tools, ctx, attachments)
         except LLMDisabled:
             return CommandResult.error(
                 "LLM is not enabled. An admin can turn it on at /admin/llm."
@@ -289,6 +366,17 @@ class AskCommand(BaseCommand):
             )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")
+
+        # Fire-and-forget rolling-summary update. The summarizer itself
+        # decides whether enough new turns have arrived to warrant an LLM
+        # call, and dedupes via per-context lock. Errors stay inside the
+        # task so they never affect the ask response.
+        if self.summarizer is not None:
+            try:
+                import asyncio as _aio
+                _aio.create_task(self.summarizer.maybe_summarize(context_key))
+            except Exception as e:
+                logger.debug(f"Failed to schedule summarizer: {e}")
 
         return CommandResult(
             text=answer,

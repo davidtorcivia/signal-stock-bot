@@ -27,5 +27,10 @@ RUN mkdir -p logs
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1
 
-# Run with gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "120", "src.main:create_gunicorn_app()"]
+# Run with gunicorn for production. gthread workers let a single process
+# hold many concurrent connections — required for the /admin/live SSE
+# endpoint, which would otherwise pin the only sync worker and freeze the
+# rest of the admin UI. The bot's signal/MCP/LLM async work runs on its
+# own loop in a separate thread (set up in build_app), so changing the
+# Flask worker class doesn't affect that.
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--worker-class", "gthread", "--threads", "8", "--timeout", "120", "src.main:create_gunicorn_app()"]

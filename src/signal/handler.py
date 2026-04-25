@@ -4,11 +4,13 @@ Signal message handler - interfaces with signal-cli-rest-api.
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
 
+from ..admin.events import get_bus
 from ..commands.dispatcher import CommandDispatcher
 
 logger = logging.getLogger(__name__)
@@ -132,6 +134,19 @@ class SignalHandler:
             from .markdown import to_signal_styled
             message = to_signal_styled(message)
 
+        # Surface outbound text to the live admin viewer.
+        try:
+            get_bus().publish(
+                "outbound",
+                recipient_tail=(recipient or "")[-4:],
+                group_id=group_id,
+                styled=styled,
+                attachments=len(attachments) if attachments else 0,
+                text=(message or "")[:240],
+            )
+        except Exception:
+            pass
+
         # Build payload for v2 API
         payload = {
             "number": self.config.phone_number,
@@ -226,6 +241,56 @@ class SignalHandler:
             logger.error(f"Reaction send error: {e}")
             return False
 
+    async def send_typing(
+        self,
+        recipient: str,
+        group_id: Optional[str] = None,
+        stop: bool = False,
+    ) -> bool:
+        """Show or clear the typing indicator for a recipient or group.
+
+        Signal clients clear the indicator on their own after ~15 seconds,
+        so for long-running work the caller is responsible for refreshing
+        — see `typing_indicator()` for an async context manager that
+        handles the refresh loop.
+        """
+        session = await self._get_session()
+        target = await self._resolve_group_id(group_id) if group_id else recipient
+        payload = {"recipient": target}
+        url = f"{self.config.api_url}/v1/typing-indicator/{self.config.phone_number}"
+        method = "DELETE" if stop else "PUT"
+        try:
+            async with session.request(method, url, json=payload) as resp:
+                if resp.status not in (200, 204):
+                    body = await resp.text()
+                    logger.debug(
+                        f"Typing indicator {method} returned {resp.status}: "
+                        f"{body[:120]}"
+                    )
+                    return False
+                return True
+        except Exception as e:
+            logger.debug(f"Typing indicator error ({method}): {e}")
+            return False
+
+    def typing_indicator(
+        self,
+        recipient: str,
+        group_id: Optional[str] = None,
+        refresh_interval: float = 10.0,
+    ):
+        """Async context manager that keeps the typing indicator visible.
+
+        Usage:
+            async with handler.typing_indicator(sender, group_id):
+                await long_running_work()
+
+        Refreshes every `refresh_interval` seconds because Signal clients
+        auto-clear the indicator after ~15s. Errors are swallowed so the
+        wrapped work is never affected by indicator failures.
+        """
+        return _TypingIndicator(self, recipient, group_id, refresh_interval)
+
     async def fetch_bot_uuid(self) -> Optional[str]:
         """Fetch and cache the bot's UUID from signal-cli API."""
         if self._bot_uuid:
@@ -252,31 +317,37 @@ class SignalHandler:
     async def _is_bot_mentioned(self, data_message: dict) -> bool:
         """
         Check if the bot is mentioned in the message.
-        
-        Signal mentions include the phone number or UUID of mentioned users.
-        We check if any mention matches our bot's phone number or UUID.
+
+        Two paths count as a mention:
+          1. Signal's structured @-mention (matched by phone or UUID).
+          2. The configured bot_name appearing as a whole word in the
+             message text — e.g. "hey Sigil, what's AAPL?". Whole-word,
+             case-insensitive so casual references like "Sigil!" or
+             "Sigil," still match without grabbing substrings.
         """
-        mentions = data_message.get("mentions", [])
-        if not mentions:
-            return False
-        
-        # Ensure we have our UUID for matching
-        if not self._bot_uuid:
-            await self.fetch_bot_uuid()
-        
-        # Check each mention - signal-cli provides the mentioned number/uuid
-        for mention in mentions:
-            # Check phone number match
-            mentioned_number = mention.get("number", "")
-            if mentioned_number == self.config.phone_number:
+        # 1) Structured @-mention
+        mentions = data_message.get("mentions") or []
+        if mentions:
+            if not self._bot_uuid:
+                await self.fetch_bot_uuid()
+            for mention in mentions:
+                if mention.get("number", "") == self.config.phone_number:
+                    return True
+                mentioned_uuid = mention.get("uuid", "")
+                if self._bot_uuid and mentioned_uuid == self._bot_uuid:
+                    return True
+
+        # 2) Plain-text name reference. Pull the live bot_name off the
+        # dispatcher; it refreshes from settings on every dispatch, so
+        # the value is at most one message stale after an admin rename.
+        bot_name = (getattr(self.dispatcher, "bot_name", "") or "").strip()
+        message_text = data_message.get("message") or ""
+        if bot_name and message_text:
+            if re.search(
+                rf"\b{re.escape(bot_name)}\b", message_text, re.IGNORECASE
+            ):
                 return True
-            
-            # Check UUID match
-            mentioned_uuid = mention.get("uuid", "")
-            if self._bot_uuid and mentioned_uuid == self._bot_uuid:
-                return True
-        
-        # No matching mention found
+
         return False
     
     async def handle_webhook(self, data: dict):
@@ -308,6 +379,17 @@ class SignalHandler:
         if group_info:
             group_id = group_info.get("groupId")
 
+        # Quoted-message info — present when the user is replying to another
+        # message. signal-cli puts the original text/author here so the LLM
+        # can see what's being replied to without us looking it up.
+        quote = data_message.get("quote") or {}
+        quote_text = (quote.get("text") or "").strip() or None
+        quote_author = (
+            quote.get("authorNumber")
+            or quote.get("author")
+            or None
+        )
+
         # Check if bot is mentioned
         is_mentioned = await self._is_bot_mentioned(data_message)
 
@@ -325,6 +407,8 @@ class SignalHandler:
             group_id=group_id,
             mentioned=is_mentioned,
             target_timestamp=message_ts,
+            quote_text=quote_text,
+            quote_author=quote_author,
         )
         
         # Send response if command was processed
@@ -359,4 +443,48 @@ class SignalHandler:
         """Close the HTTP session"""
         if self._session and not self._session.closed:
             await self._session.close()
+
+
+class _TypingIndicator:
+    """Context manager that pings the typing indicator on a refresh loop."""
+
+    def __init__(
+        self,
+        handler: "SignalHandler",
+        recipient: str,
+        group_id: Optional[str],
+        refresh_interval: float,
+    ):
+        self.handler = handler
+        self.recipient = recipient
+        self.group_id = group_id
+        self.refresh_interval = refresh_interval
+        self._task: Optional[asyncio.Task] = None
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Typing indicator loop teardown: {e}")
+        # Best-effort stop. If this fails the indicator clears itself in
+        # ~15 seconds anyway.
+        await self.handler.send_typing(self.recipient, self.group_id, stop=True)
+
+    async def _loop(self):
+        try:
+            while True:
+                await self.handler.send_typing(self.recipient, self.group_id)
+                await asyncio.sleep(self.refresh_interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Typing indicator loop error: {e}")
 

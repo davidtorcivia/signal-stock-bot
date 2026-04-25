@@ -10,10 +10,11 @@ import logging
 from datetime import timedelta
 from typing import Optional
 
-from flask import Blueprint, Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask import Blueprint, Flask, Response, abort, flash, redirect, render_template, request, session, url_for
 
 from ..cache import get_cache_manager, get_metrics
 from ..contexts import ContextPolicy, ContextRegistry
+from .events import get_bus
 from ..contexts.policy import MODE_ALLOW_ALL, MODE_ALLOW_LIST, MODE_DENY_LIST, MODES
 from ..mcp_integration import MCPManager, MCPRegistry, MCPServerConfig
 from ..mcp_integration.models import TRANSPORTS
@@ -42,6 +43,7 @@ def create_admin_blueprint(
     mcp_manager: Optional[MCPManager] = None,
     context_registry: Optional[ContextRegistry] = None,
     dispatcher=None,
+    name_registry=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -90,6 +92,11 @@ def create_admin_blueprint(
             dispatcher=dispatcher,
             loop=loop,
         )
+
+    if name_registry is not None:
+        _register_users_routes(bp, registry=name_registry, loop=loop)
+
+    _register_live_routes(bp, name_registry=name_registry, loop=loop)
 
     # Make csrf_token available to every rendered template in this blueprint.
     @bp.context_processor
@@ -875,3 +882,122 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         reactor_enabled=reactor_enabled,
         reactor_prompt=reactor_prompt,
     )
+
+
+def _register_users_routes(
+    bp: Blueprint,
+    *,
+    registry,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Routes for managing display names attached to senders."""
+
+    @bp.route("/users", methods=["GET"])
+    @admin_required
+    def users_page():
+        named = _run_on_loop(loop, registry.list_all())
+        seen = _run_on_loop(loop, registry.list_seen(limit=100))
+        # Show seen-but-unnamed first (the actionable list); named entries
+        # below for editing/deletion.
+        unnamed = [s for s in seen if not s.get("name")]
+        return render_template(
+            "users.html", named=named, unnamed=unnamed, seen=seen,
+        )
+
+    @bp.route("/users/save", methods=["POST"])
+    @admin_required
+    def users_save():
+        if not verify_csrf():
+            return redirect(url_for("admin.users_page"))
+        user_hash = (request.form.get("user_hash") or "").strip()
+        name = (request.form.get("name") or "").strip()
+        if user_hash:
+            try:
+                _run_on_loop(loop, registry.set_name(name, user_hash=user_hash))
+            except Exception as e:
+                logger.error(f"Save user name failed: {e}")
+        return redirect(url_for("admin.users_page"))
+
+    @bp.route("/users/delete", methods=["POST"])
+    @admin_required
+    def users_delete():
+        if not verify_csrf():
+            return redirect(url_for("admin.users_page"))
+        user_hash = (request.form.get("user_hash") or "").strip()
+        if user_hash:
+            try:
+                _run_on_loop(loop, registry.delete(user_hash=user_hash))
+            except Exception as e:
+                logger.error(f"Delete user name failed: {e}")
+        return redirect(url_for("admin.users_page"))
+
+
+def _register_live_routes(
+    bp: Blueprint,
+    *,
+    name_registry,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Live event stream + viewer page.
+
+    The viewer is a thin HTML page that opens an SSE connection to the
+    /admin/live/stream endpoint, where AdminEventBus replays recent
+    history then streams new events as they happen. Sender resolution
+    via NameRegistry happens server-side so the browser never sees raw
+    phone tails it can't interpret.
+    """
+
+    @bp.route("/live", methods=["GET"])
+    @admin_required
+    def live_page():
+        return render_template("live.html")
+
+    @bp.route("/live/stream", methods=["GET"])
+    @admin_required
+    def live_stream():
+        bus = get_bus()
+        q = bus.subscribe()
+        # Build a synchronous label resolver that warms the registry once.
+        def label(tail: str | None, _phone=None) -> str:
+            if name_registry is None or not tail:
+                return f"...{tail}" if tail else "..."
+            try:
+                return name_registry.display_name_sync(tail=tail)
+            except Exception:
+                return f"...{tail}"
+
+        def gen():
+            # Initial comment forces some HTTP/SSE clients to flush headers.
+            yield ": connected\n\n"
+            try:
+                while True:
+                    try:
+                        ev = q.get(timeout=15.0)
+                    except Exception:
+                        # Heartbeat — keeps the connection alive through
+                        # proxies that drop idle streams (15s undershoots
+                        # most defaults).
+                        yield ": heartbeat\n\n"
+                        continue
+                    enriched = dict(ev)
+                    if "sender_tail" in enriched:
+                        enriched["sender_label"] = label(enriched.get("sender_tail"))
+                    if "recipient_tail" in enriched:
+                        enriched["recipient_label"] = label(enriched.get("recipient_tail"))
+                    yield f"data: {json.dumps(enriched, default=str)}\n\n"
+            except GeneratorExit:
+                pass
+            finally:
+                bus.unsubscribe(q)
+
+        # Return as an SSE stream. Disable Flask's response caching and
+        # any intermediate buffering so events ship immediately.
+        return Response(
+            gen(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )

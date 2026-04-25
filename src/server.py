@@ -34,6 +34,7 @@ def create_app(
     mcp_manager=None,
     context_registry=None,
     dispatcher=None,
+    name_registry=None,
 ) -> Flask:
     """
     Create Flask application with webhook endpoint and optional admin UI.
@@ -108,6 +109,7 @@ def create_app(
             mcp_manager=mcp_manager,
             context_registry=context_registry,
             dispatcher=dispatcher,
+            name_registry=name_registry,
         )
         logger.info("Admin UI mounted at /admin")
     else:

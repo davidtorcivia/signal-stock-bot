@@ -16,6 +16,11 @@ class CommandContext:
     command: str             # The command (e.g., "price")
     args: list[str]          # Arguments after command
     policy: Optional[object] = None   # ContextPolicy resolved for this chat
+    # Quoted message info, when the user is replying to another message in
+    # Signal. Surfaced as text context for the LLM so it knows what's being
+    # responded to. None when the message isn't a reply.
+    quote_text: Optional[str] = None
+    quote_author: Optional[str] = None  # phone number, when known
 
     @property
     def is_group(self) -> bool:

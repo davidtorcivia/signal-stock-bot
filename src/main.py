@@ -67,6 +67,7 @@ from .commands import (
 )
 from .signal import SignalHandler, SignalConfig, SignalPoller
 from .server import create_app
+from .users import NameRegistry
 
 
 def setup_logging(level: str):
@@ -375,9 +376,10 @@ def build_app(config: Config):
     from .contexts import ContextRegistry
     from .settings_store import SettingsStore
     from .llm import LLMClient, ConversationHistory, EmojiReactor
+    from .llm.summarizer import Summarizer
     from .group_log import GroupMessageLog
     from .mcp_integration import MCPRegistry, MCPManager
-    from .enrichment import TwitterExpander
+    from .enrichment import CompositeEnricher, RichLinkExpander, TwitterExpander
 
     watchlist_db = WatchlistDB(config.watchlist_db_path)
     alerts_db = AlertsDB(config.watchlist_db_path)
@@ -390,16 +392,23 @@ def build_app(config: Config):
     mcp_manager = MCPManager(mcp_registry)
 
     llm_client = LLMClient(settings_store)
+    name_registry = NameRegistry(config.watchlist_db_path)
     llm_history = ConversationHistory(
         config.watchlist_db_path,
         turns_per_user=int(settings_store.get("llm_history_turns") or 6),
         settings_store=settings_store,
+        name_registry=name_registry,
     )
-    twitter_expander = TwitterExpander()
+    # Two-stage link enrichment: TwitterExpander handles x.com / twitter.com
+    # via the fxtwitter API (high-quality, no HTML parsing); RichLinkExpander
+    # handles everything else by fetching og:title / og:description meta tags.
+    # Composite runs them in order, both append snippets after the original
+    # text. Shared by ask, reactor, and group log.
+    enricher = CompositeEnricher(TwitterExpander(), RichLinkExpander())
     group_log = GroupMessageLog(
         config.watchlist_db_path,
         settings_store=settings_store,
-        enricher=twitter_expander,
+        enricher=enricher,
     )
 
     # Reactor needs the dispatcher's signal_handler, but signal_handler
@@ -412,7 +421,14 @@ def build_app(config: Config):
         llm_client=llm_client,
         signal_handler=None,
         group_log=group_log,
-        enricher=twitter_expander,
+        enricher=enricher,
+        name_registry=name_registry,
+    )
+
+    summarizer = Summarizer(
+        llm_client=llm_client,
+        history=llm_history,
+        settings_store=settings_store,
     )
 
     # ask_command is built first (without bot_tools) so the dispatcher knows
@@ -423,7 +439,9 @@ def build_app(config: Config):
         llm_history,
         group_log=group_log,
         mcp_manager=mcp_manager,
-        enricher=twitter_expander,
+        enricher=enricher,
+        name_registry=name_registry,
+        summarizer=summarizer,
     )
 
     dispatcher = create_dispatcher(
@@ -447,6 +465,9 @@ def build_app(config: Config):
     )
     signal_handler = SignalHandler(signal_config, dispatcher)
     reactor.signal = signal_handler  # late binding (see comment near reactor construction)
+    # Same late-binding trick: ask_command needs the handler to drive the
+    # typing indicator while its tool loop runs.
+    ask_command.signal_handler = signal_handler
     tail = config.signal_phone_number[-4:] if config.signal_phone_number else "????"
     logger.info(f"Signal handler configured for ...{tail}")
 
@@ -494,6 +515,7 @@ def build_app(config: Config):
         mcp_manager=mcp_manager,
         context_registry=context_registry,
         dispatcher=dispatcher,
+        name_registry=name_registry,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

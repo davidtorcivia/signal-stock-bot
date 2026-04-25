@@ -12,6 +12,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -266,10 +267,24 @@ class LLMClient:
             raise LLMError("Unexpected response from LLM") from e
 
 
+_NY = ZoneInfo("America/New_York")
+
+
 def _inject_current_time(messages: list[dict]) -> list[dict]:
-    """Append the current UTC time to the system message (or insert one)."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return _append_to_system(messages, f"Current time: {now}")
+    """Append the current time (UTC + ET, with weekday) to the system message.
+
+    The bot lives on ET — most of the chats are US-time-zone-anchored. The
+    weekday name is included because models reason about market-day vs.
+    weekend logic better with a literal "Friday" than with an ISO date.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(_NY)
+    weekday = now_et.strftime("%A")
+    et_str = now_et.strftime("%Y-%m-%d %H:%M %Z")
+    utc_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
+    return _append_to_system(
+        messages, f"Current time: {weekday}, {et_str} ({utc_str})"
+    )
 
 
 def _append_to_system(messages: list[dict], extra: str) -> list[dict]:

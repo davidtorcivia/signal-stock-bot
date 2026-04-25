@@ -96,6 +96,8 @@
             <a href="{{ url_for('admin.llm_page') }}">LLM</a>
             <a href="{{ url_for('admin.mcp_list') }}">MCP</a>
             <a href="{{ url_for('admin.context_list') }}">Contexts</a>
+            <a href="{{ url_for('admin.users_page') }}">Users</a>
+            <a href="{{ url_for('admin.live_page') }}">Live</a>
             <form method="post" action="{{ url_for('admin.logout') }}" class="inline">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="secondary" type="submit">Logout</button>
