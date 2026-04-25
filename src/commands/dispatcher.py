@@ -126,7 +126,7 @@ class CommandDispatcher:
                  bot_name: str = "Stock Bot", rate_limit: int = 30, context_manager=None,
                  max_message_length: int = 4000, settings_store=None,
                  group_log=None, context_registry=None, llm_client=None,
-                 ask_command=None):
+                 ask_command=None, reactor=None):
         self.prefix = prefix
         self.enable_inline_symbols = enable_inline_symbols
         self.bot_name = bot_name
@@ -137,6 +137,7 @@ class CommandDispatcher:
         self.context_registry = context_registry
         self.llm_client = llm_client
         self.ask_command = ask_command
+        self.reactor = reactor
         self.commands: dict[str, BaseCommand] = {}
         self._rate_limiter = UserRateLimiter(limit=rate_limit)
         self._corn_cooldown: dict[str, float] = {}  # sender -> last triggered timestamp
@@ -213,7 +214,8 @@ class CommandDispatcher:
         sender: str,
         message: str,
         group_id: Optional[str] = None,
-        mentioned: bool = False
+        mentioned: bool = False,
+        target_timestamp: Optional[int] = None,
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
@@ -233,6 +235,25 @@ class CommandDispatcher:
                 policy = await self.context_registry.resolve(group_id, sender)
             except Exception as e:
                 logger.error(f"Context policy lookup failed: {e}")
+
+        # Fire-and-forget emoji reactor (groups only). Runs in parallel with
+        # the rest of dispatch — never blocks command execution and never
+        # surfaces output. The reactor itself swallows all errors.
+        if (
+            self.reactor is not None
+            and group_id
+            and target_timestamp
+        ):
+            import asyncio
+            asyncio.create_task(
+                self.reactor.maybe_react(
+                    sender=sender,
+                    message=message,
+                    group_id=group_id,
+                    target_timestamp=target_timestamp,
+                    policy=policy,
+                )
+            )
 
         # Record group messages for LLM context (only if feature is enabled).
         if self.group_log is not None and group_id:
@@ -598,6 +619,9 @@ class CommandDispatcher:
                 augmented = await self._maybe_augment(handler.name, result.text, ctx)
                 if augmented:
                     result.text = f"{result.text}\n\n── LLM ──\n{augmented}"
+                    # The augmented portion may include markdown from the LLM;
+                    # mark the result so Signal renders it as styled text.
+                    result.styled = True
 
             return result
 
@@ -625,10 +649,14 @@ class CommandDispatcher:
         )
 
         try:
-            return await self.llm_client.chat(
-                user_message=f"Command: !{cmd_name}\n\nOutput:\n{output_text}",
-                system_override=prompt,
-            )
+            # Build the messages directly so we can pass purpose=augment for
+            # accurate metrics (LLMClient.chat doesn't take a purpose arg).
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Command: !{cmd_name}\n\nOutput:\n{output_text}"},
+            ]
+            msg = await self.llm_client.chat_messages(messages, purpose="augment")
+            return (msg.get("content") or "").strip()
         except Exception as e:
             logger.warning(f"LLM augmentation for !{cmd_name} failed: {e}")
             return None

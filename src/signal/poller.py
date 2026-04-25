@@ -143,13 +143,17 @@ class SignalPoller:
         # The WebSocket sends envelope data directly
         envelope = msg.get("envelope", msg)
         
-        # Skip empty or sync messages
-        data_msg = envelope.get("dataMessage", {})
+        # Skip empty or sync messages. Use `or {}` because dataMessage may be
+        # explicitly null (sync/typing/edit/sticker envelopes), and the
+        # default-arg form of .get() doesn't coerce a present-but-null value.
+        data_msg = envelope.get("dataMessage") or {}
         if not data_msg:
             logger.debug(f"Skipping non-data message")
             return
-        
-        text = data_msg.get("message", "")
+
+        # Same null-vs-missing trap: a "message": null field would slice into
+        # NoneType and raise, dropping the whole envelope before dispatch.
+        text = data_msg.get("message") or ""
         source = (envelope.get("source") or "")[-4:]
         
         logger.info(f"Received message from ...{source}: {text[:50]}")

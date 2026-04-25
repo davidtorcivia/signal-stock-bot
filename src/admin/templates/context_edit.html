@@ -96,6 +96,20 @@
             only when the bot is @mentioned.
         </p>
 
+        <h2 style="margin-top: 32px;">Emoji reactor</h2>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="reactor_enabled" {% if values.reactor_enabled %}checked{% endif %}>
+            <span>Enabled in this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Only effective when the global reactor is enabled at <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>.
+            Uncheck to silence reactions in this specific chat without disabling them globally.
+        </p>
+
+        <label for="reactor_prompt">Reactor prompt override (empty = use global)</label>
+        <textarea name="reactor_prompt" id="reactor_prompt" rows="6"
+                  placeholder="Optional. Specific reaction guidance for this chat (e.g. tone, what merits a react).">{{ values.reactor_prompt }}</textarea>
+
         <div style="margin-top: 24px; display:flex; gap:16px; align-items:center;">
             <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
             <a href="{{ url_for('admin.context_list') }}" class="muted">Cancel</a>

@@ -2,6 +2,7 @@
 
 from .client import LLMClient, LLMDisabled, LLMError, LLMNotConfigured
 from .history import ConversationHistory
+from .reactor import EmojiReactor
 
 __all__ = [
     "LLMClient",
@@ -9,4 +10,5 @@ __all__ = [
     "LLMError",
     "LLMNotConfigured",
     "ConversationHistory",
+    "EmojiReactor",
 ]

@@ -54,17 +54,27 @@ class ContextRegistry:
                         mcp_servers TEXT NOT NULL DEFAULT '[]',
                         system_prompt TEXT,
                         llm_intent INTEGER NOT NULL DEFAULT 0,
+                        reactor_enabled INTEGER NOT NULL DEFAULT 1,
+                        reactor_prompt TEXT,
                         first_seen REAL NOT NULL,
                         updated_at REAL NOT NULL
                     )
                     """
                 )
-                # Upgrade path for pre-existing installs — add the column if missing.
+                # Upgrade path for pre-existing installs — add columns if missing.
                 cursor = await db.execute("PRAGMA table_info(contexts)")
                 existing_cols = {r[1] for r in await cursor.fetchall()}
                 if "llm_intent" not in existing_cols:
                     await db.execute(
                         "ALTER TABLE contexts ADD COLUMN llm_intent INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "reactor_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN reactor_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                if "reactor_prompt" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN reactor_prompt TEXT"
                     )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_contexts_key ON contexts(key)"
@@ -103,6 +113,8 @@ class ContextRegistry:
             mcp_servers=json.loads(row[7] or "[]"),
             system_prompt=row[8],
             llm_intent=bool(row[9]) if len(row) > 9 else False,
+            reactor_enabled=bool(row[10]) if len(row) > 10 and row[10] is not None else True,
+            reactor_prompt=row[11] if len(row) > 11 else None,
         )
 
     async def list(self) -> list[ContextPolicy]:
@@ -110,7 +122,8 @@ class ContextRegistry:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT id, kind, key, label, command_mode, commands,
-                          mcp_mode, mcp_servers, system_prompt, llm_intent
+                          mcp_mode, mcp_servers, system_prompt, llm_intent,
+                          reactor_enabled, reactor_prompt
                    FROM contexts
                    ORDER BY
                      CASE kind WHEN 'default' THEN 0 WHEN 'group' THEN 1 ELSE 2 END,
@@ -124,7 +137,8 @@ class ContextRegistry:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT id, kind, key, label, command_mode, commands,
-                          mcp_mode, mcp_servers, system_prompt, llm_intent
+                          mcp_mode, mcp_servers, system_prompt, llm_intent,
+                          reactor_enabled, reactor_prompt
                    FROM contexts WHERE id = ?""",
                 (context_id,),
             )
@@ -136,7 +150,8 @@ class ContextRegistry:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT id, kind, key, label, command_mode, commands,
-                          mcp_mode, mcp_servers, system_prompt, llm_intent
+                          mcp_mode, mcp_servers, system_prompt, llm_intent,
+                          reactor_enabled, reactor_prompt
                    FROM contexts WHERE key = ?""",
                 (key,),
             )
@@ -201,8 +216,9 @@ class ContextRegistry:
                     """INSERT INTO contexts
                        (kind, key, label, command_mode, commands, mcp_mode,
                         mcp_servers, system_prompt, llm_intent,
+                        reactor_enabled, reactor_prompt,
                         first_seen, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy.kind,
                         policy.key,
@@ -213,6 +229,8 @@ class ContextRegistry:
                         json.dumps(policy.mcp_servers),
                         policy.system_prompt or None,
                         1 if policy.llm_intent else 0,
+                        1 if policy.reactor_enabled else 0,
+                        policy.reactor_prompt or None,
                         now,
                         now,
                     ),
@@ -224,7 +242,8 @@ class ContextRegistry:
                     """UPDATE contexts SET
                            label = ?, command_mode = ?, commands = ?,
                            mcp_mode = ?, mcp_servers = ?, system_prompt = ?,
-                           llm_intent = ?, updated_at = ?
+                           llm_intent = ?, reactor_enabled = ?,
+                           reactor_prompt = ?, updated_at = ?
                        WHERE id = ?""",
                     (
                         policy.label,
@@ -234,6 +253,8 @@ class ContextRegistry:
                         json.dumps(policy.mcp_servers),
                         policy.system_prompt or None,
                         1 if policy.llm_intent else 0,
+                        1 if policy.reactor_enabled else 0,
+                        policy.reactor_prompt or None,
                         now,
                         policy.id,
                     ),

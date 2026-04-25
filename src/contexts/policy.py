@@ -29,6 +29,9 @@ class ContextPolicy:
     mcp_servers: list[str] = field(default_factory=list)
     system_prompt: Optional[str] = None   # None / empty => use global LLM prompt
     llm_intent: bool = False              # Route non-command messages through the LLM with bot+MCP tools
+    # Emoji reactor: per-context override of the global setting + dedicated prompt
+    reactor_enabled: bool = True          # Only matters when reactor is globally enabled
+    reactor_prompt: Optional[str] = None  # None / empty => use global reactor prompt
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()

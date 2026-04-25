@@ -42,8 +42,20 @@ LIVE_KEYS = {
     "llm_augment_commands",
     "llm_augment_prompt",
     "llm_max_tool_rounds",
+    "llm_response_style",
     "ask_command_name",
     "group_context_messages",
+    # Emoji reactor (secondary cheap-LLM path)
+    "reactor_enabled",
+    "reactor_model",
+    "reactor_max_tokens",
+    "reactor_temperature",
+    "reactor_extra_body",
+    "reactor_system_prompt",
+    "reactor_min_length",
+    "reactor_sender_cooldown",
+    "reactor_group_cooldown",
+    "reactor_context_messages",
 }
 
 # Keys the admin UI exposes but that require a process restart.

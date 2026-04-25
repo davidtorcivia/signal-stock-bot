@@ -29,15 +29,16 @@ class CommandResult:
     success: bool = True
     attachments: Optional[list[str]] = None  # Base64-encoded images
     dm_only: bool = False  # If True, send as DM even in group chat
-    
+    styled: bool = False   # If True, text contains markdown to be Signal-styled
+
     @classmethod
     def error(cls, message: str) -> "CommandResult":
         return cls(text=f"◇ {message}", success=False)
-    
+
     @classmethod
     def ok(cls, message: str) -> "CommandResult":
         return cls(text=message, success=True)
-    
+
     @classmethod
     def with_chart(cls, message: str, chart_base64: str) -> "CommandResult":
         """Create result with chart attachment."""

@@ -66,6 +66,11 @@ def create_admin_blueprint(
         bp,
         settings_store=settings_store,
         provider_manager=provider_manager,
+        mcp_registry=mcp_registry,
+        mcp_manager=mcp_manager,
+        context_registry=context_registry,
+        db_path=str(settings_store.db_path) if settings_store else None,
+        loop=loop,
     )
     _register_llm_routes(bp, settings_store=settings_store)
 
@@ -95,21 +100,125 @@ def create_admin_blueprint(
     return bp
 
 
+_DB_TABLES_FOR_DASH = (
+    "watchlists",
+    "alerts",
+    "conversation_turns",
+    "group_messages",
+    "contexts",
+    "mcp_servers",
+    "admin_settings",
+)
+
+
+def _collect_db_stats(db_path: str) -> dict:
+    """Synchronous SQLite probe for the dashboard. Light queries only."""
+    import os
+    import sqlite3
+
+    out = {"path": db_path, "size_bytes": 0, "size_human": "0 B", "counts": {}}
+    try:
+        size = os.path.getsize(db_path)
+        out["size_bytes"] = size
+        out["size_human"] = _human_bytes(size)
+    except OSError:
+        pass
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            for table in _DB_TABLES_FOR_DASH:
+                try:
+                    cur = conn.execute(f"SELECT COUNT(*) FROM {table}")
+                    row = cur.fetchone()
+                    out["counts"][table] = row[0] if row else 0
+                except sqlite3.OperationalError:
+                    out["counts"][table] = None  # table absent
+    except sqlite3.Error as e:
+        logger.debug(f"DB stats probe failed: {e}")
+    return out
+
+
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024  # type: ignore
+    return f"{n:.1f} PB"
+
+
 def _register_dashboard_routes(
     bp: Blueprint,
     *,
     settings_store: SettingsStore,
     provider_manager,
+    mcp_registry: Optional[MCPRegistry] = None,
+    mcp_manager: Optional[MCPManager] = None,
+    context_registry: Optional[ContextRegistry] = None,
+    db_path: Optional[str] = None,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> None:
     @bp.route("/", methods=["GET"])
     @admin_required
     def dashboard():
         metrics = get_metrics().get_all_stats()
         provider_status = provider_manager.get_status() if provider_manager else {}
+
+        # MCP — server list + per-session status
+        mcp_view = []
+        if mcp_registry is not None and mcp_manager is not None and loop is not None:
+            try:
+                servers = _run_on_loop(loop, mcp_registry.list())
+                status_map = mcp_manager.status()
+                for s in servers:
+                    st = status_map.get(s.id) or {}
+                    mcp_view.append({
+                        "name": s.name,
+                        "transport": s.transport,
+                        "enabled": s.enabled,
+                        "running": bool(st.get("running")),
+                        "tool_count": st.get("tool_count", 0),
+                        "last_error": st.get("last_error"),
+                    })
+            except Exception as e:
+                logger.error(f"Dashboard MCP collect failed: {e}")
+
+        # Contexts — count by kind
+        context_view = {"total": 0, "group": 0, "dm": 0, "default": 0,
+                        "with_intent": 0, "with_reactor": 0, "with_prompt": 0}
+        if context_registry is not None and loop is not None:
+            try:
+                rows = _run_on_loop(loop, context_registry.list())
+                for c in rows:
+                    context_view["total"] += 1
+                    if c.kind in context_view:
+                        context_view[c.kind] += 1
+                    if c.llm_intent:
+                        context_view["with_intent"] += 1
+                    if c.reactor_enabled:
+                        context_view["with_reactor"] += 1
+                    if c.system_prompt:
+                        context_view["with_prompt"] += 1
+            except Exception as e:
+                logger.error(f"Dashboard contexts collect failed: {e}")
+
+        # Storage — DB size + table counts
+        storage_view = _collect_db_stats(db_path) if db_path else {}
+
+        # Reactor stats include emoji breakdown — also expose top-1 for header
+        reactor_view = dict(metrics.get("reactor") or {})
+        reactor_view["top_emoji"] = (
+            reactor_view.get("top_emojis", [[None, 0]])[0][0]
+            if reactor_view.get("top_emojis") else None
+        )
+
         return render_template(
             "dashboard.html",
             metrics=metrics,
             provider_status=provider_status,
+            mcp_view=mcp_view,
+            context_view=context_view,
+            storage_view=storage_view,
+            reactor_view=reactor_view,
         )
 
     @bp.route("/settings", methods=["GET", "POST"])
@@ -163,8 +272,26 @@ LLM_KEYS = [
     "llm_augment_commands",
     "llm_augment_prompt",
     "llm_system_prompt",
+    "llm_response_style",
     "llm_extra_body",
+    # Emoji reactor (cheap secondary path)
+    "reactor_enabled",
+    "reactor_model",
+    "reactor_max_tokens",
+    "reactor_temperature",
+    "reactor_extra_body",
+    "reactor_min_length",
+    "reactor_sender_cooldown",
+    "reactor_group_cooldown",
+    "reactor_context_messages",
+    "reactor_system_prompt",
 ]
+
+# Imported lazily inside the route to avoid a circular import.
+def _default_response_style():
+    from ..llm.client import DEFAULT_RESPONSE_STYLE
+    return DEFAULT_RESPONSE_STYLE
+
 
 LLM_DEFAULTS = {
     "llm_enabled": False,
@@ -179,9 +306,21 @@ LLM_DEFAULTS = {
     "group_context_messages": 0,
     "ask_command_name": "ask",
     "llm_augment_commands": "",
-    "llm_augment_prompt": "You are looking at the output of a stock-bot command. Add a brief (1-2 sentence) plain-language interpretation. No markdown, no lists.",
+    "llm_augment_prompt": "You are looking at the output of a stock-bot command. Add a brief (1-2 sentence) plain-language interpretation. No headers, no lists.",
     "llm_system_prompt": "",
+    "llm_response_style": "",   # empty => use the built-in DEFAULT_RESPONSE_STYLE
     "llm_extra_body": "",
+    # Reactor defaults
+    "reactor_enabled": False,
+    "reactor_model": "",                   # empty => same as main llm_model
+    "reactor_max_tokens": 50,
+    "reactor_temperature": 0.3,
+    "reactor_extra_body": "",
+    "reactor_min_length": 0,
+    "reactor_sender_cooldown": 30,
+    "reactor_group_cooldown": 10,
+    "reactor_context_messages": 5,
+    "reactor_system_prompt": "",           # empty => use the built-in DEFAULT_REACTOR_PROMPT
 }
 
 
@@ -223,7 +362,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
     """Persist LLM form values with schema-aware coercion."""
     import json
 
-    bool_keys = {"llm_enabled"}
+    bool_keys = {"llm_enabled", "reactor_enabled"}
     int_keys = {
         "llm_max_tokens",
         "llm_timeout_seconds",
@@ -231,8 +370,13 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
         "llm_retention_days",
         "llm_max_tool_rounds",
         "group_context_messages",
+        "reactor_max_tokens",
+        "reactor_min_length",
+        "reactor_sender_cooldown",
+        "reactor_group_cooldown",
+        "reactor_context_messages",
     }
-    float_keys = {"llm_temperature"}
+    float_keys = {"llm_temperature", "reactor_temperature"}
 
     for key in LLM_KEYS:
         if key == "llm_api_key":
@@ -266,15 +410,15 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
                 raise ValueError(f"{key} must be a number") from None
             continue
 
-        if key == "llm_extra_body":
+        if key in ("llm_extra_body", "reactor_extra_body"):
             if raw:
                 # Validate JSON up-front; reject anything that's not an object.
                 try:
                     parsed = json.loads(raw)
                 except json.JSONDecodeError as e:
-                    raise ValueError(f"Extra body is not valid JSON: {e.msg}") from None
+                    raise ValueError(f"{key} is not valid JSON: {e.msg}") from None
                 if not isinstance(parsed, dict):
-                    raise ValueError("Extra body must be a JSON object (e.g. {\"key\": \"value\"})")
+                    raise ValueError(f"{key} must be a JSON object (e.g. {{\"key\": \"value\"}})")
             store.set(key, raw)
             continue
 
@@ -556,6 +700,8 @@ def _register_context_routes(
             "mcp_servers": [],
             "system_prompt": "",
             "llm_intent": False,
+            "reactor_enabled": True,
+            "reactor_prompt": "",
         }
         if request.method == "POST":
             if not verify_csrf():
@@ -610,6 +756,8 @@ def _register_context_routes(
             "mcp_servers": policy.mcp_servers,
             "system_prompt": policy.system_prompt or "",
             "llm_intent": policy.llm_intent,
+            "reactor_enabled": policy.reactor_enabled,
+            "reactor_prompt": policy.reactor_prompt or "",
         }
         if request.method == "POST":
             values = _form_to_values(request.form)
@@ -682,6 +830,8 @@ def _form_to_values(form) -> dict:
         "mcp_servers": form.getlist("mcp_servers"),
         "system_prompt": form.get("system_prompt", ""),
         "llm_intent": form.get("llm_intent", "") == "on",
+        "reactor_enabled": form.get("reactor_enabled", "") == "on",
+        "reactor_prompt": form.get("reactor_prompt", ""),
     }
 
 
@@ -699,6 +849,8 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
     mcp_servers = form.getlist("mcp_servers")
     system_prompt = (form.get("system_prompt") or "").strip() or None
     llm_intent = form.get("llm_intent", "") == "on"
+    reactor_enabled = form.get("reactor_enabled", "") == "on"
+    reactor_prompt = (form.get("reactor_prompt") or "").strip() or None
 
     if kind not in ("group", "dm", "default"):
         raise ValueError("kind must be group, dm, or default")
@@ -720,4 +872,6 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         mcp_servers=mcp_servers,
         system_prompt=system_prompt,
         llm_intent=llm_intent,
+        reactor_enabled=reactor_enabled,
+        reactor_prompt=reactor_prompt,
     )

@@ -159,6 +159,7 @@ def create_dispatcher(
     group_log=None,
     context_registry=None,
     llm_client=None,
+    reactor=None,
 ) -> CommandDispatcher:
     """Create and configure command dispatcher."""
     dispatcher = CommandDispatcher(
@@ -172,6 +173,7 @@ def create_dispatcher(
         context_registry=context_registry,
         llm_client=llm_client,
         ask_command=ask_command,
+        reactor=reactor,
     )
 
     price_cmd = PriceCommand(provider_manager)
@@ -372,7 +374,7 @@ def build_app(config: Config):
     from .context import ContextManager
     from .contexts import ContextRegistry
     from .settings_store import SettingsStore
-    from .llm import LLMClient, ConversationHistory
+    from .llm import LLMClient, ConversationHistory, EmojiReactor
     from .group_log import GroupMessageLog
     from .mcp_integration import MCPRegistry, MCPManager
     from .enrichment import TwitterExpander
@@ -400,6 +402,19 @@ def build_app(config: Config):
         enricher=twitter_expander,
     )
 
+    # Reactor needs the dispatcher's signal_handler, but signal_handler
+    # itself depends on the dispatcher. Build the reactor with a None
+    # handler now and attach it once signal_handler exists below — the
+    # reactor only fires after dispatch starts, so the handler is set by
+    # the time any maybe_react() task actually runs.
+    reactor = EmojiReactor(
+        settings_store=settings_store,
+        llm_client=llm_client,
+        signal_handler=None,
+        group_log=group_log,
+        enricher=twitter_expander,
+    )
+
     # ask_command is built first (without bot_tools) so the dispatcher knows
     # about it, then bot_tools is built once the dispatcher is available, and
     # attached back — bot tools need to introspect the dispatcher's commands.
@@ -418,6 +433,7 @@ def build_app(config: Config):
         group_log=group_log,
         context_registry=context_registry,
         llm_client=llm_client,
+        reactor=reactor,
     )
 
     from .commands.tools import BotCommandTools
@@ -430,6 +446,7 @@ def build_app(config: Config):
         phone_number=config.signal_phone_number,
     )
     signal_handler = SignalHandler(signal_config, dispatcher)
+    reactor.signal = signal_handler  # late binding (see comment near reactor construction)
     tail = config.signal_phone_number[-4:] if config.signal_phone_number else "????"
     logger.info(f"Signal handler configured for ...{tail}")
 

@@ -110,6 +110,17 @@
         <textarea name="llm_system_prompt" id="llm_system_prompt" rows="6"
                   placeholder="Defaults to a concise stock-market assistant prompt.">{{ values.llm_system_prompt or '' }}</textarea>
 
+        <label for="llm_response_style">Response style (always appended)</label>
+        <textarea name="llm_response_style" id="llm_response_style" rows="8"
+                  placeholder="Leave empty to use the built-in default (brevity + no preamble).">{{ values.llm_response_style or '' }}</textarea>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Appended to <em>every</em> LLM call after the system prompt — including
+            per-context overrides — so it can't be talked out of by a chattier
+            prompt. Use this to enforce consistent length, tone, or formatting
+            rules across all chats. Empty = the bundled default
+            (2-4 sentences, no preamble, emphasis allowed, no headers/tables).
+        </p>
+
         <label for="llm_extra_body">Extra request body (JSON)</label>
         <textarea name="llm_extra_body" id="llm_extra_body" rows="6"
                   placeholder='{"reasoning_effort": "medium"}  or  {"thinking": {"type": "enabled", "budget_tokens": 2048}}'>{{ values.llm_extra_body or '' }}</textarea>
@@ -119,6 +130,68 @@
             <code>top_p</code>, <code>presence_penalty</code>. Must be a JSON
             object or empty. Overrides the built-in fields if keys collide.
         </p>
+
+        <h2 style="margin-top: 32px;">Emoji reactor</h2>
+        <p class="muted" style="font-size: 12px;">
+            Cheap secondary LLM call on every group message that decides whether
+            to react with an emoji (and which one). Runs in the background, never
+            blocks command handling, never surfaces output. Per-context toggle on
+            <code>/admin/contexts/&lt;id&gt;</code>.
+        </p>
+
+        <label for="reactor_enabled">Reactor enabled</label>
+        <input type="text" name="reactor_enabled" id="reactor_enabled"
+               value="{{ 'true' if values.reactor_enabled else 'false' }}"
+               placeholder="true / false">
+
+        <label for="reactor_model">Reactor model (empty = same as main)</label>
+        <input type="text" name="reactor_model" id="reactor_model"
+               value="{{ values.reactor_model or '' }}"
+               placeholder="gpt-4o-mini  or  anthropic/claude-haiku-4-5">
+
+        <label for="reactor_temperature">Reactor temperature</label>
+        <input type="text" name="reactor_temperature" id="reactor_temperature"
+               value="{{ values.reactor_temperature if values.reactor_temperature is not none else '' }}"
+               placeholder="0.3">
+
+        <label for="reactor_max_tokens">Reactor max tokens</label>
+        <input type="number" name="reactor_max_tokens" id="reactor_max_tokens" min="1"
+               value="{{ values.reactor_max_tokens or '' }}" placeholder="50">
+
+        <label for="reactor_extra_body">Reactor extra body (JSON)</label>
+        <textarea name="reactor_extra_body" id="reactor_extra_body" rows="3"
+                  placeholder='{"thinking": {"type": "disabled"}}  or  {"reasoning_effort": "minimal"}'>{{ values.reactor_extra_body or '' }}</textarea>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Replaces (not merged with) the main extra body for reactor calls.
+            Typical use: disable thinking / pick the cheap reasoning tier.
+        </p>
+
+        <label for="reactor_min_length">Min message length</label>
+        <input type="number" name="reactor_min_length" id="reactor_min_length" min="0"
+               value="{{ values.reactor_min_length if values.reactor_min_length is not none else '' }}"
+               placeholder="0">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Skip messages shorter than this without an LLM call. <code>0</code> = no minimum.
+        </p>
+
+        <label for="reactor_sender_cooldown">Per-sender cooldown (seconds)</label>
+        <input type="number" name="reactor_sender_cooldown" id="reactor_sender_cooldown" min="0"
+               value="{{ values.reactor_sender_cooldown if values.reactor_sender_cooldown is not none else '' }}"
+               placeholder="30">
+
+        <label for="reactor_group_cooldown">Per-group cooldown (seconds)</label>
+        <input type="number" name="reactor_group_cooldown" id="reactor_group_cooldown" min="0"
+               value="{{ values.reactor_group_cooldown if values.reactor_group_cooldown is not none else '' }}"
+               placeholder="10">
+
+        <label for="reactor_context_messages">Recent group messages fed to reactor</label>
+        <input type="number" name="reactor_context_messages" id="reactor_context_messages" min="0"
+               value="{{ values.reactor_context_messages if values.reactor_context_messages is not none else '' }}"
+               placeholder="5">
+
+        <label for="reactor_system_prompt">Reactor system prompt</label>
+        <textarea name="reactor_system_prompt" id="reactor_system_prompt" rows="6"
+                  placeholder="Empty = built-in default (sparing, sentiment-led, skip transactional).">{{ values.reactor_system_prompt or '' }}</textarea>
 
         <div style="margin-top: 24px;">
             <button type="submit">Save</button>

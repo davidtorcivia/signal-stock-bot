@@ -249,19 +249,55 @@ class ProviderMetrics:
         }
 
 
+@dataclass
+class LLMMetrics:
+    """Aggregated LLM call counters since process start."""
+    calls: int = 0
+    successes: int = 0
+    errors: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    total_latency_ms: float = 0.0
+    last_call_at: Optional[float] = None
+    last_error_at: Optional[float] = None
+    last_error_msg: Optional[str] = None
+    by_purpose: dict = field(default_factory=dict)   # purpose -> count
+    by_model: dict = field(default_factory=dict)     # model   -> count
+
+    @property
+    def avg_latency_ms(self) -> float:
+        return (self.total_latency_ms / self.successes) if self.successes else 0.0
+
+
+@dataclass
+class ReactorMetrics:
+    """Counters for the emoji reactor."""
+    evaluations: int = 0          # times maybe_react was actually invoked (post-skip-checks)
+    reactions_sent: int = 0       # tool was called and Signal API accepted the react
+    skipped_disabled: int = 0     # globally or per-context off
+    skipped_cooldown: int = 0
+    skipped_short: int = 0
+    skipped_no_tool: int = 0      # LLM declined (no tool call returned)
+    errors: int = 0
+    by_emoji: dict = field(default_factory=dict)
+    last_reaction_at: Optional[float] = None
+
+
 class MetricsCollector:
     """
     Global metrics collector for the application.
-    
+
     Tracks:
     - Cache statistics
     - Provider metrics
     - Request rates
+    - LLM call metrics (calls / tokens / latency / by purpose+model)
+    - Reactor metrics (evaluations / reactions / skip reasons / top emojis)
     """
-    
+
     _instance: Optional['MetricsCollector'] = None
     _lock = threading.Lock()
-    
+
     def __new__(cls):
         """Singleton pattern."""
         if cls._instance is None:
@@ -270,16 +306,18 @@ class MetricsCollector:
                     cls._instance = super().__new__(cls)
                     cls._instance._initialized = False
         return cls._instance
-    
+
     def __init__(self):
         if self._initialized:
             return
-        
+
         self._initialized = True
         self._start_time = time.time()
         self._providers: Dict[str, ProviderMetrics] = {}
         self._caches: Dict[str, TTLCache] = {}
         self._request_times: deque = deque(maxlen=1000)  # Last 1000 request timestamps
+        self._llm = LLMMetrics()
+        self._reactor = ReactorMetrics()
         self._lock = threading.RLock()
     
     def register_cache(self, name: str, cache: TTLCache):
@@ -313,25 +351,95 @@ class MetricsCollector:
         """Application uptime in seconds."""
         return time.time() - self._start_time
     
+    # ── LLM metrics ────────────────────────────────────────────────────
+
+    def record_llm_success(
+        self,
+        *,
+        purpose: str,
+        model: str,
+        latency_ms: float,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> None:
+        with self._lock:
+            m = self._llm
+            m.calls += 1
+            m.successes += 1
+            m.tokens_in += int(tokens_in or 0)
+            m.tokens_out += int(tokens_out or 0)
+            m.total_latency_ms += latency_ms
+            m.last_call_at = time.time()
+            m.by_purpose[purpose] = m.by_purpose.get(purpose, 0) + 1
+            if model:
+                m.by_model[model] = m.by_model.get(model, 0) + 1
+
+    def record_llm_error(self, *, purpose: str, model: str, error_msg: str) -> None:
+        with self._lock:
+            m = self._llm
+            m.calls += 1
+            m.errors += 1
+            m.last_error_at = time.time()
+            m.last_error_msg = (error_msg or "")[:200]
+            m.by_purpose[purpose] = m.by_purpose.get(purpose, 0) + 1
+            if model:
+                m.by_model[model] = m.by_model.get(model, 0) + 1
+
+    # ── Reactor metrics ────────────────────────────────────────────────
+
+    def record_reactor_skip(self, reason: str) -> None:
+        with self._lock:
+            r = self._reactor
+            if reason == "disabled":
+                r.skipped_disabled += 1
+            elif reason == "cooldown":
+                r.skipped_cooldown += 1
+            elif reason == "short":
+                r.skipped_short += 1
+            elif reason == "no_tool":
+                r.skipped_no_tool += 1
+
+    def record_reactor_evaluation(self) -> None:
+        with self._lock:
+            self._reactor.evaluations += 1
+
+    def record_reactor_reaction(self, emoji: str) -> None:
+        with self._lock:
+            r = self._reactor
+            r.reactions_sent += 1
+            r.last_reaction_at = time.time()
+            if emoji:
+                r.by_emoji[emoji] = r.by_emoji.get(emoji, 0) + 1
+
+    def record_reactor_error(self) -> None:
+        with self._lock:
+            self._reactor.errors += 1
+
+    # ── Aggregate snapshot ─────────────────────────────────────────────
+
     def get_all_stats(self) -> dict:
         """Get all metrics as a dictionary."""
         with self._lock:
             cache_stats = {
-                name: cache.stats 
+                name: cache.stats
                 for name, cache in self._caches.items()
             }
-            
+
             provider_stats = {
-                name: metrics.to_dict() 
+                name: metrics.to_dict()
                 for name, metrics in self._providers.items()
             }
-            
-            # Calculate aggregate cache hit rate
+
             total_hits = sum(c.stats["hits"] for c in self._caches.values())
             total_misses = sum(c.stats["misses"] for c in self._caches.values())
             total = total_hits + total_misses
             overall_hit_rate = (total_hits / total * 100) if total > 0 else 0
-            
+
+            llm = self._llm
+            top_emojis = sorted(
+                self._reactor.by_emoji.items(), key=lambda kv: kv[1], reverse=True
+            )[:8]
+
             return {
                 "uptime_seconds": self.uptime_seconds,
                 "requests_per_minute": self.requests_per_minute,
@@ -340,6 +448,34 @@ class MetricsCollector:
                     "caches": cache_stats,
                 },
                 "providers": provider_stats,
+                "llm": {
+                    "calls": llm.calls,
+                    "successes": llm.successes,
+                    "errors": llm.errors,
+                    "success_rate": (
+                        f"{(llm.successes / llm.calls * 100):.1f}%"
+                        if llm.calls else "—"
+                    ),
+                    "tokens_in": llm.tokens_in,
+                    "tokens_out": llm.tokens_out,
+                    "avg_latency_ms": f"{llm.avg_latency_ms:.0f}",
+                    "last_call_at": llm.last_call_at,
+                    "last_error_at": llm.last_error_at,
+                    "last_error_msg": llm.last_error_msg,
+                    "by_purpose": dict(llm.by_purpose),
+                    "by_model": dict(llm.by_model),
+                },
+                "reactor": {
+                    "evaluations": self._reactor.evaluations,
+                    "reactions_sent": self._reactor.reactions_sent,
+                    "skipped_disabled": self._reactor.skipped_disabled,
+                    "skipped_cooldown": self._reactor.skipped_cooldown,
+                    "skipped_short": self._reactor.skipped_short,
+                    "skipped_no_tool": self._reactor.skipped_no_tool,
+                    "errors": self._reactor.errors,
+                    "top_emojis": top_emojis,
+                    "last_reaction_at": self._reactor.last_reaction_at,
+                },
             }
 
 

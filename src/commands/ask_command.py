@@ -118,12 +118,21 @@ class AskCommand(BaseCommand):
         max_rounds = self._live_max_tool_rounds()
         tool_call_history: list[str] = []
 
-        for _round_idx in range(max_rounds):
+        for round_idx in range(max_rounds):
+            logger.info(
+                f"LLM round {round_idx + 1}/{max_rounds}: "
+                f"requesting completion ({len(messages)} msgs in context)"
+            )
             assistant_msg = await self.llm.chat_messages(messages, tools=tools)
             messages.append(assistant_msg)
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
-                return (assistant_msg.get("content") or "").strip()
+                content = (assistant_msg.get("content") or "").strip()
+                logger.info(
+                    f"LLM round {round_idx + 1}: final answer "
+                    f"({len(content)} chars, no tool calls)"
+                )
+                return content
             for call in tool_calls:
                 fn_name = (call.get("function") or {}).get("name") or "?"
                 tool_call_history.append(fn_name)
@@ -285,4 +294,5 @@ class AskCommand(BaseCommand):
             text=answer,
             success=True,
             attachments=attachments or None,
+            styled=True,
         )

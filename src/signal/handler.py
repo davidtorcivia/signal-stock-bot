@@ -106,32 +106,47 @@ class SignalHandler:
         recipient: str,
         message: str,
         group_id: Optional[str] = None,
-        attachments: Optional[list[str]] = None
+        attachments: Optional[list[str]] = None,
+        styled: bool = False,
     ):
         """
         Send a message to a recipient or group.
-        
+
         Args:
             recipient: Phone number or group ID
             message: Message text
             group_id: If set, sends to this group instead of recipient
             attachments: Optional list of base64-encoded images
+            styled: If True, the text is treated as markdown and converted to
+                    Signal styled-text syntax (`*bold*`, `_italic_`, etc.) and
+                    sent with text_mode=styled. LLM-produced messages set this.
         """
         session = await self._get_session()
-        
+
+        # Em-dash normalisation runs unconditionally — LLMs love them, but
+        # they read awkwardly in chat and the user wants them out everywhere.
+        if message:
+            message = message.replace("—", " - ").replace("–", "-")
+
+        if styled:
+            from .markdown import to_signal_styled
+            message = to_signal_styled(message)
+
         # Build payload for v2 API
         payload = {
             "number": self.config.phone_number,
             "message": message,
         }
-        
+        if styled:
+            payload["text_mode"] = "styled"
+
         if group_id:
             # Resolve group ID to V2 ID
             resolved_id = await self._resolve_group_id(group_id)
             payload["recipients"] = [resolved_id]
         else:
             payload["recipients"] = [recipient]
-        
+
         # Add base64 attachments if provided
         if attachments:
             # Signal API format: "data:<mime>;filename=<name>;base64,<data>"
@@ -161,6 +176,56 @@ class SignalHandler:
             logger.error(f"Failed to send response: {e}")
             raise
     
+    async def send_reaction(
+        self,
+        recipient: str,
+        target_author: str,
+        target_timestamp: int,
+        emoji: str,
+        group_id: Optional[str] = None,
+        remove: bool = False,
+    ) -> bool:
+        """Add (or remove) an emoji reaction to a specific message.
+
+        Reactions attach to the original envelope — they do NOT appear as
+        new messages. The signal-cli-rest-api endpoint is
+        /v1/reactions/{number}.
+
+        Args:
+            recipient: phone number to address (ignored when group_id is set)
+            target_author: phone number of the message author being reacted to
+            target_timestamp: envelope timestamp of the target message
+            emoji: single Unicode emoji
+            group_id: send reaction in this group (recommended for groups)
+            remove: if True, remove an existing reaction with this emoji
+        """
+        session = await self._get_session()
+        payload: dict[str, object] = {
+            "reaction": emoji,
+            "target_author": target_author,
+            "timestamp": int(target_timestamp),
+        }
+        if remove:
+            payload["remove"] = True
+        if group_id:
+            payload["recipient"] = await self._resolve_group_id(group_id)
+        else:
+            payload["recipient"] = recipient
+
+        url = f"{self.config.api_url}/v1/reactions/{self.config.phone_number}"
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status not in (200, 201, 204):
+                    text = await resp.text()
+                    logger.warning(
+                        f"Reaction failed: {resp.status} {text[:200]}"
+                    )
+                    return False
+                return True
+        except Exception as e:
+            logger.error(f"Reaction send error: {e}")
+            return False
+
     async def fetch_bot_uuid(self) -> Optional[str]:
         """Fetch and cache the bot's UUID from signal-cli API."""
         if self._bot_uuid:
@@ -217,44 +282,49 @@ class SignalHandler:
     async def handle_webhook(self, data: dict):
         """
         Handle incoming webhook from signal-cli-rest-api.
-        
+
         Parses the webhook payload, extracts message info,
         dispatches to command handler, and sends response.
         """
         envelope = data.get("envelope", {})
         sender = envelope.get("source")
-        
+        target_timestamp = envelope.get("timestamp")
+
         # Handle data message
         data_message = envelope.get("dataMessage", {})
         message_text = data_message.get("message", "")
-        
+        # dataMessage.timestamp is the canonical "message id" — prefer it when
+        # present; otherwise fall back to the envelope timestamp.
+        message_ts = data_message.get("timestamp") or target_timestamp
+
         # Skip empty messages or non-text messages
         if not sender or not message_text:
             logger.debug("Skipping message: no sender or empty text")
             return
-        
+
         # Extract group info if present
         group_info = data_message.get("groupInfo")
         group_id = None
         if group_info:
             group_id = group_info.get("groupId")
-        
+
         # Check if bot is mentioned
         is_mentioned = await self._is_bot_mentioned(data_message)
-        
+
         logger.info(
             f"Received message from {sender[-4:]}: "
             f"{'[group] ' if group_id else ''}"
             f"{'[@mentioned] ' if is_mentioned else ''}"
             f"{message_text[:50]}..."
         )
-        
+
         # Dispatch to command handler
         result = await self.dispatcher.dispatch(
             sender=sender,
             message=message_text,
             group_id=group_id,
             mentioned=is_mentioned,
+            target_timestamp=message_ts,
         )
         
         # Send response if command was processed
@@ -267,6 +337,7 @@ class SignalHandler:
                     message=result.text,
                     group_id=target_group,
                     attachments=result.attachments,
+                    styled=result.styled,
                 )
             except Exception as e:
                 logger.error(f"Failed to send response: {e}")
@@ -279,6 +350,7 @@ class SignalHandler:
                             message=f"{result.text}\n\n(Replied privately due to group send error)",
                             group_id=None,
                             attachments=result.attachments,
+                            styled=result.styled,
                         )
                     except Exception as fallback_e:
                         logger.error(f"Fallback DM failed: {fallback_e}")

@@ -2,6 +2,7 @@
 {% block title %}Dashboard{% endblock %}
 {% block content %}
 
+{# ── Health ──────────────────────────────────────────────────────── #}
 <div class="panel">
     <h2>Health</h2>
     <table>
@@ -10,7 +11,7 @@
             <td>{{ '%dh %dm'|format(metrics.uptime_seconds // 3600, (metrics.uptime_seconds % 3600) // 60) }}</td>
         </tr>
         <tr>
-            <th>Requests / min</th>
+            <th>Inbound msgs / min</th>
             <td>{{ '%.0f'|format(metrics.requests_per_minute) }}</td>
         </tr>
         <tr>
@@ -20,6 +21,124 @@
     </table>
 </div>
 
+{# ── LLM ─────────────────────────────────────────────────────────── #}
+<div class="panel">
+    <h2>LLM</h2>
+    {% set llm = metrics.llm %}
+    <table>
+        <tr>
+            <th>Calls</th>
+            <td>{{ llm.calls }} <span class="muted">({{ llm.success_rate }} success)</span></td>
+        </tr>
+        <tr>
+            <th>Errors</th>
+            <td>
+                {{ llm.errors }}
+                {% if llm.last_error_msg %}
+                    <span class="muted" style="margin-left: 12px;">last: {{ llm.last_error_msg|truncate(80) }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Tokens</th>
+            <td>{{ '{:,}'.format(llm.tokens_in) }} in &nbsp;·&nbsp; {{ '{:,}'.format(llm.tokens_out) }} out</td>
+        </tr>
+        <tr>
+            <th>Avg latency</th>
+            <td>{{ llm.avg_latency_ms }}ms</td>
+        </tr>
+    </table>
+
+    {% if llm.by_purpose %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By purpose</h3>
+    <table>
+        {% for purpose, count in llm.by_purpose.items() %}
+        <tr><th>{{ purpose }}</th><td>{{ count }}</td></tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
+    {% if llm.by_model %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By model</h3>
+    <table>
+        {% for model, count in llm.by_model.items() %}
+        <tr><th>{{ model }}</th><td>{{ count }}</td></tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+</div>
+
+{# ── Reactor ────────────────────────────────────────────────────── #}
+<div class="panel">
+    <h2>Emoji reactor</h2>
+    {% set r = reactor_view %}
+    <table>
+        <tr><th>LLM evaluations</th><td>{{ r.evaluations }}</td></tr>
+        <tr>
+            <th>Reactions sent</th>
+            <td>
+                {{ r.reactions_sent }}
+                {% if r.evaluations and r.reactions_sent %}
+                    <span class="muted">({{ '%.0f%%'|format(r.reactions_sent / r.evaluations * 100) }} react rate)</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Skips</th>
+            <td>
+                <span class="muted">disabled:</span> {{ r.skipped_disabled }} ·
+                <span class="muted">cooldown:</span> {{ r.skipped_cooldown }} ·
+                <span class="muted">short:</span> {{ r.skipped_short }} ·
+                <span class="muted">no react:</span> {{ r.skipped_no_tool }}
+            </td>
+        </tr>
+        <tr><th>Errors</th><td>{{ r.errors }}</td></tr>
+        {% if r.top_emojis %}
+        <tr>
+            <th>Top emoji</th>
+            <td>
+                {% for emoji, n in r.top_emojis %}
+                    {{ emoji }}<span class="muted">×{{ n }}</span>{% if not loop.last %} &nbsp; {% endif %}
+                {% endfor %}
+            </td>
+        </tr>
+        {% endif %}
+    </table>
+</div>
+
+{# ── MCP servers ────────────────────────────────────────────────── #}
+{% if mcp_view %}
+<div class="panel">
+    <h2>MCP servers</h2>
+    <table>
+        <tr>
+            <th>Name</th>
+            <th>Transport</th>
+            <th>Status</th>
+            <th>Tools</th>
+        </tr>
+        {% for s in mcp_view %}
+        <tr>
+            <td><a href="{{ url_for('admin.mcp_list') }}">{{ s.name }}</a></td>
+            <td class="muted">{{ s.transport }}</td>
+            <td>
+                {% if s.running %}
+                    <span class="dot-ok">●</span> running
+                {% elif s.last_error %}
+                    <span class="dot-bad">○</span>
+                    <span class="muted">{{ s.last_error|truncate(60) }}</span>
+                {% else %}
+                    <span class="muted">○ stopped</span>
+                {% endif %}
+            </td>
+            <td>{{ s.tool_count }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+{% endif %}
+
+{# ── Caches ────────────────────────────────────────────────────── #}
 <div class="panel">
     <h2>Caches</h2>
     <table>
@@ -40,6 +159,7 @@
     </form>
 </div>
 
+{# ── Providers ──────────────────────────────────────────────────── #}
 <div class="panel">
     <h2>Providers</h2>
     <table>
@@ -60,5 +180,71 @@
         {% endfor %}
     </table>
 </div>
+
+{# ── Contexts ──────────────────────────────────────────────────── #}
+{% if context_view and context_view.total %}
+<div class="panel">
+    <h2>Contexts</h2>
+    <table>
+        <tr>
+            <th>Total</th>
+            <td>{{ context_view.total }}</td>
+        </tr>
+        <tr>
+            <th>Groups</th>
+            <td>{{ context_view.group }}</td>
+        </tr>
+        <tr>
+            <th>DMs</th>
+            <td>{{ context_view.dm }}</td>
+        </tr>
+        <tr>
+            <th>Defaults</th>
+            <td>{{ context_view.default }}</td>
+        </tr>
+        <tr>
+            <th>With LLM intent</th>
+            <td>{{ context_view.with_intent }}</td>
+        </tr>
+        <tr>
+            <th>With reactor enabled</th>
+            <td>{{ context_view.with_reactor }}</td>
+        </tr>
+        <tr>
+            <th>With custom prompt</th>
+            <td>{{ context_view.with_prompt }}</td>
+        </tr>
+    </table>
+    <p style="margin-top: 12px;"><a href="{{ url_for('admin.context_list') }}">Manage contexts →</a></p>
+</div>
+{% endif %}
+
+{# ── Storage ──────────────────────────────────────────────────── #}
+{% if storage_view %}
+<div class="panel">
+    <h2>Storage</h2>
+    <table>
+        <tr>
+            <th>Database</th>
+            <td><code>{{ storage_view.path }}</code></td>
+        </tr>
+        <tr>
+            <th>Size</th>
+            <td>{{ storage_view.size_human }}</td>
+        </tr>
+    </table>
+    {% if storage_view.counts %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Row counts</h3>
+    <table>
+        {% for table, count in storage_view.counts.items() %}
+        <tr>
+            <th>{{ table }}</th>
+            <td>{% if count is none %}<span class="muted">—</span>{% else %}{{ '{:,}'.format(count) }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+</div>
+{% endif %}
 
 {% endblock %}
