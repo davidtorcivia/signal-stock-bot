@@ -1,7 +1,7 @@
 """LLM integration: OpenAI-compatible client + per-user conversation history."""
 
 from .client import LLMClient, LLMDisabled, LLMError, LLMNotConfigured
-from .history import ConversationHistory
+from .history import ConversationHistory, format_relative_age
 from .reactor import EmojiReactor
 
 __all__ = [
@@ -11,4 +11,5 @@ __all__ = [
     "LLMNotConfigured",
     "ConversationHistory",
     "EmojiReactor",
+    "format_relative_age",
 ]

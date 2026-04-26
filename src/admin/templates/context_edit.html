@@ -110,6 +110,21 @@
         <textarea name="reactor_prompt" id="reactor_prompt" rows="6"
                   placeholder="Optional. Specific reaction guidance for this chat (e.g. tone, what merits a react).">{{ values.reactor_prompt }}</textarea>
 
+        <h2 style="margin-top: 32px;">Natural response</h2>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="natural_response" {% if values.natural_response %}checked{% endif %}>
+            <span>Let the bot reply spontaneously in this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When on (and the reactor is enabled here), the reactor's LLM call
+            also considers whether the message warrants a real text reply —
+            for open-ended questions it can answer or obvious follow-ups to
+            its own messages without an @mention or quote-reply. The writer
+            model still gets a final say and may stay silent. Requires the
+            global switch at <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>
+            and a working reactor.
+        </p>
+
         <div style="margin-top: 24px; display:flex; gap:16px; align-items:center;">
             <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
             <a href="{{ url_for('admin.context_list') }}" class="muted">Cancel</a>

@@ -25,6 +25,34 @@ logger = logging.getLogger(__name__)
 DEFAULT_RETENTION_DAYS = 7
 
 
+def format_relative_age(seconds: float) -> str:
+    """Render a non-negative age as a short relative-time string.
+
+    Granularity buckets: "just now" (<60s), "Nm ago" (<60m), "Nh ago" (<24h),
+    "Nd ago" (<7d), "Nw ago" otherwise. Coarse on purpose — the model only
+    needs to distinguish "fresh" from "day-old" from "ancient", not
+    minute-precision recall.
+    """
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    if seconds < 7 * 86400:
+        return f"{int(seconds // 86400)}d ago"
+    return f"{int(seconds // (7 * 86400))}w ago"
+
+
+def _join_bracket(name: Optional[str], ago: Optional[str]) -> Optional[str]:
+    """Compose the inside of a `[...]` label from the parts that exist."""
+    if name and ago:
+        return f"{name}, {ago}"
+    return name or ago
+
+
 class ConversationHistory:
     """
     Rows: (id, context_key, sender_tail, role, content, created_at).
@@ -195,17 +223,22 @@ class ConversationHistory:
         context_key: str,
         turns_per_user: Optional[int] = None,
         attribute_senders: bool = False,
+        now: Optional[float] = None,
     ) -> list[dict]:
         """Return the last 2*N rows for this context in chronological order.
 
         When `attribute_senders` is True, user messages are prefixed with
         `[...tail]` so the LLM can tell speakers apart in a group thread.
+
+        When `now` is provided, user messages also carry a relative-time
+        suffix in the same bracket (`[David, 2h ago]`, `[3d ago]` in DMs)
+        so the model can tell which turns are fresh vs. days old.
         """
         await self._ensure_initialized()
         n = (turns_per_user or self.turns_per_user) * 2
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT role, content, sender_tail, user_hash
+                """SELECT role, content, sender_tail, user_hash, created_at
                    FROM conversation_turns
                    WHERE context_key = ?
                    ORDER BY created_at DESC, id DESC
@@ -215,14 +248,38 @@ class ConversationHistory:
             rows = await cursor.fetchall()
 
         turns: list[dict] = []
-        for role, content, sender_tail, user_hash in reversed(rows):
+        for role, content, sender_tail, user_hash, created_at in reversed(rows):
             text = content
-            if attribute_senders and role == "user":
-                label = self._attribution_label(user_hash, sender_tail)
-                if label:
-                    text = f"[{label}] {content}"
+            if role == "user":
+                name = (
+                    self._attribution_label(user_hash, sender_tail)
+                    if attribute_senders else None
+                )
+                ago = (
+                    format_relative_age(now - created_at)
+                    if now is not None and created_at is not None
+                    else None
+                )
+                bracket = _join_bracket(name, ago)
+                if bracket:
+                    text = f"[{bracket}] {content}"
             turns.append({"role": role, "content": text})
         return turns
+
+    async def latest_turn_timestamp(self, context_key: str) -> Optional[float]:
+        """Return the unix timestamp of the most recent turn, or None if empty.
+
+        Used by the prompt builder to decide whether the prior conversation
+        is stale enough to warrant an explicit advisory to the model.
+        """
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT MAX(created_at) FROM conversation_turns WHERE context_key = ?",
+                (context_key,),
+            )
+            row = await cursor.fetchone()
+        return row[0] if row and row[0] is not None else None
 
     def _attribution_label(
         self, user_hash: Optional[str], sender_tail: Optional[str]

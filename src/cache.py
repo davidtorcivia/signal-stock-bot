@@ -278,6 +278,7 @@ class ReactorMetrics:
     skipped_cooldown: int = 0
     skipped_short: int = 0
     skipped_no_tool: int = 0      # LLM declined (no tool call returned)
+    responses_triggered: int = 0  # should_respond tool was invoked (natural-response feature)
     errors: int = 0
     by_emoji: dict = field(default_factory=dict)
     last_reaction_at: Optional[float] = None
@@ -402,6 +403,11 @@ class MetricsCollector:
     def record_reactor_evaluation(self) -> None:
         with self._lock:
             self._reactor.evaluations += 1
+
+    def record_reactor_response(self) -> None:
+        """The reactor's should_respond tool fired (natural-response feature)."""
+        with self._lock:
+            self._reactor.responses_triggered += 1
 
     def record_reactor_reaction(self, emoji: str) -> None:
         with self._lock:

@@ -23,6 +23,8 @@ import logging
 import re
 from typing import Optional
 
+from ..admin.events import get_bus
+
 logger = logging.getLogger(__name__)
 
 
@@ -168,27 +170,78 @@ class PollVoter:
         )
         user_content = "\n\n".join(user_parts)
 
+        get_bus().publish(
+            "reactor",
+            decision="poll_seen",
+            sender_tail=(author_phone or "")[-4:],
+            group_id=group_id,
+            text=f"poll: {question[:120]}",
+        )
+
+        # Thinking-mode models burn a lot of tokens reasoning before they
+        # produce the JSON answer. 200 was way too low — the model would
+        # truncate mid-thought and never emit indices. Bumped to 2000;
+        # the actual answer is a tiny JSON array, so the cap exists only
+        # to bound runaway reasoning.
         try:
             msg = await self.llm.chat_messages(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                overrides={"max_tokens": 200, "temperature": 0.7},
+                overrides={"max_tokens": 2000, "temperature": 0.7},
                 suppress_response_style=True,
                 purpose="poll_vote",
             )
         except Exception as e:
             logger.warning(f"PollVoter: LLM call failed: {e}")
-            return
-
-        content = (msg.get("content") or "").strip()
-        indices = self._parse_indices(content, len(options))
-        if not indices:
-            logger.info(
-                f"PollVoter: no valid indices parsed from {content!r}; skipping vote"
+            get_bus().publish(
+                "reactor",
+                decision="poll_error",
+                sender_tail=(author_phone or "")[-4:],
+                group_id=group_id,
+                text=str(e)[:200],
             )
             return
+
+        # Some providers (DeepSeek, OpenRouter aggregator) put the model's
+        # answer in `reasoning_content` / `reasoning` and leave `content`
+        # empty when thinking mode is on. Search all three fields — the
+        # parser is tolerant of preamble, so giving it the reasoning text
+        # works fine. Without this fallback, every poll would be skipped
+        # whenever the main LLM has thinking enabled.
+        candidates = [
+            (msg.get("content") or "").strip(),
+            (msg.get("reasoning_content") or "").strip(),
+            (msg.get("reasoning") or "").strip(),
+        ]
+        indices: list[int] = []
+        used_field = ""
+        for field_text in candidates:
+            if not field_text:
+                continue
+            indices = self._parse_indices(field_text, len(options))
+            if indices:
+                used_field = field_text
+                break
+        if not indices:
+            logger.info(
+                f"PollVoter: no valid indices parsed from any field "
+                f"(content={candidates[0]!r}, reasoning={candidates[1] or candidates[2]!r}); "
+                f"skipping vote"
+            )
+            get_bus().publish(
+                "reactor",
+                decision="poll_skip",
+                sender_tail=(author_phone or "")[-4:],
+                group_id=group_id,
+                text="LLM returned no parsable indices",
+            )
+            return
+        logger.debug(
+            f"PollVoter: indices {indices} parsed from "
+            f"{used_field[:120]!r}"
+        )
         if not allow_multiple:
             indices = indices[:1]
 
@@ -207,7 +260,21 @@ class PollVoter:
                 f"PollVoter: voted on \"{question}\" → {chosen} "
                 f"(by [{author_label}] in group {group_id[:12]})"
             )
+            get_bus().publish(
+                "reactor",
+                decision="poll_voted",
+                sender_tail=(author_phone or "")[-4:],
+                group_id=group_id,
+                text=f"voted {chosen}",
+            )
         else:
             logger.warning(
                 f"PollVoter: vote send failed for poll {poll_ts}"
+            )
+            get_bus().publish(
+                "reactor",
+                decision="poll_error",
+                sender_tail=(author_phone or "")[-4:],
+                group_id=group_id,
+                text="signal-cli send_poll_vote failed",
             )

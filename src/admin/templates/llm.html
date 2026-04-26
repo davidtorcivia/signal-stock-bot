@@ -193,6 +193,44 @@
         <textarea name="reactor_system_prompt" id="reactor_system_prompt" rows="6"
                   placeholder="Empty = built-in default (sparing, sentiment-led, skip transactional).">{{ values.reactor_system_prompt or '' }}</textarea>
 
+        <h2 style="margin-top: 32px;">Natural response</h2>
+        <p class="muted" style="font-size: 12px;">
+            Lets the bot decide to reply to a group message even when not
+            mentioned, quoted, or addressed by name — for open-ended questions
+            the bot might know about, or obvious follow-ups to its own prior
+            replies. Decision runs inside the reactor's existing LLM call (no
+            extra cost). The writer model may still bail with no message after
+            looking at the full context. Per-context opt-in lives on
+            <code>/admin/contexts/&lt;id&gt;</code>.
+        </p>
+
+        <label for="natural_response_enabled">Natural response enabled (global kill switch)</label>
+        <input type="text" name="natural_response_enabled" id="natural_response_enabled"
+               value="{{ 'true' if values.natural_response_enabled else 'false' }}"
+               placeholder="true / false">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Off by default. Per-context flag is required in addition to this
+            switch. Requires the emoji reactor to be enabled.
+        </p>
+
+        <label for="natural_response_cooldown">Per-group cooldown (seconds)</label>
+        <input type="number" name="natural_response_cooldown" id="natural_response_cooldown" min="0"
+               value="{{ values.natural_response_cooldown if values.natural_response_cooldown is not none else '' }}"
+               placeholder="300">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Minimum time between spontaneous replies in the same group.
+            Prevents runaway interjections. Mentions/quotes always bypass this.
+        </p>
+
+        <label for="natural_response_extra_prompt">Extra reactor prompt (appended)</label>
+        <textarea name="natural_response_extra_prompt" id="natural_response_extra_prompt" rows="4"
+                  placeholder="Empty = built-in guidance for when to call should_respond.">{{ values.natural_response_extra_prompt or '' }}</textarea>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Optional. Appended to the reactor system prompt only when the
+            should_respond tool is exposed (per-context flag on, global flag
+            on, cooldown clear).
+        </p>
+
         <div style="margin-top: 24px;">
             <button type="submit">Save</button>
         </div>

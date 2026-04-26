@@ -32,6 +32,10 @@ class ContextPolicy:
     # Emoji reactor: per-context override of the global setting + dedicated prompt
     reactor_enabled: bool = True          # Only matters when reactor is globally enabled
     reactor_prompt: Optional[str] = None  # None / empty => use global reactor prompt
+    # Natural response: when True, the reactor LLM also gets a should_respond
+    # tool so it can decide to write a reply (not just react) for messages that
+    # weren't directed at the bot via mention/quote. Requires reactor_enabled.
+    natural_response: bool = False
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()

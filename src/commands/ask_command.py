@@ -15,15 +15,41 @@ The command's registered name is always "ask"; an admin-chosen alias from
 import asyncio
 import json
 import logging
+import time
 from typing import Optional
 
 from .base import BaseCommand, CommandContext, CommandResult
 from ..database import hash_phone
-from ..llm import LLMClient, LLMDisabled, LLMError, LLMNotConfigured, ConversationHistory
+from ..llm import (
+    LLMClient,
+    LLMDisabled,
+    LLMError,
+    LLMNotConfigured,
+    ConversationHistory,
+    format_relative_age,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_ROUNDS = 25
+
+# Threshold above which we add an explicit "prior conversation is stale" hint
+# to the system prompt. Tuned conservatively: anything older than half a day
+# is likely a fresh topic, not a continuation.
+STALENESS_THRESHOLD_SECONDS = 6 * 3600
+
+
+def _wrap_xml(tag: str, body: str) -> str:
+    """Wrap a block of text in semantic XML tags for the model.
+
+    Empty/whitespace bodies short-circuit to "" so callers can compose
+    suffix blocks unconditionally and rely on the surrounding `if` filter
+    to drop the empty ones.
+    """
+    inner = (body or "").strip()
+    if not inner:
+        return ""
+    return f"<{tag}>\n{inner}\n</{tag}>"
 
 
 class AskCommand(BaseCommand):
@@ -112,17 +138,20 @@ class AskCommand(BaseCommand):
             logger.debug(f"Read-time enrichment failed: {e}")
             return text
 
-    async def _build_group_context(self, ctx) -> str:
+    async def _build_group_context(self, ctx, now: float) -> str:
+        """Render recent group chat, oldest-first, wrapped for the model.
+
+        Each line gets `[Sender, 5m ago] text` so the model can tell which
+        bits of context are seconds-old vs. hours-old. Returns the full
+        `<group_context>...</group_context>` block, or "" if there's nothing
+        to show.
+        """
         limit = self._live_group_ctx()
         if limit <= 0 or not ctx.is_group or self.group_log is None:
             return ""
         msgs = await self.group_log.recent(ctx.group_id, limit=limit, exclude_last=1)
         if not msgs:
             return ""
-        if self.name_registry is not None and any(self.name_registry._cache):
-            header = "Recent group chat (oldest first; senders by name when known, last-4 otherwise):"
-        else:
-            header = "Recent group chat (oldest first, senders shown by last 4 digits):"
 
         # Enrich messages concurrently. _enrich short-circuits on empty
         # input so empty cells cost ~nothing; gathering avoids 30 sequential
@@ -130,13 +159,18 @@ class AskCommand(BaseCommand):
         raw_texts = [(m["text"] or "").strip() for m in msgs]
         enriched = await asyncio.gather(*(self._enrich(t) for t in raw_texts))
 
-        lines = [header]
+        lines: list[str] = []
         for m, text in zip(msgs, enriched):
             if not text:
                 continue
             label = self._sender_label(m["sender"])
-            lines.append(f"  [{label}] {text.replace(chr(10), ' ')}")
-        return "\n".join(lines)
+            ts = m.get("created_at")
+            ago = format_relative_age(now - ts) if ts is not None else None
+            bracket = f"{label}, {ago}" if ago else label
+            lines.append(f"[{bracket}] {text.replace(chr(10), ' ')}")
+        if not lines:
+            return ""
+        return _wrap_xml("group_context", "\n".join(lines))
 
     def _sender_label(self, phone: Optional[str]) -> str:
         if self.name_registry is None:
@@ -271,7 +305,15 @@ class AskCommand(BaseCommand):
         context_key = ctx.context_key()
         is_group = ctx.group_id is not None
 
-        if ctx.args[0].lower() in ("reset", "clear", "forget"):
+        # The reset/clear/forget subcommand is only valid when the user
+        # explicitly invoked !ask. For implicit asks (reactor-triggered
+        # spontaneous replies), the user's message could legitimately
+        # start with any of these words ("Reset the alarms", "Clear the
+        # table") — we must not interpret it as a history wipe.
+        if (
+            ctx.args[0].lower() in ("reset", "clear", "forget")
+            and not getattr(ctx, "implicit_reason", None)
+        ):
             removed = await self.history.clear(context_key)
             return CommandResult.ok(f"Cleared {removed} conversation turn(s).")
 
@@ -285,10 +327,12 @@ class AskCommand(BaseCommand):
         question = await self._enrich(question)
 
         try:
+            now_ts = time.time()
             prior = await self.history.load(
                 context_key,
                 turns_per_user=self._live_turns(),
                 attribute_senders=is_group,
+                now=now_ts,
             )
             # Re-enrich each prior turn — bot/user messages stored before
             # the enricher existed (or stored with a failed enrichment)
@@ -304,23 +348,38 @@ class AskCommand(BaseCommand):
                 for m, new_content in zip(text_msgs, enriched):
                     m["content"] = new_content
 
-            group_ctx = await self._build_group_context(ctx)
+            group_ctx_block = await self._build_group_context(ctx, now_ts)
 
-            # Long-term rolling summary, if one exists. Prepended to the
-            # group-context block so both end up in the system message in
-            # a sensible reading order: persona → long memory → recent
-            # group chat → current time → response style.
+            # Long-term rolling summary, if one exists. Lives in the system
+            # suffix so it bookends the persona; the XML tag tells the
+            # model what it is (the inner text no longer needs a prose label).
             summary_block = ""
             try:
                 summary = await self.history.get_summary(context_key)
                 if summary and summary.get("summary"):
                     summary_text = await self._enrich(summary["summary"])
-                    summary_block = (
-                        "Conversation memory (rolling summary of older "
-                        "turns):\n" + summary_text
-                    )
+                    summary_block = summary_text
             except Exception as e:
                 logger.debug(f"Failed to load summary for ask: {e}")
+
+            # Staleness advisory: if the most recent stored turn is hours old,
+            # warn the model so it doesn't assume the new message is a
+            # continuation of an old thread. Skipped when the history is
+            # empty — there's nothing to be stale about.
+            staleness_block = ""
+            try:
+                last_ts = await self.history.latest_turn_timestamp(context_key)
+            except Exception as e:
+                logger.debug(f"Failed to read latest turn timestamp: {e}")
+                last_ts = None
+            if last_ts is not None and prior:
+                age = now_ts - last_ts
+                if age >= STALENESS_THRESHOLD_SECONDS:
+                    staleness_block = (
+                        f"The most recent prior turn was {format_relative_age(age)}. "
+                        f"Treat the conversation history as background — the new "
+                        f"message may be a fresh topic, unrelated to those older turns."
+                    )
 
             # When real names are registered for this chat, tell the LLM
             # explicitly. Without this, the model parrots earlier turns
@@ -450,17 +509,51 @@ class AskCommand(BaseCommand):
                         )
                     reactor_log_block = "\n".join(lines)
 
+            # Implicit / spontaneous trigger: the reactor's should_respond
+            # tool decided this message warrants a reply, but the user did
+            # not @mention, quote-reply, or otherwise address the bot.
+            # Tell the writer to look at full context, judge whether the
+            # reactor's call was actually right, and bail with empty content
+            # if there's nothing useful to add. Empty-content from the
+            # writer becomes a silent no-op upstream (see
+            # dispatch_implicit_ask).
+            implicit_directive = ""
+            if getattr(ctx, "implicit_reason", None):
+                implicit_directive = (
+                    "Spontaneous reply: this message was NOT addressed to "
+                    "you directly — no @mention, quote-reply, or name "
+                    "trigger. The reactor flagged it because: "
+                    f"{ctx.implicit_reason!r}.\n\n"
+                    "You are now the second-stage filter. Look at the full "
+                    "group context and decide whether a real reply is "
+                    "actually warranted. It is fine — and often correct — "
+                    "to stay silent. To stay silent, return empty content "
+                    "(no tool calls, no text). The bot will say nothing.\n\n"
+                    "Reply only when you have something genuinely useful "
+                    "to add: a real answer to an open-ended question, a "
+                    "factual correction, or a substantive continuation of "
+                    "a thread you started. Skip otherwise. Be brief — "
+                    "spontaneous replies should be lighter-touch than "
+                    "ones the user explicitly asked for."
+                )
+
+            # System suffix: persona-adjacent directives + long memory +
+            # staleness advisory. Each block gets its own XML tag so the
+            # model can scan the structure instead of guessing at section
+            # boundaries in a wall of text. Group context + the live
+            # trigger are NOT placed here — they belong to the user-role
+            # message below so they read as situational input, not persona.
             system_suffix_parts = [
-                p for p in (
-                    names_directive,
-                    reactor_directive,
-                    reactor_log_block,
-                    tarot_directive,
-                    iching_directive,
-                    summary_block,
-                    group_ctx,
-                ) if p
+                _wrap_xml("identity_note", names_directive),
+                _wrap_xml("reactor_reflex", reactor_directive),
+                _wrap_xml("recent_reactions", reactor_log_block),
+                _wrap_xml("tarot_tool", tarot_directive),
+                _wrap_xml("iching_tool", iching_directive),
+                _wrap_xml("spontaneous_reply", implicit_directive),
+                _wrap_xml("conversation_memory", summary_block),
+                _wrap_xml("conversation_status", staleness_block),
             ]
+            system_suffix_parts = [p for p in system_suffix_parts if p]
             system_suffix = "\n\n".join(system_suffix_parts) or None
 
             prompt_override = None
@@ -468,18 +561,16 @@ class AskCommand(BaseCommand):
                 prompt_override = ctx.policy.system_prompt
             system_prompt = self.llm._resolve_system_prompt(prompt_override, system_suffix)
 
-            # Current question gets the same attribution prefix in group mode.
-            # Use the resolved label so the LLM sees "[David]" instead of
-            # "[...4137]" when a name is registered.
-            if is_group:
-                label = self._sender_label(ctx.sender)
-                current_user_content = f"[{label}] {question}"
-            else:
-                current_user_content = question
+            # Trigger user-message: optional group context, optional reply
+            # target, then the live message wrapped in <current_message>
+            # with an explicit "respond to this" instruction. The wrapper
+            # disambiguates the trigger from history + group context, which
+            # otherwise just look like more user turns to the model.
+            trigger_parts: list[str] = []
 
-            # If the user replied to a specific message, surface that so the
-            # LLM knows what's being responded to. Without this, "expand on
-            # that" with no chronological neighbour would be unanswerable.
+            if group_ctx_block:
+                trigger_parts.append(group_ctx_block)
+
             if ctx.quote_text:
                 quoted_label = (
                     self._sender_label(ctx.quote_author)
@@ -489,10 +580,26 @@ class AskCommand(BaseCommand):
                 quoted = (await self._enrich(ctx.quote_text)).replace("\n", " ").strip()
                 if len(quoted) > 400:
                     quoted = quoted[:399].rstrip() + "…"
-                current_user_content = (
-                    f"(Replying to [{quoted_label}]: \"{quoted}\")\n"
-                    f"{current_user_content}"
+                trigger_parts.append(
+                    f'<replying_to from="{quoted_label}">\n{quoted}\n</replying_to>'
                 )
+
+            sender_label = self._sender_label(ctx.sender) if is_group else "user"
+            # For implicit / spontaneous asks the closing instruction softens
+            # — the user didn't ask the bot anything, so "Respond to this"
+            # would override the bail-freely guidance in the system suffix.
+            closing = (
+                "Decide whether to respond. Empty output = stay silent."
+                if getattr(ctx, "implicit_reason", None)
+                else "Respond to this message."
+            )
+            trigger_parts.append(
+                f'<current_message from="{sender_label}" sent="just now">\n'
+                f"{question}\n"
+                f"</current_message>\n"
+                f"{closing}"
+            )
+            current_user_content = "\n\n".join(trigger_parts)
 
             messages: list[dict] = [{"role": "system", "content": system_prompt}]
             messages.extend(prior)

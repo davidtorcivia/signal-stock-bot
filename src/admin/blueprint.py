@@ -292,6 +292,11 @@ LLM_KEYS = [
     "reactor_group_cooldown",
     "reactor_context_messages",
     "reactor_system_prompt",
+    # Natural response: piggybacks on the reactor model. Global kill switch +
+    # tunables; per-context opt-in lives on ContextPolicy.natural_response.
+    "natural_response_enabled",
+    "natural_response_cooldown",
+    "natural_response_extra_prompt",
 ]
 
 # Imported lazily inside the route to avoid a circular import.
@@ -328,6 +333,10 @@ LLM_DEFAULTS = {
     "reactor_group_cooldown": 10,
     "reactor_context_messages": 5,
     "reactor_system_prompt": "",           # empty => use the built-in DEFAULT_REACTOR_PROMPT
+    # Natural response (piggybacks on reactor model)
+    "natural_response_enabled": False,
+    "natural_response_cooldown": 300,      # per-group seconds between spontaneous replies
+    "natural_response_extra_prompt": "",   # appended to reactor prompt; empty => built-in default
 }
 
 
@@ -369,7 +378,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
     """Persist LLM form values with schema-aware coercion."""
     import json
 
-    bool_keys = {"llm_enabled", "reactor_enabled"}
+    bool_keys = {"llm_enabled", "reactor_enabled", "natural_response_enabled"}
     int_keys = {
         "llm_max_tokens",
         "llm_timeout_seconds",
@@ -382,6 +391,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
         "reactor_sender_cooldown",
         "reactor_group_cooldown",
         "reactor_context_messages",
+        "natural_response_cooldown",
     }
     float_keys = {"llm_temperature", "reactor_temperature"}
 
@@ -709,6 +719,7 @@ def _register_context_routes(
             "llm_intent": False,
             "reactor_enabled": True,
             "reactor_prompt": "",
+            "natural_response": False,
         }
         if request.method == "POST":
             if not verify_csrf():
@@ -765,6 +776,7 @@ def _register_context_routes(
             "llm_intent": policy.llm_intent,
             "reactor_enabled": policy.reactor_enabled,
             "reactor_prompt": policy.reactor_prompt or "",
+            "natural_response": policy.natural_response,
         }
         if request.method == "POST":
             values = _form_to_values(request.form)
@@ -839,6 +851,7 @@ def _form_to_values(form) -> dict:
         "llm_intent": form.get("llm_intent", "") == "on",
         "reactor_enabled": form.get("reactor_enabled", "") == "on",
         "reactor_prompt": form.get("reactor_prompt", ""),
+        "natural_response": form.get("natural_response", "") == "on",
     }
 
 
@@ -858,6 +871,7 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
     llm_intent = form.get("llm_intent", "") == "on"
     reactor_enabled = form.get("reactor_enabled", "") == "on"
     reactor_prompt = (form.get("reactor_prompt") or "").strip() or None
+    natural_response = form.get("natural_response", "") == "on"
 
     if kind not in ("group", "dm", "default"):
         raise ValueError("kind must be group, dm, or default")
@@ -881,6 +895,7 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         llm_intent=llm_intent,
         reactor_enabled=reactor_enabled,
         reactor_prompt=reactor_prompt,
+        natural_response=natural_response,
     )
 
 

@@ -21,6 +21,11 @@ class CommandContext:
     # responded to. None when the message isn't a reply.
     quote_text: Optional[str] = None
     quote_author: Optional[str] = None  # phone number, when known
+    # Set when this !ask was triggered spontaneously by the reactor's
+    # should_respond tool — not by an explicit mention/quote/command. Carries
+    # the reactor's one-sentence justification so the writer model can decide
+    # whether the inferred intent was actually right (and bail if not).
+    implicit_reason: Optional[str] = None
 
     @property
     def is_group(self) -> bool:

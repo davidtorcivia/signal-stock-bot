@@ -139,6 +139,10 @@ class CommandDispatcher:
         self.llm_client = llm_client
         self.ask_command = ask_command
         self.reactor = reactor
+        # Late-bound by main.py once SignalHandler exists. Used only by
+        # dispatch_implicit_ask, which fires from the reactor outside the
+        # normal request/response path and so must send its own message.
+        self.signal_handler = None
         self.commands: dict[str, BaseCommand] = {}
         self._rate_limiter = UserRateLimiter(limit=rate_limit)
         self._corn_cooldown: dict[str, float] = {}  # sender -> last triggered timestamp
@@ -260,6 +264,19 @@ class CommandDispatcher:
             and target_timestamp
         ):
             import asyncio
+            # bot_will_reply suppresses should_respond inside the reactor
+            # when the dispatcher can already tell the message produces a
+            # reply on its own — mention, prefixed command, or inline ticker
+            # (e.g., "$AAPL") which routes to the price command. Without
+            # this, the user gets two replies for one message.
+            bot_will_reply = (
+                mentioned
+                or message.strip().startswith(self.prefix)
+                or (
+                    self.enable_inline_symbols
+                    and bool(self.extract_inline_symbols(message))
+                )
+            )
             asyncio.create_task(
                 self.reactor.maybe_react(
                     sender=sender,
@@ -267,6 +284,7 @@ class CommandDispatcher:
                     group_id=group_id,
                     target_timestamp=target_timestamp,
                     policy=policy,
+                    bot_will_reply=bot_will_reply,
                 )
             )
 
@@ -658,6 +676,110 @@ class CommandDispatcher:
         except Exception as e:
             logger.exception(f"Error executing command {command}")
             return CommandResult.error(f"Internal error: {type(e).__name__}")
+
+    async def dispatch_implicit_ask(
+        self,
+        *,
+        sender: str,
+        message: str,
+        group_id: Optional[str],
+        policy=None,
+        reason: str = "",
+    ) -> None:
+        """Run !ask spontaneously on behalf of the reactor's should_respond tool.
+
+        Fires outside the normal dispatch request/response path — the reactor
+        decided this message warrants a reply, so we run the writer model
+        with `implicit_reason` set (which adds a system suffix telling it to
+        bail freely) and send the result via signal_handler ourselves.
+
+        Errors are logged and swallowed; the reactor must never affect the
+        rest of the bot.
+        """
+        if self.ask_command is None or self.signal_handler is None:
+            logger.warning(
+                "dispatch_implicit_ask: ask_command or signal_handler not wired"
+            )
+            return
+        if policy is not None and not policy.allows_command("ask"):
+            logger.info("dispatch_implicit_ask: !ask not allowed by policy; skipping")
+            return
+
+        from .base import CommandContext
+        # Pre-enrichment of the message happens inside ask_command; we feed
+        # the raw message and let the existing pipeline handle it.
+        # `args` carries the whole message as a single token: ask_command
+        # falls back to `" ".join(args)` only when raw_message lacks a
+        # space, and we don't want individual user words leaking into any
+        # other arg-inspecting code path. The full message lives on
+        # raw_message; the question is reconstructed from there.
+        ctx = CommandContext(
+            sender=sender,
+            group_id=group_id,
+            raw_message=f"{self.prefix}ask {message}",
+            command="ask",
+            args=[message] if message else [""],
+            policy=policy,
+            implicit_reason=reason or "(reactor flagged this as worth a reply)",
+        )
+
+        get_audit_logger().info(
+            f"{sender[-4:]} | implicit_ask {reason[:80]!r}"
+        )
+
+        try:
+            result = await self.ask_command.execute(ctx)
+        except Exception as e:
+            logger.exception(f"Implicit ask execution failed: {e}")
+            return
+
+        # Bail gate: empty content or unsuccessful → silent. The writer model
+        # is told (in the implicit-ask system suffix) it may stay silent by
+        # returning empty content. Both branches publish a bus event so the
+        # admin live feed can show the second-stage decision.
+        sender_tail = (sender or "")[-4:]
+        if not result or not result.success:
+            logger.info("Implicit ask: writer bailed (unsuccessful result)")
+            get_bus().publish(
+                "reactor",
+                decision="respond_bailed",
+                sender_tail=sender_tail,
+                group_id=group_id,
+                text="unsuccessful result",
+            )
+            return
+        text = (result.text or "").strip()
+        if not text:
+            logger.info("Implicit ask: writer bailed (empty content)")
+            get_bus().publish(
+                "reactor",
+                decision="respond_bailed",
+                sender_tail=sender_tail,
+                group_id=group_id,
+                text="empty content",
+            )
+            return
+
+        try:
+            await self.signal_handler.send_message(
+                recipient=sender,
+                message=result.text,
+                group_id=None if result.dm_only else group_id,
+                attachments=result.attachments,
+                styled=result.styled,
+            )
+            logger.info(
+                f"Implicit ask: replied to ...{sender_tail} ({len(text)} chars)"
+            )
+            get_bus().publish(
+                "reactor",
+                decision="respond_sent",
+                sender_tail=sender_tail,
+                group_id=group_id,
+                chars=len(text),
+            )
+        except Exception as e:
+            logger.error(f"Failed to send implicit ask response: {e}")
 
     async def _maybe_augment(self, cmd_name: str, output_text: str, ctx) -> Optional[str]:
         """Return an LLM-generated augmentation string, or None to skip."""

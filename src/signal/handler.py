@@ -277,12 +277,18 @@ class SignalHandler:
             logger.warning("send_poll_vote called with no recipient/group")
             return False
 
+        # signal-cli-rest-api expects 1-INDEXED option numbers (we hit a 400
+        # "index needs to be >= 1" otherwise). Callers pass 0-indexed values
+        # because that's how the inbound poll defines them; we shift here at
+        # the wire boundary so the rest of the codebase stays consistent.
+        wire_indices = [i + 1 for i in selected_answers]
+
         session = await self._get_session()
         payload = {
             "poll_author": poll_author,
             "poll_timestamp": str(int(poll_timestamp)),
             "recipient": target,
-            "selected_answers": list(selected_answers),
+            "selected_answers": wire_indices,
         }
         url = f"{self.config.api_url}/v1/polls/{self.config.phone_number}/vote"
         try:

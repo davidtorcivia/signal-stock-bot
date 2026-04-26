@@ -56,6 +56,10 @@ LIVE_KEYS = {
     "reactor_sender_cooldown",
     "reactor_group_cooldown",
     "reactor_context_messages",
+    # Natural response (piggybacks on the reactor LLM call)
+    "natural_response_enabled",
+    "natural_response_cooldown",
+    "natural_response_extra_prompt",
 }
 
 # Keys the admin UI exposes but that require a process restart.

@@ -11,6 +11,11 @@ maybe_react() task. The reactor:
   3. If the LLM calls the tool → POSTs a Signal reaction to the message
   4. If it doesn't call the tool → no reaction; user never sees anything
 
+When natural-response is enabled (global + per-context), the same LLM call
+also gets a `should_respond` tool. If invoked, the reactor hands off to
+`implicit_response_handler` (typically the dispatcher) which runs !ask
+spontaneously and sends the result.
+
 All errors are logged and swallowed. The reactor must never affect the
 command-handling path or surface diagnostics to users.
 """
@@ -20,7 +25,7 @@ import json
 import logging
 import time
 from collections import deque
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from ..admin.events import get_bus
 from ..cache import get_metrics
@@ -57,6 +62,55 @@ REACT_TOOL = {
         },
     },
 }
+
+
+SHOULD_RESPOND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "should_respond",
+        "description": (
+            "Trigger a full text reply to this message — used when the user "
+            "is asking an open-ended question the bot can usefully answer, "
+            "or is clearly continuing a conversation with the bot without "
+            "explicitly addressing it. Do NOT call for banter, logistics, "
+            "or messages aimed at a specific other person. Mutually "
+            "exclusive with emoji_react: pick one."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "One short sentence explaining why a real reply is "
+                        "warranted (passed to the writer model as a hint)."
+                    ),
+                }
+            },
+            "required": ["reason"],
+        },
+    },
+}
+
+
+# Appended to the reactor system prompt only when the should_respond tool is
+# actually exposed (per-context flag on, global flag on, cooldown clear).
+NATURAL_RESPONSE_GUIDANCE = """\
+
+You ALSO have a should_respond(reason) tool. Call it instead of emoji_react when:
+- Someone asked an open-ended question to the group that you can usefully answer
+- A user is clearly continuing a conversation with you (responding to your earlier
+  reply) without addressing you by name, @mention, or quote-reply
+
+Do NOT call should_respond when:
+- The message is banter, chatter, logistics, or scheduling
+- The message is addressed to a specific other person (not you)
+- A simple emoji reaction fits better than a written reply
+- Anyone in the chat is already mid-thread on the topic and the bot would interrupt
+
+If you call should_respond, do not also call emoji_react. The writer model will
+look at the full context and may still decide to stay silent — your job is just
+to flag messages that plausibly warrant a reply."""
 
 
 DEFAULT_REACTOR_PROMPT = """\
@@ -113,6 +167,16 @@ class EmojiReactor:
         # emoji) so the writing LLM can reference what it reacted to and why
         # when users ask. In-memory only; survives until process restart.
         self._recent: dict[str, deque] = {}
+        # Per-group cooldown for natural-response (spontaneous text replies).
+        # Kept separate from emoji cooldowns because writes are louder than
+        # reactions and want a longer minimum gap.
+        self._implicit_response_last: dict[str, float] = {}
+        # Late-bound async handler invoked when the LLM calls should_respond.
+        # Signature: (sender, message, group_id, target_timestamp, policy,
+        # reason) -> Awaitable[None]. Wired in main.py to dispatcher.
+        self.implicit_response_handler: Optional[
+            Callable[..., Awaitable[None]]
+        ] = None
 
     def _sender_label(self, phone: str) -> str:
         if self.name_registry is None:
@@ -132,7 +196,42 @@ class EmojiReactor:
             "sender_cooldown": int(store.get("reactor_sender_cooldown") or 30),
             "group_cooldown": int(store.get("reactor_group_cooldown") or 10),
             "context_messages": int(store.get("reactor_context_messages") or 5),
+            "natural_response_enabled": bool(
+                store.get("natural_response_enabled", False)
+            ),
+            "natural_response_cooldown": int(
+                store.get("natural_response_cooldown") or 300
+            ),
+            "natural_response_extra_prompt": (
+                store.get("natural_response_extra_prompt") or ""
+            ),
         }
+
+    def _natural_response_active(self, group_id: str, cfg: dict, policy) -> bool:
+        """Decide whether to expose should_respond for this evaluation.
+
+        Three gates: global flag, per-context flag, and the per-group
+        cooldown since the last spontaneous reply. Mentions/quotes route
+        through the dispatcher's normal path and don't touch this cooldown.
+        """
+        if not cfg["natural_response_enabled"]:
+            return False
+        if policy is None or not getattr(policy, "natural_response", False):
+            return False
+        if self.implicit_response_handler is None:
+            return False
+        last = self._implicit_response_last.get(group_id, 0.0)
+        if time.time() - last < cfg["natural_response_cooldown"]:
+            return False
+        return True
+
+    def mark_implicit_response(self, group_id: str) -> None:
+        """Record that a spontaneous reply just fired (or is about to).
+
+        Called early — before ask_command runs — so concurrent reactor
+        evaluations see the cooldown advanced and don't double-fire.
+        """
+        self._implicit_response_last[group_id] = time.time()
 
     def _within_cooldown(self, sender: str, group_id: str, cfg: dict) -> bool:
         now = time.time()
@@ -224,8 +323,16 @@ class EmojiReactor:
         group_id: Optional[str],
         target_timestamp: Optional[int],
         policy=None,
+        bot_will_reply: bool = False,
     ) -> None:
-        """Background task. Logs and swallows every error."""
+        """Background task. Logs and swallows every error.
+
+        `bot_will_reply` is set by the dispatcher when it can already tell the
+        message will produce a reply (mention or prefixed command). The
+        reactor still emoji-evaluates, but suppresses the should_respond tool
+        so we don't fire a duplicate spontaneous reply on top of the explicit
+        one.
+        """
         metrics = get_metrics()
         try:
             # Groups only (per design); DMs explicitly excluded for now.
@@ -270,6 +377,22 @@ class EmojiReactor:
                 if ctx_prompt:
                     system_prompt = ctx_prompt
 
+            # Natural-response gating: when active, expose the second tool and
+            # append guidance describing when to use it. Off by default; both
+            # the global flag and per-context flag must be on. Suppressed when
+            # the dispatcher already knows it will reply (mention/command).
+            tools = [REACT_TOOL]
+            offer_should_respond = (
+                not bot_will_reply
+                and self._natural_response_active(group_id, cfg, policy)
+            )
+            if offer_should_respond:
+                tools.append(SHOULD_RESPOND_TOOL)
+                extra = cfg["natural_response_extra_prompt"].strip()
+                system_prompt = (
+                    f"{system_prompt}\n{extra or NATURAL_RESPONSE_GUIDANCE}"
+                )
+
             user_content = await self._build_user_content(
                 sender, text, group_id, cfg["context_messages"]
             )
@@ -291,13 +414,14 @@ class EmojiReactor:
             sender_tail = (sender or "")[-4:] or "????"
             preview = text.replace("\n", " ")[:60]
             logger.info(
-                f"Reactor: evaluating ...{sender_tail} ({len(text)}c): {preview!r}"
+                f"Reactor: evaluating ...{sender_tail} ({len(text)}c"
+                f"{', +respond' if offer_should_respond else ''}): {preview!r}"
             )
 
             try:
                 assistant_msg = await self.llm.chat_messages(
                     messages,
-                    tools=[REACT_TOOL],
+                    tools=tools,
                     overrides=overrides,
                     suppress_response_style=True,
                     purpose="reactor",
@@ -362,50 +486,93 @@ class EmojiReactor:
                 )
                 return
 
-            # First call wins; subsequent ones ignored
+            # should_respond wins over emoji_react when both are present —
+            # a real reply already conveys whatever a reaction would.
+            respond_reason: Optional[str] = None
+            emoji_pick: Optional[str] = None
             for call in tool_calls:
                 fn = call.get("function") or {}
-                if fn.get("name") != "emoji_react":
-                    continue
+                fname = fn.get("name")
                 raw_args = fn.get("arguments") or "{}"
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    emoji = (args.get("emoji") or "").strip() if isinstance(args, dict) else ""
+                    args = (
+                        json.loads(raw_args)
+                        if isinstance(raw_args, str)
+                        else raw_args
+                    )
                 except Exception:
                     continue
-                if not emoji:
+                if not isinstance(args, dict):
                     continue
+                if fname == "should_respond" and respond_reason is None:
+                    respond_reason = (args.get("reason") or "").strip() or "(no reason given)"
+                elif fname == "emoji_react" and emoji_pick is None:
+                    emoji_pick = (args.get("emoji") or "").strip()
 
+            if respond_reason and offer_should_respond:
+                # Mark cooldown first so concurrent reactor calls in the same
+                # group see it advanced and don't pile on. Cooldown stands
+                # even if the writer model bails — one decision per window.
+                self.mark_implicit_response(group_id)
+                metrics.record_reactor_response()
+                logger.info(
+                    f"Reactor: triggered should_respond on ...{sender_tail} "
+                    f"— {respond_reason!r}"
+                )
+                get_bus().publish(
+                    "reactor",
+                    decision="respond",
+                    sender_tail=sender_tail,
+                    group_id=group_id,
+                    text=respond_reason[:300],
+                )
+                handler = self.implicit_response_handler
+                if handler is not None:
+                    try:
+                        await handler(
+                            sender=sender,
+                            message=message,
+                            group_id=group_id,
+                            policy=policy,
+                            reason=respond_reason,
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            f"Implicit response handler failed: {e}"
+                        )
+                return
+
+            if emoji_pick:
                 self._record_cooldowns(sender, group_id)
                 ok = await self.signal.send_reaction(
                     recipient=sender,
                     target_author=sender,
                     target_timestamp=int(target_timestamp),
-                    emoji=emoji,
+                    emoji=emoji_pick,
                     group_id=group_id,
                 )
                 if ok:
-                    metrics.record_reactor_reaction(emoji)
+                    metrics.record_reactor_reaction(emoji_pick)
                     logger.info(
-                        f"Reactor: {emoji} on ...{(sender or '')[-4:]} "
+                        f"Reactor: {emoji_pick} on ...{(sender or '')[-4:]} "
                         f"({len(text)}-char msg)"
                     )
                     self._record_recent(
                         group_id=group_id,
                         sender_label=self._sender_label(sender),
                         target_text=text,
-                        emoji=emoji,
+                        emoji=emoji_pick,
                     )
                     get_bus().publish(
                         "reactor",
                         decision="react",
-                        emoji=emoji,
+                        emoji=emoji_pick,
                         sender_tail=sender_tail,
                         group_id=group_id,
                     )
                 else:
                     metrics.record_reactor_error()
-                return  # exactly one reaction per inbound message
+                return
 
         except asyncio.CancelledError:
             raise

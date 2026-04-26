@@ -601,6 +601,13 @@ def build_app(config: Config):
     # Same late-binding trick: ask_command needs the handler to drive the
     # typing indicator while its tool loop runs.
     ask_command.signal_handler = signal_handler
+    # Dispatcher needs the handler to send spontaneous replies fired by the
+    # reactor's should_respond tool — those run outside the normal request/
+    # response path so dispatch_implicit_ask must send its own messages.
+    dispatcher.signal_handler = signal_handler
+    # Reactor delegates its should_respond decisions to the dispatcher's
+    # implicit-ask path. This is what makes natural responses actually fire.
+    reactor.implicit_response_handler = dispatcher.dispatch_implicit_ask
 
     # Auto-vote on inbound polls. Bot picks option(s) via the LLM using
     # recent group context. No policy gate — per the user's request, every

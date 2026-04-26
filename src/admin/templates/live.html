@@ -91,9 +91,25 @@
         const body = document.createElement('span');
         body.className = 'body';
         if (ev.type === 'reactor') {
-            body.textContent = ev.decision === 'react'
-                ? `reacted ${ev.emoji}`
-                : 'declined';
+            if (ev.decision === 'react') {
+                body.textContent = `reacted ${ev.emoji}`;
+            } else if (ev.decision === 'respond') {
+                body.textContent = `would respond — ${ev.text || '(no reason)'}`;
+            } else if (ev.decision === 'respond_sent') {
+                body.textContent = `responded${ev.chars ? ` (${ev.chars} chars)` : ''}`;
+            } else if (ev.decision === 'respond_bailed') {
+                body.textContent = `writer bailed${ev.text ? ` — ${ev.text}` : ''}`;
+            } else if (ev.decision === 'poll_seen') {
+                body.textContent = `poll seen — ${ev.text || '(no question)'}`;
+            } else if (ev.decision === 'poll_voted') {
+                body.textContent = ev.text || 'voted';
+            } else if (ev.decision === 'poll_skip') {
+                body.textContent = `poll skipped — ${ev.text || '(no reason)'}`;
+            } else if (ev.decision === 'poll_error') {
+                body.textContent = `poll error — ${ev.text || ''}`;
+            } else {
+                body.textContent = ev.text ? `declined — ${ev.text}` : 'declined';
+            }
         } else {
             body.textContent = ev.text || '';
         }
