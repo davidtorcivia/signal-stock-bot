@@ -51,6 +51,7 @@ from .watchlist_commands import (
 )
 from .ask_command import AskCommand
 from .tarot_command import TarotCommand
+from .iching_command import IChingCommand
 from .predict_command import (
     PredictCommand,
     PredictionsCommand,
@@ -105,6 +106,7 @@ __all__ = [
     "AskCommand",
     # Woo
     "TarotCommand",
+    "IChingCommand",
     # Predictions
     "PredictCommand",
     "PredictionsCommand",

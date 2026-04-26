@@ -29,6 +29,8 @@ A self-hosted Signal bot for real-time stock quotes, market data, technical anal
 - **LLM command augmentation** — opt-in: append a brief plain-language interpretation to the output of selected commands (e.g. `!ta`, `!rating`)
 - **Twitter / X URL expansion** — pasted tweet links auto-resolve to text via fxtwitter so the LLM can see what users shared
 - **Group chat memory** — shared conversation thread per group with per-speaker attribution; configurable retention with auto-purge
+- **Emoji reactor** — fire-and-forget background LLM that picks a single emoji reaction for messages with strong sentiment; per-context toggleable, rate-limited per-sender + per-group; recent reactions inline in the writing LLM's prompt so it can answer "why did you react with X?" honestly
+- **Divination** — `!tarot` (Rider-Waite-Smith deck, single / 3-card / Celtic Cross / daily) and `!iching` (King-Wen 64 hexagrams, three-coin or yarrow-stalk casting, daily mode) — both render their own attachments and produce LLM-narrated readings on top of the canonical cards / hexagrams
 
 ---
 
@@ -304,6 +306,33 @@ Help text explains:
 
 The `!ask` alias is editable from `/admin/llm` (default `ask`, but `!ai`, `!sigil`, etc. all work the same). See [LLM Integration](#llm-integration).
 
+### Divination Commands
+
+Two image-attachment commands that draw from canonical decks/hexagrams and (optionally) get an LLM-narrated reading on top. Both also work via natural language when `llm_intent` is enabled for the context — the writing LLM receives a directive that *forces* it through the tool, so it can't fabricate cards or hexagrams in plain text.
+
+#### Tarot
+
+| Command | Description |
+|---------|-------------|
+| `!tarot` | Single random card |
+| `!tarot 3 [question]` | Three-card past / present / future spread |
+| `!tarot celtic [question]` | Ten-card Celtic Cross |
+| `!tarot daily` | Card of the day, cached per user × UTC date (same card all day) |
+
+Aliases: `!cards`, `!card`. Deck: Rider-Waite-Smith, downloaded once from Wikimedia Commons on first start (~90s) and cached in the persistent `data/tarot/` volume. Spreads are composed by `tarot_composer` into a single PNG attachment.
+
+#### I Ching
+
+| Command | Description |
+|---------|-------------|
+| `!iching [question]` | Three-coin cast (default) — `1/8, 3/8, 3/8, 1/8` distribution over `{6,7,8,9}` |
+| `!iching yarrow [question]` | Yarrow-stalk simulation — traditional `1/16, 5/16, 7/16, 3/16` distribution |
+| `!iching daily` | Hexagram of the day, cached per user × UTC date (same cast all day) |
+
+Aliases: `!ic`, `!yi`, `!yijing`. The hexagram(s) are rendered procedurally onto a parchment canvas — no image assets required. Each render shows: the Chinese name in serif CJK, pinyin · English title, the trigram pair (with procedurally-drawn mini-glyphs so we don't depend on Unicode trigram font coverage), the six-line hexagram in deep ink, a cinnabar seal in the corner with the hexagram number in Chinese numerals (e.g. `二十七` for hex 27), and keywords. Changing lines (`6` and `9`) are highlighted in cinnabar with `○` (yang→yin) or `×` (yin→yang) markers; if any are present, a transformed hexagram is rendered alongside the primary with the character `變` (*biàn* — change) between them.
+
+The casting itself uses a `random.SystemRandom` (cryptographically strong); see [`iching_command.py`](src/commands/iching_command.py) for the per-line generators.
+
 ### Admin Commands (Signal-side)
 
 | Command | Description |
@@ -452,11 +481,16 @@ Configure once at `/admin/llm`. All values apply live — no restart.
 - The configured (or per-context) system prompt
 - **Always** the current UTC time (`Current time: YYYY-MM-DD HH:MM:SS UTC`) — so the model never has to guess "now"
 - Per-user (DM) or per-group (group) conversation history
-- The user's question, with `[...1234]` sender attribution prefix in group threads
+- The user's question, with `[Name]` (or `[...1234]` if no nickname is registered) sender attribution prefix in group threads
 - All bot commands the context allows, as `bot__<name>` tools
 - All MCP tools the context allows, as `<server>__<tool>` tools
-- Optional group chat context (last N messages from the group, formatted with sender tails)
+- Optional group chat context (last N messages from the group, formatted with sender labels)
 - Tweet URLs in the user's question are auto-expanded to `[@handle] tweet text` before sending
+- Conditional system-suffix injections, gated on per-context state:
+  - **Reactor self-awareness directive + recent-reactions log** — when emoji reactor is enabled in the context (see [Emoji Reactor](#emoji-reactor))
+  - **Tarot tool directive** — when `tarot` is in the context's allow list, instructs the model to always route tarot draws through `bot__tarot` rather than fabricating a card list
+  - **I Ching tool directive** — same pattern for `bot__iching` when `iching` is allowed
+  - **Names directive** — when nicknames are registered for users in the chat, tells the model to use names rather than four-digit phone tails (and disregard older turns that claimed not to know names)
 
 ### `!ask` examples
 
@@ -466,6 +500,23 @@ Configure once at `/admin/llm`. All values apply live — no restart.
 !ask reset                                     # Clear current chat's history
 !ai how does this look?                        # If alias is configured
 ```
+
+---
+
+## Emoji Reactor
+
+A separate fire-and-forget LLM that decides whether to react to inbound group messages with a single emoji. Configured at `/admin/llm` under "Reactor". Off by default; per-context `reactor_enabled` toggle in `/admin/contexts`.
+
+**How it fires.** Every inbound group message kicks off a background `maybe_react()` task in parallel with normal command dispatch. The reactor runs through cheap rules first (per-sender cooldown, per-group cooldown, min message length), then passes the message + recent group context through the configured "reactor" model (typically a cheap/fast variant — e.g. Sonnet over Opus, or DeepSeek with thinking disabled) and gives the LLM exactly one tool: `emoji_react(emoji)`. If the LLM calls the tool, we POST a Signal reaction; if it doesn't, the user never sees anything. All errors are logged and swallowed — the reactor must never affect command handling or surface diagnostics.
+
+**Coordination with the writing LLM.** The reactor and the writing LLM (`!ask` and `llm_intent` routing) are different processes with no shared memory, which used to cause comedy: users would tease "why did you react with 💩?" and the writing LLM would indignantly deny having thumbs while the reactor kept slapping emoji on every message. The current design fixes this with two pieces injected into the writing LLM's system suffix at `!ask` time:
+
+1. A **reflex directive** explaining that emoji reactions are the bot's own out-of-band reflex, that it has no episodic memory of the specific reaction, and that it should own them rather than deny them — with explicit instruction to disregard older turns where it claimed to be text-only.
+2. A **rolling log** — last 5 reactions in the current group with target message and emoji (e.g. `💀 on [Tyler] "housing crash tweet…"`) — so the model can answer "why did you react with X?" by reading the target text instead of confabulating. The log is in-memory per-process, capped at 20 per group, and wipes on restart.
+
+Both pieces are gated on `reactor_enabled` being true globally **and** for the current context — they don't appear in the prompt for chats where the reactor is off.
+
+**Tuning.** Reactor model, max tokens, temperature, system prompt, and cooldowns all live in `/admin/llm`. Per-context system prompt overrides live in `/admin/contexts`.
 
 ---
 

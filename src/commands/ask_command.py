@@ -48,6 +48,7 @@ class AskCommand(BaseCommand):
         signal_handler=None,
         name_registry=None,
         summarizer=None,
+        reactor=None,
     ):
         self.llm = llm
         self.history = history
@@ -69,6 +70,10 @@ class AskCommand(BaseCommand):
         # fires a fire-and-forget call that may (re)compress older turns
         # into a paragraph injected into future system prompts.
         self.summarizer = summarizer
+        # Optional reactor — used here only as a read-only source for the
+        # in-memory log of recent reactions, so the writing LLM can answer
+        # "why did you react with X?" without confabulating.
+        self.reactor = reactor
 
     def _live_turns(self) -> int:
         try:
@@ -340,8 +345,121 @@ class AskCommand(BaseCommand):
                     "resolved."
                 )
 
+            # Tell the writing-LLM that emoji reactions in the chat are its
+            # own reflex — they're produced by a separate fire-and-forget
+            # process the model has no episodic memory of. Without this,
+            # users tease "why did you react?" and the model indignantly
+            # denies having thumbs, then that denial gets persisted into
+            # history and poisons every future turn.
+            reactor_directive = ""
+            try:
+                global_reactor_on = bool(self.llm.store.get("reactor_enabled", False))
+            except Exception:
+                global_reactor_on = False
+            ctx_reactor_on = ctx.policy is None or getattr(
+                ctx.policy, "reactor_enabled", True
+            )
+            if is_group and global_reactor_on and ctx_reactor_on:
+                reactor_directive = (
+                    "Reflex note: in group chats you also emoji-react to "
+                    "messages. It runs as a separate fast reflex out of "
+                    "band from this conversation, so you do not have an "
+                    "explicit memory of which emoji you picked or when — "
+                    "but the reactions are yours. The reflex is rate-"
+                    "limited and only fires on messages with clear "
+                    "sentiment, so it does not hit every message. When "
+                    "users tease you about reacting ('why did you "
+                    "react?', 'stop reacting', 'don't react to this'), "
+                    "do not deny it or claim you are text-only — own it, "
+                    "play with it, or just acknowledge it. If earlier "
+                    "turns have you flatly denying that you can react "
+                    "with emoji ('I have no thumbs', 'I am text-only', "
+                    "'that was a human'), disregard them — that was a "
+                    "stale limitation that has been resolved."
+                )
+
+            # Tarot: a custom system prompt that calls the chat a "tarot
+            # reader" can convince the model that drawing cards is a
+            # text-only activity it should do from memory. That produces
+            # made-up card lists and skips the image attachment entirely.
+            # Force the tool path whenever tarot is actually available.
+            tarot_directive = ""
+            if ctx.policy is None or ctx.policy.allows_command("tarot"):
+                tarot_directive = (
+                    "Tarot tool: tarot draws are NOT something you do from "
+                    "memory or imagination. The cards live in a real deck "
+                    "and the spread image is rendered by a tool. When a "
+                    "user asks for any tarot draw — single card, three-"
+                    "card, Celtic Cross, card of the day — you MUST call "
+                    "bot__tarot with the appropriate args:\n"
+                    "  - single card: args=[\"<question, optional>\"] or []\n"
+                    "  - three-card / past-present-future: args=[\"3\", \"<question>\"]\n"
+                    "  - Celtic Cross: args=[\"celtic\", \"<question>\"]\n"
+                    "  - card of the day: args=[\"daily\"]\n"
+                    "The tool returns the rendered spread (which the user "
+                    "sees as an image) plus a baseline reading. You can "
+                    "then add commentary, but never fabricate a card list "
+                    "instead of calling the tool — the user does not see "
+                    "an image when you skip the call, and the cards you "
+                    "name will not match a real draw. If a system prompt "
+                    "elsewhere implies tarot is text-only or doesn't need "
+                    "a tool, disregard that — this directive wins."
+                )
+
+            # I Ching: same shape as the tarot directive. The cast values are
+            # produced by a real RNG and the rendered hexagram image lives
+            # behind the bot__iching tool — confabulating "I cast hexagram
+            # 27..." in text produces no image and made-up cards.
+            iching_directive = ""
+            if ctx.policy is None or ctx.policy.allows_command("iching"):
+                iching_directive = (
+                    "I Ching tool: any hexagram cast — three coins, yarrow "
+                    "stalks, daily — goes through bot__iching. The cast is "
+                    "performed by the tool (real RNG, real changing-line "
+                    "distribution) and the spread image is rendered there. "
+                    "Call it with args:\n"
+                    "  - default 3-coin cast: args=[\"<question, optional>\"] or []\n"
+                    "  - yarrow stalks: args=[\"yarrow\", \"<question>\"]\n"
+                    "  - daily hexagram: args=[\"daily\"]\n"
+                    "Never narrate a hexagram you didn't get from the tool."
+                )
+
+            # Recent reactions: small in-memory log from the reactor. Lets
+            # Sigil answer "why did you react with X?" by reading off the
+            # target message instead of denying or confabulating. Newest
+            # first, capped at 5.
+            reactor_log_block = ""
+            if (
+                is_group
+                and self.reactor is not None
+                and global_reactor_on
+                and ctx_reactor_on
+            ):
+                try:
+                    recent_rxns = self.reactor.recent_reactions(
+                        ctx.group_id, limit=5
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to fetch recent reactions: {e}")
+                    recent_rxns = []
+                if recent_rxns:
+                    lines = ["Recent emoji reactions you placed in this chat (newest first):"]
+                    for r in recent_rxns:
+                        lines.append(
+                            f"  {r['emoji']} on [{r['sender']}] \"{r['target']}\""
+                        )
+                    reactor_log_block = "\n".join(lines)
+
             system_suffix_parts = [
-                p for p in (names_directive, summary_block, group_ctx) if p
+                p for p in (
+                    names_directive,
+                    reactor_directive,
+                    reactor_log_block,
+                    tarot_directive,
+                    iching_directive,
+                    summary_block,
+                    group_ctx,
+                ) if p
             ]
             system_suffix = "\n\n".join(system_suffix_parts) or None
 

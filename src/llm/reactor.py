@@ -19,10 +19,19 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from typing import Optional
 
 from ..admin.events import get_bus
 from ..cache import get_metrics
+
+
+# How many recent reactions to retain per group for the writing LLM to
+# reference when users ask "why did you react with X?". Small, in-memory,
+# wipes on restart — matches the natural conversational half-life of
+# "what just happened in chat?" questions.
+RECENT_REACTIONS_PER_GROUP = 20
+RECENT_TARGET_SNIPPET_LEN = 120
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +109,10 @@ class EmojiReactor:
         self.name_registry = name_registry
         self._sender_last: dict[str, float] = {}
         self._group_last: dict[str, float] = {}
+        # Rolling per-group log of (timestamp, sender_label, target_snippet,
+        # emoji) so the writing LLM can reference what it reacted to and why
+        # when users ask. In-memory only; survives until process restart.
+        self._recent: dict[str, deque] = {}
 
     def _sender_label(self, phone: str) -> str:
         if self.name_registry is None:
@@ -133,6 +146,36 @@ class EmojiReactor:
         now = time.time()
         self._sender_last[sender] = now
         self._group_last[group_id] = now
+
+    def _record_recent(
+        self, *, group_id: str, sender_label: str, target_text: str, emoji: str
+    ) -> None:
+        snippet = (target_text or "").replace("\n", " ").strip()
+        if len(snippet) > RECENT_TARGET_SNIPPET_LEN:
+            snippet = snippet[: RECENT_TARGET_SNIPPET_LEN - 1].rstrip() + "…"
+        log = self._recent.get(group_id)
+        if log is None:
+            log = deque(maxlen=RECENT_REACTIONS_PER_GROUP)
+            self._recent[group_id] = log
+        log.append((time.time(), sender_label, snippet, emoji))
+
+    def recent_reactions(self, group_id: str, limit: int = 5) -> list[dict]:
+        """Return the most recent reactions in `group_id`, newest-first.
+
+        Used by the writing LLM so it can answer "why did you react with X?"
+        without confabulating. Empty list when nothing is logged for the
+        group (including: feature off, restart-fresh, or no qualifying
+        messages yet).
+        """
+        log = self._recent.get(group_id)
+        if not log:
+            return []
+        items = list(log)[-max(1, limit):]
+        items.reverse()
+        return [
+            {"ts": ts, "sender": sender, "target": target, "emoji": emoji}
+            for ts, sender, target, emoji in items
+        ]
 
     async def _build_user_content(
         self, sender: str, message: str, group_id: str, ctx_count: int
@@ -346,6 +389,12 @@ class EmojiReactor:
                     logger.info(
                         f"Reactor: {emoji} on ...{(sender or '')[-4:]} "
                         f"({len(text)}-char msg)"
+                    )
+                    self._record_recent(
+                        group_id=group_id,
+                        sender_label=self._sender_label(sender),
+                        target_text=text,
+                        emoji=emoji,
                     )
                     get_bus().publish(
                         "reactor",

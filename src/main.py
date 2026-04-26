@@ -65,6 +65,7 @@ from .commands import (
     WatchCommand,
     AskCommand,
     TarotCommand,
+    IChingCommand,
     PredictCommand,
     PredictionsCommand,
     ResolveCommand,
@@ -276,6 +277,13 @@ def create_dispatcher(
     # command returns a friendly "still preparing" message until done.
     from .commands.tarot_command import ensure_deck_ready_async
     ensure_deck_ready_async()
+
+    iching_cmd = IChingCommand(
+        db_path=config.watchlist_db_path,
+        llm_client=llm_client,
+    )
+    dispatcher.register(iching_cmd)
+    help_commands.append(iching_cmd)
 
     # Predictions: log dated claims, follow up at the deadline, score them.
     # The store is also exposed on the dispatcher so the background
@@ -565,6 +573,7 @@ def build_app(config: Config):
         enricher=enricher,
         name_registry=name_registry,
         summarizer=summarizer,
+        reactor=reactor,
     )
 
     dispatcher = create_dispatcher(
