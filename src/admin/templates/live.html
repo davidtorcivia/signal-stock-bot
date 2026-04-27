@@ -14,6 +14,7 @@
         <label><input type="checkbox" data-filter="inbound" checked> inbound</label>
         <label><input type="checkbox" data-filter="outbound" checked> outbound</label>
         <label><input type="checkbox" data-filter="reactor" checked> reactor</label>
+        <label><input type="checkbox" data-filter="deep_think" checked> deep_think</label>
         &nbsp;
         <button class="btn" id="clear">Clear</button>
         &nbsp;
@@ -31,10 +32,11 @@
     .ev .who { font-weight: bold; margin-right: 6px; }
     .ev .body { white-space: pre-wrap; word-break: break-word; }
     .ev .meta { color: #888; font-size: 11px; margin-left: 6px; }
-    .ev.inbound  .who { color: #6cc; }
-    .ev.outbound .who { color: #c8e; }
-    .ev.reactor  .who { color: #cc6; }
-    .ev.error    .who { color: #e66; }
+    .ev.inbound    .who { color: #6cc; }
+    .ev.outbound   .who { color: #c8e; }
+    .ev.reactor    .who { color: #cc6; }
+    .ev.deep_think .who { color: #6c8cff; }
+    .ev.error      .who { color: #e66; }
     .ev.hidden { display: none; }
 </style>
 
@@ -83,6 +85,8 @@
             who.textContent = `→ ${ev.recipient_label || ('...'+(ev.recipient_tail || '????'))}`;
         } else if (ev.type === 'reactor') {
             who.textContent = `★ ${ev.sender_label || ('...'+(ev.sender_tail || '????'))}`;
+        } else if (ev.type === 'deep_think') {
+            who.textContent = `🧠 ${ev.user_tail || '????'}`;
         } else {
             who.textContent = `· ${ev.type}`;
         }
@@ -109,6 +113,24 @@
                 body.textContent = `poll error — ${ev.text || ''}`;
             } else {
                 body.textContent = ev.text ? `declined — ${ev.text}` : 'declined';
+            }
+        } else if (ev.type === 'deep_think') {
+            const q = (ev.question || '(no question)').slice(0, 140);
+            if (ev.stage === 'start') {
+                body.textContent = `start: ${q}`;
+            } else if (ev.stage === 'done') {
+                const lat = ev.latency_ms ? ` ${ev.latency_ms}ms` : '';
+                const tok = (ev.tokens_in || ev.tokens_out)
+                    ? ` ${ev.tokens_in||0}+${ev.tokens_out||0}tok`
+                    : '';
+                const ch = ev.chars ? ` → ${ev.chars}c` : '';
+                body.textContent = `done${lat}${tok}${ch}: ${q}`;
+            } else if (ev.stage === 'error') {
+                body.textContent = `error: ${ev.error_msg || ''} — ${q}`;
+            } else if (ev.stage === 'skip') {
+                body.textContent = `skip (${ev.reason || 'unknown'}): ${q}`;
+            } else {
+                body.textContent = q;
             }
         } else {
             body.textContent = ev.text || '';

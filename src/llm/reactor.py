@@ -29,6 +29,13 @@ from typing import Awaitable, Callable, Optional
 
 from ..admin.events import get_bus
 from ..cache import get_metrics
+from ..memory import (
+    NOTE_MEMORY_TOOL,
+    REACTOR_ALLOWED_KINDS,
+    REACTOR_DEFAULT_CONFIDENCE,
+    SOURCE_REACTOR,
+    SubjectResolver,
+)
 
 
 # How many recent reactions to retain per group for the writing LLM to
@@ -151,6 +158,7 @@ class EmojiReactor:
         group_log=None,
         enricher=None,
         name_registry=None,
+        memory_store=None,
     ):
         self.store = settings_store
         self.llm = llm_client
@@ -161,6 +169,14 @@ class EmojiReactor:
         # the actual content rather than just an opaque link.
         self.enricher = enricher
         self.name_registry = name_registry
+        # Optional MemoryStore — when set AND the per-context
+        # reactor_memory_writes flag is on, the reactor's LLM call also
+        # gets a note_memory tool so it can passively learn from messages
+        # the main bot never sees.
+        self.memory_store = memory_store
+        self._subject_resolver: Optional[SubjectResolver] = None
+        if name_registry is not None:
+            self._subject_resolver = SubjectResolver(name_registry)
         self._sender_last: dict[str, float] = {}
         self._group_last: dict[str, float] = {}
         # Rolling per-group log of (timestamp, sender_label, target_snippet,
@@ -224,6 +240,81 @@ class EmojiReactor:
         if time.time() - last < cfg["natural_response_cooldown"]:
             return False
         return True
+
+    def _memory_writes_active(self, policy) -> bool:
+        """Decide whether to expose `note_memory` for this evaluation.
+
+        Two gates: a wired MemoryStore + subject resolver, and the
+        per-context `reactor_memory_writes` flag on a real (non-default)
+        policy row. Default rows are excluded so writes don't pool
+        across unregistered chats.
+        """
+        if self.memory_store is None or self._subject_resolver is None:
+            return False
+        if policy is None:
+            return False
+        if getattr(policy, "id", None) is None:
+            return False
+        if getattr(policy, "kind", None) == "default":
+            return False
+        return bool(getattr(policy, "reactor_memory_writes", False))
+
+    async def _persist_note_memory(
+        self,
+        *,
+        policy,
+        sender: str,
+        target_timestamp: Optional[int],
+        args: dict,
+    ) -> None:
+        """Write a single reactor-sourced memory. Errors are logged + swallowed."""
+        store = self.memory_store
+        resolver = self._subject_resolver
+        if store is None or resolver is None or policy is None:
+            return
+        try:
+            subject_hint = (args.get("subject") or "").strip()
+            kind = (args.get("kind") or "").strip().lower()
+            content = (args.get("content") or "").strip()
+            if not subject_hint or not content:
+                return
+            if kind not in REACTOR_ALLOWED_KINDS:
+                logger.debug(
+                    f"Reactor note_memory: skipping disallowed kind {kind!r}"
+                )
+                return
+            key, label = resolver.resolve(
+                subject_hint, sender_phone=sender
+            )
+            if not key:
+                return
+            from ..database import hash_phone
+            sender_hash = hash_phone(sender) if sender else ""
+            # target_timestamp is Signal's millisecond timestamp; normalize
+            # to seconds so it lines up with conversation_turns.created_at
+            # for cross-table audit lookups.
+            msg_at = (
+                float(target_timestamp) / 1000.0
+                if target_timestamp else None
+            )
+            mem_id = await store.add(
+                context_id=policy.id,
+                subject_key=key,
+                subject_label=label,
+                kind=kind,
+                content=content,
+                confidence=REACTOR_DEFAULT_CONFIDENCE,
+                source=SOURCE_REACTOR,
+                source_user_hash=sender_hash,
+                source_message_at=msg_at,
+            )
+            if mem_id is not None:
+                logger.info(
+                    f"Reactor: noted memory #{mem_id} "
+                    f"[{kind}] about {label!r}: {content[:80]!r}"
+                )
+        except Exception as e:
+            logger.debug(f"Reactor note_memory persist failed: {e}")
 
     def mark_implicit_response(self, group_id: str) -> None:
         """Record that a spontaneous reply just fired (or is about to).
@@ -392,6 +483,15 @@ class EmojiReactor:
                 system_prompt = (
                     f"{system_prompt}\n{extra or NATURAL_RESPONSE_GUIDANCE}"
                 )
+            # Passive memory writes: the reactor already pays for an LLM
+            # call on every qualifying message, so memory extraction is
+            # essentially free. Gated per-context (off by default — opt-in
+            # in /admin/contexts) AND only when the policy belongs to a
+            # real, non-default row (so writes don't bleed across the
+            # default group/dm rows).
+            offer_note_memory = self._memory_writes_active(policy)
+            if offer_note_memory:
+                tools.append(NOTE_MEMORY_TOOL)
 
             user_content = await self._build_user_content(
                 sender, text, group_id, cfg["context_messages"]
@@ -488,8 +588,12 @@ class EmojiReactor:
 
             # should_respond wins over emoji_react when both are present —
             # a real reply already conveys whatever a reaction would.
+            # note_memory is collected separately because it's not mutually
+            # exclusive with either: the reactor can react and note in the
+            # same call, or just note silently.
             respond_reason: Optional[str] = None
             emoji_pick: Optional[str] = None
+            memory_notes: list[dict] = []
             for call in tool_calls:
                 fn = call.get("function") or {}
                 fname = fn.get("name")
@@ -508,6 +612,21 @@ class EmojiReactor:
                     respond_reason = (args.get("reason") or "").strip() or "(no reason given)"
                 elif fname == "emoji_react" and emoji_pick is None:
                     emoji_pick = (args.get("emoji") or "").strip()
+                elif fname == "note_memory":
+                    memory_notes.append(args)
+
+            # Persist any memory notes regardless of which reactor outcome
+            # wins below — passive learning is independent of the public
+            # reaction. Only fires when the per-context flag was on at
+            # offer-time.
+            if memory_notes and offer_note_memory:
+                for note in memory_notes:
+                    await self._persist_note_memory(
+                        policy=policy,
+                        sender=sender,
+                        target_timestamp=target_timestamp,
+                        args=note,
+                    )
 
             if respond_reason and offer_should_respond:
                 # Mark cooldown first so concurrent reactor calls in the same

@@ -1,0 +1,394 @@
+{% extends "base.html" %}
+{% block title %}Memories — {{ policy.label or policy.key }}{% endblock %}
+{% block content %}
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, msg in messages %}
+      <div class="{{ 'ok' if category == 'ok' else 'error' }}">{{ msg }}</div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+{# Reusable subject picker. Fed by `named_users` (list of {user_hash, name}).
+   Picking a user fills `subject` with that user's hash; the route auto-
+   fills label from the registry on submit. The custom field below it
+   carries free-text, hash, or "this chat" when not picked. #}
+{% macro subject_picker(field_name, current_key='', custom_field='subject_custom', custom_value='') %}
+<select name="{{ field_name }}" class="mem-select">
+    <option value="" {% if not current_key %}selected{% endif %}>— pick a registered user, or use custom field →</option>
+    <option value="__context__" {% if current_key == '__context__' %}selected{% endif %}>this chat (room itself)</option>
+    {% if named_users %}
+        {% for u in named_users %}
+            <option value="{{ u.user_hash }}"
+                    {% if current_key == u.user_hash %}selected{% endif %}>
+                {{ u.name }} (...{{ u.user_hash[:8] }})
+            </option>
+        {% endfor %}
+    {% endif %}
+</select>
+<input type="text" name="{{ custom_field }}" value="{{ custom_value }}"
+       placeholder="Or paste a custom subject: 64-hex hash, freetext:slug, free text"
+       class="mem-input">
+{% endmacro %}
+
+<style>
+  .mem-input, .mem-select {
+    width: 100%;
+    padding: 7px 10px;
+    background: #0b0d10;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  .mem-input + .mem-input,
+  .mem-select + .mem-input { margin-top: 6px; }
+
+  /* Collapsed details. Each memory is a <details> element so click-to-
+     expand is browser-native — no JS, no flicker, accessible by default. */
+  details.mem-card {
+    background: #0e1216;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  details.mem-card[open] {
+    background: #11161c;
+    border-color: var(--accent);
+  }
+
+  details.mem-card > summary {
+    padding: 10px 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    list-style: none;
+    user-select: none;
+  }
+  details.mem-card > summary::-webkit-details-marker { display: none; }
+  details.mem-card > summary::before {
+    content: "▸";
+    color: var(--muted);
+    font-size: 10px;
+    width: 10px;
+    flex: 0 0 10px;
+    transition: transform 0.15s ease;
+  }
+  details.mem-card[open] > summary::before {
+    transform: rotate(90deg);
+    color: var(--accent);
+  }
+  details.mem-card > summary:hover {
+    background: #131a21;
+  }
+
+  .mem-summary-kind {
+    font-size: 10px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    flex: 0 0 auto;
+    padding: 2px 6px;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    line-height: 1;
+  }
+  .mem-summary-content {
+    flex: 1;
+    color: var(--text);
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1.4;
+  }
+  .mem-summary-conf {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: monospace;
+  }
+  .mem-summary-conf-low { color: var(--bad); }
+
+  /* Expanded body */
+  .mem-body {
+    padding: 0 14px 14px 14px;
+    border-top: 1px solid var(--border);
+  }
+  .mem-content-full {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text);
+    margin: 12px 0;
+    padding: 8px 10px;
+    background: #0b0d10;
+    border-left: 2px solid var(--accent);
+    border-radius: 0 3px 3px 0;
+  }
+
+  .mem-form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 14px;
+    align-items: start;
+  }
+  .mem-form-grid .mem-full { grid-column: 1 / 3; }
+  .mem-form-grid label {
+    margin-top: 0;
+    margin-bottom: 4px;
+    font-size: 11px;
+  }
+
+  .mem-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .mem-meta {
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .mem-meta code { color: var(--text); }
+  .mem-meta .mem-sep { margin: 0 6px; opacity: 0.4; }
+
+  .mem-conf-input { width: 78px !important; }
+
+  /* Pagination */
+  .mem-pager {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 6px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+  }
+  .mem-pager a, .mem-pager span {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--text);
+    text-decoration: none;
+    min-width: 32px;
+    text-align: center;
+  }
+  .mem-pager a:hover { border-color: var(--accent); }
+  .mem-pager .mem-pager-current {
+    background: var(--accent);
+    color: #000;
+    border-color: var(--accent);
+  }
+  .mem-pager .mem-pager-disabled {
+    color: var(--muted);
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .mem-pager .mem-pager-gap {
+    border: none;
+    color: var(--muted);
+  }
+</style>
+
+<div class="panel">
+    <h1>Memories — {{ policy.label or policy.key }}</h1>
+    <p class="muted" style="font-size: 12px;">
+        <strong>{{ policy.kind }}</strong> · <code>{{ policy.key|truncate(48) }}</code>
+        · {{ total }} memor{{ 'y' if total == 1 else 'ies' }}
+        across {{ total_subjects }} subject{{ '' if total_subjects == 1 else 's' }}
+        · <a href="{{ url_for('admin.context_edit', context_id=policy.id) }}">back to context</a>
+    </p>
+    <p class="muted" style="font-size: 12px;">
+        Click a memory to expand. Source provenance:
+        <code>reactor</code> = passively learned;
+        <code>explicit</code> = the writer LLM was told to remember;
+        <code>admin</code> = saved from this page.
+    </p>
+</div>
+
+<div class="panel">
+    <h2>Add memory</h2>
+    <form method="POST" action="{{ url_for('admin.memory_create', context_id=policy.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="page" value="{{ page }}">
+
+        <div class="mem-form-grid">
+            <div>
+                <label for="subject" style="margin-top:0;">Subject</label>
+                {{ subject_picker('subject') }}
+            </div>
+            <div>
+                <label for="kind" style="margin-top:0;">Kind</label>
+                <select name="kind" id="kind" class="mem-select">
+                    {% for k in kinds %}
+                        <option value="{{ k }}">{{ k }}</option>
+                    {% endfor %}
+                </select>
+                <label for="subject_label_new" style="margin-top:10px;">Label override (optional)</label>
+                <input type="text" name="subject_label" id="subject_label_new" class="mem-input"
+                       placeholder="Auto-filled from registry for picked users.">
+            </div>
+
+            <div class="mem-full">
+                <label for="content" style="margin-top:0;">Content</label>
+                <input type="text" name="content" id="content" required class="mem-input"
+                       placeholder="One short sentence as a stand-alone fact, e.g. 'Sun in Sag, Moon in Virgo, Sag rising.'">
+            </div>
+        </div>
+
+        <div style="margin-top:14px;">
+            <button type="submit">Add memory</button>
+        </div>
+    </form>
+</div>
+
+{% for g in groups %}
+<div class="panel">
+    <h2 style="display:flex;align-items:baseline;gap:10px;">
+        <span>{{ g.subject_label }}</span>
+        <code class="muted" style="font-size: 11px; font-weight: normal;">
+            {{ g.subject_key|truncate(28, true, '') }}
+        </code>
+        <span class="muted" style="font-size: 11px; font-weight: normal; margin-left: auto;">
+            {{ g.rows|length }} memor{{ 'y' if g.rows|length == 1 else 'ies' }}
+        </span>
+    </h2>
+
+    {% for r in g.rows %}
+    <details class="mem-card">
+        <summary>
+            <span class="mem-summary-kind">{{ r.kind }}</span>
+            <span class="mem-summary-content">{{ r.content }}</span>
+            <span class="mem-summary-conf {{ 'mem-summary-conf-low' if r.confidence < 0.8 else '' }}">
+                {{ '%.2f' % r.confidence }} · {{ r.source }}
+            </span>
+        </summary>
+
+        <div class="mem-body">
+            <div class="mem-content-full">{{ r.content }}</div>
+
+            <form method="POST" action="{{ url_for('admin.memory_update', context_id=policy.id, memory_id=r.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="page" value="{{ page }}">
+                <div class="mem-form-grid">
+                    <div class="mem-full">
+                        <label>Content</label>
+                        <input type="text" name="content" value="{{ r.content }}" class="mem-input">
+                    </div>
+
+                    <div>
+                        <label>Subject</label>
+                        {% set known_keys = (named_users|map(attribute='user_hash')|list) + ['__context__'] %}
+                        {% set custom_val = r.subject_key if r.subject_key not in known_keys else '' %}
+                        {% set picker_key = r.subject_key if r.subject_key in known_keys else '' %}
+                        {{ subject_picker('subject',
+                                          current_key=picker_key,
+                                          custom_field='subject_custom',
+                                          custom_value=custom_val) }}
+                    </div>
+                    <div>
+                        <label>Label</label>
+                        <input type="text" name="subject_label" value="{{ r.subject_label }}" class="mem-input"
+                               placeholder="Display name">
+                        <label style="margin-top:10px;">Confidence (0–1)</label>
+                        <input type="number" name="confidence" value="{{ '%.2f' % r.confidence }}"
+                               min="0" max="1" step="0.05" class="mem-input mem-conf-input">
+                    </div>
+                </div>
+
+                <div class="mem-actions">
+                    <span class="mem-meta">
+                        #{{ r.id }}
+                        <span class="mem-sep">·</span>
+                        {{ r.corroborations }} corroboration{{ '' if r.corroborations == 1 else 's' }}
+                        <span class="mem-sep">·</span>
+                        {{ (r.distinct_speakers or [])|length }} distinct speaker{{ '' if (r.distinct_speakers or [])|length == 1 else 's' }}
+                        {% if r.source_user_hash %}
+                            <span class="mem-sep">·</span>
+                            triggered by <code>{{ r.source_user_hash[:8] }}</code>
+                        {% endif %}
+                        {% if r.source_message_at %}
+                            <span class="mem-sep">·</span>
+                            at {{ r.source_message_at|int }}
+                        {% endif %}
+                    </span>
+                    <button type="submit">Save</button>
+                </div>
+            </form>
+
+            <form method="POST" action="{{ url_for('admin.memory_delete', context_id=policy.id, memory_id=r.id) }}"
+                  onsubmit="return confirm('Delete memory #{{ r.id }}? This cannot be undone.');"
+                  style="margin-top:8px;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="page" value="{{ page }}">
+                <button type="submit" class="btn"
+                        style="background: transparent; color: var(--bad); border: 1px solid var(--bad); padding: 4px 10px; font-size: 12px;">
+                    Delete memory #{{ r.id }}
+                </button>
+            </form>
+        </div>
+    </details>
+    {% endfor %}
+</div>
+{% else %}
+<div class="panel">
+    <p class="muted">No memories yet for this chat.</p>
+</div>
+{% endfor %}
+
+{% if total_pages > 1 %}
+<nav class="mem-pager" aria-label="Memory pages">
+    {% if page > 1 %}
+        <a href="{{ url_for('admin.context_memories', context_id=policy.id, page=page-1, per_page=per_page) }}">‹ prev</a>
+    {% else %}
+        <span class="mem-pager-disabled">‹ prev</span>
+    {% endif %}
+
+    {% set window = 2 %}
+    {% set show_first = page > window + 2 %}
+    {% set show_last = page < total_pages - window - 1 %}
+
+    {% if show_first %}
+        <a href="{{ url_for('admin.context_memories', context_id=policy.id, page=1, per_page=per_page) }}">1</a>
+        {% if page > window + 3 %}
+            <span class="mem-pager-gap">…</span>
+        {% endif %}
+    {% endif %}
+
+    {% for p in range(1, total_pages + 1) %}
+        {% if p >= page - window and p <= page + window %}
+            {% if p == page %}
+                <span class="mem-pager-current">{{ p }}</span>
+            {% else %}
+                <a href="{{ url_for('admin.context_memories', context_id=policy.id, page=p, per_page=per_page) }}">{{ p }}</a>
+            {% endif %}
+        {% endif %}
+    {% endfor %}
+
+    {% if show_last %}
+        {% if page < total_pages - window - 2 %}
+            <span class="mem-pager-gap">…</span>
+        {% endif %}
+        <a href="{{ url_for('admin.context_memories', context_id=policy.id, page=total_pages, per_page=per_page) }}">{{ total_pages }}</a>
+    {% endif %}
+
+    {% if page < total_pages %}
+        <a href="{{ url_for('admin.context_memories', context_id=policy.id, page=page+1, per_page=per_page) }}">next ›</a>
+    {% else %}
+        <span class="mem-pager-disabled">next ›</span>
+    {% endif %}
+</nav>
+<p class="muted" style="text-align:center;font-size:11px;margin-top:8px;">
+    Page {{ page }} of {{ total_pages }} · {{ per_page }} subject{{ '' if per_page == 1 else 's' }} per page
+</p>
+{% endif %}
+
+{% endblock %}

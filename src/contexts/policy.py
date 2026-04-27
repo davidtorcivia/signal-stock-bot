@@ -36,6 +36,20 @@ class ContextPolicy:
     # tool so it can decide to write a reply (not just react) for messages that
     # weren't directed at the bot via mention/quote. Requires reactor_enabled.
     natural_response: bool = False
+    # Deep think: when True, the writer LLM gets a deep_think tool that
+    # delegates hard sub-problems to a configurable smarter model. Default
+    # on — the global kill switch is enough to disable it everywhere; per-
+    # context flag exists for cost containment in cheap chats.
+    deep_think_enabled: bool = True
+    # Memory: per-context gates for the bot's per-context memory store.
+    # `memory_writes_enabled` controls whether the writer LLM can call
+    # `remember`/`forget` in this chat (default on — explicit user-driven
+    # writes are always wanted). `reactor_memory_writes` controls whether
+    # the reactor passively learns from messages even when the main bot
+    # isn't called (default off — opt-in, since passive learning has
+    # privacy implications).
+    memory_writes_enabled: bool = True
+    reactor_memory_writes: bool = False
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()
@@ -53,6 +67,9 @@ class ContextPolicy:
         if self.mcp_mode == MODE_DENY_LIST:
             return server_name not in listed
         return True
+
+    def allows_deep_think(self) -> bool:
+        return self.deep_think_enabled
 
 
 # Fully-open fallback used when the registry can't be consulted for any reason.

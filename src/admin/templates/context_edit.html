@@ -125,6 +125,66 @@
             and a working reactor.
         </p>
 
+        <h2 style="margin-top: 32px;">Memory</h2>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="memory_writes_enabled" {% if values.memory_writes_enabled %}checked{% endif %}>
+            <span>Let the writer LLM remember/forget in this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When on, the LLM gets <code>remember</code> / <code>forget</code>
+            tools alongside <code>recall</code> so it can store durable facts
+            about people, the room, or free-text entities. Saved memories
+            auto-inject into future replies in this chat. Off makes
+            <code>recall</code> read-only — the LLM can use existing memories
+            but can't add new ones. Turn off in chats where you want to view
+            memories without letting the model edit them.
+        </p>
+
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;margin-top:12px;">
+            <input type="checkbox" name="reactor_memory_writes" {% if values.reactor_memory_writes %}checked{% endif %}>
+            <span>Let the reactor passively learn from this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Off by default. When on, the reactor's per-message LLM call also
+            gets a <code>note_memory</code> tool, so it can extract durable
+            facts from messages even when the main bot isn't called. Reactor
+            writes land at confidence 0.6 and promote to 1.0 only after
+            corroborations from at least three distinct speakers — single-
+            user repetition can't self-promote a hallucination. Privacy-
+            sensitive: only enable in chats where passive learning is
+            appropriate.
+        </p>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            <em>Heads-up:</em> if you turn this on, you may need to bump
+            <code>Reactor max tokens</code> at <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>
+            (default 50). The reactor LLM now picks between three tools and
+            its arguments — a 50-token budget can truncate the
+            <code>note_memory</code> JSON. 200 is a safer floor when this
+            flag is on.
+        </p>
+
+        {% if not is_new %}
+        <p style="margin-top: 12px;">
+            <a href="{{ url_for('admin.context_memories', context_id=policy.id) }}">
+                → View / edit stored memories for this chat
+            </a>
+        </p>
+        {% endif %}
+
+        <h2 style="margin-top: 32px;">Deep think</h2>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="deep_think_enabled" {% if values.deep_think_enabled %}checked{% endif %}>
+            <span>Allow deep_think tool in this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When on (and the global deep-think client is configured), the
+            writer LLM gets a <code>deep_think</code> tool to delegate hard
+            sub-problems to a smarter, slower, more expensive model. Turn
+            off in chats where cost containment matters more than answer
+            quality. Configure the model + key at
+            <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>.
+        </p>
+
         <div style="margin-top: 24px; display:flex; gap:16px; align-items:center;">
             <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
             <a href="{{ url_for('admin.context_list') }}" class="muted">Cancel</a>

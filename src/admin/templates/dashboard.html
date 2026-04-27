@@ -68,6 +68,147 @@
     {% endif %}
 </div>
 
+{# ── Deep think ──────────────────────────────────────────────────── #}
+<div class="panel">
+    <h2>Deep think</h2>
+    {% set dt = deep_think_view %}
+    {% set st = dt.status or {} %}
+    {% set today = dt.usage_today or {} %}
+    <table>
+        <tr>
+            <th>Status</th>
+            <td>
+                {% if st.ready %}
+                    <span class="dot-ok">●</span> ready
+                    <span class="muted">{{ st.model }}{% if st.base_url %} @ {{ st.base_url }}{% endif %}</span>
+                {% elif st.enabled %}
+                    <span class="dot-bad">○</span> enabled but not configured
+                    {% if not st.api_key_set %}<span class="muted">(missing api_key)</span>{% endif %}
+                    {% if not st.model %}<span class="muted">(missing model)</span>{% endif %}
+                    {% if not st.base_url %}<span class="muted">(missing base_url)</span>{% endif %}
+                {% else %}
+                    <span class="muted">○ disabled</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Calls</th>
+            <td>{{ dt.calls or 0 }} <span class="muted">({{ dt.success_rate or '—' }} success)</span></td>
+        </tr>
+        <tr>
+            <th>Errors</th>
+            <td>
+                {{ dt.errors or 0 }}
+                {% if dt.last_error_msg %}
+                    <span class="muted" style="margin-left: 12px;">last: {{ dt.last_error_msg|truncate(80) }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Tokens</th>
+            <td>{{ '{:,}'.format(dt.tokens_in or 0) }} in &nbsp;·&nbsp; {{ '{:,}'.format(dt.tokens_out or 0) }} out</td>
+        </tr>
+        <tr>
+            <th>Avg latency</th>
+            <td>{{ dt.avg_latency_ms or '0' }}ms</td>
+        </tr>
+        <tr>
+            <th>Today ({{ today.date or '—' }})</th>
+            <td>
+                {{ today.total_calls or 0 }} calls
+                {% if today.per_user %}
+                    <span class="muted" style="margin-left: 12px;">
+                        users: {{ today.per_user|length }}
+                    </span>
+                {% endif %}
+                {% if today.per_group %}
+                    <span class="muted" style="margin-left: 12px;">
+                        groups: {{ today.per_group|length }}
+                    </span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Caps</th>
+            <td>
+                {% if st.caps_enabled %}
+                    <span class="dot-ok">●</span> enforced
+                {% else %}
+                    <span class="muted">○ visibility-only</span>
+                {% endif %}
+                <span class="muted" style="margin-left: 12px;">
+                    user/day: {{ st.user_daily_cap or '∞' }} ·
+                    group/day: {{ st.group_daily_cap or '∞' }}
+                </span>
+            </td>
+        </tr>
+    </table>
+
+    {% if dt.by_model %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By model</h3>
+    <table>
+        {% for model, count in dt.by_model.items() %}
+        <tr><th>{{ model }}</th><td>{{ count }}</td></tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
+    {% if today.per_user or today.per_group %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Today's usage</h3>
+    {% if today.per_user %}
+    <p style="font-size: 12px; margin: 4px 0;"><span class="muted">By user (8-char hash prefix):</span></p>
+    <table>
+        {% for user_key, count in today.per_user.items() %}
+        <tr><th><code>{{ user_key[:12] }}…</code></th><td>{{ count }}{% if st.user_daily_cap %} <span class="muted">/ {{ st.user_daily_cap }}</span>{% endif %}</td></tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+    {% if today.per_group %}
+    <p style="font-size: 12px; margin: 4px 0;"><span class="muted">By group:</span></p>
+    <table>
+        {% for group_key, count in today.per_group.items() %}
+        <tr><th><code>{{ group_key[:16] }}…</code></th><td>{{ count }}{% if st.group_daily_cap %} <span class="muted">/ {{ st.group_daily_cap }}</span>{% endif %}</td></tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+    {% endif %}
+
+    {% if dt.recent_calls %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Recent calls</h3>
+    <table style="font-size: 12px;">
+        <tr>
+            <th>Question</th>
+            <th>Latency</th>
+            <th>Tokens</th>
+            <th>Status</th>
+        </tr>
+        {% for call in dt.recent_calls %}
+        <tr>
+            <td style="max-width: 380px; word-break: break-word;">
+                {{ call.question|truncate(120) }}
+                {% if call.user_tail or call.group_id %}
+                <div class="muted" style="font-size: 11px;">
+                    {% if call.user_tail %}<code>{{ call.user_tail }}</code>{% endif %}
+                    {% if call.group_id %} · group <code>{{ call.group_id[:12] }}…</code>{% endif %}
+                </div>
+                {% endif %}
+            </td>
+            <td>{{ call.latency_ms }}ms</td>
+            <td>{{ call.tokens_in }}+{{ call.tokens_out }}</td>
+            <td>
+                {% if call.ok %}
+                    <span class="dot-ok">●</span>
+                {% else %}
+                    <span class="dot-bad">○</span>
+                    <span class="muted">{{ call.error_msg|truncate(40) }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+</div>
+
 {# ── Reactor ────────────────────────────────────────────────────── #}
 <div class="panel">
     <h2>Emoji reactor</h2>

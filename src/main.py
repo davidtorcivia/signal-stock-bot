@@ -505,8 +505,9 @@ def build_app(config: Config):
     from .database import WatchlistDB, AlertsDB
     from .context import ContextManager
     from .contexts import ContextRegistry
+    from .memory import MemoryStore
     from .settings_store import SettingsStore
-    from .llm import LLMClient, ConversationHistory, EmojiReactor
+    from .llm import LLMClient, ConversationHistory, EmojiReactor, DeepThinkClient
     from .llm.summarizer import Summarizer
     from .group_log import GroupMessageLog
     from .mcp_integration import MCPRegistry, MCPManager
@@ -517,6 +518,7 @@ def build_app(config: Config):
     context_manager = ContextManager(config.watchlist_db_path)
     settings_store = SettingsStore(config.watchlist_db_path)
     context_registry = ContextRegistry(config.watchlist_db_path)
+    memory_store = MemoryStore(config.watchlist_db_path)
     logger.info(f"Database: {config.watchlist_db_path}")
 
     mcp_registry = MCPRegistry(config.watchlist_db_path)
@@ -554,12 +556,24 @@ def build_app(config: Config):
         group_log=group_log,
         enricher=enricher,
         name_registry=name_registry,
+        memory_store=memory_store,
     )
 
     summarizer = Summarizer(
         llm_client=llm_client,
         history=llm_history,
         settings_store=settings_store,
+    )
+
+    # Deep-think client — points at a separately configured (smarter,
+    # slower, more expensive) model. Off by default; admins flip it on
+    # at /admin/llm. The writer LLM gets it as a tool call, gated per-
+    # context via ContextPolicy.deep_think_enabled. The deep model gets
+    # the same tool kit the writer has (bot_tools wired below after the
+    # dispatcher exists; mcp_manager already exists at this point).
+    deep_think_client = DeepThinkClient(
+        settings_store,
+        mcp_manager=mcp_manager,
     )
 
     # ask_command is built first (without bot_tools) so the dispatcher knows
@@ -574,6 +588,8 @@ def build_app(config: Config):
         name_registry=name_registry,
         summarizer=summarizer,
         reactor=reactor,
+        deep_think=deep_think_client,
+        memory_store=memory_store,
     )
 
     dispatcher = create_dispatcher(
@@ -588,7 +604,11 @@ def build_app(config: Config):
     )
 
     from .commands.tools import BotCommandTools
-    ask_command.bot_tools = BotCommandTools(dispatcher)
+    bot_tools = BotCommandTools(dispatcher)
+    ask_command.bot_tools = bot_tools
+    # Same tool adapter for the deep model — late-binding is the same
+    # circular-dep workaround as ask_command's.
+    deep_think_client.bot_tools = bot_tools
 
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
 
@@ -699,6 +719,8 @@ def build_app(config: Config):
         context_registry=context_registry,
         dispatcher=dispatcher,
         name_registry=name_registry,
+        deep_think_client=deep_think_client,
+        memory_store=memory_store,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

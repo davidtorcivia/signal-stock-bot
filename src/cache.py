@@ -270,6 +270,27 @@ class LLMMetrics:
 
 
 @dataclass
+class DeepThinkMetrics:
+    """Counters for the deep_think tool — separate from main LLM since it
+    points at a different (more expensive) model and we want isolated
+    cost/latency visibility on the dashboard."""
+    calls: int = 0
+    successes: int = 0
+    errors: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    total_latency_ms: float = 0.0
+    last_call_at: Optional[float] = None
+    last_error_at: Optional[float] = None
+    last_error_msg: Optional[str] = None
+    by_model: dict = field(default_factory=dict)     # model -> count
+
+    @property
+    def avg_latency_ms(self) -> float:
+        return (self.total_latency_ms / self.successes) if self.successes else 0.0
+
+
+@dataclass
 class ReactorMetrics:
     """Counters for the emoji reactor."""
     evaluations: int = 0          # times maybe_react was actually invoked (post-skip-checks)
@@ -318,6 +339,7 @@ class MetricsCollector:
         self._caches: Dict[str, TTLCache] = {}
         self._request_times: deque = deque(maxlen=1000)  # Last 1000 request timestamps
         self._llm = LLMMetrics()
+        self._deep_think = DeepThinkMetrics()
         self._reactor = ReactorMetrics()
         self._lock = threading.RLock()
     
@@ -383,6 +405,37 @@ class MetricsCollector:
             m.last_error_at = time.time()
             m.last_error_msg = (error_msg or "")[:200]
             m.by_purpose[purpose] = m.by_purpose.get(purpose, 0) + 1
+            if model:
+                m.by_model[model] = m.by_model.get(model, 0) + 1
+
+    # ── Deep think metrics ────────────────────────────────────────────
+
+    def record_deep_think_success(
+        self,
+        *,
+        model: str,
+        latency_ms: float,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> None:
+        with self._lock:
+            m = self._deep_think
+            m.calls += 1
+            m.successes += 1
+            m.tokens_in += int(tokens_in or 0)
+            m.tokens_out += int(tokens_out or 0)
+            m.total_latency_ms += latency_ms
+            m.last_call_at = time.time()
+            if model:
+                m.by_model[model] = m.by_model.get(model, 0) + 1
+
+    def record_deep_think_error(self, *, model: str, error_msg: str) -> None:
+        with self._lock:
+            m = self._deep_think
+            m.calls += 1
+            m.errors += 1
+            m.last_error_at = time.time()
+            m.last_error_msg = (error_msg or "")[:200]
             if model:
                 m.by_model[model] = m.by_model.get(model, 0) + 1
 
@@ -481,6 +534,22 @@ class MetricsCollector:
                     "errors": self._reactor.errors,
                     "top_emojis": top_emojis,
                     "last_reaction_at": self._reactor.last_reaction_at,
+                },
+                "deep_think": {
+                    "calls": self._deep_think.calls,
+                    "successes": self._deep_think.successes,
+                    "errors": self._deep_think.errors,
+                    "success_rate": (
+                        f"{(self._deep_think.successes / self._deep_think.calls * 100):.1f}%"
+                        if self._deep_think.calls else "—"
+                    ),
+                    "tokens_in": self._deep_think.tokens_in,
+                    "tokens_out": self._deep_think.tokens_out,
+                    "avg_latency_ms": f"{self._deep_think.avg_latency_ms:.0f}",
+                    "last_call_at": self._deep_think.last_call_at,
+                    "last_error_at": self._deep_think.last_error_at,
+                    "last_error_msg": self._deep_think.last_error_msg,
+                    "by_model": dict(self._deep_think.by_model),
                 },
             }
 

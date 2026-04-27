@@ -57,6 +57,9 @@ class ContextRegistry:
                         reactor_enabled INTEGER NOT NULL DEFAULT 1,
                         reactor_prompt TEXT,
                         natural_response INTEGER NOT NULL DEFAULT 0,
+                        deep_think_enabled INTEGER NOT NULL DEFAULT 1,
+                        memory_writes_enabled INTEGER NOT NULL DEFAULT 1,
+                        reactor_memory_writes INTEGER NOT NULL DEFAULT 0,
                         first_seen REAL NOT NULL,
                         updated_at REAL NOT NULL
                     )
@@ -80,6 +83,18 @@ class ContextRegistry:
                 if "natural_response" not in existing_cols:
                     await db.execute(
                         "ALTER TABLE contexts ADD COLUMN natural_response INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "deep_think_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN deep_think_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                if "memory_writes_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN memory_writes_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                if "reactor_memory_writes" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN reactor_memory_writes INTEGER NOT NULL DEFAULT 0"
                     )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_contexts_key ON contexts(key)"
@@ -105,6 +120,13 @@ class ContextRegistry:
         "mcp_mode, mcp_servers, system_prompt, llm_intent"
     )
 
+    _SELECT_FIELDS = (
+        "id, kind, key, label, command_mode, commands, "
+        "mcp_mode, mcp_servers, system_prompt, llm_intent, "
+        "reactor_enabled, reactor_prompt, natural_response, "
+        "deep_think_enabled, memory_writes_enabled, reactor_memory_writes"
+    )
+
     @staticmethod
     def _row_to_policy(row) -> ContextPolicy:
         return ContextPolicy(
@@ -121,19 +143,20 @@ class ContextRegistry:
             reactor_enabled=bool(row[10]) if len(row) > 10 and row[10] is not None else True,
             reactor_prompt=row[11] if len(row) > 11 else None,
             natural_response=bool(row[12]) if len(row) > 12 and row[12] is not None else False,
+            deep_think_enabled=bool(row[13]) if len(row) > 13 and row[13] is not None else True,
+            memory_writes_enabled=bool(row[14]) if len(row) > 14 and row[14] is not None else True,
+            reactor_memory_writes=bool(row[15]) if len(row) > 15 and row[15] is not None else False,
         )
 
     async def list(self) -> list[ContextPolicy]:
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT id, kind, key, label, command_mode, commands,
-                          mcp_mode, mcp_servers, system_prompt, llm_intent,
-                          reactor_enabled, reactor_prompt, natural_response
-                   FROM contexts
-                   ORDER BY
-                     CASE kind WHEN 'default' THEN 0 WHEN 'group' THEN 1 ELSE 2 END,
-                     label, key"""
+                f"""SELECT {self._SELECT_FIELDS}
+                    FROM contexts
+                    ORDER BY
+                      CASE kind WHEN 'default' THEN 0 WHEN 'group' THEN 1 ELSE 2 END,
+                      label, key"""
             )
             rows = await cursor.fetchall()
         return [self._row_to_policy(r) for r in rows]
@@ -142,10 +165,7 @@ class ContextRegistry:
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT id, kind, key, label, command_mode, commands,
-                          mcp_mode, mcp_servers, system_prompt, llm_intent,
-                          reactor_enabled, reactor_prompt, natural_response
-                   FROM contexts WHERE id = ?""",
+                f"SELECT {self._SELECT_FIELDS} FROM contexts WHERE id = ?",
                 (context_id,),
             )
             row = await cursor.fetchone()
@@ -155,10 +175,7 @@ class ContextRegistry:
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT id, kind, key, label, command_mode, commands,
-                          mcp_mode, mcp_servers, system_prompt, llm_intent,
-                          reactor_enabled, reactor_prompt, natural_response
-                   FROM contexts WHERE key = ?""",
+                f"SELECT {self._SELECT_FIELDS} FROM contexts WHERE key = ?",
                 (key,),
             )
             row = await cursor.fetchone()
@@ -223,8 +240,10 @@ class ContextRegistry:
                        (kind, key, label, command_mode, commands, mcp_mode,
                         mcp_servers, system_prompt, llm_intent,
                         reactor_enabled, reactor_prompt, natural_response,
+                        deep_think_enabled, memory_writes_enabled,
+                        reactor_memory_writes,
                         first_seen, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy.kind,
                         policy.key,
@@ -238,6 +257,9 @@ class ContextRegistry:
                         1 if policy.reactor_enabled else 0,
                         policy.reactor_prompt or None,
                         1 if policy.natural_response else 0,
+                        1 if policy.deep_think_enabled else 0,
+                        1 if policy.memory_writes_enabled else 0,
+                        1 if policy.reactor_memory_writes else 0,
                         now,
                         now,
                     ),
@@ -251,6 +273,9 @@ class ContextRegistry:
                            mcp_mode = ?, mcp_servers = ?, system_prompt = ?,
                            llm_intent = ?, reactor_enabled = ?,
                            reactor_prompt = ?, natural_response = ?,
+                           deep_think_enabled = ?,
+                           memory_writes_enabled = ?,
+                           reactor_memory_writes = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -264,6 +289,9 @@ class ContextRegistry:
                         1 if policy.reactor_enabled else 0,
                         policy.reactor_prompt or None,
                         1 if policy.natural_response else 0,
+                        1 if policy.deep_think_enabled else 0,
+                        1 if policy.memory_writes_enabled else 0,
+                        1 if policy.reactor_memory_writes else 0,
                         now,
                         policy.id,
                     ),

@@ -60,6 +60,22 @@ LIVE_KEYS = {
     "natural_response_enabled",
     "natural_response_cooldown",
     "natural_response_extra_prompt",
+    # Deep think (separate "smarter" model exposed as a tool to the writer)
+    "deep_think_enabled",
+    "deep_think_base_url",
+    "deep_think_api_key",
+    "deep_think_model",
+    "deep_think_temperature",
+    "deep_think_max_tokens",
+    "deep_think_timeout_seconds",
+    "deep_think_extra_body",
+    "deep_think_system_prompt",
+    "deep_think_context_max_chars",
+    "deep_think_max_tool_rounds",
+    # Cap infrastructure — disabled by default; counters track usage either way
+    "deep_think_caps_enabled",
+    "deep_think_user_daily_cap",
+    "deep_think_group_daily_cap",
 }
 
 # Keys the admin UI exposes but that require a process restart.

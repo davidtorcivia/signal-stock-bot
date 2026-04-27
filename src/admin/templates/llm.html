@@ -231,6 +231,93 @@
             on, cooldown clear).
         </p>
 
+        <h2 style="margin-top: 32px;">Deep think</h2>
+        <p class="muted" style="font-size: 12px;">
+            A separate (smarter, slower, more expensive) model exposed to the
+            writer LLM as a <code>deep_think(question, context)</code> tool.
+            The writer decides when to delegate hard sub-problems. Empty
+            fields fall back to the corresponding LLM setting above, so
+            typically you only need to set the model + max_tokens (and maybe
+            api_key/base_url) to point at a different endpoint. Per-context
+            opt-out lives on <code>/admin/contexts/&lt;id&gt;</code>.
+        </p>
+
+        <label for="deep_think_enabled">Deep think enabled</label>
+        <input type="text" name="deep_think_enabled" id="deep_think_enabled"
+               value="{{ 'true' if values.deep_think_enabled else 'false' }}"
+               placeholder="true / false">
+
+        <label for="deep_think_base_url">Base URL (empty = same as main)</label>
+        <input type="text" name="deep_think_base_url" id="deep_think_base_url"
+               value="{{ values.deep_think_base_url or '' }}"
+               placeholder="https://api.openai.com/v1">
+
+        <label for="deep_think_api_key">API key
+            {% if deep_think_api_key_set %}<span class="muted" style="font-size:11px;">(configured — leave blank to keep)</span>{% endif %}
+        </label>
+        <input type="password" name="deep_think_api_key" id="deep_think_api_key"
+               value="" placeholder="{{ 'leave blank to keep existing' if deep_think_api_key_set else 'sk-...' }}">
+
+        <label for="deep_think_model">Model</label>
+        <input type="text" name="deep_think_model" id="deep_think_model"
+               value="{{ values.deep_think_model or '' }}"
+               placeholder="gpt-5  or  anthropic/claude-opus-4-7">
+
+        <label for="deep_think_temperature">Temperature</label>
+        <input type="text" name="deep_think_temperature" id="deep_think_temperature"
+               value="{{ values.deep_think_temperature if values.deep_think_temperature is not none else '' }}"
+               placeholder="0.7">
+
+        <label for="deep_think_max_tokens">Max tokens (deep models burn budget on reasoning)</label>
+        <input type="number" name="deep_think_max_tokens" id="deep_think_max_tokens" min="100"
+               value="{{ values.deep_think_max_tokens or '' }}" placeholder="8000">
+
+        <label for="deep_think_timeout_seconds">Timeout (seconds)</label>
+        <input type="number" name="deep_think_timeout_seconds" id="deep_think_timeout_seconds" min="10"
+               value="{{ values.deep_think_timeout_seconds or '' }}" placeholder="120">
+
+        <label for="deep_think_extra_body">Extra body (JSON, empty = inherit)</label>
+        <textarea name="deep_think_extra_body" id="deep_think_extra_body" rows="3"
+                  placeholder='{"reasoning": {"effort": "high"}}  or  {"thinking": {"type": "enabled", "budget_tokens": 4000}}'>{{ values.deep_think_extra_body or '' }}</textarea>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Replaces (not merged with) main extra_body. Typical use: enable
+            high-effort reasoning on the deep model.
+        </p>
+
+        <label for="deep_think_system_prompt">System prompt (empty = built-in careful-reasoner default)</label>
+        <textarea name="deep_think_system_prompt" id="deep_think_system_prompt" rows="6"
+                  placeholder="Empty = built-in default optimized for careful step-by-step reasoning, plain prose, honest about uncertainty.">{{ values.deep_think_system_prompt or '' }}</textarea>
+
+        <label for="deep_think_context_max_chars">Writer-supplied context budget (chars)</label>
+        <input type="number" name="deep_think_context_max_chars" id="deep_think_context_max_chars" min="0"
+               value="{{ values.deep_think_context_max_chars or '' }}" placeholder="8000">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Hard cap on the optional <code>context</code> arg the writer
+            passes. Truncated server-side — protects against runaway prompts.
+        </p>
+
+        <h3 style="margin-top: 24px;">Caps (currently visibility-only)</h3>
+        <p class="muted" style="font-size: 11px;">
+            Counters always advance; enforcement only runs when "Caps enforced"
+            is true. Use the dashboard to monitor usage before flipping
+            enforcement on.
+        </p>
+
+        <label for="deep_think_caps_enabled">Caps enforced</label>
+        <input type="text" name="deep_think_caps_enabled" id="deep_think_caps_enabled"
+               value="{{ 'true' if values.deep_think_caps_enabled else 'false' }}"
+               placeholder="false">
+
+        <label for="deep_think_user_daily_cap">Per-user daily cap (0 = unlimited)</label>
+        <input type="number" name="deep_think_user_daily_cap" id="deep_think_user_daily_cap" min="0"
+               value="{{ values.deep_think_user_daily_cap if values.deep_think_user_daily_cap is not none else '' }}"
+               placeholder="10">
+
+        <label for="deep_think_group_daily_cap">Per-group daily cap (0 = unlimited)</label>
+        <input type="number" name="deep_think_group_daily_cap" id="deep_think_group_daily_cap" min="0"
+               value="{{ values.deep_think_group_daily_cap if values.deep_think_group_daily_cap is not none else '' }}"
+               placeholder="50">
+
         <div style="margin-top: 24px;">
             <button type="submit">Save</button>
         </div>

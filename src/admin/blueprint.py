@@ -44,6 +44,8 @@ def create_admin_blueprint(
     context_registry: Optional[ContextRegistry] = None,
     dispatcher=None,
     name_registry=None,
+    deep_think_client=None,
+    memory_store=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -73,6 +75,7 @@ def create_admin_blueprint(
         context_registry=context_registry,
         db_path=str(settings_store.db_path) if settings_store else None,
         loop=loop,
+        deep_think_client=deep_think_client,
     )
     _register_llm_routes(bp, settings_store=settings_store)
 
@@ -91,6 +94,8 @@ def create_admin_blueprint(
             mcp_registry=mcp_registry,
             dispatcher=dispatcher,
             loop=loop,
+            memory_store=memory_store,
+            name_registry=name_registry,
         )
 
     if name_registry is not None:
@@ -163,6 +168,7 @@ def _register_dashboard_routes(
     context_registry: Optional[ContextRegistry] = None,
     db_path: Optional[str] = None,
     loop: Optional[asyncio.AbstractEventLoop] = None,
+    deep_think_client=None,
 ) -> None:
     @bp.route("/", methods=["GET"])
     @admin_required
@@ -218,6 +224,25 @@ def _register_dashboard_routes(
             if reactor_view.get("top_emojis") else None
         )
 
+        # Deep-think stats: status snapshot + today's usage + recent calls
+        # log so the dashboard surfaces "is it on, who's hitting it, what
+        # have they asked, how slow/cheap was it" without leaving the page.
+        deep_think_view: dict = dict(metrics.get("deep_think") or {})
+        if deep_think_client is not None:
+            try:
+                deep_think_view["status"] = deep_think_client.status()
+                deep_think_view["usage_today"] = deep_think_client.usage_today()
+                deep_think_view["recent_calls"] = deep_think_client.recent_calls(limit=10)
+            except Exception as e:
+                logger.error(f"Dashboard deep_think collect failed: {e}")
+                deep_think_view["status"] = {"enabled": False, "ready": False}
+                deep_think_view["usage_today"] = {"total_calls": 0, "per_user": {}, "per_group": {}}
+                deep_think_view["recent_calls"] = []
+        else:
+            deep_think_view["status"] = {"enabled": False, "ready": False}
+            deep_think_view["usage_today"] = {"total_calls": 0, "per_user": {}, "per_group": {}}
+            deep_think_view["recent_calls"] = []
+
         return render_template(
             "dashboard.html",
             metrics=metrics,
@@ -226,6 +251,7 @@ def _register_dashboard_routes(
             context_view=context_view,
             storage_view=storage_view,
             reactor_view=reactor_view,
+            deep_think_view=deep_think_view,
         )
 
     @bp.route("/settings", methods=["GET", "POST"])
@@ -297,6 +323,21 @@ LLM_KEYS = [
     "natural_response_enabled",
     "natural_response_cooldown",
     "natural_response_extra_prompt",
+    # Deep think (separate model for hard sub-problems)
+    "deep_think_enabled",
+    "deep_think_base_url",
+    "deep_think_api_key",
+    "deep_think_model",
+    "deep_think_temperature",
+    "deep_think_max_tokens",
+    "deep_think_timeout_seconds",
+    "deep_think_extra_body",
+    "deep_think_system_prompt",
+    "deep_think_context_max_chars",
+    "deep_think_max_tool_rounds",
+    "deep_think_caps_enabled",
+    "deep_think_user_daily_cap",
+    "deep_think_group_daily_cap",
 ]
 
 # Imported lazily inside the route to avoid a circular import.
@@ -337,6 +378,23 @@ LLM_DEFAULTS = {
     "natural_response_enabled": False,
     "natural_response_cooldown": 300,      # per-group seconds between spontaneous replies
     "natural_response_extra_prompt": "",   # appended to reactor prompt; empty => built-in default
+    # Deep think — empty string fields fall back to llm_* equivalents at runtime,
+    # so admins can override only the model + max_tokens to point at a smarter
+    # endpoint and inherit everything else.
+    "deep_think_enabled": False,
+    "deep_think_base_url": "",
+    "deep_think_api_key": "",
+    "deep_think_model": "",
+    "deep_think_temperature": 0.7,
+    "deep_think_max_tokens": 8000,
+    "deep_think_timeout_seconds": 120,
+    "deep_think_extra_body": "",
+    "deep_think_system_prompt": "",        # empty => use built-in CAREFUL_REASONER prompt
+    "deep_think_context_max_chars": 8000,  # writer-supplied context budget cap
+    "deep_think_max_tool_rounds": 15,      # cap on tool-loop rounds inside one think() call
+    "deep_think_caps_enabled": False,      # counters always track; enforcement gated by this
+    "deep_think_user_daily_cap": 10,
+    "deep_think_group_daily_cap": 50,
 }
 
 
@@ -364,11 +422,14 @@ def _register_llm_routes(bp: Blueprint, *, settings_store: SettingsStore) -> Non
         # Don't round-trip the API key to the browser — show a "configured" flag.
         api_key_set = bool(values.get("llm_api_key"))
         values["llm_api_key"] = ""
+        deep_think_api_key_set = bool(values.get("deep_think_api_key"))
+        values["deep_think_api_key"] = ""
 
         return render_template(
             "llm.html",
             values=values,
             api_key_set=api_key_set,
+            deep_think_api_key_set=deep_think_api_key_set,
             saved=saved,
             error=error,
         )
@@ -378,7 +439,13 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
     """Persist LLM form values with schema-aware coercion."""
     import json
 
-    bool_keys = {"llm_enabled", "reactor_enabled", "natural_response_enabled"}
+    bool_keys = {
+        "llm_enabled",
+        "reactor_enabled",
+        "natural_response_enabled",
+        "deep_think_enabled",
+        "deep_think_caps_enabled",
+    }
     int_keys = {
         "llm_max_tokens",
         "llm_timeout_seconds",
@@ -392,13 +459,20 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
         "reactor_group_cooldown",
         "reactor_context_messages",
         "natural_response_cooldown",
+        "deep_think_max_tokens",
+        "deep_think_timeout_seconds",
+        "deep_think_context_max_chars",
+        "deep_think_max_tool_rounds",
+        "deep_think_user_daily_cap",
+        "deep_think_group_daily_cap",
     }
-    float_keys = {"llm_temperature", "reactor_temperature"}
+    float_keys = {"llm_temperature", "reactor_temperature", "deep_think_temperature"}
 
     for key in LLM_KEYS:
-        if key == "llm_api_key":
-            # Only overwrite when the user typed a new value; empty = keep existing
-            submitted = form.get("llm_api_key", "").strip()
+        if key in ("llm_api_key", "deep_think_api_key"):
+            # Only overwrite when the user typed a new value; empty = keep existing.
+            # Same masked-input pattern for both API keys.
+            submitted = form.get(key, "").strip()
             if submitted:
                 store.set(key, submitted)
             continue
@@ -696,7 +770,12 @@ def _register_context_routes(
     mcp_registry: Optional[MCPRegistry],
     dispatcher,
     loop: asyncio.AbstractEventLoop,
+    memory_store=None,
+    name_registry=None,
 ) -> None:
+    """Context CRUD + (when memory_store is wired) memory CRUD nested under
+    each context. Memory routes are mounted unconditionally so the template
+    link at /admin/contexts/<id> never builds against a missing route."""
     @bp.route("/contexts", methods=["GET"])
     @admin_required
     def context_list():
@@ -720,6 +799,9 @@ def _register_context_routes(
             "reactor_enabled": True,
             "reactor_prompt": "",
             "natural_response": False,
+            "deep_think_enabled": True,
+            "memory_writes_enabled": True,
+            "reactor_memory_writes": False,
         }
         if request.method == "POST":
             if not verify_csrf():
@@ -777,6 +859,9 @@ def _register_context_routes(
             "reactor_enabled": policy.reactor_enabled,
             "reactor_prompt": policy.reactor_prompt or "",
             "natural_response": policy.natural_response,
+            "deep_think_enabled": policy.deep_think_enabled,
+            "memory_writes_enabled": policy.memory_writes_enabled,
+            "reactor_memory_writes": policy.reactor_memory_writes,
         }
         if request.method == "POST":
             values = _form_to_values(request.form)
@@ -800,10 +885,359 @@ def _register_context_routes(
     def context_delete(context_id: int):
         if verify_csrf():
             try:
+                # Cascade memories before the row goes — orphans would
+                # otherwise sit unaddressable in the DB if the context
+                # is later re-created with a new auto-increment id.
+                if memory_store is not None:
+                    try:
+                        n = _run_on_loop(
+                            loop, memory_store.delete_for_context(context_id)
+                        )
+                        if n:
+                            logger.info(
+                                f"Context delete: removed {n} memor"
+                                f"{'y' if n == 1 else 'ies'} for "
+                                f"context {context_id}"
+                            )
+                    except Exception as e:
+                        logger.error(f"Memory cascade-delete failed: {e}")
                 _run_on_loop(loop, registry.delete(context_id))
             except Exception as e:
                 logger.error(f"Context delete failed: {e}")
         return redirect(url_for("admin.context_list"))
+
+    _register_memory_routes(
+        bp,
+        registry=registry,
+        memory_store=memory_store,
+        loop=loop,
+        name_registry=name_registry,
+    )
+
+
+def _register_memory_routes(
+    bp: Blueprint,
+    *,
+    registry: ContextRegistry,
+    memory_store,
+    loop: asyncio.AbstractEventLoop,
+    name_registry=None,
+) -> None:
+    """Routes for browsing and editing per-context memory rows.
+
+    Always mounted (even when `memory_store` is None) so the link from the
+    context-edit page builds. When the store is missing, every route 404s
+    cleanly instead of `url_for` raising BuildError mid-render.
+    """
+    from ..memory import KINDS, freetext_subject_key, is_user_hash
+
+    def _store_or_404():
+        if memory_store is None:
+            abort(404)
+
+    def _named_users() -> list[dict]:
+        """Return [{user_hash, name}] sorted by name, or [] if no registry."""
+        if name_registry is None:
+            return []
+        try:
+            rows = _run_on_loop(loop, name_registry.list_all())
+        except Exception as e:
+            logger.debug(f"named user list failed: {e}")
+            return []
+        return [
+            {"user_hash": r["user_hash"], "name": r["name"]}
+            for r in rows
+            if r.get("user_hash") and r.get("name")
+        ]
+
+    @bp.route("/contexts/<int:context_id>/memories", methods=["GET"])
+    @admin_required
+    def context_memories(context_id: int):
+        _store_or_404()
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        rows = _run_on_loop(loop, memory_store.list_for_context(context_id))
+        # Group by subject for readable rendering.
+        grouped: dict = {}
+        for r in rows:
+            key = r["subject_key"]
+            grouped.setdefault(key, {
+                "subject_key": key,
+                "subject_label": r["subject_label"] or key,
+                "rows": [],
+            })["rows"].append(r)
+        # Refresh group display labels for user-hash subjects from the live
+        # registry so renames show through immediately, mirroring the
+        # preamble's behavior.
+        users = _named_users()
+        users_by_hash = {u["user_hash"]: u["name"] for u in users}
+        for g in grouped.values():
+            live = users_by_hash.get(g["subject_key"])
+            if live:
+                g["subject_label"] = live
+        groups_all = sorted(
+            grouped.values(),
+            key=lambda g: (g["subject_label"] or "").lower(),
+        )
+
+        # Paginate at the subject level — each "page" shows N subjects with
+        # all their memories, which keeps related rows together. Within a
+        # single subject most chats have a small number of memories, so
+        # there's no inner-pagination yet.
+        try:
+            per_page = max(1, min(int(request.args.get("per_page") or 10), 50))
+        except (TypeError, ValueError):
+            per_page = 10
+        try:
+            page = max(1, int(request.args.get("page") or 1))
+        except (TypeError, ValueError):
+            page = 1
+        total_subjects = len(groups_all)
+        total_pages = max(1, (total_subjects + per_page - 1) // per_page)
+        if page > total_pages:
+            page = total_pages
+        start = (page - 1) * per_page
+        groups = groups_all[start:start + per_page]
+
+        return render_template(
+            "context_memories.html",
+            policy=policy,
+            groups=groups,
+            kinds=list(KINDS),
+            total=len(rows),
+            total_subjects=total_subjects,
+            named_users=users,
+            page=page,
+            per_page=per_page,
+            total_pages=total_pages,
+        )
+
+    @bp.route("/contexts/<int:context_id>/memories/new", methods=["POST"])
+    @admin_required
+    def memory_create(context_id: int):
+        _store_or_404()
+        if not verify_csrf():
+            flash("Session expired, please reload the page.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        # The picker fills `subject` directly with a user_hash or
+        # __context__; the free-text fallback is `subject_custom`. Either
+        # one wins (picker first), so the form has both visible without
+        # client-side JS to swap them.
+        subject_hint = (request.form.get("subject") or "").strip()
+        if not subject_hint:
+            subject_hint = (request.form.get("subject_custom") or "").strip()
+        kind = (request.form.get("kind") or "").strip().lower()
+        content = (request.form.get("content") or "").strip()
+        if not subject_hint or kind not in KINDS or not content:
+            flash(
+                "Memory not saved — subject, kind, and content are all required.",
+                "error",
+            )
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        # If the picker fed in a known user_hash with no explicit label,
+        # fill the label from NameRegistry so it renders nicely in the UI
+        # without the admin having to retype the name.
+        label_in = request.form.get("subject_label") or ""
+        if not label_in.strip() and is_user_hash(subject_hint):
+            for u in _named_users():
+                if u["user_hash"] == subject_hint:
+                    label_in = u["name"]
+                    break
+        subject_key, subject_label = _admin_resolve_subject(
+            subject_hint, label_in,
+            is_user_hash, freetext_subject_key,
+        )
+        if not subject_key:
+            flash("Memory not saved — subject is empty after normalization.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        try:
+            mem_id = _run_on_loop(
+                loop,
+                memory_store.add(
+                    context_id=context_id,
+                    subject_key=subject_key,
+                    subject_label=subject_label,
+                    kind=kind,
+                    content=content,
+                    source="admin",
+                ),
+            )
+            if mem_id:
+                flash(f"Saved memory #{mem_id} about {subject_label}.", "ok")
+            else:
+                flash("Memory not saved — input rejected.", "error")
+        except Exception as e:
+            logger.error(f"Memory create failed: {e}")
+            flash(f"Memory create failed: {e}", "error")
+        return redirect(
+            _memories_redirect_url(context_id, request.form.get("page"))
+        )
+
+    @bp.route(
+        "/contexts/<int:context_id>/memories/<int:memory_id>/update",
+        methods=["POST"],
+    )
+    @admin_required
+    def memory_update(context_id: int, memory_id: int):
+        _store_or_404()
+        if not verify_csrf():
+            flash("Session expired, please reload the page.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        # Cross-context guard: refuse updates that don't belong to the URL's
+        # context_id. Stops admins (or a stale form posting to a different
+        # URL) from mutating a memory in a different chat by id.
+        existing = _run_on_loop(loop, memory_store.get(memory_id))
+        if not existing or existing.get("context_id") != context_id:
+            flash(f"No memory #{memory_id} in this chat.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        content = (request.form.get("content") or "").strip()
+        confidence_raw = request.form.get("confidence")
+        subject_hint = (request.form.get("subject") or "").strip()
+        if not subject_hint:
+            subject_hint = (request.form.get("subject_custom") or "").strip()
+        subject_label_in = (request.form.get("subject_label") or "").strip()
+        # Auto-fill label from the registry if the picker handed us a hash
+        # with no explicit label override.
+        if not subject_label_in and is_user_hash(subject_hint):
+            for u in _named_users():
+                if u["user_hash"] == subject_hint:
+                    subject_label_in = u["name"]
+                    break
+        confidence: Optional[float] = None
+        if confidence_raw is not None and confidence_raw != "":
+            try:
+                confidence = float(confidence_raw)
+            except ValueError:
+                confidence = None
+        new_key: Optional[str] = None
+        new_label: Optional[str] = None
+        if subject_hint:
+            new_key, resolved_label = _admin_resolve_subject(
+                subject_hint, subject_label_in,
+                is_user_hash, freetext_subject_key,
+            )
+            if not new_key:
+                flash("Subject ignored — empty after normalization.", "error")
+                new_key = None
+            else:
+                new_label = resolved_label
+        elif subject_label_in:
+            new_label = subject_label_in
+        if not (content or confidence is not None or new_key or new_label):
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        try:
+            ok = _run_on_loop(
+                loop,
+                memory_store.update(
+                    memory_id,
+                    content=content or None,
+                    confidence=confidence,
+                    subject_key=new_key,
+                    subject_label=new_label,
+                ),
+            )
+            if ok:
+                flash(f"Memory #{memory_id} updated.", "ok")
+            else:
+                flash(f"No changes saved for #{memory_id}.", "error")
+        except Exception as e:
+            logger.error(f"Memory update failed: {e}")
+            flash(f"Memory update failed: {e}", "error")
+        return redirect(
+            _memories_redirect_url(context_id, request.form.get("page"))
+        )
+
+    @bp.route(
+        "/contexts/<int:context_id>/memories/<int:memory_id>/delete",
+        methods=["POST"],
+    )
+    @admin_required
+    def memory_delete(context_id: int, memory_id: int):
+        _store_or_404()
+        if not verify_csrf():
+            flash("Session expired, please reload the page.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        # Same cross-context guard as update — never delete a memory whose
+        # context_id doesn't match the URL.
+        existing = _run_on_loop(loop, memory_store.get(memory_id))
+        if not existing or existing.get("context_id") != context_id:
+            flash(f"No memory #{memory_id} in this chat.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        try:
+            ok = _run_on_loop(loop, memory_store.delete(memory_id))
+            flash(
+                f"Memory #{memory_id} deleted." if ok
+                else f"Memory #{memory_id} could not be deleted.",
+                "ok" if ok else "error",
+            )
+        except Exception as e:
+            logger.error(f"Memory delete failed: {e}")
+            flash(f"Memory delete failed: {e}", "error")
+        return redirect(
+            _memories_redirect_url(context_id, request.form.get("page"))
+        )
+
+
+def _memories_redirect_url(context_id: int, page_raw) -> str:
+    """Build the memories-page redirect URL, preserving `page` when valid.
+
+    Forms include a hidden `page` field so save/delete bounces the admin
+    back to the same page they were on instead of page 1. Defaults to
+    no `page=` (page 1) when the field is missing or unparseable.
+    """
+    try:
+        page = int(page_raw or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page > 1:
+        return url_for("admin.context_memories", context_id=context_id, page=page)
+    return url_for("admin.context_memories", context_id=context_id)
+
+
+def _admin_resolve_subject(
+    subject_hint: str,
+    subject_label_in,
+    is_user_hash_fn,
+    freetext_subject_key_fn,
+) -> tuple[str, str]:
+    """Translate the admin form's subject input into (key, label).
+
+    Hex hash → user (label from form, falls back to short-hash); literal
+    "this chat"/"context"/"the room" → SUBJECT_CONTEXT; else free-text
+    slug. Names are NOT auto-resolved against NameRegistry here on
+    purpose — admins should paste a hash for cross-context user identity
+    or use free-text for chat-local subjects, which avoids name-collision
+    footguns when two registered users share a first name.
+    """
+    s = (subject_hint or "").strip()
+    sub_low = s.lower()
+    if sub_low in ("this chat", "context", "the room"):
+        from ..memory import SUBJECT_CONTEXT
+        return SUBJECT_CONTEXT, "this chat"
+    if is_user_hash_fn(s):
+        label = (subject_label_in or "").strip() or f"...{s[:6]}"
+        return s, label
+    return freetext_subject_key_fn(s), s
 
 
 # Virtual command names that aren't real BaseCommand classes but are
@@ -852,6 +1286,9 @@ def _form_to_values(form) -> dict:
         "reactor_enabled": form.get("reactor_enabled", "") == "on",
         "reactor_prompt": form.get("reactor_prompt", ""),
         "natural_response": form.get("natural_response", "") == "on",
+        "deep_think_enabled": form.get("deep_think_enabled", "") == "on",
+        "memory_writes_enabled": form.get("memory_writes_enabled", "") == "on",
+        "reactor_memory_writes": form.get("reactor_memory_writes", "") == "on",
     }
 
 
@@ -872,6 +1309,9 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
     reactor_enabled = form.get("reactor_enabled", "") == "on"
     reactor_prompt = (form.get("reactor_prompt") or "").strip() or None
     natural_response = form.get("natural_response", "") == "on"
+    deep_think_enabled = form.get("deep_think_enabled", "") == "on"
+    memory_writes_enabled = form.get("memory_writes_enabled", "") == "on"
+    reactor_memory_writes = form.get("reactor_memory_writes", "") == "on"
 
     if kind not in ("group", "dm", "default"):
         raise ValueError("kind must be group, dm, or default")
@@ -896,6 +1336,9 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         reactor_enabled=reactor_enabled,
         reactor_prompt=reactor_prompt,
         natural_response=natural_response,
+        deep_think_enabled=deep_think_enabled,
+        memory_writes_enabled=memory_writes_enabled,
+        reactor_memory_writes=reactor_memory_writes,
     )
 
 

@@ -17,6 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Pre-install npx-based MCP servers so first-call doesn't trigger an
+# `npm install` that prints to stdout — npm's progress messages corrupt
+# the MCP stdio JSONRPC stream and either spam parse errors or push the
+# 30s startup-handshake budget over the line, causing brave-search to
+# fail on cold-cache container starts. Install once at image build,
+# then invoke the resulting binary directly (db row uses
+# `brave-search-mcp-server` with empty args, no `npx`).
+RUN npm install -g @brave/brave-search-mcp-server@latest
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

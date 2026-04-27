@@ -15,6 +15,7 @@ The command's registered name is always "ask"; an admin-chosen alias from
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -28,6 +29,18 @@ from ..llm import (
     ConversationHistory,
     format_relative_age,
 )
+from ..memory import (
+    FORGET_TOOL,
+    KINDS,
+    MemoryStore,
+    RECALL_TOOL,
+    REMEMBER_TOOL,
+    SOURCE_EXPLICIT,
+    SubjectResolver,
+    build_preamble,
+    compute_explicit_confidence,
+    render_recall_results,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +50,103 @@ DEFAULT_MAX_TOOL_ROUNDS = 25
 # to the system prompt. Tuned conservatively: anything older than half a day
 # is likely a fresh topic, not a continuation.
 STALENESS_THRESHOLD_SECONDS = 6 * 3600
+
+
+# Phrases that almost always mean "use the smarter model" — when these appear
+# in the user's message, we inject a strong hint pushing the writer toward
+# deep_think instead of trusting the model's own judgement of "is this hard?"
+# Writers under-call deep_think because plausible-sounding answers come easily
+# from training; explicit user intent is a much more reliable trigger than
+# difficulty self-assessment.
+_DEEP_THINK_TRIGGER_RE = re.compile(
+    r"\b("
+    r"think\s+(?:hard|carefully|deeply|long|really)"
+    r"|deep[\s-]?think"
+    r"|really\s+think"
+    r"|carefully\s+think"
+    r"|think\s+(?:about|on)\s+(?:this|that|it)\s+(?:hard|carefully|really)"
+    r"|take\s+your\s+time"
+    r"|dig\s+(?:in|into|deep)"
+    r"|do\s+(?:some\s+)?(?:real\s+)?research"
+    r"|give\s+(?:it|this|that)\s+(?:real|some)\s+thought"
+    r"|put\s+some\s+thought\s+into"
+    r"|don'?t\s+(?:just\s+)?(?:guess|hand[\s-]?wave)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _user_explicitly_asked_to_think(text: str) -> bool:
+    return bool(_DEEP_THINK_TRIGGER_RE.search(text or ""))
+
+
+# Tool exposed to the writer LLM when DeepThinkClient is configured + ready.
+# Single tool, no namespace prefix — distinguishes itself by literal name in
+# the dispatch path inside _execute_tool_call.
+_DEEP_THINK_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "deep_think",
+        "description": (
+            "Delegate ONE focused hard sub-problem to a smarter, slower "
+            "model that ALSO HAS THE SAME TOOL KIT YOU DO (price, chart, "
+            "news, MCP servers — everything except deep_think itself). "
+            "Use when a question is genuinely hard: multi-step reasoning, "
+            "careful comparisons, research that needs to chain several "
+            "tool calls, or anything where you'd hand-wave. The deep "
+            "model will fetch its own data — you don't need to pre-load "
+            "results into context unless they're already in the chat. "
+            "Do NOT use for simple lookups you can do directly, tarot/"
+            "iching draws, or banter. Returns the smart model's text "
+            "which you weave into your reply (don't paste verbatim). "
+            "Slow (10-90s typical) — the bot will send your "
+            "`status_message` to the chat immediately when you invoke "
+            "this so the user knows you're working on it. On "
+            "'(unavailable: ...)' or '(rate-limited: ...)' stubs, just "
+            "answer without it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "The precise sub-question to think hard about. "
+                        "Be specific — this is sent verbatim to a fresh "
+                        "model with no other context unless you supply it."
+                    ),
+                },
+                "context": {
+                    "type": "string",
+                    "description": (
+                        "Optional supporting context (history snippets, "
+                        "the user's framing, etc.) the deep model should "
+                        "consider. Capped to 8000 chars by the bot."
+                    ),
+                },
+                "status_message": {
+                    "type": "string",
+                    "description": (
+                        "A short message sent to the chat IMMEDIATELY "
+                        "when this tool fires, before the deep model "
+                        "runs (which takes 10-90s). Tell the user you're "
+                        "thinking hard so they don't think the bot is "
+                        "stuck. Write it in YOUR OWN voice for THIS "
+                        "specific chat — match the persona, tone, and "
+                        "language you're using. Vary the wording each "
+                        "time, don't copy-paste a stock phrase. Keep it "
+                        "under 100 chars and casual. Examples (English "
+                        "neutral — adapt to your context): 'gimme a sec "
+                        "to dig into this', 'hold on, this one needs "
+                        "real thought', 'lemme actually work this out — "
+                        "back in a minute'."
+                    ),
+                },
+            },
+            "required": ["question", "status_message"],
+        },
+    },
+}
 
 
 def _wrap_xml(tag: str, body: str) -> str:
@@ -75,12 +185,26 @@ class AskCommand(BaseCommand):
         name_registry=None,
         summarizer=None,
         reactor=None,
+        deep_think=None,
+        memory_store: Optional[MemoryStore] = None,
     ):
         self.llm = llm
         self.history = history
         self.group_log = group_log
         self.mcp_manager = mcp_manager
         self.bot_tools = bot_tools
+        # Optional MemoryStore — when set, the writer LLM gets remember/
+        # recall/forget tools (gated per-context via memory_writes_enabled)
+        # and stored memories about active speakers in the chat are
+        # auto-injected into the system suffix.
+        self.memory_store = memory_store
+        self.subject_resolver: Optional[SubjectResolver] = None
+        # Optional DeepThinkClient — when set and the per-context policy
+        # allows it, exposed to the writer LLM as a `deep_think` tool.
+        # The client itself reads its own enabled flag at call time, so a
+        # disabled or unconfigured client just returns "(unavailable)" stubs
+        # the writer can integrate or discard.
+        self.deep_think = deep_think
         # Optional message-text enricher (e.g. TwitterExpander) — called on the
         # user's question so pasted links carry their content into the prompt.
         self.enricher = enricher
@@ -100,6 +224,10 @@ class AskCommand(BaseCommand):
         # in-memory log of recent reactions, so the writing LLM can answer
         # "why did you react with X?" without confabulating.
         self.reactor = reactor
+        # Late-bound after construction (NameRegistry shares the same
+        # late-binding pattern as bot_tools / signal_handler).
+        if name_registry is not None:
+            self.subject_resolver = SubjectResolver(name_registry)
 
     def _live_turns(self) -> int:
         try:
@@ -186,6 +314,31 @@ class AskCommand(BaseCommand):
             if policy is not None:
                 mcp_tools = [t for t in mcp_tools if policy.allows_mcp(t.server_name)]
             schemas.extend(t.to_openai_tool() for t in mcp_tools)
+        # deep_think is exposed only when the client is wired AND the global
+        # flag is on AND the per-context policy permits. The client returns
+        # "(unavailable)" for disabled/unconfigured calls, but suppressing
+        # the schema entirely keeps the writer from wasting tool-call rounds
+        # on a guaranteed-stub when we already know it's off.
+        if self.deep_think is not None:
+            dt_status = self.deep_think.status()
+            policy_ok = policy is None or policy.allows_deep_think()
+            if dt_status.get("ready") and policy_ok:
+                schemas.append(_DEEP_THINK_TOOL_SCHEMA)
+        # Memory tools: recall is always exposed when a store is wired and
+        # the policy resolves to a real (non-default) row; remember/forget
+        # require the per-context memory_writes_enabled flag. Default rows
+        # are excluded so passive-learning writes don't bleed across
+        # unregistered DMs sharing the default:dm policy.
+        if (
+            self.memory_store is not None
+            and policy is not None
+            and policy.id is not None
+            and policy.kind != "default"
+        ):
+            schemas.append(RECALL_TOOL)
+            if getattr(policy, "memory_writes_enabled", True):
+                schemas.append(REMEMBER_TOOL)
+                schemas.append(FORGET_TOOL)
         return schemas or None
 
     async def _run_tool_loop(
@@ -246,6 +399,108 @@ class AskCommand(BaseCommand):
             f"`Max tool-call rounds per !ask` in /admin/llm."
         )
 
+    async def _handle_memory_tool(
+        self,
+        name: str,
+        args: dict,
+        caller_ctx: CommandContext,
+    ) -> str:
+        """Dispatch remember/recall/forget. Returns the tool result text."""
+        store = self.memory_store
+        policy = caller_ctx.policy
+        if store is None or policy is None or policy.id is None:
+            return "(memory unavailable in this chat)"
+        if policy.kind == "default":
+            return "(memory unavailable: this chat has no explicit context row)"
+
+        resolver = self.subject_resolver
+        sender_phone = caller_ctx.sender
+
+        sender_user_hash = hash_phone(sender_phone) if sender_phone else ""
+
+        if name == "recall":
+            subject_hint = (args.get("subject") or "").strip()
+            query = (args.get("query") or "").strip()
+            if subject_hint and resolver is not None:
+                key, _ = resolver.resolve(
+                    subject_hint, sender_phone=sender_phone
+                )
+                if not key:
+                    return "(could not resolve subject)"
+                rows = await store.list_for_subject(
+                    context_id=policy.id,
+                    subject_key=key,
+                )
+                if query:
+                    ql = query.lower()
+                    rows = [r for r in rows if ql in r["content"].lower()]
+            elif query:
+                rows = await store.search(
+                    context_id=policy.id, query=query, limit=12,
+                )
+            else:
+                rows = await store.list_for_context(
+                    policy.id, limit=20,
+                )
+            return render_recall_results(rows, name_registry=self.name_registry)
+
+        if name == "remember":
+            if not getattr(policy, "memory_writes_enabled", True):
+                return "(memory writes disabled for this chat)"
+            subject_hint = (args.get("subject") or "").strip()
+            kind = (args.get("kind") or "").strip().lower()
+            content = (args.get("content") or "").strip()
+            if not subject_hint or kind not in KINDS or not content:
+                return (
+                    "ERROR: remember requires non-empty subject, content, "
+                    f"and kind in {sorted(KINDS)}."
+                )
+            if resolver is None:
+                return "(subject resolver not configured)"
+            key, label = resolver.resolve(
+                subject_hint, sender_phone=sender_phone
+            )
+            if not key:
+                return "(could not resolve subject)"
+            # Third-party memories (about anyone other than the speaker or
+            # the room) start at lower confidence — the bot was just told
+            # what to store via prompt and can't independently verify it.
+            # Corroboration from a second speaker promotes them to full.
+            initial_conf = compute_explicit_confidence(
+                subject_key=key, sender_user_hash=sender_user_hash,
+            )
+            mem_id = await store.add(
+                context_id=policy.id,
+                subject_key=key,
+                subject_label=label,
+                kind=kind,
+                content=content,
+                confidence=initial_conf,
+                source=SOURCE_EXPLICIT,
+                source_user_hash=sender_user_hash,
+                source_message_at=time.time(),
+            )
+            if mem_id is None:
+                return "(memory not saved — invalid input)"
+            return f"saved memory #{mem_id} about {label or subject_hint}"
+
+        if name == "forget":
+            if not getattr(policy, "memory_writes_enabled", True):
+                return "(memory writes disabled for this chat)"
+            try:
+                memory_id = int(args.get("memory_id") or 0)
+            except (TypeError, ValueError):
+                return "ERROR: forget requires an integer memory_id"
+            if memory_id <= 0:
+                return "ERROR: memory_id must be a positive integer"
+            existing = await store.get(memory_id)
+            if not existing or existing.get("context_id") != policy.id:
+                return f"(no memory #{memory_id} in this chat)"
+            ok = await store.delete(memory_id)
+            return f"forgot memory #{memory_id}" if ok else "(forget failed)"
+
+        return f"(unknown memory tool: {name})"
+
     async def _execute_tool_call(
         self,
         call: dict,
@@ -272,9 +527,60 @@ class AskCommand(BaseCommand):
             self.bot_tools is not None
             and name.startswith(self.bot_tools.NAMESPACE + "__")
         )
+        is_deep_think = name == "deep_think" and self.deep_think is not None
+        is_memory = name in ("remember", "recall", "forget") and (
+            self.memory_store is not None
+        )
 
         try:
-            if is_bot_tool:
+            if is_memory:
+                content = await self._handle_memory_tool(
+                    name, args, caller_ctx
+                )
+            elif is_deep_think:
+                # Policy gate is also checked when filtering schemas in
+                # _collect_tools, but a writer that hallucinates the tool
+                # call (or holds an in-flight schema across a policy
+                # change) shouldn't bypass enforcement.
+                policy = caller_ctx.policy
+                if policy is not None and not policy.allows_deep_think():
+                    content = "(deep_think unavailable: not allowed in this chat)"
+                else:
+                    # Send the writer's status message to the chat right
+                    # now so the user sees something happen before the
+                    # 10-90s wait. Best-effort — failure to send doesn't
+                    # block the deep_think call; a typing indicator is a
+                    # decent fallback.
+                    status_msg = str(args.get("status_message") or "").strip()
+                    if status_msg and self.signal_handler is not None:
+                        try:
+                            await self.signal_handler.send_message(
+                                recipient=caller_ctx.sender,
+                                message=status_msg,
+                                group_id=caller_ctx.group_id,
+                                styled=True,
+                            )
+                            logger.info(
+                                f"DeepThink: sent placeholder to "
+                                f"...{caller_ctx.sender[-4:]}: {status_msg!r}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"DeepThink placeholder send failed: {e}")
+
+                    user_hash = hash_phone(caller_ctx.sender)
+                    # Pass caller_ctx + attachments so the deep model gets
+                    # the same tool kit (filtered by the same policy) and
+                    # any attachments it produces (charts, etc.) bubble up
+                    # to the writer's attachment list.
+                    content = await self.deep_think.think(
+                        question=str(args.get("question") or ""),
+                        context=str(args.get("context") or ""),
+                        user_hash=user_hash,
+                        group_id=caller_ctx.group_id,
+                        caller_ctx=caller_ctx,
+                        attachments=attachments,
+                    )
+            elif is_bot_tool:
                 result = await self.bot_tools.call(name, args, caller_ctx)
                 content = result.text if result else "(no result)"
                 if result and result.attachments:
@@ -483,6 +789,85 @@ class AskCommand(BaseCommand):
                     "Never narrate a hexagram you didn't get from the tool."
                 )
 
+            # Deep think: heavyweight delegation tool. Surface only when
+            # both the client is ready AND the per-context policy allows
+            # it, so the writer doesn't get told about a tool it can't
+            # actually call. The tool itself is pre-filtered out of
+            # _collect_tools when these checks fail.
+            deep_think_directive = ""
+            # Whether the user's current message contains an explicit
+            # ask-to-think-hard phrase. Initialized False so the trigger
+            # block below remains safe even when the directive isn't built
+            # (deep_think disabled / unconfigured).
+            deep_think_user_trigger = False
+            if (
+                self.deep_think is not None
+                and self.deep_think.status().get("ready")
+                and (ctx.policy is None or ctx.policy.allows_deep_think())
+            ):
+                # Strong hint — appended after the directive — when the
+                # user's CURRENT message contains an explicit ask-to-think-
+                # hard phrase. The base directive lives in persona space;
+                # this is situational and goes near the end of the system
+                # suffix so it has recency-bias weight against any
+                # contradicting framing the writer model might pattern-
+                # match on (e.g. "easy question, just answer it").
+                deep_think_user_trigger = _user_explicitly_asked_to_think(question)
+
+                deep_think_directive = (
+                    "Deep-think tool: a separate, slower, smarter model is "
+                    "available via the deep_think(question, context, "
+                    "status_message) tool. It HAS THE SAME TOOL KIT YOU "
+                    "DO — every bot command and every MCP server you can "
+                    "call, the deep model can call too. So when you "
+                    "delegate, you're handing off a research task, not "
+                    "just a thinking task: it will fetch its own data, "
+                    "chain its own tool calls, and return a finished "
+                    "answer.\n\n"
+                    "WHEN TO CALL IT — be liberal, not stingy. Lean "
+                    "toward calling deep_think for any of these:\n"
+                    "  * The user explicitly asks you to think hard, "
+                    "think carefully, take your time, dig deep, really "
+                    "think about it, give it real thought, etc. THIS IS "
+                    "AN UNAMBIGUOUS TRIGGER — honor it every time, even "
+                    "if you feel you could answer directly. The user is "
+                    "asking for the smart model.\n"
+                    "  * Multi-step reasoning, careful comparisons, "
+                    "synthesis across multiple sources.\n"
+                    "  * Research that needs several chained tool calls "
+                    "to reach a confident answer.\n"
+                    "  * Open-ended judgment calls (recommendations, "
+                    "rankings, predictions) where confidence matters.\n"
+                    "  * Anywhere you'd otherwise hand-wave, hedge, or "
+                    "guess. If your draft answer would start with "
+                    "\"probably\" or \"I'd guess\", call deep_think.\n\n"
+                    "WHEN NOT TO CALL IT: trivial lookups you can do "
+                    "with one tool (a single price quote, a single news "
+                    "fetch), tarot/iching draws (their own tools), or "
+                    "pure banter.\n\n"
+                    "Pass a precise question (not a topic) and any "
+                    "context the deep model needs (the user's actual "
+                    "framing, constraints, prior turns) — but you don't "
+                    "need to pre-load tool results, the deep model can "
+                    "fetch fresh data itself.\n\n"
+                    "IMPORTANT — status_message: the tool is SLOW (10-90s "
+                    "typical), so when you call it the bot will "
+                    "immediately send your `status_message` to the chat "
+                    "as a real message the user sees. Use this to tell "
+                    "the user you're thinking — write it in YOUR OWN "
+                    "voice for THIS chat (match the persona, language, "
+                    "tone). Vary the phrasing every time, don't reuse a "
+                    "stock line. Keep it under 100 chars and casual. "
+                    "Examples (adapt to your voice): 'gimme a sec to dig "
+                    "into this', 'hold on, this one needs real thought', "
+                    "'lemme actually work this out — back in a minute'.\n\n"
+                    "After the tool returns, weave its text into your "
+                    "own final reply (don't paste verbatim, don't repeat "
+                    "the status message). On '(unavailable: ...)' or "
+                    "'(rate-limited: ...)' stubs, just answer the user "
+                    "directly using what you know."
+                )
+
             # Recent reactions: small in-memory log from the reactor. Lets
             # Sigil answer "why did you react with X?" by reading off the
             # target message instead of denying or confabulating. Newest
@@ -543,15 +928,62 @@ class AskCommand(BaseCommand):
             # boundaries in a wall of text. Group context + the live
             # trigger are NOT placed here — they belong to the user-role
             # message below so they read as situational input, not persona.
+            # Late-binding hint that fires only on this turn — the user
+            # just asked you to think hard. Place it AFTER conversation_
+            # memory so it has stronger recency-weight than any "answer
+            # quickly" framing in summary or staleness blocks.
+            deep_think_trigger_hint = ""
+            if (
+                self.deep_think is not None
+                and self.deep_think.status().get("ready")
+                and (ctx.policy is None or ctx.policy.allows_deep_think())
+                and deep_think_user_trigger
+            ):
+                deep_think_trigger_hint = (
+                    "USER EXPLICITLY ASKED YOU TO THINK HARD on the "
+                    "current message. Call deep_think now — that's "
+                    "exactly what it's for. Do not answer directly from "
+                    "memory and do not skip the tool. Pass a precise "
+                    "sub-question and a status_message in your voice."
+                )
+
+            # Per-context memory preamble: facts learned about people in
+            # this chat. Auto-injected for the current sender, the room
+            # itself, and anyone named in the message. The writer doesn't
+            # need a tool call to reference these.
+            memory_block = ""
+            if (
+                self.memory_store is not None
+                and ctx.policy is not None
+                and ctx.policy.id is not None
+                and ctx.policy.kind != "default"
+            ):
+                try:
+                    memory_block = await build_preamble(
+                        memory_store=self.memory_store,
+                        context_id=ctx.policy.id,
+                        sender_phone=ctx.sender,
+                        sender_user_hash=user_hash,
+                        sender_label=self._sender_label(ctx.sender)
+                            if is_group else None,
+                        current_message_text=question,
+                        name_registry=self.name_registry,
+                    )
+                except Exception as e:
+                    logger.debug(f"Memory preamble build failed: {e}")
+
             system_suffix_parts = [
                 _wrap_xml("identity_note", names_directive),
                 _wrap_xml("reactor_reflex", reactor_directive),
                 _wrap_xml("recent_reactions", reactor_log_block),
                 _wrap_xml("tarot_tool", tarot_directive),
                 _wrap_xml("iching_tool", iching_directive),
+                _wrap_xml("deep_think_tool", deep_think_directive),
                 _wrap_xml("spontaneous_reply", implicit_directive),
                 _wrap_xml("conversation_memory", summary_block),
+                _wrap_xml("context_memories", memory_block),
                 _wrap_xml("conversation_status", staleness_block),
+                _wrap_xml("deep_think_trigger", deep_think_trigger_hint),
             ]
             system_suffix_parts = [p for p in system_suffix_parts if p]
             system_suffix = "\n\n".join(system_suffix_parts) or None
