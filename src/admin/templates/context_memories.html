@@ -17,6 +17,7 @@
 {% macro subject_picker(field_name, current_key='', custom_field='subject_custom', custom_value='') %}
 <select name="{{ field_name }}" class="mem-select">
     <option value="" {% if not current_key %}selected{% endif %}>— pick a registered user, or use custom field →</option>
+    <option value="__self__" {% if current_key == '__self__' %}selected{% endif %}>the bot itself (its identity / persona / model)</option>
     <option value="__context__" {% if current_key == '__context__' %}selected{% endif %}>this chat (room itself)</option>
     {% if named_users %}
         {% for u in named_users %}
@@ -286,7 +287,7 @@
 
                     <div>
                         <label>Subject</label>
-                        {% set known_keys = (named_users|map(attribute='user_hash')|list) + ['__context__'] %}
+                        {% set known_keys = (named_users|map(attribute='user_hash')|list) + ['__context__', '__self__'] %}
                         {% set custom_val = r.subject_key if r.subject_key not in known_keys else '' %}
                         {% set picker_key = r.subject_key if r.subject_key in known_keys else '' %}
                         {{ subject_picker('subject',

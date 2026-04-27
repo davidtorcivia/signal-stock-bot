@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 
 SUBJECT_CONTEXT = "__context__"          # the room itself
+SUBJECT_SELF = "__self__"                # the bot itself (its persona,
+                                         # model, capabilities, voice)
 SUBJECT_FREETEXT_PREFIX = "freetext:"
 
 KIND_IDENTITY = "identity"
@@ -110,7 +112,7 @@ def freetext_subject_key(label: str) -> str:
         return ""
     if s.startswith(SUBJECT_FREETEXT_PREFIX):
         return s
-    if s == SUBJECT_CONTEXT:
+    if s in (SUBJECT_CONTEXT, SUBJECT_SELF):
         return s
     if is_user_hash(s):
         return s
@@ -497,7 +499,12 @@ def compute_explicit_confidence(
     """
     if not subject_key:
         return EXPLICIT_THIRD_PARTY_CONFIDENCE
-    if subject_key == SUBJECT_CONTEXT:
+    # Self / context / bot-self all land at full confidence: the speaker
+    # is presumably authoritative about themselves and the room, and a
+    # bot-self memory ("you are Sigil, a tarot reader" / "you are running
+    # Claude Opus 4.7") is an admin-or-user declaration *about the bot*
+    # that the bot should adopt, not a claim about a third party.
+    if subject_key in (SUBJECT_CONTEXT, SUBJECT_SELF):
         return EXPLICIT_SELF_CONFIDENCE
     if sender_user_hash and subject_key == sender_user_hash:
         return EXPLICIT_SELF_CONFIDENCE
@@ -574,6 +581,17 @@ class SubjectResolver:
         s = (subject_hint or "").strip()
         low = s.lower()
 
+        # Bot-self hints. Listed BEFORE the human-self hints below because
+        # "myself" is ambiguous and we want the LLM (which is "the bot")
+        # to pin it on the bot side. The unambiguous human-side keyword
+        # is "speaker" / "the user" — the LLM is told to use those when
+        # it means the human in the chat, not "self".
+        if low in (
+            "yourself", "myself", "the bot", "you", "the assistant",
+            "the ai", "bot", "you (the bot)", "self (bot)",
+        ):
+            return SUBJECT_SELF, "the bot"
+
         if low in ("", "self", "me", "the user", "speaker", "the speaker"):
             if sender_phone and self.name_registry is not None:
                 from .database import hash_phone
@@ -615,9 +633,10 @@ class SubjectResolver:
 MAX_PREAMBLE_LINES = 30
 MIN_PREAMBLE_CONFIDENCE = 0.5
 
-# Always-visible subjects: the room itself, and the current sender. Other
-# subjects are added when they appear by name in the current message.
-ALWAYS_INCLUDE_KEYS = (SUBJECT_CONTEXT,)
+# Always-visible subjects, in render order. Bot-self FIRST so the model
+# reads its own identity before anything else; room context next; then
+# the current sender / named subjects are appended downstream.
+ALWAYS_INCLUDE_KEYS = (SUBJECT_SELF, SUBJECT_CONTEXT)
 
 
 def _kind_label(kind: str) -> str:
@@ -685,7 +704,7 @@ async def build_preamble(
         subjects.append((key, label))
 
     for k in ALWAYS_INCLUDE_KEYS:
-        _add(k, "this chat")
+        _add(k, _label_for_key(k, name_registry))
 
     if sender_user_hash:
         _add(sender_user_hash, sender_label or "the speaker")
@@ -748,11 +767,14 @@ async def build_preamble(
         return ""
 
     intro = (
-        "Stored memories about people and things in this chat. These were "
-        "either explicitly noted or learned passively from prior messages. "
+        "Stored memories scoped to this chat. The first block — \"About you "
+        "(the bot)\" — is your own identity, persona, and capabilities as "
+        "set in this chat; treat it as authoritative. The rest are about "
+        "the room itself, the current speaker, and anyone they mentioned. "
         "Use them when relevant; do not parrot them at users unprompted. "
-        "If a stored memory contradicts what the user just said, trust the "
-        "user and call `remember` (when available) to update it."
+        "If a stored memory contradicts what the user just said about "
+        "themselves, trust the user and call `remember` (when available) "
+        "to update it."
     )
     return intro + "\n\n" + "\n\n".join(blocks)
 
@@ -760,6 +782,8 @@ async def build_preamble(
 def _label_for_key(key: str, name_registry) -> str:
     if key == SUBJECT_CONTEXT:
         return "this chat"
+    if key == SUBJECT_SELF:
+        return "you (the bot)"
     if key.startswith(SUBJECT_FREETEXT_PREFIX):
         return key[len(SUBJECT_FREETEXT_PREFIX):].replace("-", " ")
     if is_user_hash(key) and name_registry is not None:
@@ -811,13 +835,20 @@ REMEMBER_TOOL = {
                 "subject": {
                     "type": "string",
                     "description": (
-                        "Who/what this memory is about. Use a registered "
-                        "name (e.g. 'David'), 'this chat' for the room "
-                        "itself, 'self' for the current speaker, or a "
-                        "free-text label for non-Signal entities ('the "
-                        "cat', 'their boss'). Names map to that user "
-                        "across all contexts; free-text is local to "
-                        "this chat."
+                        "Who/what this memory is about. Options:\n"
+                        "  - a registered name (e.g. 'David') → that user\n"
+                        "  - 'speaker' or 'the user' → the human currently "
+                        "talking\n"
+                        "  - 'yourself' or 'the bot' → YOU, the bot — your "
+                        "own identity, persona, model, voice, capabilities. "
+                        "These are what the chat has told you about who "
+                        "YOU are in this room.\n"
+                        "  - 'this chat' → the room itself\n"
+                        "  - free-text label → non-Signal entities ('the "
+                        "cat', 'their boss')\n"
+                        "Names map to that user across all contexts; "
+                        "free-text and bot-self memories are local to this "
+                        "chat."
                     ),
                 },
                 "kind": {
@@ -825,10 +856,11 @@ REMEMBER_TOOL = {
                     "enum": list(KINDS),
                     "description": (
                         "identity = stable trait (sun sign, role, where "
-                        "they live). preference = what they like/dislike/"
-                        "want. fact = neutral durable info that isn't "
-                        "identity or preference. event = something that "
-                        "happened on a specific occasion."
+                        "they live, model name, persona). preference = "
+                        "what they like/dislike/want. fact = neutral "
+                        "durable info that isn't identity or preference. "
+                        "event = something that happened on a specific "
+                        "occasion."
                     ),
                 },
                 "content": {
@@ -935,10 +967,12 @@ NOTE_MEMORY_TOOL = {
                     "type": "string",
                     "description": (
                         "Who the memory is about. Registered names "
-                        "('David'), 'this chat' for the room, or 'self' "
-                        "for the speaker. Use the registered name when "
-                        "the speaker is talking about themselves — the "
-                        "system maps it to the right person."
+                        "('David'), 'this chat' for the room, 'speaker' "
+                        "for the human currently talking, or 'yourself' "
+                        "for the bot itself (its persona / model / voice "
+                        "as set in this chat). Use the registered name "
+                        "when the speaker is talking about themselves — "
+                        "the system maps it to the right person."
                     ),
                 },
                 "kind": {

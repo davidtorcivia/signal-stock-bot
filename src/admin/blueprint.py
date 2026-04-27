@@ -1234,6 +1234,12 @@ def _admin_resolve_subject(
     if sub_low in ("this chat", "context", "the room"):
         from ..memory import SUBJECT_CONTEXT
         return SUBJECT_CONTEXT, "this chat"
+    if sub_low in (
+        "the bot", "yourself", "myself", "you", "self bot", "bot",
+        "the bot itself", "__self__",
+    ):
+        from ..memory import SUBJECT_SELF
+        return SUBJECT_SELF, "the bot"
     if is_user_hash_fn(s):
         label = (subject_label_in or "").strip() or f"...{s[:6]}"
         return s, label
