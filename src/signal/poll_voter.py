@@ -24,6 +24,7 @@ import re
 from typing import Optional
 
 from ..admin.events import get_bus
+from ..group_log import BOT_SENDER
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,12 @@ class PollVoter:
         self.bot_phone = bot_phone
 
     def _label(self, phone: Optional[str]) -> str:
+        if phone == BOT_SENDER:
+            return (
+                self.name_registry.bot_name
+                if self.name_registry is not None
+                else "Bot"
+            )
         if self.name_registry is None:
             return f"...{(phone or '')[-4:] or '????'}"
         return self.name_registry.label_for(phone)

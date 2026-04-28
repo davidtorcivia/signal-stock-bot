@@ -525,7 +525,7 @@ def build_app(config: Config):
     mcp_manager = MCPManager(mcp_registry)
 
     llm_client = LLMClient(settings_store)
-    name_registry = NameRegistry(config.watchlist_db_path)
+    name_registry = NameRegistry(config.watchlist_db_path, bot_name=config.bot_name)
     llm_history = ConversationHistory(
         config.watchlist_db_path,
         turns_per_user=int(settings_store.get("llm_history_turns") or 6),

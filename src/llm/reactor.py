@@ -29,6 +29,7 @@ from typing import Awaitable, Callable, Optional
 
 from ..admin.events import get_bus
 from ..cache import get_metrics
+from ..group_log import BOT_SENDER
 from ..memory import (
     NOTE_MEMORY_TOOL,
     REACTOR_ALLOWED_KINDS,
@@ -195,6 +196,12 @@ class EmojiReactor:
         ] = None
 
     def _sender_label(self, phone: str) -> str:
+        if phone == BOT_SENDER:
+            return (
+                self.name_registry.bot_name
+                if self.name_registry is not None
+                else "Bot"
+            )
         if self.name_registry is None:
             return f"...{(phone or '')[-4:] or '????'}"
         return self.name_registry.label_for(phone)

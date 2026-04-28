@@ -22,6 +22,13 @@ MAX_ROWS_PER_GROUP = 500
 # Default retention when no setting is provided. Used as a safety floor.
 DEFAULT_RETENTION_DAYS = 7
 
+# Sentinel `sender` value for the bot's own replies. Stored in the same
+# `sender` column as user phones so group_context renders chronologically;
+# label resolution layers (NameRegistry.label_for, the per-command
+# `_sender_label` helpers) translate this back to the configured bot name.
+# Chosen to be unambiguously not a phone number.
+BOT_SENDER = "__bot__"
+
 
 class GroupMessageLog:
     """SQLite-backed rolling log of group chat messages.
@@ -108,6 +115,42 @@ class GroupMessageLog:
                 (age_cutoff,),
             )
             # Row-cap purge for this group
+            await db.execute(
+                """DELETE FROM group_messages
+                   WHERE group_id = ?
+                     AND id NOT IN (
+                         SELECT id FROM group_messages
+                         WHERE group_id = ?
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT ?
+                     )""",
+                (group_id, group_id, MAX_ROWS_PER_GROUP),
+            )
+            await db.commit()
+
+    async def append_bot(self, group_id: str, text: str) -> None:
+        """Record one of the bot's own replies under the BOT_SENDER sentinel.
+
+        Same row-cap and age purges as `append`, but skips the enricher —
+        bot answers come out of the writer LLM already enriched, and any
+        URLs they contain were the model's choice; re-expanding could
+        bloat or distort the message that actually went to the chat.
+        """
+        if not group_id or not text:
+            return
+        await self._ensure_initialized()
+        now = time.time()
+        age_cutoff = now - self._retention_seconds()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO group_messages (group_id, sender, text, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (group_id, BOT_SENDER, text, now),
+            )
+            await db.execute(
+                "DELETE FROM group_messages WHERE created_at < ?",
+                (age_cutoff,),
+            )
             await db.execute(
                 """DELETE FROM group_messages
                    WHERE group_id = ?

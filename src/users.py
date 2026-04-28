@@ -22,6 +22,7 @@ from typing import Optional
 import aiosqlite
 
 from .database import hash_phone
+from .group_log import BOT_SENDER
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,13 @@ logger = logging.getLogger(__name__)
 class NameRegistry:
     """Async sqlite-backed map of sender hash → display name."""
 
-    def __init__(self, db_path: str = "data/watchlist.db"):
+    def __init__(self, db_path: str = "data/watchlist.db", bot_name: str = "Bot"):
         self.db_path = Path(db_path)
+        # Display name for the bot itself. Used to translate the BOT_SENDER
+        # sentinel into a real label in group_context lines, so the model
+        # sees its own past messages as "[Sigil, 5m ago] ..." rather than
+        # an opaque sentinel.
+        self.bot_name = bot_name or "Bot"
         self._initialized = False
         # Hot-path cache. Names change rarely, so a simple in-memory dict
         # avoids hitting sqlite for every history-replay attribution.
@@ -135,7 +141,13 @@ class NameRegistry:
         pattern that ask, reactor, and poll-voter were each reimplementing.
         Swallows lookup errors — there's no caller-meaningful difference
         between "registry unavailable" and "no name registered".
+
+        The BOT_SENDER sentinel resolves to the configured bot name so the
+        bot's own past replies (logged into group_log) read as themselves
+        in group_context, not as `...___b`.
         """
+        if phone == BOT_SENDER:
+            return self.bot_name
         tail = (phone or "")[-4:] or "????"
         try:
             return self.display_name_sync(phone=phone, tail=tail)

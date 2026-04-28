@@ -21,6 +21,7 @@ from typing import Optional
 
 from .base import BaseCommand, CommandContext, CommandResult
 from ..database import hash_phone
+from ..group_log import BOT_SENDER
 from ..llm import (
     LLMClient,
     LLMDisabled,
@@ -78,6 +79,34 @@ _DEEP_THINK_TRIGGER_RE = re.compile(
 
 def _user_explicitly_asked_to_think(text: str) -> bool:
     return bool(_DEEP_THINK_TRIGGER_RE.search(text or ""))
+
+
+# `[to <addressee>]` (with optional `, <time ago>`) is the playback prefix the
+# load path adds to assistant turns in groups, so the model can pair its own
+# past replies with the right asker. Some models pattern-match on that and
+# start writing it into their visible reply text — users see "[to David] hey
+# AAPL is at 150" instead of plain prose. The system prompt tells the model
+# not to do this; this regex strips it as belt-and-braces if it leaks anyway.
+# Also prevents double-prefixing when the leaked text gets stored back and
+# the load path adds *another* `[to ...]` on top.
+_ADDRESSEE_LEAK_RE = re.compile(
+    r"^\s*\[to [^\]\n]{1,80}\]\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_addressee_leak(text: str) -> str:
+    """Remove a `[to <Name>[, <time>]] ` prefix the model copied into output."""
+    if not text:
+        return text
+    # One pass is enough in practice; loop guards against a model that
+    # somehow stacked two addressee labels (cheap and bounded).
+    for _ in range(2):
+        new = _ADDRESSEE_LEAK_RE.sub("", text, count=1)
+        if new == text:
+            break
+        text = new
+    return text
 
 
 # Tool exposed to the writer LLM when DeepThinkClient is configured + ready.
@@ -301,6 +330,12 @@ class AskCommand(BaseCommand):
         return _wrap_xml("group_context", "\n".join(lines))
 
     def _sender_label(self, phone: Optional[str]) -> str:
+        if phone == BOT_SENDER:
+            return (
+                self.name_registry.bot_name
+                if self.name_registry is not None
+                else "Bot"
+            )
         if self.name_registry is None:
             return f"...{(phone or '')[-4:] or '????'}"
         return self.name_registry.label_for(phone)
@@ -687,6 +722,44 @@ class AskCommand(BaseCommand):
                         f"message may be a fresh topic, unrelated to those older turns."
                     )
 
+            # Multi-speaker group rules. The conversation history and the
+            # group_context block both label every turn with a `[Name, time
+            # ago]` bracket; without an explicit contract, the model has
+            # been mis-attributing statements between speakers and even
+            # confusing its own past replies with users'. Spelled out as
+            # ground rules so the model treats brackets as the source of
+            # truth for who said what.
+            attribution_rules = ""
+            if is_group:
+                attribution_rules = (
+                    "Attribution rules — this is a multi-speaker group chat:\n"
+                    "- Every line in <group_context> and every user message "
+                    "in the conversation history begins with `[Name, time ago]` "
+                    "showing WHO spoke and WHEN. Different `[Name]` brackets "
+                    "are different people. Never combine, conflate, or "
+                    "transfer statements between speakers.\n"
+                    "- Your own past replies (assistant turns) are tagged "
+                    "`[to Name, time ago]` showing WHO you were answering. "
+                    "Those are your words, not the addressee's. Untagged "
+                    "assistant turns are still yours — they just predate this "
+                    "labeling.\n"
+                    "- The `[to Name, ...]` bracket is INTERNAL METADATA only — "
+                    "it is added to your past turns at replay time so YOU can "
+                    "see who you were answering. NEVER write `[to Name]` (or "
+                    "any `[bracket-prefix]`) at the start of your visible "
+                    "reply. If you want to address someone by name in chat, "
+                    "use natural prose (e.g. `David — yes, …`) — never the "
+                    "bracket form.\n"
+                    "- The current message is wrapped in "
+                    "`<current_message from=\"Name\">`. Reply to that speaker; "
+                    "do not assume the prior turn's asker is still in front "
+                    "of you.\n"
+                    "- When asked \"what did X say\" or \"what did I say\", "
+                    "trust the bracket labels — they are the source of truth "
+                    "for attribution. If a label is missing or you can't "
+                    "tell, say you don't know rather than guessing."
+                )
+
             # When real names are registered for this chat, tell the LLM
             # explicitly. Without this, the model parrots earlier turns
             # where it (correctly at the time) said it didn't know names —
@@ -973,6 +1046,7 @@ class AskCommand(BaseCommand):
                     logger.debug(f"Memory preamble build failed: {e}")
 
             system_suffix_parts = [
+                _wrap_xml("attribution_rules", attribution_rules),
                 _wrap_xml("identity_note", names_directive),
                 _wrap_xml("reactor_reflex", reactor_directive),
                 _wrap_xml("recent_reactions", reactor_log_block),
@@ -1063,6 +1137,14 @@ class AskCommand(BaseCommand):
         if not answer:
             return CommandResult.error("LLM returned no answer.")
 
+        # Strip any `[to <Name>]` prefix the writer copied from its own
+        # playback labels into the visible reply. The system prompt tells
+        # it not to, but this is the safety net so users never see the
+        # internal attribution metadata as literal output text — and it
+        # prevents double-prefixing when the leaked text gets stored back
+        # and the load path adds its own `[to ...]` bracket on top.
+        answer = _strip_addressee_leak(answer)
+
         try:
             # Store the raw question (no prefix) + sender_tail separately; the
             # load path re-adds the prefix when replaying in a group context.
@@ -1070,11 +1152,31 @@ class AskCommand(BaseCommand):
                 context_key, "user", question,
                 user_hash=user_hash, sender_tail=sender_tail,
             )
+            # Persist the addressee on the assistant row too: the load path
+            # uses it to render `[to Name, time ago]` in group playback so
+            # the model can pair its prior answers with the right asker.
             await self.history.append(
-                context_key, "assistant", answer, user_hash=user_hash,
+                context_key, "assistant", answer,
+                user_hash=user_hash, sender_tail=sender_tail,
             )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")
+
+        # Mirror the bot's own reply into the group_log so subsequent !ask
+        # calls see it in `<group_context>` alongside human messages —
+        # otherwise the bot's voice is invisible in the time-ordered group
+        # view and only shows up in the user/assistant alternation. Gated
+        # the same way as inbound logging in dispatcher.py: only when the
+        # group_context_messages feature is on.
+        if (
+            is_group
+            and self.group_log is not None
+            and self._live_group_ctx() > 0
+        ):
+            try:
+                await self.group_log.append_bot(ctx.group_id, answer)
+            except Exception as e:
+                logger.error(f"Failed to append bot reply to group log: {e}")
 
         # Fire-and-forget rolling-summary update. The summarizer itself
         # decides whether enough new turns have arrived to warrant an LLM

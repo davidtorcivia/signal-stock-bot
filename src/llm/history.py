@@ -263,6 +263,21 @@ class ConversationHistory:
                 bracket = _join_bracket(name, ago)
                 if bracket:
                     text = f"[{bracket}] {content}"
+            elif role == "assistant" and attribute_senders:
+                # Group playback: tag the bot's prior reply with whom it
+                # answered so the model can pair questions with answers
+                # across speakers. `user_hash` / `sender_tail` were stored
+                # at append time as the addressee of this reply.
+                name = self._attribution_label(user_hash, sender_tail)
+                ago = (
+                    format_relative_age(now - created_at)
+                    if now is not None and created_at is not None
+                    else None
+                )
+                if name:
+                    bracket = _join_bracket(f"to {name}", ago)
+                    if bracket:
+                        text = f"[{bracket}] {content}"
             turns.append({"role": role, "content": text})
         return turns
 
