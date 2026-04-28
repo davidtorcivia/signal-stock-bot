@@ -48,6 +48,7 @@ def create_admin_blueprint(
     memory_store=None,
     prediction_store=None,
     prediction_resolver=None,
+    oracle_store=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -98,6 +99,7 @@ def create_admin_blueprint(
             loop=loop,
             memory_store=memory_store,
             name_registry=name_registry,
+            oracle_store=oracle_store,
         )
 
     if name_registry is not None:
@@ -790,6 +792,7 @@ def _register_context_routes(
     loop: asyncio.AbstractEventLoop,
     memory_store=None,
     name_registry=None,
+    oracle_store=None,
 ) -> None:
     """Context CRUD + (when memory_store is wired) memory CRUD nested under
     each context. Memory routes are mounted unconditionally so the template
@@ -887,6 +890,18 @@ def _register_context_routes(
             values["key"] = policy.key
 
         all_commands, all_servers = _available_commands_and_servers(dispatcher, mcp_registry, loop)
+
+        # Per-context oracles. Only group contexts can have them; for
+        # default/dm rows we still pass an empty list so the template
+        # always has the variable defined.
+        oracles_view: list[dict] = []
+        if oracle_store is not None and policy.kind == "group":
+            try:
+                rows = _run_on_loop(loop, oracle_store.list_for_context(context_id))
+                oracles_view = [_oracle_to_view(o) for o in rows]
+            except Exception as e:
+                logger.error(f"Oracle list failed for ctx #{context_id}: {e}")
+
         return render_template(
             "context_edit.html",
             is_new=False,
@@ -895,6 +910,11 @@ def _register_context_routes(
             modes=MODES,
             all_commands=all_commands,
             all_servers=all_servers,
+            oracles=oracles_view,
+            oracle_kinds=_ORACLE_KIND_OPTIONS,
+            oracle_schedule_kinds=_ORACLE_SCHEDULE_OPTIONS,
+            oracle_kind_descriptions=_ORACLE_KIND_DESCRIPTIONS,
+            oracle_schedule_descriptions=_ORACLE_SCHEDULE_DESCRIPTIONS,
             error=error,
         )
 
@@ -924,6 +944,14 @@ def _register_context_routes(
                 logger.error(f"Context delete failed: {e}")
         return redirect(url_for("admin.context_list"))
 
+    if oracle_store is not None:
+        _register_oracle_routes(
+            bp,
+            registry=registry,
+            oracle_store=oracle_store,
+            loop=loop,
+        )
+
     _register_memory_routes(
         bp,
         registry=registry,
@@ -931,6 +959,158 @@ def _register_context_routes(
         loop=loop,
         name_registry=name_registry,
     )
+
+
+_ORACLE_KIND_OPTIONS = ("tarot", "iching", "market_open", "market_close", "freeform")
+_ORACLE_SCHEDULE_OPTIONS = ("sunrise", "sunset", "clock")
+
+
+def _oracle_kind_descriptions() -> dict:
+    from ..contexts.oracles import KIND_DESCRIPTIONS
+    return KIND_DESCRIPTIONS
+
+
+def _oracle_schedule_descriptions() -> dict:
+    from ..contexts.oracles import SCHEDULE_DESCRIPTIONS
+    return SCHEDULE_DESCRIPTIONS
+
+
+# Lazy-loaded so the admin blueprint doesn't import astral at module
+# load time when oracles aren't enabled. The two dicts above are
+# string→string and cheap to import; doing it eagerly is fine.
+_ORACLE_KIND_DESCRIPTIONS = _oracle_kind_descriptions()
+_ORACLE_SCHEDULE_DESCRIPTIONS = _oracle_schedule_descriptions()
+
+
+def _oracle_to_view(o) -> dict:
+    """Flatten a ContextOracle into a template-friendly dict that
+    includes a human-readable schedule string."""
+    return {
+        "id": o.id,
+        "context_id": o.context_id,
+        "enabled": o.enabled,
+        "kind": o.kind,
+        "schedule_kind": o.schedule_kind,
+        "offset_minutes": o.offset_minutes,
+        "clock_time": o.clock_time or "",
+        "timezone": o.timezone,
+        "weekdays_only": o.weekdays_only,
+        "prompt": o.prompt or "",
+        "label": o.label or "",
+        "description": o.describe(),
+    }
+
+
+def _form_to_oracle(form, *, context_id: int, oracle_id: Optional[int] = None):
+    from ..contexts.oracles import ContextOracle
+
+    def _int(name: str, default: int = 0) -> int:
+        try:
+            return int((form.get(name) or "").strip() or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _bool(name: str) -> bool:
+        return (form.get(name) or "").lower() in ("1", "true", "yes", "on")
+
+    return ContextOracle(
+        id=oracle_id,
+        context_id=context_id,
+        enabled=_bool("enabled"),
+        kind=(form.get("kind") or "tarot").strip(),
+        schedule_kind=(form.get("schedule_kind") or "sunrise").strip(),
+        offset_minutes=_int("offset_minutes", 0),
+        clock_time=(form.get("clock_time") or "").strip() or None,
+        timezone=(form.get("timezone") or "America/New_York").strip(),
+        weekdays_only=_bool("weekdays_only"),
+        prompt=(form.get("prompt") or "").strip() or None,
+        label=(form.get("label") or "").strip(),
+    )
+
+
+def _register_oracle_routes(
+    bp: Blueprint,
+    *,
+    registry: ContextRegistry,
+    oracle_store,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Per-context oracle CRUD nested under /admin/contexts/<id>/oracles.
+
+    Add/edit/delete actions all redirect back to the context-edit
+    page so admin sees the updated list immediately. Validation
+    errors flash; the form lives on the context-edit page itself.
+    """
+
+    def _ctx_or_404(context_id: int):
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        if policy.kind != "group":
+            abort(400)
+        return policy
+
+    @bp.route("/contexts/<int:context_id>/oracles/new", methods=["POST"])
+    @admin_required
+    def oracle_new(context_id: int):
+        if not verify_csrf():
+            abort(400)
+        _ctx_or_404(context_id)
+        try:
+            oracle = _form_to_oracle(request.form, context_id=context_id)
+            _run_on_loop(loop, oracle_store.upsert(oracle))
+            flash("Oracle added.", "ok")
+        except ValueError as e:
+            flash(f"Oracle add failed: {e}", "error")
+        except Exception as e:
+            logger.exception(f"Oracle new failed: {e}")
+            flash(f"Oracle add failed: {e}", "error")
+        return redirect(url_for("admin.context_edit", context_id=context_id))
+
+    @bp.route(
+        "/contexts/<int:context_id>/oracles/<int:oracle_id>/edit",
+        methods=["POST"],
+    )
+    @admin_required
+    def oracle_edit(context_id: int, oracle_id: int):
+        if not verify_csrf():
+            abort(400)
+        _ctx_or_404(context_id)
+        existing = _run_on_loop(loop, oracle_store.get(oracle_id))
+        if not existing or existing.context_id != context_id:
+            abort(404)
+        try:
+            oracle = _form_to_oracle(
+                request.form, context_id=context_id, oracle_id=oracle_id,
+            )
+            _run_on_loop(loop, oracle_store.upsert(oracle))
+            flash(f"Oracle #{oracle_id} updated.", "ok")
+        except ValueError as e:
+            flash(f"Oracle update failed: {e}", "error")
+        except Exception as e:
+            logger.exception(f"Oracle edit failed: {e}")
+            flash(f"Oracle update failed: {e}", "error")
+        return redirect(url_for("admin.context_edit", context_id=context_id))
+
+    @bp.route(
+        "/contexts/<int:context_id>/oracles/<int:oracle_id>/delete",
+        methods=["POST"],
+    )
+    @admin_required
+    def oracle_delete(context_id: int, oracle_id: int):
+        if not verify_csrf():
+            abort(400)
+        _ctx_or_404(context_id)
+        existing = _run_on_loop(loop, oracle_store.get(oracle_id))
+        if not existing or existing.context_id != context_id:
+            abort(404)
+        try:
+            _run_on_loop(loop, oracle_store.delete(oracle_id))
+            flash(f"Oracle #{oracle_id} deleted.", "ok")
+        except Exception as e:
+            logger.exception(f"Oracle delete failed: {e}")
+            flash(f"Oracle delete failed: {e}", "error")
+        return redirect(url_for("admin.context_edit", context_id=context_id))
 
 
 def _register_memory_routes(

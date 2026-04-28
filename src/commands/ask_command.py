@@ -1099,6 +1099,46 @@ class AskCommand(BaseCommand):
                         )
                     reactor_log_block = "\n".join(lines)
 
+            # Python sandbox: when the Pyodide MCP server is running, the
+            # writer LLM gets `pyodide__pyodide_execute(code, timeout)` and
+            # `pyodide__pyodide_install-packages(package)` exposed
+            # automatically. The directive tells Sigil what's pre-loaded,
+            # what to use it for (real computation, not paraphrasing
+            # data), and to bump the default 5s timeout — finance work
+            # routinely overruns that.
+            python_tool_directive = ""
+            if self.mcp_manager is not None and any(
+                t.server_name == "pyodide"
+                for t in self.mcp_manager.all_tools()
+            ):
+                python_tool_directive = (
+                    "Python sandbox (Pyodide): you have a real Python "
+                    "interpreter via `pyodide__pyodide_execute(code, "
+                    "timeout)`. State persists across calls in the "
+                    "same conversation — variables stick. "
+                    "Pre-loaded: numpy, pandas, scipy, matplotlib, "
+                    "scikit-learn (Pyodide bundle), plus yfinance and "
+                    "statsmodels (pre-cached). For other PyPI packages "
+                    "call `pyodide__pyodide_install-packages(package)` "
+                    "first.\n\n"
+                    "USE IT for actual computation: correlations, "
+                    "regressions, NPV/IRR, Black-Scholes from formula, "
+                    "volatility estimation, custom indicators, "
+                    "portfolio metrics — anything where a number is "
+                    "the answer and you'd otherwise guess.\n\n"
+                    "Pass `timeout=30000` (30s) for non-trivial work — "
+                    "the default is 5s which is often too tight for "
+                    "yfinance fetches or matrix math. The hard ceiling "
+                    "from the bot side is 30s per call.\n\n"
+                    "Pattern: either fetch data via existing tools "
+                    "(bot__price, bot__chart) and paste it into your "
+                    "script as a Python literal, OR import yfinance "
+                    "inside the sandbox and fetch directly. After "
+                    "computing, weave the result into your reply in "
+                    "plain prose — DO NOT dump raw stdout / DataFrame "
+                    "reprs / matplotlib output to the user."
+                )
+
             # Implicit / spontaneous trigger: the reactor's should_respond
             # tool decided this message warrants a reply, but the user did
             # not @mention, quote-reply, or otherwise address the bot.
@@ -1197,6 +1237,7 @@ class AskCommand(BaseCommand):
                 _wrap_xml("tarot_tool", tarot_directive),
                 _wrap_xml("iching_tool", iching_directive),
                 _wrap_xml("deep_think_tool", deep_think_directive),
+                _wrap_xml("python_tool", python_tool_directive),
                 _wrap_xml("spontaneous_reply", implicit_directive),
                 _wrap_xml("conversation_memory", summary_block),
                 _wrap_xml("context_memories", memory_block),

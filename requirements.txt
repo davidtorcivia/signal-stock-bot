@@ -23,6 +23,11 @@ thefuzz>=0.19.0
 # "in 2 weeks", "next Friday"). dateutil chokes on relative phrases.
 dateparser>=1.2
 
+# Sunrise / sunset calculations for the daily oracle worker. Pure-Python,
+# tiny, MIT — uses NOAA's algorithm so no native deps and works in the
+# slim Python image without extra system packages.
+astral>=3.2
+
 # Admin web UI
 bcrypt>=4.0
 

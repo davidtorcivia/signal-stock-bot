@@ -81,6 +81,16 @@ LIVE_KEYS = {
     "deep_think_group_daily_cap",
 }
 
+# Legacy keys kept readable so the migration in
+# `src/contexts/oracles.py:prepopulate_for_existing_contexts` can carry
+# over the old global setting on first boot of the per-context oracles.
+# Removed from LIVE_KEYS so the admin settings page stops surfacing
+# them — admins manage oracles per-context now via /admin/contexts/<id>.
+_LEGACY_DEPRECATED_KEYS = {
+    "daily_oracle_enabled",
+    "daily_oracle_group_id",
+}
+
 # Keys the admin UI exposes but that require a process restart.
 RESTART_KEYS = {
     "command_prefix",

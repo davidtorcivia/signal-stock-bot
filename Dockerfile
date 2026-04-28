@@ -22,9 +22,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the MCP stdio JSONRPC stream and either spam parse errors or push the
 # 30s startup-handshake budget over the line, causing brave-search to
 # fail on cold-cache container starts. Install once at image build,
-# then invoke the resulting binary directly (db row uses
-# `brave-search-mcp-server` with empty args, no `npx`).
-RUN npm install -g @brave/brave-search-mcp-server@latest
+# then invoke the resulting binary directly (db rows use the binary
+# names with empty args, no `npx`).
+#
+# mcp-pyodide ships a Pyodide-in-Node Python sandbox the writer LLM
+# uses for real computation (correlations, regressions, options
+# pricing, custom indicators). Pinned because Pyodide bundles change
+# behavior across versions and the bot's quant directives in
+# ask_command.py are written against a specific package set.
+RUN npm install -g \
+        @brave/brave-search-mcp-server@latest \
+        mcp-pyodide@1.0.0
 
 # Install Python dependencies
 COPY requirements.txt .

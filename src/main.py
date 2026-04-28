@@ -285,6 +285,13 @@ def create_dispatcher(
     dispatcher.register(iching_cmd)
     help_commands.append(iching_cmd)
 
+    # Numerology: pure-Python birthdate/name calculation, no I/O. Lives in
+    # the woo command cluster alongside tarot + iching.
+    from .commands.numerology_command import NumerologyCommand
+    numerology_cmd = NumerologyCommand()
+    dispatcher.register(numerology_cmd)
+    help_commands.append(numerology_cmd)
+
     # Predictions: log dated claims, follow up at the deadline, score them.
     # The store is also exposed on the dispatcher so the background
     # resolver worker (scheduled in build_app) can reuse the same instance.
@@ -403,6 +410,64 @@ def _sweep_attachments_once(
     else:
         log.debug(
             f"Attachment cleanup: nothing to remove (errors={errors})"
+        )
+
+
+async def _warm_pyodide(mcp_manager) -> None:
+    """Warm the Pyodide sandbox so the first writer-LLM call doesn't pay
+    the bundle-load + wheel-download cost.
+
+    Two-phase warmup, both fire-and-forget:
+      1. Trigger Pyodide's WASM bundle load and import the always-needed
+         scientific libs (numpy/pandas/scipy come pre-built in the
+         Pyodide bundle so this is just a deserialize + import).
+      2. Pre-fetch yfinance + statsmodels wheels into the persistent
+         cache directory so subsequent cold-starts skip the download.
+
+    Failures degrade gracefully — the first user call pays whatever
+    cost was skipped. We don't block bot startup on Pyodide being ready.
+    """
+    # Brief grace so start_all_enabled finishes before we look at tools.
+    await asyncio.sleep(2.0)
+
+    # If pyodide isn't running (admin disabled it, or start failed),
+    # skip warmup silently.
+    has_pyodide = any(
+        t.server_name == "pyodide" for t in mcp_manager.all_tools()
+    )
+    if not has_pyodide:
+        logging.info("Pyodide warmup: server not running, skipping")
+        return
+
+    try:
+        await mcp_manager.call_tool(
+            "pyodide__pyodide_execute",
+            {
+                "code": (
+                    "import numpy, pandas, scipy, json, datetime\n"
+                    "'pyodide warmup ready'"
+                ),
+                "timeout": 25000,
+            },
+        )
+        logging.info("Pyodide warmup: bundle loaded + scientific libs imported")
+    except Exception as e:
+        logging.warning(
+            f"Pyodide warmup phase 1 (bundle load) failed: {e} — "
+            f"first user call will pay the cold-start"
+        )
+        return
+
+    try:
+        await mcp_manager.call_tool(
+            "pyodide__pyodide_install-packages",
+            {"package": "yfinance statsmodels"},
+        )
+        logging.info("Pyodide warmup: yfinance + statsmodels wheels cached")
+    except Exception as e:
+        logging.warning(
+            f"Pyodide warmup phase 2 (package install) failed: {e} — "
+            f"writer LLM can install on demand via pyodide_install-packages"
         )
 
 
@@ -651,6 +716,15 @@ def build_app(config: Config):
     # Single shared event loop for all async work
     loop = _start_background_loop()
 
+    # Auto-register MCP servers we ship as defaults (e.g. pyodide). No-op
+    # if they're already in the registry — admin edits survive deploys.
+    try:
+        asyncio.run_coroutine_threadsafe(
+            mcp_registry.ensure_defaults(), loop
+        ).result(timeout=10)
+    except Exception as e:
+        logger.error(f"MCP defaults registration error: {e}")
+
     # Start any MCP servers marked enabled=1 in the registry.
     try:
         asyncio.run_coroutine_threadsafe(
@@ -658,6 +732,12 @@ def build_app(config: Config):
         ).result(timeout=60)
     except Exception as e:
         logger.error(f"MCP auto-start error: {e}")
+
+    # Pre-warm the Pyodide sandbox so the writer LLM's first call doesn't
+    # eat the bundle-load + wheel-download cost (~10-15s otherwise).
+    # Fire-and-forget — failure just means the first user call pays the
+    # cold-start, no impact on bot availability.
+    asyncio.run_coroutine_threadsafe(_warm_pyodide(mcp_manager), loop)
 
     # Background alert worker
     asyncio.run_coroutine_threadsafe(
@@ -704,6 +784,45 @@ def build_app(config: Config):
     asyncio.run_coroutine_threadsafe(prediction_resolver.run_forever(), loop)
     logger.info("Prediction resolver scheduled")
 
+    # Daily oracle worker — per-context, multi-oracle. Each enabled
+    # oracle fires once per day at its configured time (sunrise/sunset
+    # +/- offset, or fixed clock time). On first boot of this code,
+    # heuristic prepopulation seeds default oracle rows for existing
+    # group contexts (disabled by default — admin opts in via the UI).
+    # Old global settings are honored as a one-time migration.
+    from .daily_oracle import DailyOracleWorker
+    from .contexts.oracles import OracleStore, prepopulate_for_existing_contexts
+
+    oracle_store = OracleStore(config.watchlist_db_path)
+    try:
+        asyncio.run_coroutine_threadsafe(
+            prepopulate_for_existing_contexts(
+                oracle_store, context_registry, settings_store=settings_store,
+            ),
+            loop,
+        ).result(timeout=15)
+    except Exception as e:
+        logger.error(f"Oracle prepopulation failed: {e}")
+
+    tarot_cmd_for_oracle = dispatcher.commands.get("tarot")
+    iching_cmd_for_oracle = dispatcher.commands.get("iching")
+    if tarot_cmd_for_oracle is not None and iching_cmd_for_oracle is not None:
+        daily_oracle = DailyOracleWorker(
+            oracle_store=oracle_store,
+            context_registry=context_registry,
+            tarot_command=tarot_cmd_for_oracle,
+            iching_command=iching_cmd_for_oracle,
+            ask_command=ask_command,
+            signal_handler=signal_handler,
+            bot_phone=config.signal_phone_number,
+        )
+        asyncio.run_coroutine_threadsafe(daily_oracle.run_forever(), loop)
+        logger.info("Daily oracle worker scheduled (multi-oracle)")
+    else:
+        logger.warning(
+            "Daily oracle: tarot/iching commands not registered; worker not started"
+        )
+
     # WebSocket message poller
     poller = SignalPoller(
         api_url=config.signal_api_url,
@@ -735,6 +854,7 @@ def build_app(config: Config):
         memory_store=memory_store,
         prediction_store=dispatcher.prediction_store,
         prediction_resolver=prediction_resolver,
+        oracle_store=oracle_store,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

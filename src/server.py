@@ -39,6 +39,7 @@ def create_app(
     memory_store=None,
     prediction_store=None,
     prediction_resolver=None,
+    oracle_store=None,
 ) -> Flask:
     """
     Create Flask application with webhook endpoint and optional admin UI.
@@ -118,6 +119,7 @@ def create_app(
             memory_store=memory_store,
             prediction_store=prediction_store,
             prediction_resolver=prediction_resolver,
+            oracle_store=oracle_store,
         )
         logger.info("Admin UI mounted at /admin")
     else:

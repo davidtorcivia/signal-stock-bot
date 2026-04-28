@@ -204,4 +204,164 @@
     {% endif %}
 </div>
 
+{# ── Daily oracles ──────────────────────────────────────────────────── #}
+{% if not is_new and policy.kind == 'group' %}
+<div class="panel">
+    <h2>Daily oracles</h2>
+    <p class="muted" style="font-size: 12px;">
+        Sigil can post to this group on its own schedule — once per day,
+        per oracle. Multiple oracles per chat are fine (e.g. a morning
+        market check + a closing recap). Oracles fire at the configured
+        time using NYC ET as the sunrise/sunset anchor; clock schedules
+        use the per-oracle timezone. Errors stay inside the worker — a
+        broken oracle won't affect anything else.
+    </p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, msg in messages %}
+          <div class="{{ 'ok' if category == 'ok' else 'error' }}">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {% if oracles %}
+    <table style="margin-bottom: 16px;">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Kind</th>
+                <th>Schedule</th>
+                <th>Label</th>
+                <th>Enabled</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for o in oracles %}
+            <tr>
+                <td>{{ o.id }}</td>
+                <td>{{ o.kind }}</td>
+                <td>{{ o.description }}{% if o.weekdays_only %} <span class="muted">(weekdays only)</span>{% endif %}</td>
+                <td>{{ o.label or '—' }}</td>
+                <td>{{ '✓' if o.enabled else '—' }}</td>
+                <td>
+                    <details>
+                        <summary style="cursor:pointer;color:var(--accent);">edit</summary>
+                        <form method="post"
+                              action="{{ url_for('admin.oracle_edit', context_id=policy.id, oracle_id=o.id) }}"
+                              style="margin-top:8px;">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <label>Kind</label>
+                            <select name="kind">
+                                {% for k in oracle_kinds %}
+                                    <option value="{{ k }}" {% if k == o.kind %}selected{% endif %}>{{ k }}</option>
+                                {% endfor %}
+                            </select>
+                            <label>Schedule</label>
+                            <select name="schedule_kind">
+                                {% for s in oracle_schedule_kinds %}
+                                    <option value="{{ s }}" {% if s == o.schedule_kind %}selected{% endif %}>{{ s }}</option>
+                                {% endfor %}
+                            </select>
+                            <label>Offset minutes (sunrise/sunset only; +/- signed)</label>
+                            <input type="number" name="offset_minutes" value="{{ o.offset_minutes }}">
+                            <label>Clock time HH:MM (clock only)</label>
+                            <input type="text" name="clock_time" value="{{ o.clock_time }}" placeholder="09:25">
+                            <label>Timezone</label>
+                            <input type="text" name="timezone" value="{{ o.timezone }}" placeholder="America/New_York">
+                            <label>Label (admin-readable)</label>
+                            <input type="text" name="label" value="{{ o.label }}" placeholder="morning tarot">
+                            <label>Prompt (freeform only)</label>
+                            <textarea name="prompt" rows="3" placeholder="What should Sigil post about?">{{ o.prompt }}</textarea>
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                                <input type="checkbox" name="enabled" {% if o.enabled %}checked{% endif %}>
+                                <span>Enabled</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                                <input type="checkbox" name="weekdays_only" {% if o.weekdays_only %}checked{% endif %}>
+                                <span>Weekdays only (skip Sat/Sun)</span>
+                            </label>
+                            <div style="margin-top: 12px; display:flex; gap:12px;">
+                                <button type="submit">Save</button>
+                            </div>
+                        </form>
+                        <form method="post"
+                              action="{{ url_for('admin.oracle_delete', context_id=policy.id, oracle_id=o.id) }}"
+                              onsubmit="return confirm('Delete this oracle?');"
+                              style="margin-top: 8px;">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete oracle</button>
+                        </form>
+                    </details>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="muted">No oracles configured for this chat yet.</p>
+    {% endif %}
+
+    <details style="margin-top: 12px;">
+        <summary style="cursor:pointer;color:var(--accent);">+ add an oracle</summary>
+        <form method="post" action="{{ url_for('admin.oracle_new', context_id=policy.id) }}" style="margin-top: 12px;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <label>Kind</label>
+            <select name="kind">
+                {% for k in oracle_kinds %}
+                    <option value="{{ k }}">{{ k }}</option>
+                {% endfor %}
+            </select>
+            <p class="muted" style="font-size: 11px; margin-top: 4px;">
+                {% for k, desc in oracle_kind_descriptions.items() %}
+                    <strong>{{ k }}</strong>: {{ desc }}<br>
+                {% endfor %}
+            </p>
+
+            <label>Schedule</label>
+            <select name="schedule_kind">
+                {% for s in oracle_schedule_kinds %}
+                    <option value="{{ s }}">{{ s }}</option>
+                {% endfor %}
+            </select>
+            <p class="muted" style="font-size: 11px; margin-top: 4px;">
+                {% for s, desc in oracle_schedule_descriptions.items() %}
+                    <strong>{{ s }}</strong>: {{ desc }}<br>
+                {% endfor %}
+            </p>
+
+            <label>Offset minutes (for sunrise/sunset, signed)</label>
+            <input type="number" name="offset_minutes" value="0" placeholder="1">
+
+            <label>Clock time HH:MM (for clock schedule)</label>
+            <input type="text" name="clock_time" placeholder="09:25">
+
+            <label>Timezone (IANA)</label>
+            <input type="text" name="timezone" value="America/New_York" placeholder="America/New_York">
+
+            <label>Label</label>
+            <input type="text" name="label" placeholder="morning tarot">
+
+            <label>Prompt (freeform kind only)</label>
+            <textarea name="prompt" rows="3" placeholder="What should Sigil post?"></textarea>
+
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                <input type="checkbox" name="enabled">
+                <span>Enabled</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                <input type="checkbox" name="weekdays_only">
+                <span>Weekdays only</span>
+            </label>
+
+            <div style="margin-top: 12px;">
+                <button type="submit">Add oracle</button>
+            </div>
+        </form>
+    </details>
+</div>
+{% endif %}
+
 {% endblock %}

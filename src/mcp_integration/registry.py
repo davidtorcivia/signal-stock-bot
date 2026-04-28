@@ -13,6 +13,30 @@ from .models import MCPServerConfig
 logger = logging.getLogger(__name__)
 
 
+# MCP servers we ship as defaults. `ensure_defaults` inserts these on
+# first boot (idempotent — uniqueness is enforced by the registry's
+# UNIQUE constraint on `name`). Admin can disable via the UI; deletion
+# would let auto-register recreate on the next boot, so the admin UI
+# uses the enabled flag rather than delete for shipped defaults.
+#
+# Pyodide is pre-installed in the Dockerfile so first-call doesn't
+# trigger an npm fetch (would corrupt the stdio MCP handshake the same
+# way it does for brave-search). Cache dir lives on the persistent
+# volume so wheel downloads (yfinance, statsmodels, etc.) survive
+# restarts.
+_DEFAULT_SERVERS: tuple[MCPServerConfig, ...] = (
+    MCPServerConfig(
+        id=None,
+        name="pyodide",
+        transport="stdio",
+        enabled=True,
+        command="mcp-pyodide",
+        args=[],
+        env={"PYODIDE_CACHE_DIR": "/app/data/pyodide-cache"},
+    ),
+)
+
+
 class MCPRegistry:
     def __init__(self, db_path: str = "data/watchlist.db"):
         self.db_path = Path(db_path)
@@ -127,6 +151,29 @@ class MCPRegistry:
                 )
                 await db.commit()
                 return cfg.id
+
+    async def ensure_defaults(self) -> None:
+        """Idempotently register the default MCP servers we ship.
+
+        Called once at boot before `start_all_enabled` so the writer LLM
+        gets the python sandbox (and any future shipped defaults)
+        without admin setup. Existing rows with the same name are left
+        alone — admin edits to command/args/env survive across deploys.
+        """
+        existing = await self.list()
+        by_name = {c.name: c for c in existing}
+        for default in _DEFAULT_SERVERS:
+            if default.name in by_name:
+                continue
+            try:
+                await self.upsert(default)
+                logger.info(
+                    f"Auto-registered default MCP server: {default.name}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to auto-register {default.name}: {e}"
+                )
 
     async def delete(self, server_id: int) -> bool:
         await self._ensure_initialized()
