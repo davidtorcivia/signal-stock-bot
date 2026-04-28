@@ -23,6 +23,8 @@ import json
 import logging
 from typing import Optional
 
+from .commands.base import CommandContext
+from .contexts.policy import ContextPolicy, MODE_ALLOW_LIST
 from .predictions import (
     Prediction,
     PredictionStore,
@@ -35,7 +37,23 @@ from .predictions import (
 logger = logging.getLogger(__name__)
 
 
-_LLM_VERDICT_PROMPT = """\
+# Read-only research commands the resolver lets Sigil call when judging
+# free-form claims. Excludes anything that writes state (alert/watch/
+# predict/resolve), random draws (tarot/iching), and admin-y commands.
+# MCP servers are unrestricted — they're already read-only by nature
+# (search, fetch, edgar lookups).
+_RESEARCH_COMMANDS = [
+    "price", "chart", "ta", "news", "rating", "earnings",
+    "dividend", "insider", "short", "corr", "economy",
+]
+
+# Cap on tool-call rounds the resolver lets Sigil chain. Too few and it
+# can't do real research; too many and one stuck prediction starves the
+# sweep. 6 is enough for "fetch news → fetch price → judge".
+_MAX_RESOLVER_ROUNDS = 6
+
+
+_LLM_VERDICT_PROMPT_NO_TOOLS = """\
 You are judging whether a prediction came true. Reply with ONLY a JSON \
 object (no preamble, no explanation outside the JSON):
 
@@ -54,6 +72,40 @@ it as a cop-out — only when there's real ambiguity.
   - The note must be one sentence, plain prose, no hedging language."""
 
 
+_LLM_VERDICT_PROMPT_WITH_TOOLS = """\
+You are judging whether a prediction came true. The deadline has passed; \
+your job is to decide right / wrong / unclear and explain in one sentence.
+
+You have research tools available — USE THEM before judging. The point of \
+the tools is that you can actually verify the claim instead of guessing \
+from training data. Typical pattern:
+  - Stock-price claim → call bot__price for the current quote
+  - Earnings / dividend / rating claim → call the matching bot__ tool
+  - News / event / world-state claim → search the web (Brave) or fetch a \
+specific URL
+  - Macro / economic claim → bot__economy or web search
+
+Don't skip the tools. A confident-sounding "wrong" without a lookup is \
+worse than "unclear". After at most a few tool calls, return your verdict.
+
+Final reply MUST be a single JSON object with no other text:
+
+  {
+    "verdict": "right" | "wrong" | "unclear",
+    "note": "<one short sentence citing what you found>"
+  }
+
+Verdict rules:
+  - "right": the predicted outcome happened on or before the deadline.
+  - "wrong": the opposite happened, or the deadline passed without it.
+  - "unclear": you genuinely cannot tell even after using tools. Use this \
+when the claim is unfalsifiable, partially fulfilled, or sources disagree. \
+Don't use it as a cop-out for skipping research.
+  - The note must be one sentence, plain prose, no hedging — cite the \
+key fact your tools surfaced (e.g. "AAPL closed at $172, threshold was \
+$200")."""
+
+
 class PredictionResolver:
     def __init__(
         self,
@@ -62,12 +114,27 @@ class PredictionResolver:
         provider_manager,
         signal_handler,
         llm_client=None,
+        bot_tools=None,
+        mcp_manager=None,
+        bot_phone: str = "",
         interval_seconds: int = 900,  # 15 min
     ):
         self.store = store
         self.providers = provider_manager
         self.signal = signal_handler
         self.llm = llm_client
+        # When both are wired, the LLM resolver runs as a tool-using
+        # research loop instead of a single zero-shot call. bot_tools
+        # exposes !price/!news/etc. as bot__* tools; mcp_manager exposes
+        # web search / fetch / EDGAR. Either or both can be None — the
+        # resolver degrades gracefully (no tools = vanilla LLM judgment).
+        self.bot_tools = bot_tools
+        self.mcp_manager = mcp_manager
+        # Sender identity for tool dispatch. Bot tools eventually route
+        # through dispatcher._execute_command which expects a real phone
+        # number for hash_phone() and audit logging. The configured bot
+        # phone is the right identity here — the resolver IS the bot.
+        self.bot_phone = bot_phone
         self.interval = interval_seconds
 
     async def run_forever(self) -> None:
@@ -194,6 +261,13 @@ class PredictionResolver:
         except Exception:
             return None
 
+        # Two paths: tool-enabled research loop (preferred) or vanilla
+        # zero-shot judgment (fallback when bot_tools/mcp aren't wired).
+        # The tool path massively improves accuracy on time-sensitive
+        # claims past the model's training cutoff — without it Sigil is
+        # guessing for anything that needs a fresh price or news lookup.
+        tools_available = self.bot_tools is not None or self.mcp_manager is not None
+
         user_content = (
             f"Prediction: \"{pred.claim}\"\n"
             f"Made by [{pred.user_label}]\n"
@@ -201,10 +275,19 @@ class PredictionResolver:
             f"{_iso(pred.deadline_utc)}\n\n"
             f"Judge it now."
         )
+
+        if not tools_available:
+            return await self._resolve_with_llm_zero_shot(pred, user_content)
+
+        return await self._resolve_with_llm_tools(pred, user_content)
+
+    async def _resolve_with_llm_zero_shot(
+        self, pred: Prediction, user_content: str
+    ) -> Optional[tuple[str, str]]:
         try:
             msg = await self.llm.chat_messages(
                 messages=[
-                    {"role": "system", "content": _LLM_VERDICT_PROMPT},
+                    {"role": "system", "content": _LLM_VERDICT_PROMPT_NO_TOOLS},
                     {"role": "user", "content": user_content},
                 ],
                 overrides={"max_tokens": 200, "temperature": 0.2},
@@ -217,7 +300,6 @@ class PredictionResolver:
 
         verdict, note = _parse_verdict(msg.get("content") or "")
         if verdict is None:
-            # Parsing failed — leave pending; we'll retry next sweep.
             logger.info(
                 f"Resolver: couldn't parse verdict for #{pred.id} from "
                 f"{msg.get('content')!r}"
@@ -225,6 +307,130 @@ class PredictionResolver:
             return None
         await self.store.resolve(pred.id, verdict=verdict, note=note)
         return verdict, note
+
+    async def _resolve_with_llm_tools(
+        self, pred: Prediction, user_content: str
+    ) -> Optional[tuple[str, str]]:
+        """Tool-loop verdict path. Sigil can call price/news/web tools
+        before deciding. Returns the verdict on success or None to leave
+        the row pending for the next sweep.
+        """
+        # Synthetic context for bot-tool dispatch. Caller_ctx.sender must
+        # be a real phone for hash_phone()/audit; the bot's own phone is
+        # the appropriate identity here. Permissive policy in allow_list
+        # mode restricts Sigil to research-only commands so the resolver
+        # can't accidentally write state (no !alert/!watch/!predict).
+        synth_policy = ContextPolicy(
+            id=None,
+            kind="default",
+            key="__resolver__",
+            command_mode=MODE_ALLOW_LIST,
+            commands=list(_RESEARCH_COMMANDS),
+        )
+        caller_ctx = CommandContext(
+            sender=self.bot_phone or "",
+            group_id=pred.group_id,
+            raw_message="",
+            command="(resolver)",
+            args=[],
+            policy=synth_policy,
+        )
+
+        tools = self._collect_resolver_tools(synth_policy)
+        if not tools:
+            # Filtered down to nothing — fall back to zero-shot.
+            return await self._resolve_with_llm_zero_shot(pred, user_content)
+
+        messages: list[dict] = [
+            {"role": "system", "content": _LLM_VERDICT_PROMPT_WITH_TOOLS},
+            {"role": "user", "content": user_content},
+        ]
+
+        for round_idx in range(_MAX_RESOLVER_ROUNDS):
+            try:
+                assistant_msg = await self.llm.chat_messages(
+                    messages,
+                    tools=tools,
+                    overrides={"max_tokens": 800, "temperature": 0.2},
+                    suppress_response_style=True,
+                    purpose="predict_resolve",
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Resolver: LLM call failed for #{pred.id} "
+                    f"round {round_idx}: {e}"
+                )
+                return None
+
+            messages.append(assistant_msg)
+            tool_calls = assistant_msg.get("tool_calls") or []
+            if not tool_calls:
+                # Final answer — parse JSON verdict from content.
+                verdict, note = _parse_verdict(assistant_msg.get("content") or "")
+                if verdict is None:
+                    logger.info(
+                        f"Resolver: couldn't parse verdict for #{pred.id} "
+                        f"from {(assistant_msg.get('content') or '')[:200]!r}"
+                    )
+                    return None
+                await self.store.resolve(pred.id, verdict=verdict, note=note)
+                return verdict, note
+
+            # Dispatch every tool call this round, then re-prompt.
+            for call in tool_calls:
+                await self._dispatch_tool_call(call, messages, caller_ctx)
+
+        logger.warning(
+            f"Resolver: hit tool-round cap ({_MAX_RESOLVER_ROUNDS}) "
+            f"on #{pred.id} without verdict; leaving pending"
+        )
+        return None
+
+    def _collect_resolver_tools(self, policy: ContextPolicy) -> list[dict]:
+        out: list[dict] = []
+        if self.bot_tools is not None:
+            out.extend(self.bot_tools.list_tools(policy=policy))
+        if self.mcp_manager is not None:
+            out.extend(t.to_openai_tool() for t in self.mcp_manager.all_tools())
+        return out
+
+    async def _dispatch_tool_call(
+        self, call: dict, messages: list[dict], caller_ctx: CommandContext
+    ) -> None:
+        """Run one tool call and append its result message. Errors come
+        back as tool-result text so the model can recover, mirroring
+        ask_command's contract."""
+        call_id = call.get("id") or ""
+        fn = call.get("function") or {}
+        name = fn.get("name") or ""
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            args = {}
+
+        is_bot_tool = (
+            self.bot_tools is not None
+            and name.startswith(self.bot_tools.NAMESPACE + "__")
+        )
+        try:
+            if is_bot_tool:
+                result = await self.bot_tools.call(name, args, caller_ctx)
+                content = result.text if result else "(no result)"
+            elif self.mcp_manager is not None:
+                content = await self.mcp_manager.call_tool(name, args)
+            else:
+                content = f"ERROR: unknown tool {name}"
+        except Exception as e:
+            logger.warning(f"Resolver: tool {name} failed: {e}")
+            content = f"ERROR: {e}"
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": name,
+            "content": content if isinstance(content, str) else str(content),
+        })
 
     async def _post_resolution(
         self, pred: Prediction, verdict: str, note: str

@@ -131,6 +131,50 @@
             object or empty. Overrides the built-in fields if keys collide.
         </p>
 
+        <h3 style="margin-top: 24px;">OpenRouter provider routing</h3>
+        <p class="muted" style="font-size: 11px;">
+            When the base URL points at OpenRouter, pin which upstream
+            provider serves the model. Useful when a model has wildly
+            different latency between hosts (e.g. Cerebras ≪ slower
+            general-purpose providers). Ignored by non-OpenRouter
+            endpoints. If you set <code>provider</code> directly in
+            "Extra request body" above, that wins — these fields are
+            skipped to avoid double-setting.
+        </p>
+
+        <label for="llm_provider_order">Preferred providers (comma-separated)</label>
+        <input type="text" name="llm_provider_order" id="llm_provider_order"
+               value="{{ values.llm_provider_order or '' }}"
+               placeholder="Cerebras, Groq, Together">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Tried in order. Empty = default OpenRouter routing (price-based
+            with latency tie-break). Provider names must match the slugs
+            shown on the OpenRouter model page (case-sensitive).
+        </p>
+
+        <label for="llm_provider_only">Only these providers (no fallback)</label>
+        <input type="text" name="llm_provider_only" id="llm_provider_only"
+               value="{{ 'true' if values.llm_provider_only else 'false' }}"
+               placeholder="true / false">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When <code>true</code>, requests fail if none of the preferred
+            providers can serve them — preventing silent fallback to a slow
+            host. When <code>false</code>, OpenRouter falls back to other
+            providers after the preferred list is exhausted. No effect when
+            the preferred list is empty.
+        </p>
+
+        <label for="llm_provider_sort">Sort by (advanced)</label>
+        <input type="text" name="llm_provider_sort" id="llm_provider_sort"
+               value="{{ values.llm_provider_sort or '' }}"
+               placeholder="throughput  ·  latency  ·  price">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Optional. <code>throughput</code> picks the fastest-tokens-per-
+            second provider, <code>latency</code> the lowest-time-to-first-
+            token, <code>price</code> the cheapest. Combine with the
+            preferred list to sort within it. Empty = no sort.
+        </p>
+
         <h2 style="margin-top: 32px;">Emoji reactor</h2>
         <p class="muted" style="font-size: 12px;">
             Cheap secondary LLM call on every group message that decides whether

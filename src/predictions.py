@@ -261,6 +261,60 @@ class PredictionStore:
             await db.commit()
             return cursor.rowcount > 0
 
+    async def force_set_verdict(
+        self,
+        pred_id: int,
+        *,
+        verdict: str,
+        note: Optional[str] = None,
+        resolver_user_hash: Optional[str] = None,
+    ) -> bool:
+        """Admin override path: set the verdict regardless of current status.
+
+        Distinct from `resolve()` which only fires on still-pending rows
+        (the auto-resolver's safety against double-posting). Admin
+        editing on the dashboard needs to fix already-resolved rows that
+        the auto-resolver got wrong, so we update unconditionally and
+        leave status='resolved' (or upgrade expired → resolved).
+        """
+        if verdict not in VALID_VERDICTS:
+            raise ValueError(f"invalid verdict: {verdict!r}")
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE predictions
+                   SET status = 'resolved',
+                       verdict = ?,
+                       resolution_note = ?,
+                       resolved_at = ?,
+                       resolver_user_hash = ?
+                   WHERE id = ?""",
+                (verdict, note, time.time(), resolver_user_hash, pred_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def revert_to_pending(self, pred_id: int) -> bool:
+        """Admin path: send a resolved/expired prediction back to pending so
+        the auto-resolver can re-judge it (or the admin can override it
+        again). Clears the verdict but keeps the original deadline so the
+        resolver picks it up immediately.
+        """
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE predictions
+                   SET status = 'pending',
+                       verdict = NULL,
+                       resolution_note = NULL,
+                       resolved_at = NULL,
+                       resolver_user_hash = NULL
+                   WHERE id = ?""",
+                (pred_id,),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def expire(self, pred_id: int, *, note: Optional[str] = None) -> bool:
         """Mark as expired — auto-resolver tried and gave up. Doesn't count."""
         await self._ensure_initialized()
@@ -316,6 +370,92 @@ class PredictionStore:
                 "accuracy": (rights / judged) if judged else None,
             })
         return out[:limit]
+
+    async def total_counts(self) -> dict:
+        """Aggregate counts across every context — for the admin dashboard.
+
+        Returns: {total, pending, resolved, expired, right, wrong, unclear,
+        accuracy} where accuracy is right / (right + wrong) over all
+        resolved predictions, or None when nothing is judged yet.
+        """
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """SELECT
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status='pending'  THEN 1 ELSE 0 END) AS pending,
+                       SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved,
+                       SUM(CASE WHEN status='expired'  THEN 1 ELSE 0 END) AS expired,
+                       SUM(CASE WHEN verdict='right'   THEN 1 ELSE 0 END) AS rights,
+                       SUM(CASE WHEN verdict='wrong'   THEN 1 ELSE 0 END) AS wrongs,
+                       SUM(CASE WHEN verdict='unclear' THEN 1 ELSE 0 END) AS unclears
+                   FROM predictions"""
+            ) as cur:
+                row = await cur.fetchone()
+        total, pending, resolved, expired, rights, wrongs, unclears = (
+            row if row else (0, 0, 0, 0, 0, 0, 0)
+        )
+        rights = rights or 0
+        wrongs = wrongs or 0
+        judged = rights + wrongs
+        return {
+            "total": total or 0,
+            "pending": pending or 0,
+            "resolved": resolved or 0,
+            "expired": expired or 0,
+            "right": rights,
+            "wrong": wrongs,
+            "unclear": unclears or 0,
+            "accuracy": (rights / judged) if judged else None,
+        }
+
+    async def recent_all(self, *, limit: int = 50) -> list[Prediction]:
+        """Most recent predictions across every context, newest-first."""
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"SELECT {self._COLS} FROM predictions "
+                f"ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [self._row_to_pred(r) for r in rows]
+
+    async def upcoming_all(self, *, limit: int = 50) -> list[Prediction]:
+        """Pending predictions across every context, soonest-deadline first."""
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"SELECT {self._COLS} FROM predictions "
+                f"WHERE status = 'pending' "
+                f"ORDER BY deadline_utc ASC LIMIT ?",
+                (limit,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [self._row_to_pred(r) for r in rows]
+
+    async def contexts_with_predictions(self) -> list[dict]:
+        """Distinct context_keys that have at least one prediction, with
+        per-context status counts. Lets the dashboard render one
+        leaderboard panel per active chat without separate round-trips.
+        """
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """SELECT context_key,
+                          COUNT(*) AS total,
+                          SUM(CASE WHEN status='pending'  THEN 1 ELSE 0 END) AS pending,
+                          SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved
+                   FROM predictions
+                   GROUP BY context_key
+                   ORDER BY total DESC"""
+            ) as cur:
+                rows = await cur.fetchall()
+        return [
+            {"context_key": r[0], "total": r[1] or 0,
+             "pending": r[2] or 0, "resolved": r[3] or 0}
+            for r in rows
+        ]
 
     async def user_record(self, user_hash: str, context_key: str) -> dict:
         """Single-user record for inline display ("David's record: 7/12, 58%")."""

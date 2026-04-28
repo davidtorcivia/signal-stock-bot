@@ -37,6 +37,8 @@ def create_app(
     name_registry=None,
     deep_think_client=None,
     memory_store=None,
+    prediction_store=None,
+    prediction_resolver=None,
 ) -> Flask:
     """
     Create Flask application with webhook endpoint and optional admin UI.
@@ -114,6 +116,8 @@ def create_app(
             name_registry=name_registry,
             deep_think_client=deep_think_client,
             memory_store=memory_store,
+            prediction_store=prediction_store,
+            prediction_resolver=prediction_resolver,
         )
         logger.info("Admin UI mounted at /admin")
     else:

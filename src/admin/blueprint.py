@@ -46,6 +46,8 @@ def create_admin_blueprint(
     name_registry=None,
     deep_think_client=None,
     memory_store=None,
+    prediction_store=None,
+    prediction_resolver=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -100,6 +102,16 @@ def create_admin_blueprint(
 
     if name_registry is not None:
         _register_users_routes(bp, registry=name_registry, loop=loop)
+
+    if prediction_store is not None:
+        _register_predictions_routes(
+            bp,
+            prediction_store=prediction_store,
+            prediction_resolver=prediction_resolver,
+            context_registry=context_registry,
+            name_registry=name_registry,
+            loop=loop,
+        )
 
     _register_live_routes(bp, name_registry=name_registry, loop=loop)
 
@@ -307,6 +319,11 @@ LLM_KEYS = [
     "llm_system_prompt",
     "llm_response_style",
     "llm_extra_body",
+    # OpenRouter provider routing — pin which upstream provider serves
+    # the model so latency stays predictable across requests.
+    "llm_provider_order",
+    "llm_provider_only",
+    "llm_provider_sort",
     # Emoji reactor (cheap secondary path)
     "reactor_enabled",
     "reactor_model",
@@ -441,6 +458,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
 
     bool_keys = {
         "llm_enabled",
+        "llm_provider_only",
         "reactor_enabled",
         "natural_response_enabled",
         "deep_think_enabled",
@@ -1394,6 +1412,294 @@ def _register_users_routes(
             except Exception as e:
                 logger.error(f"Delete user name failed: {e}")
         return redirect(url_for("admin.users_page"))
+
+
+def _register_predictions_routes(
+    bp: Blueprint,
+    *,
+    prediction_store,
+    prediction_resolver,
+    context_registry: Optional[ContextRegistry],
+    name_registry,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Prediction-game admin view: aggregate stats, per-context leaderboards,
+    upcoming deadlines, and a flat recent feed. Read-only — manual resolution
+    still happens via !resolve in chat.
+    """
+    import time as _time
+
+    @bp.route("/predictions", methods=["GET"])
+    @admin_required
+    def predictions_page():
+        store = prediction_store
+        if store is None:
+            return render_template("predictions.html", available=False,
+                                   counts={}, leaderboards=[],
+                                   upcoming=[], recent=[])
+
+        # Resolve context_key → friendly label once. The registry stores
+        # `kind`+`key` separately (no prefix); predictions use
+        # `f"{kind}:{key}"`. Stitch them so the template can show
+        # human-readable chat names instead of opaque hashes.
+        ctx_labels: dict[str, str] = {}
+        if context_registry is not None:
+            try:
+                policies = _run_on_loop(loop, context_registry.list())
+                for p in policies:
+                    if p.kind in ("group", "dm") and p.key:
+                        ctx_labels[f"{p.kind}:{p.key}"] = p.label or "(unlabeled)"
+                    elif p.kind == "default":
+                        ctx_labels[f"default:{p.key or ''}"] = (
+                            p.label or "(default)"
+                        )
+            except Exception as e:
+                logger.error(f"Predictions: context label resolution failed: {e}")
+
+        def label_for_ctx(ck: str) -> str:
+            return ctx_labels.get(ck) or ck
+
+        def label_for_user(user_hash: str, fallback: Optional[str]) -> str:
+            if name_registry is not None:
+                cached = name_registry._cache.get(user_hash)
+                if cached:
+                    return cached
+                if user_hash == _bot_user_hash():
+                    return name_registry.bot_name
+            return fallback or "(unknown)"
+
+        try:
+            counts = _run_on_loop(loop, store.total_counts())
+        except Exception as e:
+            logger.error(f"Predictions: counts failed: {e}")
+            counts = {}
+
+        try:
+            ctx_summaries = _run_on_loop(loop, store.contexts_with_predictions())
+        except Exception as e:
+            logger.error(f"Predictions: context list failed: {e}")
+            ctx_summaries = []
+
+        # Per-context leaderboards. Skip contexts that have no resolved
+        # predictions yet — a leaderboard with everyone at 0/0 is noise.
+        leaderboards = []
+        for s in ctx_summaries:
+            ck = s["context_key"]
+            try:
+                rows = _run_on_loop(loop, store.leaderboard(ck, limit=20))
+            except Exception as e:
+                logger.error(f"Predictions: leaderboard for {ck} failed: {e}")
+                continue
+            scoring = [r for r in rows if (r["right"] + r["wrong"]) > 0]
+            pending = sum(r["pending"] for r in rows)
+            entries = []
+            for r in scoring:
+                judged = r["right"] + r["wrong"]
+                entries.append({
+                    "label": label_for_user(r["user_hash"], r["label"]),
+                    "right": r["right"],
+                    "wrong": r["wrong"],
+                    "judged": judged,
+                    "accuracy": r["accuracy"],
+                    "pending": r["pending"],
+                })
+            if entries or pending:
+                leaderboards.append({
+                    "context_label": label_for_ctx(ck),
+                    "context_key": ck,
+                    "total": s["total"],
+                    "pending_total": pending,
+                    "entries": entries,
+                })
+
+        try:
+            upcoming_raw = _run_on_loop(loop, store.upcoming_all(limit=20))
+        except Exception as e:
+            logger.error(f"Predictions: upcoming failed: {e}")
+            upcoming_raw = []
+
+        try:
+            recent_raw = _run_on_loop(loop, store.recent_all(limit=30))
+        except Exception as e:
+            logger.error(f"Predictions: recent failed: {e}")
+            recent_raw = []
+
+        def render_pred(p) -> dict:
+            now = _time.time()
+            delta = p.deadline_utc - now
+            if p.status == "pending":
+                if delta <= 0:
+                    deadline_rel = "due"
+                elif delta < 3600:
+                    deadline_rel = "<1h"
+                elif delta < 86400:
+                    deadline_rel = f"{int(delta // 3600)}h"
+                else:
+                    deadline_rel = f"{int(delta // 86400)}d"
+            else:
+                deadline_rel = ""
+            return {
+                "id": p.id,
+                "user_label": label_for_user(p.user_hash, p.user_label),
+                "claim": p.claim,
+                "context_label": label_for_ctx(p.context_key),
+                "deadline_iso": _time.strftime(
+                    "%Y-%m-%d", _time.gmtime(p.deadline_utc)
+                ),
+                "deadline_rel": deadline_rel,
+                "status": p.status,
+                "verdict": p.verdict or "",
+                "resolution_note": p.resolution_note or "",
+                "is_structured": p.is_structured,
+                "ticker": p.ticker,
+                "threshold": p.threshold,
+                "direction": p.direction,
+            }
+
+        upcoming = [render_pred(p) for p in upcoming_raw]
+        recent = [render_pred(p) for p in recent_raw]
+
+        return render_template(
+            "predictions.html",
+            available=True,
+            counts=counts,
+            leaderboards=leaderboards,
+            upcoming=upcoming,
+            recent=recent,
+        )
+
+    def _bot_user_hash() -> str:
+        # Lazy import — avoids pulling group_log at module load time.
+        from ..database import hash_phone
+        from ..group_log import BOT_SENDER
+        return hash_phone(BOT_SENDER)
+
+    @bp.route("/predictions/<int:pred_id>/resolve", methods=["POST"])
+    @admin_required
+    def predictions_resolve_now(pred_id: int):
+        """Trigger Sigil to settle one prediction immediately (no waiting
+        for the next sweep). Falls back to structured-quote when the
+        prediction is stock-shape; otherwise hits the LLM tool loop.
+        """
+        if not verify_csrf():
+            abort(400)
+        if prediction_store is None or prediction_resolver is None:
+            flash("Prediction resolver not configured.", "error")
+            return redirect(url_for("admin.predictions_page"))
+
+        try:
+            pred = _run_on_loop(loop, prediction_store.get(pred_id))
+            if pred is None:
+                flash(f"No prediction #{pred_id}.", "error")
+                return redirect(url_for("admin.predictions_page"))
+            if pred.status != "pending":
+                flash(
+                    f"#{pred_id} is already {pred.status}. Use Override "
+                    f"to change the verdict.",
+                    "error",
+                )
+                return redirect(url_for("admin.predictions_page"))
+
+            # Pre-fetch quote for structured predictions so the resolver
+            # has the same shape it sees in the cron sweep.
+            quotes = {}
+            if pred.is_structured and pred.ticker:
+                price = _run_on_loop(
+                    loop, prediction_resolver._safe_quote(pred.ticker)
+                )
+                if price is not None:
+                    quotes[pred.ticker] = price
+
+            outcome = _run_on_loop(
+                loop, prediction_resolver._resolve_one(pred, quotes),
+                timeout=120.0,
+            )
+            if outcome is None:
+                flash(
+                    f"Sigil couldn't settle #{pred_id} right now "
+                    f"(quote miss or LLM unavailable). Will retry on the "
+                    f"next sweep.",
+                    "error",
+                )
+            else:
+                verdict, note = outcome
+                # Mirror the cron behavior: post the verdict back to the
+                # originating chat so users see it in real time, not just
+                # in the dashboard.
+                try:
+                    _run_on_loop(
+                        loop,
+                        prediction_resolver._post_resolution(pred, verdict, note),
+                    )
+                except Exception as e:
+                    logger.warning(f"Resolve-now post failed for #{pred_id}: {e}")
+                flash(
+                    f"#{pred_id} resolved {verdict.upper()}"
+                    f"{' — ' + note if note else ''}.",
+                    "ok",
+                )
+        except Exception as e:
+            logger.exception(f"Resolve-now failed for #{pred_id}: {e}")
+            flash(f"Failed to resolve #{pred_id}: {e}", "error")
+        return redirect(url_for("admin.predictions_page"))
+
+    @bp.route("/predictions/<int:pred_id>/override", methods=["POST"])
+    @admin_required
+    def predictions_override(pred_id: int):
+        """Set verdict + note manually. Works on any status — the admin's
+        whole point of being here is to fix wrong auto-resolutions, so
+        unconditional update is the right contract."""
+        if not verify_csrf():
+            abort(400)
+        if prediction_store is None:
+            flash("Prediction store not configured.", "error")
+            return redirect(url_for("admin.predictions_page"))
+
+        verdict = (request.form.get("verdict") or "").strip().lower()
+        note = (request.form.get("note") or "").strip() or None
+        if verdict not in ("right", "wrong", "unclear"):
+            flash("Verdict must be right, wrong, or unclear.", "error")
+            return redirect(url_for("admin.predictions_page"))
+
+        try:
+            ok = _run_on_loop(
+                loop,
+                prediction_store.force_set_verdict(
+                    pred_id, verdict=verdict, note=note,
+                    resolver_user_hash=None,
+                ),
+            )
+            if ok:
+                flash(f"#{pred_id} overridden to {verdict.upper()}.", "ok")
+            else:
+                flash(f"No prediction #{pred_id}.", "error")
+        except Exception as e:
+            logger.exception(f"Override failed for #{pred_id}: {e}")
+            flash(f"Failed to override #{pred_id}: {e}", "error")
+        return redirect(url_for("admin.predictions_page"))
+
+    @bp.route("/predictions/<int:pred_id>/revert", methods=["POST"])
+    @admin_required
+    def predictions_revert(pred_id: int):
+        """Send a resolved/expired prediction back to pending. Useful when
+        the admin wants the auto-resolver to take another pass — e.g.
+        the LLM was wrong but Sigil now has more recent tools/data."""
+        if not verify_csrf():
+            abort(400)
+        if prediction_store is None:
+            flash("Prediction store not configured.", "error")
+            return redirect(url_for("admin.predictions_page"))
+
+        try:
+            ok = _run_on_loop(loop, prediction_store.revert_to_pending(pred_id))
+            if ok:
+                flash(f"#{pred_id} reverted to pending.", "ok")
+            else:
+                flash(f"No prediction #{pred_id}.", "error")
+        except Exception as e:
+            logger.exception(f"Revert failed for #{pred_id}: {e}")
+            flash(f"Failed to revert #{pred_id}: {e}", "error")
+        return redirect(url_for("admin.predictions_page"))
 
 
 def _register_live_routes(

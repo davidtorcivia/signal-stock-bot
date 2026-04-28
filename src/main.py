@@ -606,6 +606,11 @@ def build_app(config: Config):
     from .commands.tools import BotCommandTools
     bot_tools = BotCommandTools(dispatcher)
     ask_command.bot_tools = bot_tools
+    # PredictionStore is constructed inside create_dispatcher (so the
+    # background resolver can share it via dispatcher.prediction_store);
+    # late-bind it onto ask_command here so the writer LLM gets the
+    # `predict_self` tool exposed.
+    ask_command.prediction_store = dispatcher.prediction_store
     # Same tool adapter for the deep model — late-binding is the same
     # circular-dep workaround as ask_command's.
     deep_think_client.bot_tools = bot_tools
@@ -688,6 +693,13 @@ def build_app(config: Config):
         provider_manager=provider_manager,
         signal_handler=signal_handler,
         llm_client=llm_client,
+        # Give the resolver Sigil's full research toolkit so free-form
+        # claims get verified against live data (price/news/web) instead
+        # of judged from training memory. The synthetic policy inside the
+        # resolver narrows this to read-only commands.
+        bot_tools=bot_tools,
+        mcp_manager=mcp_manager,
+        bot_phone=config.signal_phone_number,
     )
     asyncio.run_coroutine_threadsafe(prediction_resolver.run_forever(), loop)
     logger.info("Prediction resolver scheduled")
@@ -721,6 +733,8 @@ def build_app(config: Config):
         name_registry=name_registry,
         deep_think_client=deep_think_client,
         memory_store=memory_store,
+        prediction_store=dispatcher.prediction_store,
+        prediction_resolver=prediction_resolver,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

@@ -20,8 +20,14 @@ import time
 from typing import Optional
 
 from .base import BaseCommand, CommandContext, CommandResult
+from .predict_command import (
+    PREDICT_SELF_TOOL,
+    _format_deadline,
+    extract_prediction,
+)
 from ..database import hash_phone
 from ..group_log import BOT_SENDER
+from ..predictions import PredictionStore
 from ..llm import (
     LLMClient,
     LLMDisabled,
@@ -216,6 +222,7 @@ class AskCommand(BaseCommand):
         reactor=None,
         deep_think=None,
         memory_store: Optional[MemoryStore] = None,
+        prediction_store: Optional[PredictionStore] = None,
     ):
         self.llm = llm
         self.history = history
@@ -227,6 +234,11 @@ class AskCommand(BaseCommand):
         # and stored memories about active speakers in the chat are
         # auto-injected into the system suffix.
         self.memory_store = memory_store
+        # Optional PredictionStore — when set and the per-context policy
+        # allows the !predict command, the writer LLM gets a `predict_self`
+        # tool letting Sigil log its own forecasts under a bot-author row
+        # so its calls appear on the leaderboard alongside humans.
+        self.prediction_store = prediction_store
         self.subject_resolver: Optional[SubjectResolver] = None
         # Optional DeepThinkClient — when set and the per-context policy
         # allows it, exposed to the writer LLM as a `deep_think` tool.
@@ -374,6 +386,16 @@ class AskCommand(BaseCommand):
             if getattr(policy, "memory_writes_enabled", True):
                 schemas.append(REMEMBER_TOOL)
                 schemas.append(FORGET_TOOL)
+        # predict_self: the bot's own prediction logging tool. Distinct from
+        # `bot__predict` (which the writer can already invoke to log a
+        # prediction on the asker's behalf) — this one authors as the bot
+        # under a sentinel hash so Sigil shows up on the leaderboard. Only
+        # exposed when the prediction store is wired AND the per-context
+        # policy allows the !predict command at all.
+        if self.prediction_store is not None and (
+            policy is None or policy.allows_command("predict")
+        ):
+            schemas.append(PREDICT_SELF_TOOL)
         return schemas or None
 
     async def _run_tool_loop(
@@ -432,6 +454,71 @@ class AskCommand(BaseCommand):
             f"The model was working through: {recent_str}. "
             f"Either ask a more focused question, or raise "
             f"`Max tool-call rounds per !ask` in /admin/llm."
+        )
+
+    async def _handle_predict_self_tool(
+        self,
+        args: dict,
+        caller_ctx: CommandContext,
+    ) -> str:
+        """Log a prediction authored by the bot itself.
+
+        Uses the BOT_SENDER sentinel as the user_hash source so the bot's
+        forecasts land on the leaderboard as a distinct row, separate from
+        whichever human asked. The same parsing pipeline that backs
+        !predict is reused so structured stock-shape claims still
+        auto-resolve via live price.
+        """
+        store = self.prediction_store
+        if store is None:
+            return "(predict_self unavailable: no prediction store wired)"
+        # Defence-in-depth policy check (also gated when filtering tool
+        # schemas). Only applies when a policy is present.
+        policy = caller_ctx.policy
+        if policy is not None and not policy.allows_command("predict"):
+            return "(predict_self unavailable: !predict not allowed in this chat)"
+
+        claim_text = str(args.get("claim") or "").strip()
+        if not claim_text:
+            return "ERROR: predict_self requires a non-empty claim with a deadline."
+
+        parsed, err = await extract_prediction(claim_text, llm_client=self.llm)
+        if err is not None:
+            return f"ERROR: {err}"
+        assert parsed is not None  # extract_prediction post-condition
+
+        bot_label = (
+            self.name_registry.bot_name
+            if self.name_registry is not None
+            else "Bot"
+        )
+        try:
+            pred_id = await store.create(
+                user_hash=hash_phone(BOT_SENDER),
+                user_label=bot_label,
+                group_id=caller_ctx.group_id,
+                context_key=caller_ctx.context_key(),
+                claim=parsed["claim"],
+                deadline_utc=parsed["deadline_utc"],
+                ticker=parsed.get("ticker"),
+                threshold=parsed.get("threshold"),
+                direction=parsed.get("direction"),
+            )
+        except Exception as e:
+            logger.exception(f"predict_self: store.create failed: {e}")
+            return "ERROR: couldn't save the prediction."
+
+        deadline_str = _format_deadline(parsed["deadline_utc"])
+        kind_note = ""
+        if parsed.get("ticker"):
+            kind_note = (
+                f" (auto-resolves: {parsed['ticker']} "
+                f"{parsed['direction']} ${parsed['threshold']:g})"
+            )
+        return (
+            f"Logged your own prediction #{pred_id}: "
+            f"\"{parsed['claim']}\" due {deadline_str}{kind_note}. "
+            f"It's on the leaderboard under {bot_label}."
         )
 
     async def _handle_memory_tool(
@@ -566,9 +653,14 @@ class AskCommand(BaseCommand):
         is_memory = name in ("remember", "recall", "forget") and (
             self.memory_store is not None
         )
+        is_predict_self = (
+            name == "predict_self" and self.prediction_store is not None
+        )
 
         try:
-            if is_memory:
+            if is_predict_self:
+                content = await self._handle_predict_self_tool(args, caller_ctx)
+            elif is_memory:
                 content = await self._handle_memory_tool(
                     name, args, caller_ctx
                 )

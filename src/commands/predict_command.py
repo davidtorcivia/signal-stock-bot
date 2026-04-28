@@ -304,6 +304,83 @@ def _format_deadline(deadline_utc: float) -> str:
     return dt.datetime.fromtimestamp(deadline_utc, tz=dt.timezone.utc).strftime("%Y-%m-%d")
 
 
+async def extract_prediction(text: str, llm_client=None) -> tuple[Optional[dict], Optional[str]]:
+    """Public wrapper around the predict-parser pipeline.
+
+    Returns `(parsed, error)` where exactly one is non-None: the parsed
+    prediction dict (claim, deadline_utc, optional ticker/threshold/direction)
+    on success, or a human-readable error string on failure. Used by both
+    `PredictCommand.execute` (via inline calls) and the LLM-facing
+    `predict_self` tool so the two paths stay in sync.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, (
+            "Tell me what you're predicting and by when. "
+            "Example: AAPL above $200 by June 1"
+        )
+    parsed = _parse_stock_shape(raw)
+    if parsed is None and not _has_any_deadline(raw):
+        return None, (
+            "I couldn't find a deadline in that. Add `by <date>` "
+            "(e.g. `by June 1`, `by 2026-09-01`, `by EOY`)."
+        )
+    if parsed is None:
+        parsed = await _llm_extract(llm_client, raw)
+    if parsed is None:
+        return None, (
+            "I couldn't pin down what you're predicting or when. Try "
+            "`<claim> by <date>`."
+        )
+    return parsed, None
+
+
+# LLM tool schema — exposed to the writer model in groups when a
+# PredictionStore is wired and the per-context policy allows the !predict
+# command. Intentionally distinct from `bot__predict` (which logs a
+# prediction on behalf of the human asker) — this one authors as the bot
+# itself, so Sigil's own forecasts land on the leaderboard separately.
+PREDICT_SELF_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "predict_self",
+        "description": (
+            "Log YOUR OWN (the bot's) prediction. Use this when you want "
+            "to put YOUR forecast on record — \"I think AAPL hits $250 "
+            "by Friday\" — distinct from `bot__predict` which logs a "
+            "prediction for the human who asked. Your predictions land "
+            "on the leaderboard under your bot name, alongside humans, "
+            "and auto-resolve at the deadline.\n\n"
+            "Format the claim like a user would: \"<claim> by <date>\". "
+            "Stock-shape claims auto-resolve via live price "
+            "(\"AAPL above $200 by June 1\"); free-form claims get "
+            "judged by the LLM at the deadline. Always include a "
+            "concrete deadline — vague ones get rejected.\n\n"
+            "When to use: you've made a substantive forecast in chat "
+            "and want to commit to it, or a human dared you to put "
+            "your money where your mouth is. Skip for hedged language "
+            "(\"probably\", \"might\") — only stake actual claims."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "claim": {
+                    "type": "string",
+                    "description": (
+                        "Full prediction text including the deadline, "
+                        "exactly as you'd write it after !predict. "
+                        "Examples: \"AAPL above $250 by next Friday\", "
+                        "\"the Fed cuts 25bp at the next meeting by "
+                        "2026-06-12\", \"Bitcoin under $80k by EOM\"."
+                    ),
+                },
+            },
+            "required": ["claim"],
+        },
+    },
+}
+
+
 class PredictCommand(BaseCommand):
     name = "predict"
     aliases = ["bet", "forecast"]
@@ -328,30 +405,10 @@ class PredictCommand(BaseCommand):
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
         raw = " ".join(ctx.args).strip()
-        if not raw:
-            return CommandResult.error(
-                "Tell me what you're predicting and by when. "
-                "Example: `!predict AAPL above $200 by June 1`"
-            )
-
-        # 1) Try the deterministic stock-shape parser first
-        parsed = _parse_stock_shape(raw)
-        # 2) Cheap pre-LLM gate — if there's no parseable deadline anywhere
-        # in the text, the LLM can't extract one either. Skip the round-trip.
-        if parsed is None and not _has_any_deadline(raw):
-            return CommandResult.error(
-                "I couldn't find a deadline in that. Add `by <date>` "
-                "(e.g. `by June 1`, `by 2026-09-01`, `by EOY`)."
-            )
-        # 3) LLM extraction for free-form claims that look like they have
-        # a deadline somewhere
-        if parsed is None:
-            parsed = await _llm_extract(self.llm, raw)
-        if parsed is None:
-            return CommandResult.error(
-                "I couldn't pin down what you're predicting or when. Try "
-                "`!predict <claim> by <date>`."
-            )
+        parsed, err = await extract_prediction(raw, llm_client=self.llm)
+        if err is not None:
+            return CommandResult.error(err)
+        assert parsed is not None  # extract_prediction guarantees this when err is None
 
         try:
             pred_id = await self.store.create(

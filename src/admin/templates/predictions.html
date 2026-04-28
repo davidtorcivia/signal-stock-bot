@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% block title %}Predictions{% endblock %}
+{% block content %}
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, msg in messages %}
+      <div class="{{ 'ok' if category == 'ok' else 'error' }}">{{ msg }}</div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+{% if not available %}
+<div class="panel">
+    <h1>Predictions</h1>
+    <p class="muted">Prediction store not configured.</p>
+</div>
+{% else %}
+
+{# ── Aggregate counters ──────────────────────────────────────────── #}
+<div class="panel">
+    <h2>Predictions — overall</h2>
+    {% set c = counts %}
+    <table>
+        <tr>
+            <th>Total logged</th>
+            <td>{{ c.total or 0 }}</td>
+        </tr>
+        <tr>
+            <th>Pending</th>
+            <td>
+                {{ c.pending or 0 }}
+                {% if c.pending %}
+                    <span class="muted" style="margin-left: 12px;">awaiting deadline</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Resolved</th>
+            <td>
+                {{ c.resolved or 0 }}
+                {% if c.resolved %}
+                    <span class="muted" style="margin-left: 12px;">
+                        ✅ {{ c.right or 0 }} &nbsp;·&nbsp;
+                        ❌ {{ c.wrong or 0 }} &nbsp;·&nbsp;
+                        🤷 {{ c.unclear or 0 }}
+                    </span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Expired</th>
+            <td>
+                {{ c.expired or 0 }}
+                {% if c.expired %}
+                    <span class="muted" style="margin-left: 12px;">resolver gave up; doesn't score</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Overall accuracy</th>
+            <td>
+                {% if c.accuracy is not none %}
+                    {{ '%.0f'|format(c.accuracy * 100) }}% &nbsp;<span class="muted">({{ c.right }}/{{ (c.right or 0) + (c.wrong or 0) }} judged)</span>
+                {% else %}
+                    <span class="muted">no resolved predictions yet</span>
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+</div>
+
+{# ── Per-context leaderboards ────────────────────────────────────── #}
+<div class="panel">
+    <h2>Leaderboards</h2>
+    {% if not leaderboards %}
+        <p class="muted">No predictions logged yet. Try <code>!predict AAPL above $200 by June 1</code> in a chat.</p>
+    {% else %}
+        {% for lb in leaderboards %}
+            <h3 style="margin-top: 18px; font-size: 13px;">
+                {{ lb.context_label }}
+                <span class="muted" style="font-weight: normal; margin-left: 8px;">
+                    {{ lb.total }} total
+                    {% if lb.pending_total %} &nbsp;·&nbsp; {{ lb.pending_total }} pending{% endif %}
+                </span>
+            </h3>
+            {% if lb.entries %}
+            <table>
+                <thead>
+                    <tr><th>#</th><th>User</th><th>Right / Judged</th><th>Accuracy</th><th>Pending</th></tr>
+                </thead>
+                <tbody>
+                {% for e in lb.entries %}
+                    <tr>
+                        <td>{{ loop.index }}</td>
+                        <td>{{ e.label }}</td>
+                        <td>{{ e.right }} / {{ e.judged }}</td>
+                        <td>
+                            {% if e.accuracy is not none %}
+                                {{ '%.0f'|format(e.accuracy * 100) }}%
+                            {% else %}
+                                <span class="muted">—</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ e.pending or 0 }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+                <p class="muted" style="margin-left: 4px;">No resolved predictions yet — {{ lb.pending_total }} still pending.</p>
+            {% endif %}
+        {% endfor %}
+    {% endif %}
+</div>
+
+{# Inline form snippet — repeated for upcoming + recent rows. Renders a
+   compact "Resolve now / override / revert" cluster scoped to one
+   prediction. Buttons are styled as plain text links to keep the table
+   scannable; styles below. #}
+{% macro action_cell(p) -%}
+    <div class="pred-actions">
+        {% if p.status == 'pending' %}
+            <form method="post" action="{{ url_for('admin.predictions_resolve_now', pred_id=p.id) }}" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="action-link" title="Trigger Sigil to settle this prediction now">resolve now</button>
+            </form>
+        {% else %}
+            <form method="post" action="{{ url_for('admin.predictions_revert', pred_id=p.id) }}" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="action-link" title="Send back to pending so the auto-resolver re-judges">revert</button>
+            </form>
+        {% endif %}
+        <form method="post" action="{{ url_for('admin.predictions_override', pred_id=p.id) }}" class="override-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <select name="verdict">
+                <option value="right" {{ 'selected' if p.verdict == 'right' }}>right</option>
+                <option value="wrong" {{ 'selected' if p.verdict == 'wrong' }}>wrong</option>
+                <option value="unclear" {{ 'selected' if p.verdict == 'unclear' }}>unclear</option>
+            </select>
+            <input type="text" name="note" placeholder="reason (optional)" value="{{ p.resolution_note or '' }}">
+            <button type="submit" class="action-link" title="Force-set the verdict (works on any status)">override</button>
+        </form>
+    </div>
+{%- endmacro %}
+
+<style>
+  .pred-actions { display: flex; flex-direction: column; gap: 4px; min-width: 280px; }
+  .action-link {
+    background: none; border: 0; color: var(--accent); padding: 0;
+    font: inherit; cursor: pointer; text-decoration: underline;
+  }
+  .action-link:hover { opacity: 0.8; }
+  .override-form { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .override-form select { padding: 2px 4px; background: #0b0d10; color: var(--text);
+    border: 1px solid var(--border); border-radius: 3px; font: inherit; font-size: 12px; }
+  .override-form input[type="text"] { width: 130px; padding: 2px 6px; font-size: 12px; }
+</style>
+
+{# ── Upcoming pending ────────────────────────────────────────────── #}
+<div class="panel">
+    <h2>Upcoming deadlines</h2>
+    {% if not upcoming %}
+        <p class="muted">No pending predictions.</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr><th>#</th><th>Due</th><th>User</th><th>Claim</th><th>Chat</th><th>Actions</th></tr>
+            </thead>
+            <tbody>
+            {% for p in upcoming %}
+                <tr>
+                    <td>{{ p.id }}</td>
+                    <td>
+                        {{ p.deadline_iso }}
+                        {% if p.deadline_rel %}
+                            <span class="muted" style="margin-left: 6px;">({{ p.deadline_rel }})</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ p.user_label }}</td>
+                    <td>
+                        {{ p.claim|truncate(80) }}
+                        {% if p.is_structured %}
+                            <span class="muted" style="margin-left: 6px;">[{{ p.ticker }} {{ p.direction }} {{ p.threshold }}]</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="muted">{{ p.context_label }}</span></td>
+                    <td>{{ action_cell(p) }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+</div>
+
+{# ── Recently logged (any status) ─────────────────────────────────── #}
+<div class="panel">
+    <h2>Recent</h2>
+    {% if not recent %}
+        <p class="muted">Nothing recent.</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr><th>#</th><th>User</th><th>Claim</th><th>Status</th><th>Verdict</th><th>Chat</th><th>Actions</th></tr>
+            </thead>
+            <tbody>
+            {% for p in recent %}
+                <tr>
+                    <td>{{ p.id }}</td>
+                    <td>{{ p.user_label }}</td>
+                    <td>{{ p.claim|truncate(80) }}</td>
+                    <td>
+                        {% if p.status == 'pending' %}
+                            <span class="muted">pending</span>
+                            {% if p.deadline_rel %} ({{ p.deadline_rel }}){% endif %}
+                        {% elif p.status == 'resolved' %}
+                            resolved
+                        {% else %}
+                            <span class="muted">{{ p.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if p.verdict == 'right' %}
+                            <span class="dot-ok">✅ right</span>
+                        {% elif p.verdict == 'wrong' %}
+                            <span class="dot-bad">❌ wrong</span>
+                        {% elif p.verdict == 'unclear' %}
+                            🤷
+                        {% else %}
+                            <span class="muted">—</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="muted">{{ p.context_label }}</span></td>
+                    <td>{{ action_cell(p) }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}

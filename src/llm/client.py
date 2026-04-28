@@ -42,6 +42,47 @@ DEFAULT_RESPONSE_STYLE = (
 )
 
 
+_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+
+
+def build_provider_routing(
+    *,
+    order: Optional[str],
+    only: bool,
+    sort: Optional[str],
+) -> Optional[dict]:
+    """Compose an OpenRouter `provider` field from admin settings.
+
+    OpenRouter's provider routing lets you pin which upstream
+    inference provider serves the request — useful when the named
+    model has wildly different latency profiles between providers
+    (e.g. Cerebras vs. a slow general-purpose host). See:
+    openrouter.ai/docs/features/provider-routing
+
+    Returns None when nothing is configured so the caller can skip
+    adding the field (default OpenRouter routing wins).
+
+    Behavior:
+      - `order`: comma/space-separated provider names → `provider.order`
+      - `only`: when True AND `order` is non-empty, sets
+        `allow_fallbacks: false` so the request fails rather than
+        silently routing to a slower provider
+      - `sort`: one of throughput/latency/price → `provider.sort`
+    """
+    out: dict = {}
+    if order:
+        names = [p.strip() for p in order.replace(",", " ").split() if p.strip()]
+        if names:
+            out["order"] = names
+            if only:
+                out["allow_fallbacks"] = False
+    if sort:
+        s = sort.strip().lower()
+        if s in _PROVIDER_SORT_VALUES:
+            out["sort"] = s
+    return out or None
+
+
 class LLMError(Exception):
     """Upstream API returned an error."""
 
@@ -187,6 +228,23 @@ class LLMClient:
                 logger.warning(f"extra_body is not valid JSON, ignoring: {e}")
         elif isinstance(extra_raw, dict) and extra_raw:
             payload.update(extra_raw)
+
+        # OpenRouter provider routing — applied after extra_body so a power
+        # user who put `"provider": {...}` into extra_body keeps full
+        # control. Without this, "fast provider only" would have to be
+        # hand-typed JSON in the extra-body field every time. Applies to
+        # every call going through this client (writer + reactor +
+        # augmentation + extraction), since they all benefit from a fast
+        # upstream. Deep-think has its own client and is intentionally
+        # excluded — that path is meant to be slow/smart.
+        if "provider" not in payload:
+            provider = build_provider_routing(
+                order=self.store.get("llm_provider_order"),
+                only=bool(self.store.get("llm_provider_only", False)),
+                sort=self.store.get("llm_provider_sort"),
+            )
+            if provider:
+                payload["provider"] = provider
         headers = {
             "Authorization": f"Bearer {cfg['api_key']}",
             "Content-Type": "application/json",
