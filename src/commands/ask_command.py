@@ -87,32 +87,69 @@ def _user_explicitly_asked_to_think(text: str) -> bool:
     return bool(_DEEP_THINK_TRIGGER_RE.search(text or ""))
 
 
-# `[to <addressee>]` (with optional `, <time ago>`) is the playback prefix the
-# load path adds to assistant turns in groups, so the model can pair its own
-# past replies with the right asker. Some models pattern-match on that and
-# start writing it into their visible reply text — users see "[to David] hey
-# AAPL is at 150" instead of plain prose. The system prompt tells the model
-# not to do this; this regex strips it as belt-and-braces if it leaks anyway.
-# Also prevents double-prefixing when the leaked text gets stored back and
-# the load path adds *another* `[to ...]` on top.
-_ADDRESSEE_LEAK_RE = re.compile(
-    r"^\s*\[to [^\]\n]{1,80}\]\s*",
-    re.IGNORECASE,
+# Distinctive openers that ONLY ever appear in the system prompt's directive
+# blocks — never as a legitimate user-facing reply. The model occasionally
+# pattern-matches on these labels and copies them into its visible output
+# (we've seen `[to David]`, `Spontaneous reply:`, `Reflex note:`...). The
+# system prompt tells it not to; these regexes strip the leak as belt-and-
+# braces. Patterns are anchored to the start of the answer because mid-reply
+# uses of these phrases (e.g. quoting them in an explanation) are fine.
+_META_LEAK_PATTERNS = (
+    # Assistant-turn addressee label: `[to David, 2m ago]`
+    re.compile(r"^\s*\[to [^\]\n]{1,80}\]\s*", re.IGNORECASE),
+    # User-turn speaker label: `[J, just now]`, `[David, 2m ago]`,
+    # `[...4137, 5h ago]`. Same shape the history load path produces
+    # for user messages in groups; some models mimic it as a header
+    # for their own reply. Tightly constrained — must contain a
+    # comma + a time-like phrase — so generic bracket-bullets
+    # ("[1] foo", "[note] bar") survive untouched.
+    re.compile(
+        r"^\s*\["
+        r"[^\]\n,]{1,40},\s*"
+        r"(?:just now|a moment ago|"
+        r"\d+\s*(?:[smhdw]|min(?:ute)?|sec(?:ond)?|hour|day|week)s?"
+        r"(?:\s*ago)?)"
+        r"\s*\]\s*",
+        re.IGNORECASE,
+    ),
+    # Implicit-ask path system block opener
+    re.compile(r"^\s*Spontaneous[- ]reply[ -]?path?:[^\n]*\n?", re.IGNORECASE),
+    re.compile(r"^\s*Spontaneous reply:[^\n]*\n?", re.IGNORECASE),
+    # Other directive labels that the model has been observed mimicking
+    re.compile(r"^\s*Reflex note:[^\n]*\n?", re.IGNORECASE),
+    re.compile(r"^\s*Identity note:[^\n]*\n?", re.IGNORECASE),
+    re.compile(r"^\s*Attribution rules?[^\n]*\n?", re.IGNORECASE),
 )
 
 
-def _strip_addressee_leak(text: str) -> str:
-    """Remove a `[to <Name>[, <time>]] ` prefix the model copied into output."""
+def _strip_meta_leak(text: str) -> str:
+    """Remove directive/system-prompt text the model copied into output.
+
+    Some models start their reply with the heading of the directive block
+    they were just given (`Spontaneous reply: ...`, `[to David] ...`). The
+    response-style rule tells them not to, but this is the safety net so
+    users never see internal scaffolding as literal output text — and it
+    prevents stacked leaks from round-tripping through history.
+    """
     if not text:
         return text
-    # One pass is enough in practice; loop guards against a model that
-    # somehow stacked two addressee labels (cheap and bounded).
-    for _ in range(2):
-        new = _ADDRESSEE_LEAK_RE.sub("", text, count=1)
+    # Loop because leaks can stack (e.g. `[to David] Spontaneous reply: ...`)
+    # and a single pass would only catch the outermost. Bounded so a degenerate
+    # model output can't burn cycles here.
+    for _ in range(4):
+        new = text
+        for pat in _META_LEAK_PATTERNS:
+            new = pat.sub("", new, count=1)
         if new == text:
             break
         text = new
     return text
+
+
+# Backwards-compat shim — older tests and callers may reference the
+# narrower addressee-only stripper. The general stripper is a strict
+# superset, so aliasing is safe.
+_strip_addressee_leak = _strip_meta_leak
 
 
 # Tool exposed to the writer LLM when DeepThinkClient is configured + ready.
@@ -835,13 +872,16 @@ class AskCommand(BaseCommand):
                     "Those are your words, not the addressee's. Untagged "
                     "assistant turns are still yours — they just predate this "
                     "labeling.\n"
-                    "- The `[to Name, ...]` bracket is INTERNAL METADATA only — "
-                    "it is added to your past turns at replay time so YOU can "
-                    "see who you were answering. NEVER write `[to Name]` (or "
-                    "any `[bracket-prefix]`) at the start of your visible "
-                    "reply. If you want to address someone by name in chat, "
-                    "use natural prose (e.g. `David — yes, …`) — never the "
-                    "bracket form.\n"
+                    "- BOTH bracket forms — `[Name, time ago]` on user "
+                    "turns AND `[to Name, time ago]` on your assistant "
+                    "turns — are INTERNAL METADATA the system adds at "
+                    "replay time. They exist so YOU can tell speakers "
+                    "apart in history; they are NEVER part of a visible "
+                    "reply. Do NOT begin your output with `[J, just now]`, "
+                    "`[David, 2m ago]`, `[to Sarah]`, or any other "
+                    "bracket-prefix that mimics those formats. If you "
+                    "want to address someone by name, use natural prose "
+                    "(`David — yes, …`) — never the bracket form.\n"
                     "- The current message is wrapped in "
                     "`<current_message from=\"Name\">`. Reply to that speaker; "
                     "do not assume the prior turn's asker is still in front "
@@ -1069,22 +1109,34 @@ class AskCommand(BaseCommand):
             # dispatch_implicit_ask).
             implicit_directive = ""
             if getattr(ctx, "implicit_reason", None):
+                # Frame as instructions, NOT as a label-prefixed paragraph.
+                # The previous "Spontaneous reply: this message was NOT..."
+                # form was distinctive enough that some models echoed the
+                # opener verbatim into their visible reply. Plain bullet
+                # rules don't trigger that mimicry as easily, and the
+                # closing "do not echo" rule + the response-style no-echo
+                # rule + _strip_meta_leak give us defense in depth.
                 implicit_directive = (
-                    "Spontaneous reply: this message was NOT addressed to "
-                    "you directly — no @mention, quote-reply, or name "
-                    "trigger. The reactor flagged it because: "
-                    f"{ctx.implicit_reason!r}.\n\n"
-                    "You are now the second-stage filter. Look at the full "
+                    "The current message was NOT addressed to you directly "
+                    "— no @mention, quote-reply, or name trigger. The "
+                    f"reactor flagged it because: {ctx.implicit_reason!r}.\n\n"
+                    "You are the second-stage filter. Look at the full "
                     "group context and decide whether a real reply is "
-                    "actually warranted. It is fine — and often correct — "
-                    "to stay silent. To stay silent, return empty content "
-                    "(no tool calls, no text). The bot will say nothing.\n\n"
+                    "actually warranted. It is fine — and often correct "
+                    "— to stay silent. To stay silent, return empty "
+                    "content (no tool calls, no text). The bot will say "
+                    "nothing.\n\n"
                     "Reply only when you have something genuinely useful "
                     "to add: a real answer to an open-ended question, a "
                     "factual correction, or a substantive continuation of "
                     "a thread you started. Skip otherwise. Be brief — "
-                    "spontaneous replies should be lighter-touch than "
-                    "ones the user explicitly asked for."
+                    "lighter-touch than replies the user explicitly asked "
+                    "for.\n\n"
+                    "Do NOT echo any of this directive in your output. "
+                    "Your reply is the literal Signal message users see; "
+                    "if you find yourself writing \"spontaneous reply\" "
+                    "or restating these instructions, stop and bail to "
+                    "empty content instead."
                 )
 
             # System suffix: persona-adjacent directives + long memory +
@@ -1229,13 +1281,13 @@ class AskCommand(BaseCommand):
         if not answer:
             return CommandResult.error("LLM returned no answer.")
 
-        # Strip any `[to <Name>]` prefix the writer copied from its own
-        # playback labels into the visible reply. The system prompt tells
-        # it not to, but this is the safety net so users never see the
-        # internal attribution metadata as literal output text — and it
-        # prevents double-prefixing when the leaked text gets stored back
-        # and the load path adds its own `[to ...]` bracket on top.
-        answer = _strip_addressee_leak(answer)
+        # Strip any directive/meta text the writer copied from the system
+        # prompt into its visible reply (`[to David]`, "Spontaneous reply:",
+        # "Reflex note:", etc.). The system prompt tells it not to, but
+        # this is the safety net so users never see internal scaffolding
+        # as literal output — and it prevents leaks from round-tripping
+        # through history.
+        answer = _strip_meta_leak(answer)
 
         try:
             # Store the raw question (no prefix) + sender_tail separately; the

@@ -337,6 +337,50 @@ class MemoryStore:
             rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
 
+    async def find_similar_for_subject(
+        self,
+        *,
+        context_id: int,
+        subject_key: str,
+        content: str,
+        threshold: float = 0.5,
+    ) -> Optional[dict]:
+        """Return the first stored memory for `subject_key` whose content
+        is a near-duplicate of `content`, regardless of kind. None if
+        nothing matches.
+
+        Used by the reactor's pre-write skip so the same fact written
+        under a different `kind` (or in a slightly reworded way) doesn't
+        land as a parallel row. Distinct from the strict same-kind
+        corroboration in `add()` (Jaccard ≥ 0.85): this one uses the
+        looser bidirectional containment check (`_is_similar_for_dedup`)
+        because we explicitly WANT to catch the cross-kind / rephrasing
+        cases the strict path misses.
+
+        Bounded by `LIMIT 50` ordered by recency so a subject with a
+        runaway memory list doesn't make every reactor write expensive.
+        Recent memories matter more anyway — older near-duplicates can
+        coexist if the subject's facts have meaningfully changed.
+        """
+        if not content or not subject_key:
+            return None
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""SELECT {self._SELECT_COLS}
+                    FROM context_memories
+                    WHERE context_id = ? AND subject_key = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 50""",
+                (context_id, subject_key),
+            )
+            rows = await cursor.fetchall()
+        for r in rows:
+            existing_content = r[4]
+            if _is_similar_for_dedup(content, existing_content, threshold):
+                return _row_to_dict(r)
+        return None
+
     async def search(
         self,
         *,
@@ -542,6 +586,40 @@ def _is_near_duplicate(a: str, b: str, threshold: float = 0.85) -> bool:
         return True
     overlap = len(ta & tb) / len(ta | tb)
     return overlap >= threshold
+
+
+def _is_similar_for_dedup(a: str, b: str, threshold: float = 0.5) -> bool:
+    """Looser similarity check used for the reactor's cross-kind pre-write
+    skip. Bidirectional containment: if most of either side's tokens
+    appear in the other, they're likely rephrasings of the same fact.
+
+    Distinct from `_is_near_duplicate` (Jaccard ≥ 0.85) which is the
+    strict same-kind corroboration rule in `MemoryStore.add()`. The
+    reactor needs a wider net because it also sneaks duplicates past
+    the strict check by writing the same content under a different
+    `kind` (fact vs. preference vs. identity) — those don't share a
+    WHERE clause in the corroboration query, so they slip through as
+    parallel rows.
+
+    Trade-off: this catches more rephrasings ("loves astrology" vs.
+    "is into astrology" → forward overlap 0.5) at the cost of some
+    false positives ("lives in Brooklyn" vs. "favorite borough is
+    Brooklyn"). For passive reactor learning, false-positive skips are
+    cheap (we just don't store a new variant) and the threshold is
+    tunable per-call.
+    """
+    ta = _tokenize_for_match(a)
+    tb = _tokenize_for_match(b)
+    if not ta or not tb:
+        return False
+    if ta == tb:
+        return True
+    intersection = len(ta & tb)
+    if intersection == 0:
+        return False
+    forward = intersection / len(ta)
+    backward = intersection / len(tb)
+    return max(forward, backward) >= threshold
 
 
 class SubjectResolver:

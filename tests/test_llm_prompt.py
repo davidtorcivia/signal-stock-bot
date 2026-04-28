@@ -13,6 +13,7 @@ import pytest
 
 from src.commands.ask_command import (
     _strip_addressee_leak,
+    _strip_meta_leak,
     _wrap_xml,
     STALENESS_THRESHOLD_SECONDS,
 )
@@ -119,6 +120,111 @@ def test_strip_addressee_leak_doesnt_eat_other_brackets():
 def test_strip_addressee_leak_empty_input():
     assert _strip_addressee_leak("") == ""
     assert _strip_addressee_leak(None) is None  # type: ignore[arg-type]
+
+
+# ---------- _strip_meta_leak (general directive-text leaks) ------------------
+
+def test_strip_meta_leak_spontaneous_reply_opener():
+    """The implicit-ask directive used to start with `Spontaneous reply:` —
+    some models echoed that opener verbatim into their visible output."""
+    leaked = (
+        "Spontaneous reply: this message was NOT addressed to you directly\n"
+        "Hey, AAPL just hit 250."
+    )
+    assert _strip_meta_leak(leaked) == "Hey, AAPL just hit 250."
+
+
+def test_strip_meta_leak_spontaneous_reply_path_variant():
+    # The post-fix directive uses "spontaneous-reply path" — also strip if
+    # the model parrots that phrasing.
+    leaked = "spontaneous-reply path: ok\nReal answer here."
+    out = _strip_meta_leak(leaked)
+    assert "spontaneous" not in out.lower()
+    assert "Real answer here." in out
+
+
+def test_strip_meta_leak_other_directive_labels():
+    # Each of these is a known directive-block opener; none should ever
+    # legitimately start a reply.
+    for opener in (
+        "Reflex note: emoji reactions are mine\nReal text",
+        "Identity note: registered names available\nReal text",
+        "Attribution rules: this is multi-speaker\nReal text",
+    ):
+        out = _strip_meta_leak(opener)
+        assert out.strip().startswith("Real text"), f"didn't strip: {opener!r}"
+
+
+def test_strip_meta_leak_stacked_leaks():
+    """Sometimes the model stacks an addressee bracket AND a directive
+    label. Both come off."""
+    leaked = "[to David, 2m ago] Spontaneous reply: hey\nthe price is $150"
+    out = _strip_meta_leak(leaked)
+    assert "Spontaneous" not in out
+    assert "[to" not in out
+    assert "the price is $150" in out
+
+
+def test_strip_meta_leak_mid_reply_quotation_preserved():
+    # If the bot legitimately quotes one of these phrases mid-reply (e.g.
+    # explaining what `[to ...]` is), that's not a leak — only leading
+    # matches are stripped.
+    answer = "Sure — `[to David]` means the addressee is David."
+    assert _strip_meta_leak(answer) == answer
+
+
+def test_strip_meta_leak_passthrough():
+    assert _strip_meta_leak("hello there") == "hello there"
+    assert _strip_meta_leak("") == ""
+
+
+def test_strip_meta_leak_user_turn_speaker_bracket():
+    """The actual leak observed in production: the model echoed the
+    user-turn `[Name, time]` format from history playback into its
+    own reply. Real example: `[J, just now] That tracks. ...`"""
+    leaked = (
+        "[J, just now] That tracks. The Pirate Party is the only "
+        "platform that requires you to read the manifesto cover to cover."
+    )
+    out = _strip_meta_leak(leaked)
+    assert out.startswith("That tracks.")
+    assert "[J, just now]" not in out
+
+
+def test_strip_meta_leak_user_turn_with_minutes_ago():
+    assert (
+        _strip_meta_leak("[David, 2m ago] hey there")
+        == "hey there"
+    )
+
+
+def test_strip_meta_leak_user_turn_with_tail_form():
+    assert (
+        _strip_meta_leak("[...4137, 5h ago] sure")
+        == "sure"
+    )
+
+
+def test_strip_meta_leak_user_turn_paraphrased_time():
+    """The model sometimes paraphrases the time ('a moment ago',
+    '5 minutes ago') instead of the canonical short form. Strip those too."""
+    assert (
+        _strip_meta_leak("[Sarah, a moment ago] yo")
+        == "yo"
+    )
+    assert (
+        _strip_meta_leak("[Sarah, 5 minutes ago] yo")
+        == "yo"
+    )
+
+
+def test_strip_meta_leak_does_not_eat_legit_bracket_pairs():
+    """Sanity: the comma+time constraint protects against accidentally
+    stripping legitimate `[X, Y]` pairs that aren't time-shaped."""
+    # A footnote-style citation should survive.
+    assert _strip_meta_leak("[Ref, p.42] details") == "[Ref, p.42] details"
+    # A title in brackets, no time-shape, also survives.
+    assert _strip_meta_leak("[Q1, 2026] earnings") == "[Q1, 2026] earnings"
 
 
 # ---------- staleness threshold ----------------------------------------------

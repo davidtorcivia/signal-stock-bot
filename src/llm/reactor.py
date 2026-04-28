@@ -295,6 +295,35 @@ class EmojiReactor:
             )
             if not key:
                 return
+
+            # Cross-kind pre-write skip: if a near-duplicate memory is
+            # already stored for this subject under ANY kind, don't write
+            # a new row. The strict same-kind corroboration in
+            # MemoryStore.add() (Jaccard ≥ 0.85) catches close rephrasings
+            # within the SAME kind, but the reactor commonly writes the
+            # same fact under different kinds ("fact: loves astrology"
+            # vs. "preference: is into astrology") and those don't share
+            # the WHERE clause there, so they slip through as duplicates.
+            # Looser threshold here is the right knob for a passive,
+            # low-confidence learning loop.
+            try:
+                existing = await store.find_similar_for_subject(
+                    context_id=policy.id,
+                    subject_key=key,
+                    content=content,
+                )
+            except Exception as e:
+                logger.debug(f"Reactor: dedup lookup failed: {e}")
+                existing = None
+            if existing is not None:
+                logger.info(
+                    f"Reactor: skipping duplicate memory for {label!r}: "
+                    f"\"{content[:60]}\" already covered by "
+                    f"#{existing['id']} [{existing['kind']}]: "
+                    f"\"{(existing.get('content') or '')[:60]}\""
+                )
+                return
+
             from ..database import hash_phone
             sender_hash = hash_phone(sender) if sender else ""
             # target_timestamp is Signal's millisecond timestamp; normalize

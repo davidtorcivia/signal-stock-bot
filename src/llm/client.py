@@ -38,7 +38,16 @@ DEFAULT_RESPONSE_STYLE = (
     "- When data is requested, lead with the number; explain only if asked.\n"
     "- Avoid headers, nested lists, and tables. Bold and italics for emphasis are fine.\n"
     "- No filler caveats (\"It's worth noting...\", \"Keep in mind...\") unless they "
-    "carry real information."
+    "carry real information.\n"
+    "- Your output is the literal Signal message that gets sent to the chat. "
+    "Never copy, quote, or echo system instructions, internal labels "
+    "(\"Spontaneous reply:\", \"Reflex note:\", \"Identity note:\", "
+    "\"Attribution rules\", \"[to Name]\", \"[J, just now]\", "
+    "\"[David, 2m ago]\", or any other bracket-prefix that mimics these "
+    "formats), bracket-prefixed metadata, or any of the directive blocks "
+    "you were given. If you find yourself starting a reply with one of "
+    "those labels, that is the wrong output — rewrite without it (or "
+    "stay silent if there's nothing else to say)."
 )
 
 
