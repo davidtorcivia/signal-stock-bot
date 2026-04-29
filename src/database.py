@@ -20,6 +20,57 @@ def hash_phone(phone: str) -> str:
     return hashlib.sha256(phone.encode()).hexdigest()
 
 
+async def apply_db_pragmas(db) -> None:
+    """Apply tuning pragmas. WAL is sticky on the file (set once, persists);
+    synchronous=NORMAL is per-connection. Cheap to call repeatedly in
+    `_ensure_initialized`. Concrete wins: writers no longer block readers
+    (WAL), and write fsync drops from per-commit to per-checkpoint
+    (NORMAL). Safe — NORMAL still survives crashes; only catastrophic
+    power-loss-mid-fsync can lose the *last* committed transaction."""
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+
+
+class _DBContext:
+    """Async context manager that ensures the store is initialized then
+    yields an aiosqlite connection. Replaces the
+        async with db_session(self) as db:
+            ...
+    pattern at every store call site. Bound to a store via
+    `db_session(store)`; commits are still the caller's responsibility
+    (so read-only queries don't pay the commit cost)."""
+
+    def __init__(self, store) -> None:
+        self._store = store
+        self._cm = None
+        self._db = None
+
+    async def __aenter__(self):
+        await self._store._ensure_initialized()
+        self._cm = aiosqlite.connect(self._store.db_path)
+        self._db = await self._cm.__aenter__()
+        return self._db
+
+    async def __aexit__(self, exc_type, exc, tb):
+        cm = self._cm
+        self._db = None
+        self._cm = None
+        if cm is not None:
+            return await cm.__aexit__(exc_type, exc, tb)
+        return False
+
+
+def db_session(store) -> "_DBContext":
+    """Open a connection on `store.db_path` after ensuring the schema
+    exists. The store must expose `db_path` and `_ensure_initialized`.
+
+        async with db_session(self) as db:
+            await db.execute("...")
+            await db.commit()
+    """
+    return _DBContext(store)
+
+
 class WatchlistDB:
     """
     SQLite-backed watchlist storage.
@@ -43,6 +94,7 @@ class WatchlistDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
         async with aiosqlite.connect(self.db_path) as db:
+            await apply_db_pragmas(db)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS watchlists (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +105,7 @@ class WatchlistDB:
                 )
             """)
             await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_hash 
+                CREATE INDEX IF NOT EXISTS idx_user_hash
                 ON watchlists(user_hash)
             """)
             await db.commit()
@@ -98,9 +150,7 @@ class WatchlistDB:
     
     async def remove_symbol(self, user_hash: str, symbol: str) -> bool:
         """Remove a symbol from user's watchlist. Returns True if removed."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM watchlists WHERE user_hash = ? AND symbol = ?",
                 (user_hash, symbol.upper())
@@ -110,9 +160,7 @@ class WatchlistDB:
     
     async def get_watchlist(self, user_hash: str) -> list[str]:
         """Get all symbols in user's watchlist, ordered by when they were added."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT symbol FROM watchlists WHERE user_hash = ? ORDER BY added_at",
                 (user_hash,)
@@ -122,9 +170,7 @@ class WatchlistDB:
     
     async def clear(self, user_hash: str) -> int:
         """Clear all symbols from user's watchlist. Returns count removed."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM watchlists WHERE user_hash = ?",
                 (user_hash,)
@@ -134,9 +180,7 @@ class WatchlistDB:
     
     async def count(self, user_hash: str) -> int:
         """Get count of symbols in user's watchlist."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM watchlists WHERE user_hash = ?",
                 (user_hash,)
@@ -167,6 +211,7 @@ class AlertsDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
         async with aiosqlite.connect(self.db_path) as db:
+            await apply_db_pragmas(db)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,9 +281,7 @@ class AlertsDB:
     
     async def get_active_alerts(self, user_hash: str) -> list[dict]:
         """Get all active alerts for a user."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """SELECT id, symbol, condition, target_value, group_id, created_at
                    FROM alerts 
@@ -261,9 +304,7 @@ class AlertsDB:
     
     async def get_all_active_alerts(self) -> list[dict]:
         """Get all active alerts across all users (for background worker)."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """SELECT id, user_hash, user_phone, symbol, condition, target_value, group_id
                    FROM alerts 
@@ -291,9 +332,7 @@ class AlertsDB:
             alert_id: Alert ID
             user_hash: If provided, only remove if owned by this user (security)
         """
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             if user_hash:
                 cursor = await db.execute(
                     "DELETE FROM alerts WHERE id = ? AND user_hash = ?",
@@ -310,9 +349,7 @@ class AlertsDB:
     
     async def trigger_alert(self, alert_id: int) -> bool:
         """Mark an alert as triggered (deactivates it)."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """UPDATE alerts 
                    SET active = 0, triggered_at = CURRENT_TIMESTAMP
@@ -324,9 +361,7 @@ class AlertsDB:
     
     async def count_active(self, user_hash: str) -> int:
         """Count active alerts for a user."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM alerts WHERE user_hash = ? AND active = 1",
                 (user_hash,)
@@ -336,9 +371,7 @@ class AlertsDB:
     
     async def clear_user_alerts(self, user_hash: str) -> int:
         """Clear all alerts for a user."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM alerts WHERE user_hash = ?",
                 (user_hash,)

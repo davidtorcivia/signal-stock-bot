@@ -2,6 +2,24 @@
 {% block title %}Dashboard{% endblock %}
 {% block content %}
 
+{# ── Window selector ─────────────────────────────────────────────── #}
+{# LLM, deep-think, and reactor stats below render the selected
+   time window from the persistent metric_events log. Cache hit-rate
+   and uptime are inherently process-local and stay as since-boot. #}
+<div class="panel" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+    <span style="font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Window</span>
+    {% for opt in metrics.window_options or ['24h', '7d', '30d'] %}
+        {% if opt == metrics.window_key %}
+            <strong style="padding: 4px 10px; border: 1px solid var(--accent, #888); border-radius: 4px;">{{ opt }}</strong>
+        {% else %}
+            <a href="?window={{ opt }}" style="padding: 4px 10px; border: 1px solid var(--muted); border-radius: 4px; text-decoration: none;">{{ opt }}</a>
+        {% endif %}
+    {% endfor %}
+    <span class="muted" style="margin-left: auto; font-size: 11px;">
+        Persisted across restarts. Data older than 30d is pruned.
+    </span>
+</div>
+
 {# ── Health ──────────────────────────────────────────────────────── #}
 <div class="panel">
     <h2>Health</h2>
@@ -15,6 +33,10 @@
             <td>{{ '%.0f'|format(metrics.requests_per_minute) }}</td>
         </tr>
         <tr>
+            <th>Inbound msgs ({{ metrics.window_key }})</th>
+            <td>{{ '{:,}'.format(metrics.window_request_count or 0) }}</td>
+        </tr>
+        <tr>
             <th>Cache hit rate</th>
             <td>{{ metrics.cache.overall_hit_rate }}</td>
         </tr>
@@ -23,7 +45,7 @@
 
 {# ── LLM ─────────────────────────────────────────────────────────── #}
 <div class="panel">
-    <h2>LLM</h2>
+    <h2>LLM <span class="muted" style="font-size: 12px;">· {{ metrics.window_key }}</span></h2>
     {% set llm = metrics.llm %}
     <table>
         <tr>
@@ -41,11 +63,11 @@
         </tr>
         <tr>
             <th>Tokens</th>
-            <td>{{ '{:,}'.format(llm.tokens_in) }} in &nbsp;·&nbsp; {{ '{:,}'.format(llm.tokens_out) }} out</td>
+            <td>{{ '{:,}'.format(llm.tokens_in or 0) }} in &nbsp;·&nbsp; {{ '{:,}'.format(llm.tokens_out or 0) }} out</td>
         </tr>
         <tr>
             <th>Avg latency</th>
-            <td>{{ llm.avg_latency_ms }}ms</td>
+            <td>{% if llm.avg_latency_ms %}{{ '%.0f'|format(llm.avg_latency_ms) }}ms{% else %}—{% endif %}</td>
         </tr>
     </table>
 

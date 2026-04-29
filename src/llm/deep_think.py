@@ -143,7 +143,7 @@ class DeepThinkClient:
             return default
 
         return {
-            "enabled": bool(store.get("deep_think_enabled", False)),
+            "enabled": store.get_bool("deep_think_enabled", False),
             "base_url": _str("deep_think_base_url", "llm_base_url").strip().rstrip("/"),
             "api_key": _str("deep_think_api_key", "llm_api_key").strip(),
             "model": _str("deep_think_model", "llm_model").strip(),
@@ -152,11 +152,11 @@ class DeepThinkClient:
             "timeout": int(_num("deep_think_timeout_seconds", "llm_timeout_seconds", 120)),
             "extra_body": _str("deep_think_extra_body", "llm_extra_body"),
             "system_prompt": store.get("deep_think_system_prompt") or DEFAULT_DEEP_THINK_PROMPT,
-            "context_max_chars": int(store.get("deep_think_context_max_chars") or 8000),
-            "max_tool_rounds": int(store.get("deep_think_max_tool_rounds") or 15),
-            "caps_enabled": bool(store.get("deep_think_caps_enabled", False)),
-            "user_daily_cap": int(store.get("deep_think_user_daily_cap") or 0),
-            "group_daily_cap": int(store.get("deep_think_group_daily_cap") or 0),
+            "context_max_chars": store.get_int("deep_think_context_max_chars", 8000),
+            "max_tool_rounds": store.get_int("deep_think_max_tool_rounds", 15),
+            "caps_enabled": store.get_bool("deep_think_caps_enabled", False),
+            "user_daily_cap": store.get_int("deep_think_user_daily_cap", 0),
+            "group_daily_cap": store.get_int("deep_think_group_daily_cap", 0),
         }
 
     def status(self) -> dict:

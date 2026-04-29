@@ -155,20 +155,20 @@ class CommandDispatcher:
         """Pull live-editable values from the settings store."""
         if not self.settings_store:
             return
-        bot_name = self.settings_store.get("bot_name")
+        bot_name = self.settings_store.get_stripped("bot_name")
         if bot_name:
             self.bot_name = bot_name
-        rate_limit = self.settings_store.get("user_rate_limit")
-        if rate_limit:
-            self._rate_limiter.limit = int(rate_limit)
-        max_len = self.settings_store.get("max_message_length")
-        if max_len:
-            self.max_message_length = int(max_len)
+        self._rate_limiter.limit = self.settings_store.get_int(
+            "user_rate_limit", self._rate_limiter.limit, min_value=1,
+        )
+        self.max_message_length = self.settings_store.get_int(
+            "max_message_length", self.max_message_length, min_value=1,
+        )
 
         # Live alias for the !ask command — keeps the base name registered too.
         ask_cmd = self.commands.get("ask")
         if ask_cmd is not None:
-            alias = (self.settings_store.get("ask_command_name") or "").strip().lower()
+            alias = self.settings_store.get_stripped("ask_command_name").lower()
             if alias and alias != "ask" and self.commands.get(alias) is not ask_cmd:
                 self.commands[alias] = ask_cmd
     
@@ -290,13 +290,10 @@ class CommandDispatcher:
 
         # Record group messages for LLM context (only if feature is enabled).
         if self.group_log is not None and group_id:
-            try:
-                ctx_limit = int(
-                    (self.settings_store.get("group_context_messages") if self.settings_store else 0)
-                    or 0
-                )
-            except (TypeError, ValueError):
-                ctx_limit = 0
+            ctx_limit = (
+                self.settings_store.get_int("group_context_messages", 0, min_value=0)
+                if self.settings_store else 0
+            )
             if ctx_limit > 0:
                 try:
                     await self.group_log.append(group_id, sender, message)

@@ -330,6 +330,65 @@ def create_dispatcher(
     return dispatcher
 
 
+async def _metrics_flush_worker(interval_seconds: float = 10.0) -> None:
+    """Drain the in-memory metric event queue to SQLite every N seconds.
+
+    Buffered writes mean the dashboard sees data ~`interval_seconds`
+    behind real time, which is fine for a graph that updates on page
+    reload. The queue is bounded so even a stuck flusher can't OOM.
+    """
+    log = logging.getLogger(__name__)
+    from .metrics_log import get_metrics_log
+    metrics_log = get_metrics_log()
+    log.info(f"Metrics flush worker started (interval={interval_seconds}s)")
+    while True:
+        try:
+            written = await metrics_log.flush()
+            if written:
+                log.debug(f"Flushed {written} metric events")
+        except asyncio.CancelledError:
+            log.info("Metrics flush worker cancelled")
+            try:
+                await metrics_log.flush()  # final drain
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            log.error(f"Metrics flush error: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
+async def _metrics_prune_worker(
+    interval_seconds: float = 24 * 3600,
+    retention_seconds: float = 30 * 24 * 3600,
+) -> None:
+    """Drop metric events older than `retention_seconds` once a day.
+
+    30d matches the largest dashboard window so older events would never
+    be visible anyway. Capping retention keeps the table small and the
+    windowed queries fast.
+    """
+    log = logging.getLogger(__name__)
+    from .metrics_log import get_metrics_log
+    metrics_log = get_metrics_log()
+    log.info(
+        f"Metrics prune worker started "
+        f"(retention={int(retention_seconds / 86400)}d, "
+        f"interval={int(interval_seconds / 3600)}h)"
+    )
+    while True:
+        try:
+            deleted = await metrics_log.prune(retention_seconds)
+            if deleted:
+                log.info(f"Pruned {deleted} stale metric events")
+        except asyncio.CancelledError:
+            log.info("Metrics prune worker cancelled")
+            raise
+        except Exception as e:
+            log.error(f"Metrics prune error: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
 async def _attachment_cleanup_worker(
     attachments_dir: str,
     retention_days: int = 14,
@@ -749,6 +808,14 @@ def build_app(config: Config):
         loop,
     )
     logger.info("Background alert worker scheduled")
+
+    # Persistent metrics: flush every 10s, prune events older than the
+    # max selectable dashboard window (30d) once a day. Without flushing,
+    # queue events would accumulate in memory between samples; without
+    # pruning the metric_events table grows forever.
+    asyncio.run_coroutine_threadsafe(_metrics_flush_worker(), loop)
+    asyncio.run_coroutine_threadsafe(_metrics_prune_worker(), loop)
+    logger.info("Metrics flush + prune workers scheduled")
 
     # Periodic cleanup of signal-cli's attachment cache. The cache lives on
     # the persistent volume and grows without bound (signal-cli never

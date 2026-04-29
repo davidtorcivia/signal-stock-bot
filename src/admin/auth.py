@@ -11,6 +11,8 @@ Flow:
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import secrets
 import time
@@ -65,6 +67,20 @@ class LoginRateLimiter:
 
 def _generate_code() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _hash_code(code: str) -> str:
+    """Hash the 2FA code before stashing in the session.
+
+    Flask sessions are signed (HMAC-protected) but not encrypted — the
+    payload is base64-decodable by anyone holding the cookie. If a session
+    cookie leaks (network capture on plain-HTTP LAN access, browser
+    extension, log scraping), an attacker who reads the cookie can extract
+    the still-active 6-digit code and bypass 2FA. Hashing keeps the cookie
+    from carrying the secret; only the verifier (which has the user's
+    submitted code) can recompute the hash and compare.
+    """
+    return hashlib.sha256(code.encode()).hexdigest()
 
 
 def _client_ip() -> str:
@@ -127,7 +143,7 @@ def register_auth_routes(
                     pw = request.form.get("password", "").encode()
                     if pw and bcrypt.checkpw(pw, password_hash):
                         code = _generate_code()
-                        session["pending_2fa_code"] = code
+                        session["pending_2fa_hash"] = _hash_code(code)
                         session["pending_2fa_expires"] = time.time() + TWOFA_TTL_SECONDS
                         session["pending_2fa_attempts"] = 0
                         session.pop("authenticated", None)
@@ -143,7 +159,7 @@ def register_auth_routes(
     def twofa():
         if session.get("authenticated"):
             return redirect(url_for("admin.dashboard"))
-        if not session.get("pending_2fa_code"):
+        if not session.get("pending_2fa_hash"):
             return redirect(url_for("admin.login"))
 
         error = None
@@ -154,12 +170,21 @@ def register_auth_routes(
                 _clear_pending()
                 return redirect(url_for("admin.login"))
             elif session.get("pending_2fa_attempts", 0) >= TWOFA_MAX_ATTEMPTS:
+                # Charge the IP rate limiter so an attacker who has the
+                # password can't just keep re-logging in to get a fresh
+                # set of 2FA attempts. Every burnt 2FA cycle costs an IP
+                # login slot, capping brute-force throughput at
+                # LOGIN_RATE_LIMIT bursts per LOGIN_RATE_WINDOW.
+                rate_limiter.record(_client_ip())
                 _clear_pending()
                 error = "Too many attempts. Start over."
             else:
                 submitted = request.form.get("code", "").strip()
-                expected = session.get("pending_2fa_code", "")
-                if submitted and secrets.compare_digest(submitted, expected):
+                expected_hash = session.get("pending_2fa_hash", "")
+                submitted_hash = _hash_code(submitted) if submitted else ""
+                if submitted and expected_hash and hmac.compare_digest(
+                    submitted_hash, expected_hash
+                ):
                     _clear_pending()
                     session["authenticated"] = True
                     session["login_time"] = time.time()
@@ -181,7 +206,12 @@ def register_auth_routes(
 
 
 def _clear_pending() -> None:
-    for key in ("pending_2fa_code", "pending_2fa_expires", "pending_2fa_attempts"):
+    for key in (
+        "pending_2fa_code",       # legacy key — clean up old sessions
+        "pending_2fa_hash",
+        "pending_2fa_expires",
+        "pending_2fa_attempts",
+    ):
         session.pop(key, None)
 
 

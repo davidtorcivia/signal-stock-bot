@@ -310,23 +310,15 @@ class AskCommand(BaseCommand):
             self.subject_resolver = SubjectResolver(name_registry)
 
     def _live_turns(self) -> int:
-        try:
-            return max(0, int(self.llm.store.get("llm_history_turns") or 6))
-        except (TypeError, ValueError):
-            return 6
+        return self.llm.store.get_int("llm_history_turns", 6, min_value=0)
 
     def _live_group_ctx(self) -> int:
-        try:
-            return max(0, int(self.llm.store.get("group_context_messages") or 0))
-        except (TypeError, ValueError):
-            return 0
+        return self.llm.store.get_int("group_context_messages", 0, min_value=0)
 
     def _live_max_tool_rounds(self) -> int:
-        try:
-            v = int(self.llm.store.get("llm_max_tool_rounds") or DEFAULT_MAX_TOOL_ROUNDS)
-            return max(1, v)
-        except (TypeError, ValueError):
-            return DEFAULT_MAX_TOOL_ROUNDS
+        return self.llm.store.get_int(
+            "llm_max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS, min_value=1
+        )
 
     async def _enrich(self, text: str) -> str:
         """Best-effort, idempotent re-enrichment at LLM-feed boundaries.
@@ -592,6 +584,15 @@ class AskCommand(BaseCommand):
             return f"ERROR: {err}"
         assert parsed is not None
 
+        # Caller-as-predictor enforcement: the LLM tool can only revise
+        # the asker's own pending prediction, not someone else's. Without
+        # this, a prompt-injected message in a group chat could coax
+        # Sigil into rewriting another member's claim within their
+        # 15-min grace window.
+        caller_user_hash = (
+            hash_phone(caller_ctx.sender) if caller_ctx.sender else None
+        )
+
         try:
             status = await store.update_pending(
                 pred_id,
@@ -600,6 +601,7 @@ class AskCommand(BaseCommand):
                 ticker=parsed.get("ticker"),
                 threshold=parsed.get("threshold"),
                 direction=parsed.get("direction"),
+                expected_user_hash=caller_user_hash,
             )
         except Exception as e:
             logger.exception(f"predict_update: store.update_pending failed: {e}")
@@ -607,6 +609,11 @@ class AskCommand(BaseCommand):
 
         if status == "not_found":
             return f"ERROR: no prediction #{pred_id}."
+        if status == "not_owner":
+            return (
+                f"ERROR: prediction #{pred_id} belongs to a different chat "
+                f"member. You can only update your own predictions."
+            )
         if status == "not_pending":
             return (
                 f"ERROR: #{pred_id} is already resolved or expired. "

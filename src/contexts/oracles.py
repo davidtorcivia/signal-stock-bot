@@ -32,6 +32,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+
+from ..database import db_session
 from astral import LocationInfo
 from astral.sun import sun
 
@@ -237,6 +239,8 @@ class OracleStore:
                 return
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             async with aiosqlite.connect(self.db_path) as db:
+                from ..database import apply_db_pragmas
+                await apply_db_pragmas(db)
                 await db.execute(
                     """
                     CREATE TABLE IF NOT EXISTS context_oracles (
@@ -291,8 +295,7 @@ class OracleStore:
         )
 
     async def list_for_context(self, context_id: int) -> list[ContextOracle]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"SELECT {self._COLS} FROM context_oracles "
                 f"WHERE context_id = ? ORDER BY id",
@@ -302,8 +305,7 @@ class OracleStore:
         return [self._row_to_oracle(r) for r in rows]
 
     async def list_enabled(self) -> list[ContextOracle]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"SELECT {self._COLS} FROM context_oracles "
                 f"WHERE enabled = 1 ORDER BY id"
@@ -312,8 +314,7 @@ class OracleStore:
         return [self._row_to_oracle(r) for r in rows]
 
     async def get(self, oracle_id: int) -> Optional[ContextOracle]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"SELECT {self._COLS} FROM context_oracles WHERE id = ?",
                 (oracle_id,),
@@ -379,8 +380,7 @@ class OracleStore:
             return oracle.id
 
     async def delete(self, oracle_id: int) -> bool:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM context_oracles WHERE id = ?", (oracle_id,)
             )
@@ -389,8 +389,7 @@ class OracleStore:
 
     async def delete_for_context(self, context_id: int) -> int:
         """Cleanup hook for ContextRegistry.delete — drops orphan rows."""
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM context_oracles WHERE context_id = ?",
                 (context_id,),
@@ -399,8 +398,7 @@ class OracleStore:
             return cursor.rowcount
 
     async def mark_fired(self, oracle_id: int, fired_at: float) -> None:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             await db.execute(
                 "UPDATE context_oracles SET last_fired_at = ?, updated_at = ? "
                 "WHERE id = ?",

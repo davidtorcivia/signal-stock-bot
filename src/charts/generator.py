@@ -242,8 +242,11 @@ class ChartGenerator:
             comp_df.set_index('Date', inplace=True)
             comp_df.index = pd.DatetimeIndex(comp_df.index)
             
-            # Align to main dataframe dates
-            comp_df = comp_df.reindex(df.index, method='ffill')
+            # Align to main dataframe dates. `reindex(method='ffill')` is
+            # deprecated in pandas 2.1+; the two-step form (reindex, then
+            # ffill) is the supported replacement and works on both 2.0
+            # and newer.
+            comp_df = comp_df.reindex(df.index).ffill()
             
             # Normalize both to percent return from start
             main_normalized = (df['Close'] / df['Close'].iloc[0] - 1) * 100
@@ -314,8 +317,15 @@ class ChartGenerator:
         
         import matplotlib.pyplot as plt
 
-        fig, axes = mpf.plot(df, **plot_kwargs)
+        # `fig` may not be bound if mpf.plot raises mid-creation. The
+        # bare `finally: plt.close(fig)` form would NameError on that
+        # path while a half-built figure stays in matplotlib's global
+        # registry. The two-step form (init to None, close-if-bound,
+        # plus close('all') sweep on the failure path) keeps the
+        # process from leaking figures over time.
+        fig = None
         try:
+            fig, _axes = mpf.plot(df, **plot_kwargs)
             fig.suptitle(
                 title,
                 color='#FFFFFF',
@@ -343,7 +353,10 @@ class ChartGenerator:
                 pad_inches=0.1,
             )
         finally:
-            plt.close(fig)
+            if fig is not None:
+                plt.close(fig)
+            else:
+                plt.close('all')
 
         buf.seek(0)
         base64_data = base64.b64encode(buf.read()).decode('utf-8')

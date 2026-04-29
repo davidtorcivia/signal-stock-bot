@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,44 @@ class SettingsStore:
             if not self._loaded:
                 self._load_all()
             return self._cache.get(key, default)
+
+    # Typed accessors — every live-config read used to repeat
+    #   try: int(store.get(key) or default) except (TypeError, ValueError): return default
+    # in each consumer. Centralizing here means a missing/garbage value
+    # falls back uniformly and `min_value` clamping is one keyword instead
+    # of one extra `max(...)` line at every call site.
+
+    def get_int(
+        self, key: str, default: int, *, min_value: Optional[int] = None
+    ) -> int:
+        raw = self.get(key)
+        try:
+            v = int(raw) if raw not in (None, "") else default
+        except (TypeError, ValueError):
+            v = default
+        if min_value is not None and v < min_value:
+            v = min_value
+        return v
+
+    def get_float(self, key: str, default: float) -> float:
+        raw = self.get(key)
+        try:
+            return float(raw) if raw not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        raw = self.get(key)
+        if raw is None:
+            return default
+        return bool(raw)
+
+    def get_str(self, key: str, default: str = "") -> str:
+        raw = self.get(key)
+        return str(raw) if raw is not None else default
+
+    def get_stripped(self, key: str, default: str = "") -> str:
+        return self.get_str(key, default).strip()
 
     def set(self, key: str, value: Any) -> None:
         if key not in ALLOWED_KEYS:

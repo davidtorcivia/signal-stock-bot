@@ -293,10 +293,9 @@ class MassiveProvider(BaseProvider):
 
     async def health_check(self) -> bool:
         try:
-            # Simple status check
             await self.get_quote("AAPL")
             return True
-        except:
+        except Exception:
             return False
     
     async def close(self):

@@ -20,6 +20,8 @@ from typing import Optional
 
 import aiosqlite
 
+from ..database import db_session
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_RETENTION_DAYS = 7
@@ -76,21 +78,19 @@ class ConversationHistory:
         self._initialized = False
 
     def _retention_seconds(self) -> float:
-        days = DEFAULT_RETENTION_DAYS
-        if self.settings_store is not None:
-            try:
-                raw = self.settings_store.get("llm_retention_days")
-                if raw is not None:
-                    days = max(1, int(raw))
-            except (TypeError, ValueError):
-                pass
-        return days * 86400.0
+        if self.settings_store is None:
+            return DEFAULT_RETENTION_DAYS * 86400.0
+        return self.settings_store.get_int(
+            "llm_retention_days", DEFAULT_RETENTION_DAYS, min_value=1,
+        ) * 86400.0
 
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            from ..database import apply_db_pragmas
+            await apply_db_pragmas(db)
             # Fresh installs get the new schema directly.
             await db.execute(
                 """
@@ -140,8 +140,7 @@ class ConversationHistory:
         Shape: {summary: str, summary_through_id: int, turns_summarized: int,
                 updated_at: float}.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """SELECT summary, summary_through_id, turns_summarized, updated_at
                    FROM conversation_summaries WHERE context_key = ?""",
@@ -164,8 +163,7 @@ class ConversationHistory:
         summary_through_id: int,
         turns_summarized: int,
     ) -> None:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             await db.execute(
                 """INSERT INTO conversation_summaries
                    (context_key, summary, summary_through_id, turns_summarized, updated_at)
@@ -188,8 +186,7 @@ class ConversationHistory:
         already covered by the existing summary. Used by the summarizer to
         decide what fresh material to feed the LLM.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT MAX(id) FROM conversation_turns WHERE context_key = ?",
                 (context_key,),
@@ -287,8 +284,7 @@ class ConversationHistory:
         Used by the prompt builder to decide whether the prior conversation
         is stale enough to warrant an explicit advisory to the model.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT MAX(created_at) FROM conversation_turns WHERE context_key = ?",
                 (context_key,),
@@ -358,8 +354,7 @@ class ConversationHistory:
             await db.commit()
 
     async def clear(self, context_key: str) -> int:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM conversation_turns WHERE context_key = ?", (context_key,)
             )

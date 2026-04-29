@@ -10,6 +10,8 @@ from typing import Optional
 
 import aiosqlite
 
+from .database import db_session
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +47,8 @@ class ContextManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
         async with aiosqlite.connect(self.db_path) as db:
+            from .database import apply_db_pragmas
+            await apply_db_pragmas(db)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_context (
                     user_hash TEXT PRIMARY KEY,
@@ -60,9 +64,7 @@ class ContextManager:
 
     async def get_context(self, user_hash: str) -> Context:
         """Get active context for user."""
-        await self._ensure_initialized()
-        
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT last_symbol, last_intent, updated_at FROM conversation_context WHERE user_hash = ?",
                 (user_hash,)

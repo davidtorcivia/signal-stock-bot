@@ -55,6 +55,8 @@ from typing import Optional
 
 import aiosqlite
 
+from .database import db_session
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,11 +129,17 @@ class MemoryStore:
         self.db_path = Path(db_path)
         self._initialized = False
 
-    async def _ensure_initialized(self) -> None:
+    async def _ensure_initialized(self) -> None:  # noqa: D401
+        # Wraps schema setup; tuning pragmas applied here too. WAL is sticky
+        # on the file (so it persists for every other store sharing this DB)
+        # but we re-apply on every init because all stores call this lazily
+        # and the first one to land sets it.
         if self._initialized:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            from .database import apply_db_pragmas
+            await apply_db_pragmas(db)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS context_memories (
@@ -324,8 +332,7 @@ class MemoryStore:
     async def list_for_context(
         self, context_id: int, limit: int = 500
     ) -> list[dict]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}
                     FROM context_memories
@@ -364,8 +371,7 @@ class MemoryStore:
         """
         if not content or not subject_key:
             return None
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}
                     FROM context_memories
@@ -410,8 +416,7 @@ class MemoryStore:
         return [_row_to_dict(r) for r in rows]
 
     async def get(self, memory_id: int) -> Optional[dict]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}, context_id
                     FROM context_memories WHERE id = ?""",
@@ -473,8 +478,7 @@ class MemoryStore:
             return cursor.rowcount > 0
 
     async def delete(self, memory_id: int) -> bool:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM context_memories WHERE id = ?", (memory_id,)
             )
@@ -482,8 +486,7 @@ class MemoryStore:
             return cursor.rowcount > 0
 
     async def delete_for_context(self, context_id: int) -> int:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "DELETE FROM context_memories WHERE context_id = ?",
                 (context_id,),

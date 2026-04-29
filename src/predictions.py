@@ -34,6 +34,8 @@ from typing import Optional
 
 import aiosqlite
 
+from .database import db_session
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,6 +92,8 @@ class PredictionStore:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            from .database import apply_db_pragmas
+            await apply_db_pragmas(db)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,10 +116,23 @@ class PredictionStore:
                     resolver_user_hash TEXT
                 )
             """)
+            # Partial indexes on pending rows. Resolved/expired predictions
+            # never get scanned by the resolver cron or the upcoming-list
+            # queries, so we keep them out of the index entirely. Index
+            # stays small forever even as the table accumulates years of
+            # historical resolved predictions — the cost of `list_due`
+            # doesn't degrade with table size.
             await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_pred_status_deadline "
-                "ON predictions(status, deadline_utc)"
+                "CREATE INDEX IF NOT EXISTS idx_pred_pending_deadline "
+                "ON predictions(deadline_utc) WHERE status = 'pending'"
             )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pred_pending_user "
+                "ON predictions(user_hash, deadline_utc) WHERE status = 'pending'"
+            )
+            # Drop the old non-partial index — the partial ones above are
+            # strictly better for every query that filters on status='pending'.
+            await db.execute("DROP INDEX IF EXISTS idx_pred_status_deadline")
             # Multi-user consensus voting on resolutions. Without this,
             # any single chat member could mark any prediction however
             # they wanted — fine for "trust everyone" groups, terrible
@@ -197,8 +214,7 @@ class PredictionStore:
         threshold: Optional[float] = None,
         direction: Optional[str] = None,
     ) -> int:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """INSERT INTO predictions
                    (user_hash, user_label, group_id, context_key, claim,
@@ -212,8 +228,7 @@ class PredictionStore:
             return cursor.lastrowid or 0
 
     async def get(self, pred_id: int) -> Optional[Prediction]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 f"SELECT {self._COLS} FROM predictions WHERE id = ?",
                 (pred_id,),
@@ -271,8 +286,7 @@ class PredictionStore:
     ) -> bool:
         if verdict not in VALID_VERDICTS:
             raise ValueError(f"invalid verdict: {verdict!r}")
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """UPDATE predictions
                    SET status = 'resolved',
@@ -304,8 +318,7 @@ class PredictionStore:
         """
         if verdict not in VALID_VERDICTS:
             raise ValueError(f"invalid verdict: {verdict!r}")
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """UPDATE predictions
                    SET status = 'resolved',
@@ -325,8 +338,7 @@ class PredictionStore:
         again). Clears the verdict but keeps the original deadline so the
         resolver picks it up immediately.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """UPDATE predictions
                    SET status = 'pending',
@@ -370,8 +382,7 @@ class PredictionStore:
         """
         if verdict not in VALID_VERDICTS:
             raise ValueError(f"invalid verdict: {verdict!r}")
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             # Lock the row group up-front so concurrent voters don't
             # both think they're casting the threshold-meeting vote.
             await db.execute("BEGIN IMMEDIATE")
@@ -499,6 +510,7 @@ class PredictionStore:
         ticker: Optional[str] = None,
         threshold: Optional[float] = None,
         direction: Optional[str] = None,
+        expected_user_hash: Optional[str] = None,
     ) -> str:
         """Revise a pending prediction's claim/deadline within the grace
         window. Returns a status string:
@@ -506,22 +518,31 @@ class PredictionStore:
           - "not_found"    → no row with that id
           - "not_pending"  → already resolved/expired (status check)
           - "stale"        → past the UPDATE_GRACE_SECONDS window
+          - "not_owner"    → expected_user_hash doesn't match the predictor
+
+        When `expected_user_hash` is provided, the row's user_hash must
+        match. This guards the LLM-tool path: prompt-injection in a group
+        message can otherwise coax Sigil into calling
+        `predict_update(other_user_pred_id)` and rewriting someone else's
+        claim within their grace window.
         """
         await self._ensure_initialized()
         now = time.time()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT status, created_at FROM predictions WHERE id = ?",
+                "SELECT status, created_at, user_hash FROM predictions WHERE id = ?",
                 (pred_id,),
             )
             row = await cursor.fetchone()
             if not row:
                 return "not_found"
-            status, created_at = row[0], row[1]
+            status, created_at, row_user_hash = row[0], row[1], row[2]
             if status != STATUS_PENDING:
                 return "not_pending"
             if (now - (created_at or 0)) > self.UPDATE_GRACE_SECONDS:
                 return "stale"
+            if expected_user_hash is not None and row_user_hash != expected_user_hash:
+                return "not_owner"
             await db.execute(
                 """UPDATE predictions
                    SET claim = ?, deadline_utc = ?,
@@ -534,8 +555,7 @@ class PredictionStore:
 
     async def expire(self, pred_id: int, *, note: Optional[str] = None) -> bool:
         """Mark as expired — auto-resolver tried and gave up. Doesn't count."""
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """UPDATE predictions
                    SET status = 'expired',
@@ -556,8 +576,7 @@ class PredictionStore:
         for that user. Callers should prefer resolving from the live
         NameRegistry so renamed users show their current name.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 """SELECT user_hash,
                           (SELECT user_label FROM predictions p2
@@ -595,8 +614,7 @@ class PredictionStore:
         accuracy} where accuracy is right / (right + wrong) over all
         resolved predictions, or None when nothing is judged yet.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 """SELECT
                        COUNT(*) AS total,
@@ -628,8 +646,7 @@ class PredictionStore:
 
     async def recent_all(self, *, limit: int = 50) -> list[Prediction]:
         """Most recent predictions across every context, newest-first."""
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 f"SELECT {self._COLS} FROM predictions "
                 f"ORDER BY created_at DESC LIMIT ?",
@@ -640,8 +657,7 @@ class PredictionStore:
 
     async def upcoming_all(self, *, limit: int = 50) -> list[Prediction]:
         """Pending predictions across every context, soonest-deadline first."""
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 f"SELECT {self._COLS} FROM predictions "
                 f"WHERE status = 'pending' "
@@ -656,8 +672,7 @@ class PredictionStore:
         per-context status counts. Lets the dashboard render one
         leaderboard panel per active chat without separate round-trips.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 """SELECT context_key,
                           COUNT(*) AS total,
@@ -676,8 +691,7 @@ class PredictionStore:
 
     async def user_record(self, user_hash: str, context_key: str) -> dict:
         """Single-user record for inline display ("David's record: 7/12, 58%")."""
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             async with db.execute(
                 """SELECT
                        SUM(CASE WHEN verdict='right' THEN 1 ELSE 0 END) AS rights,

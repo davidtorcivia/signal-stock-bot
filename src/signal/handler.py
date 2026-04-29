@@ -5,6 +5,7 @@ Signal message handler - interfaces with signal-cli-rest-api.
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -61,6 +62,12 @@ class SignalHandler:
         self._bot_uuid: Optional[str] = None  # Fetched on first use
         self._group_id_map: dict[str, str] = {}
         self._group_map_lock = asyncio.Lock()
+        # (sender, timestamp) -> seen_at — drops duplicate webhook
+        # deliveries. signal-cli can re-emit messages on reconnect; we
+        # don't want the bot to dispatch the same `!ask` twice. Bounded
+        # in size to cap memory under sustained traffic.
+        self._seen_messages: dict[tuple, float] = {}
+        self._seen_messages_max = 1024
         # PollVoter is injected post-construction (avoids circular deps with
         # the LLM client / group log). When None, inbound polls are ignored.
         self.poll_voter = None
@@ -174,7 +181,7 @@ class SignalHandler:
             ]
         
         url = f"{self.config.api_url}/v2/send"
-        
+
         try:
             async with session.post(url, json=payload) as resp:
                 if resp.status not in (200, 201):
@@ -186,10 +193,19 @@ class SignalHandler:
                             f"{att[:30]}..." for att in debug_payload["base64_attachments"]
                         ]
                     logger.error(f"Failed to send message: {resp.status} - {error} - Payload: {debug_payload}")
+                    # Stale-group invalidation: if a send to a group fails
+                    # with a 4xx (group renamed, bot removed-readded, v2 ID
+                    # rotated), drop the cached resolution so the next send
+                    # re-fetches. Without this, every subsequent send to
+                    # this internal id silently fails until the bot
+                    # restarts.
+                    if group_id and 400 <= resp.status < 500:
+                        self._group_id_map.pop(group_id, None)
                     raise Exception(f"Send failed: {resp.status}")
-                
-                logger.debug(f"Message sent successfully to {recipient[-4:] if recipient else group_id}")
-                
+
+                tail = recipient[-4:] if recipient and len(recipient) >= 4 else (group_id or "?")
+                logger.debug(f"Message sent successfully to {tail}")
+
         except Exception as e:
             logger.error(f"Failed to send response: {e}")
             raise
@@ -472,6 +488,35 @@ class SignalHandler:
         if not sender or not message_text:
             logger.debug("Skipping message: no sender or empty text")
             return
+
+        # Self-message guard: if signal-cli ever echoes our own outbound
+        # message back through the receive endpoint (has happened on
+        # certain reconnect paths), the dispatcher would treat it as
+        # input and could loop. Drop it before any further work.
+        if sender == self.config.phone_number:
+            logger.debug("Skipping own outbound echo")
+            return
+
+        # Idempotency: signal-cli replays buffered messages on websocket
+        # reconnect. Without this, a transient disconnect during an
+        # `!ask` causes the same prompt to be processed twice — the user
+        # sees two responses and the LLM history records two turns.
+        # Dedup on (sender, dataMessage.timestamp) with a 60s TTL.
+        if message_ts:
+            key = (sender, message_ts)
+            now = time.time()
+            if key in self._seen_messages and now - self._seen_messages[key] < 60.0:
+                logger.debug(f"Skipping duplicate message {key}")
+                return
+            self._seen_messages[key] = now
+            # Bounded LRU-ish: when full, drop the oldest 10% in one pass.
+            if len(self._seen_messages) > self._seen_messages_max:
+                cutoff = sorted(self._seen_messages.values())[
+                    self._seen_messages_max // 10
+                ]
+                self._seen_messages = {
+                    k: v for k, v in self._seen_messages.items() if v >= cutoff
+                }
 
         # Extract group info if present
         group_info = data_message.get("groupInfo")

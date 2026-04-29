@@ -13,6 +13,8 @@ from typing import Optional
 
 import aiosqlite
 
+from .database import db_session
+
 logger = logging.getLogger(__name__)
 
 # Hard cap per group — protects the DB from runaway chat volume.
@@ -55,21 +57,19 @@ class GroupMessageLog:
         self._initialized = False
 
     def _retention_seconds(self) -> float:
-        days = DEFAULT_RETENTION_DAYS
-        if self.settings_store is not None:
-            try:
-                raw = self.settings_store.get("llm_retention_days")
-                if raw is not None:
-                    days = max(1, int(raw))
-            except (TypeError, ValueError):
-                pass
-        return days * 86400.0
+        if self.settings_store is None:
+            return DEFAULT_RETENTION_DAYS * 86400.0
+        return self.settings_store.get_int(
+            "llm_retention_days", DEFAULT_RETENTION_DAYS, min_value=1,
+        ) * 86400.0
 
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            from .database import apply_db_pragmas
+            await apply_db_pragmas(db)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS group_messages (
@@ -144,8 +144,7 @@ class GroupMessageLog:
         tail = (tail or "").strip()
         if not tail or not group_id:
             return None
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """SELECT sender FROM group_messages
                    WHERE group_id = ?
@@ -203,8 +202,7 @@ class GroupMessageLog:
         """
         if limit <= 0 or not group_id:
             return []
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """SELECT sender, text, created_at FROM group_messages
                    WHERE group_id = ?

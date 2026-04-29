@@ -19,6 +19,8 @@ from typing import Optional
 
 import aiosqlite
 
+from ..database import db_session
+
 from .policy import ContextPolicy, MODE_ALLOW_ALL
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,8 @@ class ContextRegistry:
                 return
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             async with aiosqlite.connect(self.db_path) as db:
+                from ..database import apply_db_pragmas
+                await apply_db_pragmas(db)
                 await db.execute(
                     """
                     CREATE TABLE IF NOT EXISTS contexts (
@@ -149,8 +153,7 @@ class ContextRegistry:
         )
 
     async def list(self) -> list[ContextPolicy]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_FIELDS}
                     FROM contexts
@@ -162,8 +165,7 @@ class ContextRegistry:
         return [self._row_to_policy(r) for r in rows]
 
     async def get(self, context_id: int) -> Optional[ContextPolicy]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"SELECT {self._SELECT_FIELDS} FROM contexts WHERE id = ?",
                 (context_id,),
@@ -172,8 +174,7 @@ class ContextRegistry:
         return self._row_to_policy(row) if row else None
 
     async def get_by_key(self, key: str) -> Optional[ContextPolicy]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"SELECT {self._SELECT_FIELDS} FROM contexts WHERE key = ?",
                 (key,),

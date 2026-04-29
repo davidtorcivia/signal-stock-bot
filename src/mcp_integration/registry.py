@@ -8,6 +8,8 @@ from typing import Optional
 
 import aiosqlite
 
+from ..database import db_session
+
 from .models import MCPServerConfig
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,8 @@ class MCPRegistry:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            from ..database import apply_db_pragmas
+            await apply_db_pragmas(db)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -82,8 +86,7 @@ class MCPRegistry:
         )
 
     async def list(self) -> list[MCPServerConfig]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT id, name, transport, enabled, command, args, env, url, headers "
                 "FROM mcp_servers ORDER BY name"
@@ -92,8 +95,7 @@ class MCPRegistry:
         return [self._row_to_config(r) for r in rows]
 
     async def get(self, server_id: int) -> Optional[MCPServerConfig]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT id, name, transport, enabled, command, args, env, url, headers "
                 "FROM mcp_servers WHERE id = ?",
@@ -176,8 +178,7 @@ class MCPRegistry:
                 )
 
     async def delete(self, server_id: int) -> bool:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
             await db.commit()
             return cursor.rowcount > 0

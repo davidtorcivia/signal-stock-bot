@@ -21,6 +21,8 @@ from typing import Optional
 
 import aiosqlite
 
+from .database import db_session
+
 from .database import hash_phone
 from .group_log import BOT_SENDER
 
@@ -82,6 +84,8 @@ class NameRegistry:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
+            from .database import apply_db_pragmas
+            await apply_db_pragmas(db)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_names (
@@ -178,8 +182,7 @@ class NameRegistry:
         name = (name or "").strip()
         if not name:
             return await self.delete(user_hash=h)
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             await db.execute(
                 """INSERT INTO user_names(user_hash, name, updated_at)
                    VALUES(?, ?, ?)
@@ -201,16 +204,14 @@ class NameRegistry:
         h = self._resolve_hash(user_hash=user_hash, phone=phone)
         if not h:
             return False
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             await db.execute("DELETE FROM user_names WHERE user_hash = ?", (h,))
             await db.commit()
         self._cache.pop(h, None)
         return True
 
     async def list_all(self) -> list[dict]:
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 "SELECT user_hash, name, updated_at FROM user_names ORDER BY name"
             )
@@ -227,8 +228,7 @@ class NameRegistry:
         appeared in — the bot otherwise has no way to tell `...4137` apart
         from `...4137` in another group.
         """
-        await self._ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 """
                 SELECT user_hash, sender_tail, MAX(created_at) AS last_seen,

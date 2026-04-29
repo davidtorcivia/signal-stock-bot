@@ -107,17 +107,34 @@ class LLMNotConfigured(LLMError):
 class LLMClient:
     def __init__(self, settings_store):
         self.store = settings_store
+        # Long-lived session reused across all chat calls. Without this,
+        # every call (writer, reactor, deep_think extractors, augmentation)
+        # opens a fresh TCP+TLS connection — a measurable hit at scale and
+        # a hard ceiling on connection-pool reuse to OpenRouter/etc.
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     def _config(self) -> dict:
         return {
-            "enabled": bool(self.store.get("llm_enabled", False)),
-            "base_url": (self.store.get("llm_base_url") or "").strip().rstrip("/"),
-            "api_key": (self.store.get("llm_api_key") or "").strip(),
-            "model": (self.store.get("llm_model") or "").strip(),
-            "temperature": float(self.store.get("llm_temperature") or 0.7),
-            "max_tokens": int(self.store.get("llm_max_tokens") or 1000),
+            "enabled": self.store.get_bool("llm_enabled", False),
+            "base_url": self.store.get_stripped("llm_base_url").rstrip("/"),
+            "api_key": self.store.get_stripped("llm_api_key"),
+            "model": self.store.get_stripped("llm_model"),
+            "temperature": self.store.get_float("llm_temperature", 0.7),
+            "max_tokens": self.store.get_int("llm_max_tokens", 1000),
             "system_prompt": self.store.get("llm_system_prompt") or DEFAULT_SYSTEM_PROMPT,
-            "timeout": int(self.store.get("llm_timeout_seconds") or 30),
+            "timeout": self.store.get_int("llm_timeout_seconds", 30),
         }
 
     def status(self) -> dict:
@@ -268,19 +285,20 @@ class LLMClient:
         # connections (e.g. OpenRouter holding a TCP socket open while a
         # thinking model deliberates server-side), so we belt-and-braces it
         # with an asyncio.wait_for at +5s past the configured timeout.
+        session = await self._get_session()
+
         async def _do_call():
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    body = await resp.text()
-                    if resp.status == 401:
-                        raise LLMError("LLM rejected the API key (401).")
-                    if resp.status == 429:
-                        raise LLMError("LLM rate-limited (429). Try again in a moment.")
-                    if resp.status >= 400:
-                        # Truncate body — upstream errors can be verbose
-                        snippet = body[:200].replace("\n", " ")
-                        raise LLMError(f"LLM HTTP {resp.status}: {snippet}")
-                    return await resp.json(content_type=None)
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                body = await resp.text()
+                if resp.status == 401:
+                    raise LLMError("LLM rejected the API key (401).")
+                if resp.status == 429:
+                    raise LLMError("LLM rate-limited (429). Try again in a moment.")
+                if resp.status >= 400:
+                    # Truncate body — upstream errors can be verbose
+                    snippet = body[:200].replace("\n", " ")
+                    raise LLMError(f"LLM HTTP {resp.status}: {snippet}")
+                return await resp.json(content_type=None)
 
         # Hard ceiling is intentionally well above cfg["timeout"]: aiohttp's
         # total= should fire first on a normal slow request; this only kicks

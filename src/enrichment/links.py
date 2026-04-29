@@ -20,12 +20,16 @@ Behaviour:
 """
 
 import asyncio
+import ipaddress
 import logging
 import re
+import socket
 import time
 from typing import Optional
 
 import aiohttp
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import DefaultResolver
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +41,56 @@ URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 SKIP_HOSTS = {
     "twitter.com", "x.com", "fxtwitter.com", "fixupx.com", "vxtwitter.com",
     "t.co",
-    "localhost", "127.0.0.1",
 }
+
+
+def _is_public_ip(host: str) -> bool:
+    """True only for globally-routable addresses. False on parse failure."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv4Address):
+        return not (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        )
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    )
+
+
+class _PublicOnlyResolver(AbstractResolver):
+    """aiohttp resolver that refuses non-public IPs.
+
+    Plugged into the ClientSession's TCPConnector so the SSRF check runs
+    at every DNS lookup — including the lookups aiohttp does for redirect
+    targets, which a hostname-only allow/deny list can't catch. Reject
+    paths: literal IPs in the URL (e.g. `http://169.254.169.254`), DNS
+    names that resolve to RFC1918/loopback/link-local, and DNS names where
+    any A/AAAA record points internal (DNS rebinding mitigation).
+    """
+
+    def __init__(self) -> None:
+        self._inner = DefaultResolver()
+
+    async def resolve(self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET):
+        try:
+            ipaddress.ip_address(host)
+            is_literal = True
+        except ValueError:
+            is_literal = False
+        if is_literal and not _is_public_ip(host):
+            raise OSError(f"refusing private IP literal: {host}")
+        infos = await self._inner.resolve(host, port=port, family=family)
+        safe = [info for info in infos if _is_public_ip(info["host"])]
+        if not safe:
+            raise OSError(f"refusing host with only private resolutions: {host}")
+        return safe
+
+    async def close(self) -> None:
+        await self._inner.close()
 SKIP_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
     ".mp4", ".mov", ".avi", ".webm", ".mp3", ".wav", ".ogg",
@@ -126,9 +178,11 @@ class RichLinkExpander:
         async with self._session_lock:
             if self._session is None or self._session.closed:
                 timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT, connect=2.0)
+                connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver())
                 self._session = aiohttp.ClientSession(
                     timeout=timeout,
                     headers={"User-Agent": USER_AGENT, "Accept-Language": "en"},
+                    connector=connector,
                 )
             return self._session
 

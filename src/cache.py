@@ -359,6 +359,7 @@ class MetricsCollector:
         """Record a request timestamp for rate calculation."""
         with self._lock:
             self._request_times.append(time.time())
+        _persist("request")
     
     @property
     def requests_per_minute(self) -> float:
@@ -396,6 +397,11 @@ class MetricsCollector:
             m.by_purpose[purpose] = m.by_purpose.get(purpose, 0) + 1
             if model:
                 m.by_model[model] = m.by_model.get(model, 0) + 1
+        _persist(
+            "llm_success",
+            purpose=purpose, model=model, latency_ms=latency_ms,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+        )
 
     def record_llm_error(self, *, purpose: str, model: str, error_msg: str) -> None:
         with self._lock:
@@ -407,6 +413,10 @@ class MetricsCollector:
             m.by_purpose[purpose] = m.by_purpose.get(purpose, 0) + 1
             if model:
                 m.by_model[model] = m.by_model.get(model, 0) + 1
+        _persist(
+            "llm_error",
+            purpose=purpose, model=model, error_msg=(error_msg or "")[:200],
+        )
 
     # ── Deep think metrics ────────────────────────────────────────────
 
@@ -428,6 +438,11 @@ class MetricsCollector:
             m.last_call_at = time.time()
             if model:
                 m.by_model[model] = m.by_model.get(model, 0) + 1
+        _persist(
+            "dt_success",
+            model=model, latency_ms=latency_ms,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+        )
 
     def record_deep_think_error(self, *, model: str, error_msg: str) -> None:
         with self._lock:
@@ -438,6 +453,9 @@ class MetricsCollector:
             m.last_error_msg = (error_msg or "")[:200]
             if model:
                 m.by_model[model] = m.by_model.get(model, 0) + 1
+        _persist(
+            "dt_error", model=model, error_msg=(error_msg or "")[:200],
+        )
 
     # ── Reactor metrics ────────────────────────────────────────────────
 
@@ -452,15 +470,18 @@ class MetricsCollector:
                 r.skipped_short += 1
             elif reason == "no_tool":
                 r.skipped_no_tool += 1
+        _persist("reactor_skip", skip_reason=reason)
 
     def record_reactor_evaluation(self) -> None:
         with self._lock:
             self._reactor.evaluations += 1
+        _persist("reactor_eval")
 
     def record_reactor_response(self) -> None:
         """The reactor's should_respond tool fired (natural-response feature)."""
         with self._lock:
             self._reactor.responses_triggered += 1
+        _persist("reactor_response")
 
     def record_reactor_reaction(self, emoji: str) -> None:
         with self._lock:
@@ -469,10 +490,12 @@ class MetricsCollector:
             r.last_reaction_at = time.time()
             if emoji:
                 r.by_emoji[emoji] = r.by_emoji.get(emoji, 0) + 1
+        _persist("reactor_react", emoji=emoji)
 
     def record_reactor_error(self) -> None:
         with self._lock:
             self._reactor.errors += 1
+        _persist("reactor_error")
 
     # ── Aggregate snapshot ─────────────────────────────────────────────
 
@@ -619,6 +642,20 @@ def get_cache_manager() -> CacheManager:
 def get_metrics() -> MetricsCollector:
     """Get the global metrics collector."""
     return MetricsCollector()
+
+
+def _persist(kind: str, **fields) -> None:
+    """Append one metric event to the persistent log so the dashboard
+    can show windowed views (24h / 7d / 30d) that survive restarts.
+    Lazy-imported to avoid a top-level cycle (metrics_log itself imports
+    from .database, which other stores import from). Failure is silent —
+    metrics persistence must never affect the hot path it's measuring.
+    """
+    try:
+        from .metrics_log import get_metrics_log
+        get_metrics_log().record(kind, **fields)
+    except Exception:
+        pass
 
 
 class RequestDeduplicator:

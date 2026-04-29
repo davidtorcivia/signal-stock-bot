@@ -187,8 +187,39 @@ def _register_dashboard_routes(
     @bp.route("/", methods=["GET"])
     @admin_required
     def dashboard():
+        from ..metrics_log import get_metrics_log, parse_window, WINDOWS
+
+        # Window selector — `?window=24h|7d|30d`. Default 24h. Unknown
+        # values fall back to default rather than 4xx so a stale link
+        # from an old admin session doesn't 400.
+        window_key, window_seconds = parse_window(request.args.get("window"))
+
         metrics = get_metrics().get_all_stats()
         provider_status = provider_manager.get_status() if provider_manager else {}
+
+        # Pull windowed stats from the persistent log. Replaces the
+        # since-boot LLM/deep-think/reactor counters in `metrics` so the
+        # template gets a 24h/7d/30d view that survives restarts.
+        windowed = None
+        if loop is not None:
+            try:
+                windowed = _run_on_loop(loop, get_metrics_log().query_window(window_seconds))
+                # Splice the windowed values into the same keys the
+                # existing template reads (llm/deep_think/reactor) — keeps
+                # the template diff minimal and the cumulative-since-boot
+                # numbers still available under the *_lifetime keys.
+                metrics["llm_lifetime"] = metrics.get("llm")
+                metrics["deep_think_lifetime"] = metrics.get("deep_think")
+                metrics["reactor_lifetime"] = metrics.get("reactor")
+                metrics["llm"] = windowed["llm"]
+                metrics["deep_think"] = windowed["deep_think"]
+                metrics["reactor"] = windowed["reactor"]
+                metrics["window_request_count"] = windowed["request_count"]
+            except Exception as e:
+                logger.error(f"Dashboard windowed metrics failed: {e}")
+
+        metrics["window_key"] = window_key
+        metrics["window_options"] = list(WINDOWS.keys())
 
         # MCP — server list + per-session status
         mcp_view = []
