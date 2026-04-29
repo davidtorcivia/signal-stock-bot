@@ -20,17 +20,20 @@ A self-hosted Signal bot for real-time stock quotes, market data, technical anal
 - **@mention support** for natural-language queries
 - **Intelligent caching** with type-specific TTLs
 
-### Admin & Intelligence (new)
-- **Admin web UI** at `/admin` — login + Signal-delivered 2FA, settings dashboard, live edits without restart
-- **LLM integration** — `!ask` command with conversation history, OpenAI-compatible (works with OpenAI, OpenRouter, Groq, Anthropic-via-OR, Ollama, llama.cpp, etc.); always injects current UTC time into the system prompt
-- **MCP servers** — register and manage Model Context Protocol servers (stdio / SSE / HTTP) via the admin UI; `npx`, `uvx`, `git` available in the container
-- **LLM tool calling** — bot commands and MCP tools exposed to the LLM as function calls; chart attachments bubble back into the chat
-- **Per-context policies** — scope which commands and MCP servers work in each group/DM; assign per-chat system prompts; toggle whether non-command messages route through the LLM (with bot tools) or the regex NLP fallback
-- **LLM command augmentation** — opt-in: append a brief plain-language interpretation to the output of selected commands (e.g. `!ta`, `!rating`)
-- **Twitter / X URL expansion** — pasted tweet links auto-resolve to text via fxtwitter so the LLM can see what users shared
-- **Group chat memory** — shared conversation thread per group with per-speaker attribution; configurable retention with auto-purge
-- **Emoji reactor** — fire-and-forget background LLM that picks a single emoji reaction for messages with strong sentiment; per-context toggleable, rate-limited per-sender + per-group; recent reactions inline in the writing LLM's prompt so it can answer "why did you react with X?" honestly
-- **Divination** — `!tarot` (Rider-Waite-Smith deck, single / 3-card / Celtic Cross / daily) and `!iching` (King-Wen 64 hexagrams, three-coin or yarrow-stalk casting, daily mode) — both render their own attachments and produce LLM-narrated readings on top of the canonical cards / hexagrams
+### Admin & Intelligence
+- **Admin web UI** at `/admin` — login + Signal-delivered 2FA, dashboard, predictions console, per-context editor, live event feed; live edits without restart
+- **LLM integration** — `!ask` with rolling per-context conversation history, OpenAI-compatible (works with OpenAI, OpenRouter, Groq, Anthropic-via-OR, Ollama, llama.cpp, etc.); always injects current UTC time + persona; supports OpenRouter provider pinning (preferred providers, no-fallback, sort axis) so latency-sensitive deployments can keep traffic on Cerebras/Groq
+- **Deep-think tool** — separate slower, smarter model exposed to the writer LLM via a `deep_think(question, context)` tool with its own toolkit, status messaging, and per-context budget caps
+- **MCP servers** — register and manage Model Context Protocol servers (stdio / SSE / HTTP) via the admin UI. Pyodide Python sandbox auto-registered + pre-warmed at boot so Sigil can run real numpy/pandas/scipy/yfinance computations on demand. `npx`, `uvx`, `git` available in the container
+- **LLM tool calling** — bot commands and MCP tools exposed as function calls; chart and tarot attachments bubble back into the chat
+- **Per-context policies** — scope which commands and MCP servers work in each group/DM; assign per-chat system prompts; toggle reactor / natural-response / deep-think / memory writes; configure per-context daily oracles
+- **Per-context memory store** — `remember`/`recall`/`forget` LLM tools with subject resolution (registered names, "yourself", "this chat", or free-text), promotion-by-corroboration, cross-kind dedup so the reactor doesn't flood the same fact under different `kind`s
+- **Speaker attribution in groups** — every user turn rendered as `[Name, time ago]` and assistant turns as `[to Name, time ago]` so the model can pair questions with answers across interleaved speakers; explicit `<attribution_rules>` block + leak-stripping post-processor so the bracket scaffolding never bleeds into the visible reply
+- **Emoji reactor + natural response** — fire-and-forget background LLM picks emoji reactions; optionally also decides when to chime in even without a mention; per-context toggleable, rate-limited
+- **Twitter / X URL expansion** — pasted tweet links auto-resolve to text via fxtwitter so the LLM sees what users shared
+- **Predictions game** — `!predict <claim> by <date>`, multi-user consensus `!resolve`, leaderboard, auto-resolver (cron + Sigil with research tools); LLM tools `predict_self` / `predict_for(subject)` / `predict_update(id)` so the bot can stake its own forecasts, log on behalf of a chat member, or fix mis-extracted claims within a 15-min grace window
+- **Per-context daily oracles** — each group can have any number of scheduled posts (tarot draw / I Ching cast / pre-market check / closing recap / freeform). Schedules are sunrise/sunset (NYC anchor) ± offset minutes or fixed clock time in any IANA timezone, with optional weekdays-only filter. Heuristic prepopulation seeds sensible defaults based on context labels
+- **Divination** — `!tarot` (Rider-Waite-Smith deck), `!iching` (King-Wen 64 hexagrams), `!numerology` (Pythagorean — life path / personal year / expression / soul urge / personality, master numbers preserved)
 
 ---
 
@@ -306,6 +309,17 @@ Help text explains:
 
 The `!ask` alias is editable from `/admin/llm` (default `ask`, but `!ai`, `!sigil`, etc. all work the same). See [LLM Integration](#llm-integration).
 
+### Prediction Commands
+
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `!predict <claim> by <when>` | `!bet`, `!forecast` | Log a dated prediction. Stock-shape claims auto-resolve via live price; freeform claims get LLM-judged at the deadline |
+| `!predictions [@user]` | `!preds`, `!mybets` | List open predictions (yours by default) |
+| `!resolve <id> right\|wrong\|unclear [reason]` | `!verdict` | Cast a resolution vote (see [Predictions Game](#predictions-game) for the consensus rules) |
+| `!leaderboard` | `!lb`, `!scores` | Per-chat accuracy ranking |
+
+Sigil can also drive the prediction store itself via the `predict_self` / `predict_for` / `predict_update` LLM tools — see [Predictions Game](#predictions-game).
+
 ### Divination Commands
 
 Two image-attachment commands that draw from canonical decks/hexagrams and (optionally) get an LLM-narrated reading on top. Both also work via natural language when `llm_intent` is enabled for the context — the writing LLM receives a directive that *forces* it through the tool, so it can't fabricate cards or hexagrams in plain text.
@@ -332,6 +346,16 @@ Aliases: `!cards`, `!card`. Deck: Rider-Waite-Smith, downloaded once from Wikime
 Aliases: `!ic`, `!yi`, `!yijing`. The hexagram(s) are rendered procedurally onto a parchment canvas — no image assets required. Each render shows: the Chinese name in serif CJK, pinyin · English title, the trigram pair (with procedurally-drawn mini-glyphs so we don't depend on Unicode trigram font coverage), the six-line hexagram in deep ink, a cinnabar seal in the corner with the hexagram number in Chinese numerals (e.g. `二十七` for hex 27), and keywords. Changing lines (`6` and `9`) are highlighted in cinnabar with `○` (yang→yin) or `×` (yin→yang) markers; if any are present, a transformed hexagram is rendered alongside the primary with the character `變` (*biàn* — change) between them.
 
 The casting itself uses a `random.SystemRandom` (cryptographically strong); see [`iching_command.py`](src/commands/iching_command.py) for the per-line generators.
+
+#### Numerology
+
+| Command | Description |
+|---------|-------------|
+| `!numerology <birthdate>` | Date-derived numbers only (life path, birthday, personal year, personal day) |
+| `!numerology <birthdate> <full name>` | Adds expression / soul urge / personality |
+| `!numerology <full name>` | Name-only |
+
+Aliases: `!numbers`, `!num`. Pythagorean letter values; Y treated as consonant; **master numbers (11, 22, 33) preserved at every step** rather than reduced to 2/4/6. Pure-Python lookup tables — no MCP or external API.
 
 ### Admin Commands (Signal-side)
 
@@ -446,11 +470,16 @@ For internet exposure, put Caddy/nginx in front for TLS and set `SESSION_COOKIE_
 
 | Page | Purpose |
 |------|---------|
-| `/admin/` | Dashboard — uptime, requests/min, cache stats, provider health, "Clear all caches" |
+| `/admin/` | Dashboard — uptime, requests/min, cache stats, provider health, deep-think usage, reactor stats, DB size, "Clear all caches" |
 | `/admin/settings` | Live-editable: bot name, rate limit, message length cap, admin numbers, webhook secret. Restart-required: command prefix, provider API keys |
-| `/admin/llm` | LLM provider config + augmentation + tool-round cap (see below) |
-| `/admin/mcp` | Add / start / stop / delete MCP servers, view discovered tools (see below) |
-| `/admin/contexts` | Per-chat policy: command allow/deny, MCP allow/deny, system prompt, LLM intent toggle (see below) |
+| `/admin/llm` | LLM provider config (incl. OpenRouter provider routing), reactor + natural-response, deep-think model, augmentation, tool-round cap |
+| `/admin/mcp` | Add / start / stop / delete MCP servers, view discovered tools (Pyodide auto-registered) |
+| `/admin/contexts` | Per-chat policy: command/MCP allow/deny, system prompt, LLM intent toggle, reactor / natural-response / deep-think / memory-writes flags |
+| `/admin/contexts/<id>` | Edit one context **and** manage its daily oracles (kind, schedule, offset/clock, weekdays-only, prompt) |
+| `/admin/contexts/<id>/memories` | Browse / add / edit / delete the per-context memory store rows |
+| `/admin/predictions` | Aggregate counters, per-context leaderboards, upcoming deadlines, recent feed; per-row "resolve now" / "override verdict" / "revert to pending" actions |
+| `/admin/users` | Map sender hashes → display names so attribution + memory subjects work without users typing their own name |
+| `/admin/live` | Live event stream (SSE) — every inbound message, command result, reactor decision, prediction resolution, oracle post |
 
 ---
 
@@ -476,21 +505,45 @@ Configure once at `/admin/llm`. All values apply live — no restart.
 | Ask command alias | Adds an extra alias for `!ask` (the canonical name always works too) |
 | System prompt | Default LLM system prompt; overridden per-context if set on a context |
 | Extra request body (JSON) | Merged into every chat payload — use for `thinking`, `reasoning_effort`, `top_p`, etc. Validated as JSON object on save |
+| Preferred providers (OpenRouter) | Comma-separated provider slugs (e.g. `Cerebras, Groq, Together`). Sets `provider.order` on the request body |
+| Only these providers | When true, sets `provider.allow_fallbacks: false` so the request fails rather than silently routing to a slow host |
+| Sort by | `throughput` / `latency` / `price` — sets `provider.sort` so OpenRouter ranks within (or globally absent) the preferred list |
+
+Deep-think gets its own block with separate base URL / API key / model / temperature / max-tokens / system prompt / extra body / per-user + per-group daily caps. It's exposed to the writer LLM as a `deep_think(question, context, status_message)` tool — the writer delegates hard sub-problems and the deep model gets the same toolkit (price/news/MCP/etc.) to research before answering.
 
 ### What gets sent to the LLM on every call
-- The configured (or per-context) system prompt
-- **Always** the current UTC time (`Current time: YYYY-MM-DD HH:MM:SS UTC`) — so the model never has to guess "now"
-- Per-user (DM) or per-group (group) conversation history
-- The user's question, with `[Name]` (or `[...1234]` if no nickname is registered) sender attribution prefix in group threads
+
+- The configured (or per-context) system prompt + persona
+- **Always** the current UTC + ET time with weekday — so the model never has to guess "now"
+- Per-context conversation history. In groups, user turns prefix `[Name, time ago]` (or `[...4137, time ago]` for unregistered users) and the bot's own past replies prefix `[to Name, time ago]` so question/answer pairing across speakers is unambiguous
+- Optional `<group_context>` block — last N inbound messages (configurable per chat) plus the bot's own posts back into the chat, time-ordered with the same bracket attribution
 - All bot commands the context allows, as `bot__<name>` tools
 - All MCP tools the context allows, as `<server>__<tool>` tools
-- Optional group chat context (last N messages from the group, formatted with sender labels)
 - Tweet URLs in the user's question are auto-expanded to `[@handle] tweet text` before sending
 - Conditional system-suffix injections, gated on per-context state:
-  - **Reactor self-awareness directive + recent-reactions log** — when emoji reactor is enabled in the context (see [Emoji Reactor](#emoji-reactor))
-  - **Tarot tool directive** — when `tarot` is in the context's allow list, instructs the model to always route tarot draws through `bot__tarot` rather than fabricating a card list
-  - **I Ching tool directive** — same pattern for `bot__iching` when `iching` is allowed
-  - **Names directive** — when nicknames are registered for users in the chat, tells the model to use names rather than four-digit phone tails (and disregard older turns that claimed not to know names)
+  - **`<attribution_rules>`** — multi-speaker rules: `[Name]` and `[to Name]` brackets are internal metadata only; never echoed into visible replies (a regex-based stripper enforces this on the way out, just in case)
+  - **`<context_memories>`** — auto-injected memory preamble for the active speaker, the room, and any names mentioned in the message (no `recall` tool call needed for in-frame subjects)
+  - **`<conversation_memory>`** — long-running rolling summary when conversation history gets long
+  - **`<reactor_reflex>` + recent-reactions log** — when reactor is enabled, so the model can answer "why did you react with X?" honestly
+  - **`<tarot_tool>` / `<iching_tool>`** — force-route divination through the actual rendering tools rather than fabricating cards in text
+  - **`<deep_think_tool>`** — when the deep client is wired and the context allows it
+  - **`<python_tool>`** — when the Pyodide MCP is up: tells Sigil it has a real Python interpreter with numpy/pandas/scipy/yfinance/statsmodels, when to use it, and to set a 30s timeout for non-trivial work
+  - **`<spontaneous_reply>`** — when the reactor's `should_respond` flagged this message; instructs the writer to bail to empty content if a real reply isn't warranted
+  - **Identity / staleness notes** — e.g. "real names are now available, disregard older turns where you claimed not to know them"
+
+### Memory tools
+
+When a per-context memory store row exists for the chat, the writer LLM gets:
+
+| Tool | Purpose |
+|------|---------|
+| `remember(subject, kind, content)` | Save a memory. Subject can be a registered name, `"yourself"` (the bot), `"this chat"` (the room), or free text. Kind: `identity` / `preference` / `fact` / `event`. Near-duplicate corroboration bumps the existing row's count + confidence rather than inserting a parallel row |
+| `recall(subject?, query?)` | Look up. Active-speaker / room / bot-self memories are auto-injected, so this is for the rest |
+| `forget(memory_id)` | Delete by id |
+
+Confidence ladder: explicit user-driven memories about themselves start at 0.9; about a third party at 0.6 (corroboration from a second speaker promotes); reactor-sourced memories start at 0.4 and only promote to 1.0 once N **distinct** speakers corroborate (single-user repetition can't self-promote). Reactor pre-write also runs a looser cross-kind dedup so the same fact written under `fact` once and `preference` next doesn't land twice.
+
+Memories can be browsed / edited from `/admin/contexts/<id>/memories`.
 
 ### `!ask` examples
 
@@ -520,6 +573,75 @@ Both pieces are gated on `reactor_enabled` being true globally **and** for the c
 
 ---
 
+## Predictions Game
+
+A polymarket-style on-chat prediction registry: anyone can log a dated claim, the bot follows up at the deadline, and a per-chat leaderboard tracks accuracy.
+
+### Logging predictions (humans + the bot)
+
+| Path | Author identity | When |
+|------|-----------------|------|
+| `!predict <claim> by <when>` | The user who typed it | Manual, in-chat |
+| `bot__predict` LLM tool | The asker (whoever ran `!ask`) | LLM was asked to log on the asker's behalf |
+| `predict_self` LLM tool | The bot itself (`BOT_SENDER` sentinel hash) | Sigil stakes its own forecast |
+| `predict_for(subject, claim)` LLM tool | A third-party chat member | "Anthony just said SPY goes down tomorrow" → logged on Anthony's row, not Sigil's, not the asker's. Subject can be a registered name **or** the `...4810` phone-tail form for unregistered users |
+| `predict_update(id, claim)` LLM tool | (preserves original predictor) | Revise claim/deadline within **15 minutes** of creation. Past that, locked — admin override on dashboard only |
+
+### Deadline parsing
+
+`<claim> by <date>`. Stock-shape claims (`TICKER above|below $price by date`) get a deterministic regex extraction; freeform claims fall through to an LLM extractor. Bare dates default to **21:00 UTC** (≈ post-NY-close). `EOD` / `EOM` / `EOW` and weekday names (`by Friday`) are handled explicitly. The parser also corrects `dateparser`'s "PREFER_DATES_FROM=future" year-bump bug: `April 29` said early on April 29 in UTC stays in this year rather than jumping to next April 29.
+
+### Resolution paths (consensus, not free-for-all)
+
+`!resolve <id> right|wrong|unclear [reason]` is a **vote**, not an instant verdict:
+
+- **Auto-resolver** (cron, every 15 min) — for structured stock-shape claims, fetches the live quote and applies. For freeform claims, hands off to Sigil running through a small tool loop with the bot's research kit (price/news/chart/Brave search/EDGAR/etc.) restricted to read-only commands. Most predictions resolve here without anyone touching `!resolve`
+- **Admin** (number in `ADMIN_NUMBERS`) — resolves solo, immediately
+- **Non-admin** — vote is recorded; **2 distinct non-predictor users agreeing on the same verdict** applies the resolution. Voters can change their mind (the upsert replaces their previous verdict). The **predictor cannot vote on their own** prediction
+- Disagreement keeps the prediction pending — the chat response shows the tally (`1 right, 2 wrong`) and how many more agreements are needed
+
+### Leaderboard
+
+`!leaderboard` ranks chat members by accuracy on resolved (`right` + `wrong`) predictions. `unclear` and `expired` rows don't count. Sigil shows up on the leaderboard as its own row when it stakes via `predict_self`. The web view at `/admin/predictions` adds aggregate counters, per-context leaderboards, upcoming deadlines, and per-row admin actions (resolve-now via Sigil, override verdict + note, revert to pending).
+
+---
+
+## Per-Context Daily Oracles
+
+Each group context can have any number of scheduled posts that fire once per day. Manage from `/admin/contexts/<id>` (Daily oracles panel).
+
+### Kinds
+
+| Kind | What Sigil posts |
+|------|------------------|
+| `tarot` | Single random card draw with the rendered spread image |
+| `iching` | Three-coin cast with the procedurally-rendered hexagram |
+| `market_open` | Pre-market check — pulls index futures + day's events via tools, writes a 2-4 sentence opener |
+| `market_close` | Closing recap — index moves + leaders/laggards + notable news |
+| `freeform` | Sigil-generated post from an admin-supplied prompt |
+
+### Schedules
+
+| Schedule | Behavior |
+|----------|----------|
+| `sunrise` | NYC civil sunrise + signed `offset_minutes` |
+| `sunset` | NYC civil sunset + signed `offset_minutes` |
+| `clock` | Fixed `HH:MM` in any IANA timezone |
+
+`weekdays_only` flag skips Saturday and Sunday — sensible default for the market kinds.
+
+### Heuristic prepopulation
+
+On first boot of the new schema, every group context gets default oracle rows seeded based on its label:
+
+- Labels matching `money / stocks / finance / market / trader / trading / invest / wsb / wallstreet` → `market_open` at 09:25 ET + `market_close` at 16:05 ET, weekdays only
+- Labels matching `woo / astro / tarot / magic / witch / spirit / occult / esoteric / divin / ritual / mystic / moon` → sunrise tarot (NYC, +1 min)
+- Other labels → nothing seeded; admin adds via UI
+
+All seeded rows land **disabled** by default — admin reviews and flips enabled per row. Idempotent: contexts that already have any oracle row are skipped on re-run, so admin edits survive deploys. Per-oracle `last_fired_at` tracking makes restarts during the firing window safe (no double-post).
+
+---
+
 ## MCP Servers
 
 Manage at `/admin/mcp`. Supports stdio, SSE, and streamable HTTP transports.
@@ -530,6 +652,15 @@ Manage at `/admin/mcp`. Supports stdio, SSE, and streamable HTTP transports.
 - `uvx` (Astral's uv) — Python servers from PyPI, wheels, or `git+https://...` URLs
 - `node` / `npx` — npm-packaged servers
 - `git` — required by uvx for git-hosted Python servers
+- Pre-installed servers: `@brave/brave-search-mcp-server`, `mcp-pyodide` (used by the Python sandbox; see below)
+
+### Auto-registered defaults
+
+On first boot the registry seeds defaults that show up in `/admin/mcp` ready to go (admin can disable but if a default row is deleted it's recreated on next boot — toggle `enabled` rather than deleting):
+
+| Server | What it gives Sigil |
+|--------|---------------------|
+| `pyodide` | Real Python interpreter via Pyodide-in-Node. Pre-loaded: numpy, pandas, scipy, matplotlib, scikit-learn (Pyodide bundle) plus yfinance + statsmodels (pre-cached). State persists across calls in a conversation. Used for actual computation — correlations, regressions, NPV/IRR, options pricing, custom indicators — not paraphrasing fetched data. Pre-warmed at bot boot so the writer LLM's first call doesn't pay the bundle-load + wheel-download cost (~10-15s otherwise). Cache dir lives on the persistent volume |
 
 ### Adding a server
 
@@ -744,15 +875,23 @@ Providers are tried in priority order. When one is rate-limited, the next is use
 │                                                                  │
 │  ┌────────────────┐  ┌──────────────┐  ┌────────────────────┐   │
 │  │ Market data    │  │ LLM client   │  │ MCP manager        │   │
-│  │ Providers w/   │  │ OpenAI-compat│  │ stdio / sse / http │   │
-│  │ failover +     │  │ tool-calling │  │ npx / uvx / git    │   │
-│  │ caching        │  │ + history    │  │ available          │   │
+│  │ Providers w/   │  │ + writer +   │  │ stdio / sse / http │   │
+│  │ failover +     │  │ deep_think + │  │ Pyodide auto-      │   │
+│  │ caching        │  │ reactor      │  │ registered         │   │
 │  └────────────────┘  └──────────────┘  └────────────────────┘   │
 │                                                                  │
-│  Persistence (SQLite): watchlists · alerts · contexts · LLM      │
-│    history · group log · MCP server configs · admin settings     │
+│  Background workers (asyncio): alert sweeper, prediction         │
+│    resolver (cron + tool-enabled Sigil), per-context oracle      │
+│    scheduler, attachment-cache reaper, summarizer                │
 │                                                                  │
-│  Admin UI (Flask + Jinja + HTMX) at /admin — bcrypt + Signal 2FA │
+│  Persistence (SQLite): watchlists · alerts · contexts · LLM      │
+│    history · group log · per-context memories · predictions +    │
+│    resolution_votes · context_oracles · MCP server configs ·     │
+│    admin settings · user nicknames                               │
+│                                                                  │
+│  Admin UI (Flask + Jinja) at /admin — bcrypt + Signal 2FA;       │
+│  dashboard, predictions console, per-context editor (incl.       │
+│  oracles + memories), live SSE event feed, users registry        │
 └──────────────────────────────────────────────────────────────────┘
 ```
 

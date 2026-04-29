@@ -21,7 +21,9 @@ from typing import Optional
 
 from .base import BaseCommand, CommandContext, CommandResult
 from .predict_command import (
+    PREDICT_FOR_TOOL,
     PREDICT_SELF_TOOL,
+    PREDICT_UPDATE_TOOL,
     _format_deadline,
     extract_prediction,
 )
@@ -433,6 +435,8 @@ class AskCommand(BaseCommand):
             policy is None or policy.allows_command("predict")
         ):
             schemas.append(PREDICT_SELF_TOOL)
+            schemas.append(PREDICT_FOR_TOOL)
+            schemas.append(PREDICT_UPDATE_TOOL)
         return schemas or None
 
     async def _run_tool_loop(
@@ -556,6 +560,197 @@ class AskCommand(BaseCommand):
             f"Logged your own prediction #{pred_id}: "
             f"\"{parsed['claim']}\" due {deadline_str}{kind_note}. "
             f"It's on the leaderboard under {bot_label}."
+        )
+
+    async def _handle_predict_update_tool(
+        self,
+        args: dict,
+        caller_ctx: CommandContext,
+    ) -> str:
+        """Revise a still-pending prediction's claim/deadline within the
+        15-minute grace window. Re-uses extract_prediction so the new
+        claim goes through the same parser as the original."""
+        store = self.prediction_store
+        if store is None:
+            return "(predict_update unavailable: no prediction store wired)"
+        policy = caller_ctx.policy
+        if policy is not None and not policy.allows_command("predict"):
+            return "(predict_update unavailable: !predict not allowed in this chat)"
+
+        try:
+            pred_id = int(args.get("id") or 0)
+        except (TypeError, ValueError):
+            return "ERROR: predict_update requires an integer prediction id."
+        if pred_id <= 0:
+            return "ERROR: predict_update requires a positive id."
+        claim_text = str(args.get("claim") or "").strip()
+        if not claim_text:
+            return "ERROR: predict_update requires a non-empty new claim."
+
+        parsed, err = await extract_prediction(claim_text, llm_client=self.llm)
+        if err is not None:
+            return f"ERROR: {err}"
+        assert parsed is not None
+
+        try:
+            status = await store.update_pending(
+                pred_id,
+                claim=parsed["claim"],
+                deadline_utc=parsed["deadline_utc"],
+                ticker=parsed.get("ticker"),
+                threshold=parsed.get("threshold"),
+                direction=parsed.get("direction"),
+            )
+        except Exception as e:
+            logger.exception(f"predict_update: store.update_pending failed: {e}")
+            return "ERROR: couldn't update the prediction."
+
+        if status == "not_found":
+            return f"ERROR: no prediction #{pred_id}."
+        if status == "not_pending":
+            return (
+                f"ERROR: #{pred_id} is already resolved or expired. "
+                f"Admin can override the verdict from the dashboard if "
+                f"the auto-resolution was wrong."
+            )
+        if status == "stale":
+            return (
+                f"ERROR: #{pred_id} is past the 15-minute edit window. "
+                f"Predictions are locked after that to keep the "
+                f"leaderboard honest. Ask an admin to fix it from the "
+                f"dashboard if it's genuinely wrong."
+            )
+        if status != "ok":
+            return f"ERROR: unexpected store status {status!r}."
+
+        deadline_str = _format_deadline(parsed["deadline_utc"])
+        kind_note = ""
+        if parsed.get("ticker"):
+            kind_note = (
+                f" (auto-resolves: {parsed['ticker']} "
+                f"{parsed['direction']} ${parsed['threshold']:g})"
+            )
+        return (
+            f"Updated prediction #{pred_id}: "
+            f"\"{parsed['claim']}\" due {deadline_str}{kind_note}."
+        )
+
+    async def _handle_predict_for_tool(
+        self,
+        args: dict,
+        caller_ctx: CommandContext,
+    ) -> str:
+        """Log a prediction on behalf of a third-party chat member.
+
+        Subject can be a registered name or a phone-tail (`...4810`).
+        We resolve in that order:
+          1. Tail format `...XXXX` → most recent sender in the group
+             whose phone ends in those 4 digits.
+          2. Registered name → SubjectResolver against NameRegistry.
+          3. Reject anything that resolves to the bot, the room, or
+             a free-text label — predictions need a real chat member.
+        """
+        store = self.prediction_store
+        if store is None:
+            return "(predict_for unavailable: no prediction store wired)"
+        policy = caller_ctx.policy
+        if policy is not None and not policy.allows_command("predict"):
+            return "(predict_for unavailable: !predict not allowed in this chat)"
+
+        subject_hint = str(args.get("subject") or "").strip()
+        claim_text = str(args.get("claim") or "").strip()
+        if not subject_hint:
+            return "ERROR: predict_for requires a non-empty subject."
+        if not claim_text:
+            return "ERROR: predict_for requires a non-empty claim with a deadline."
+
+        # 1) Tail-format lookup: covers users who aren't in the name
+        # registry. The LLM sees them in group_context as `[...4810, ...]`
+        # and can pass that through verbatim.
+        user_hash: Optional[str] = None
+        user_label: Optional[str] = None
+        tail_match = re.match(r"^\s*\.\.\.\s*([A-Za-z0-9]{4})\s*$", subject_hint)
+        if tail_match and self.group_log is not None and caller_ctx.group_id:
+            tail = tail_match.group(1)
+            try:
+                phone = await self.group_log.find_recent_sender_by_tail(
+                    caller_ctx.group_id, tail,
+                )
+            except Exception as e:
+                logger.debug(f"predict_for: tail lookup failed: {e}")
+                phone = None
+            if phone:
+                user_hash = hash_phone(phone)
+                user_label = self._sender_label(phone)
+            else:
+                return (
+                    f"ERROR: no recent sender in this group ends in {tail!r}. "
+                    f"If they're registered by name, pass the name instead."
+                )
+
+        # 2) Name resolution via the existing SubjectResolver.
+        if user_hash is None:
+            resolver = self.subject_resolver
+            if resolver is None:
+                return "(predict_for unavailable: subject resolver not wired)"
+            from ..memory import SUBJECT_CONTEXT, SUBJECT_SELF, is_user_hash
+            key, label = resolver.resolve(
+                subject_hint, sender_phone=caller_ctx.sender,
+            )
+            if not key:
+                return f"(could not resolve subject {subject_hint!r})"
+            if key == SUBJECT_SELF:
+                return (
+                    "ERROR: predict_for is for OTHER people. Use "
+                    "predict_self for your own forecasts."
+                )
+            if key == SUBJECT_CONTEXT:
+                return (
+                    "ERROR: predict_for needs a real chat member. The "
+                    "room itself can't have a leaderboard row."
+                )
+            if not is_user_hash(key):
+                return (
+                    f"ERROR: {subject_hint!r} resolved to a free-text "
+                    f"subject ({label!r}). Predictions need a registered "
+                    f"chat member or the user's tail (e.g. '...4810')."
+                )
+            user_hash = key
+            user_label = label or subject_hint
+
+        # 3) Parse the claim — same pipeline that backs !predict so
+        # stock-shape claims auto-resolve at the deadline.
+        parsed, err = await extract_prediction(claim_text, llm_client=self.llm)
+        if err is not None:
+            return f"ERROR: {err}"
+        assert parsed is not None
+
+        try:
+            pred_id = await store.create(
+                user_hash=user_hash,
+                user_label=user_label or subject_hint,
+                group_id=caller_ctx.group_id,
+                context_key=caller_ctx.context_key(),
+                claim=parsed["claim"],
+                deadline_utc=parsed["deadline_utc"],
+                ticker=parsed.get("ticker"),
+                threshold=parsed.get("threshold"),
+                direction=parsed.get("direction"),
+            )
+        except Exception as e:
+            logger.exception(f"predict_for: store.create failed: {e}")
+            return "ERROR: couldn't save the prediction."
+
+        deadline_str = _format_deadline(parsed["deadline_utc"])
+        kind_note = ""
+        if parsed.get("ticker"):
+            kind_note = (
+                f" (auto-resolves: {parsed['ticker']} "
+                f"{parsed['direction']} ${parsed['threshold']:g})"
+            )
+        return (
+            f"Logged prediction #{pred_id} for {user_label}: "
+            f"\"{parsed['claim']}\" due {deadline_str}{kind_note}."
         )
 
     async def _handle_memory_tool(
@@ -693,10 +888,20 @@ class AskCommand(BaseCommand):
         is_predict_self = (
             name == "predict_self" and self.prediction_store is not None
         )
+        is_predict_for = (
+            name == "predict_for" and self.prediction_store is not None
+        )
+        is_predict_update = (
+            name == "predict_update" and self.prediction_store is not None
+        )
 
         try:
             if is_predict_self:
                 content = await self._handle_predict_self_tool(args, caller_ctx)
+            elif is_predict_for:
+                content = await self._handle_predict_for_tool(args, caller_ctx)
+            elif is_predict_update:
+                content = await self._handle_predict_update_tool(args, caller_ctx)
             elif is_memory:
                 content = await self._handle_memory_tool(
                     name, args, caller_ctx

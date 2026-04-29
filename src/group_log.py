@@ -9,6 +9,7 @@ user messages are stored — no bot replies. Sender is masked to the last
 import logging
 import time
 from pathlib import Path
+from typing import Optional
 
 import aiosqlite
 
@@ -127,6 +128,35 @@ class GroupMessageLog:
                 (group_id, group_id, MAX_ROWS_PER_GROUP),
             )
             await db.commit()
+
+    async def find_recent_sender_by_tail(
+        self, group_id: str, tail: str, *, limit: int = 200
+    ) -> Optional[str]:
+        """Find the most recent phone number in `group_id` whose last
+        4 chars match `tail`. Returns None when no match found.
+
+        Used by `predict_for` to attribute a prediction to an
+        unregistered user the LLM only knows by their `...4810` tail
+        from the group_context block. We scan inbound messages (the
+        bot's own posts have BOT_SENDER as their sender, so they're
+        naturally excluded).
+        """
+        tail = (tail or "").strip()
+        if not tail or not group_id:
+            return None
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT sender FROM group_messages
+                   WHERE group_id = ?
+                     AND sender != ?
+                     AND substr(sender, -4) = ?
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                (group_id, BOT_SENDER, tail),
+            )
+            row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def append_bot(self, group_id: str, text: str) -> None:
         """Record one of the bot's own replies under the BOT_SENDER sentinel.

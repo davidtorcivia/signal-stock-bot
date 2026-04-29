@@ -73,6 +73,24 @@ _DATEPARSER_SETTINGS = {
     "TO_TIMEZONE": "UTC",
 }
 
+
+# Patterns that signal the user explicitly meant a future year, so the
+# year-bump correction below shouldn't undo it. Anything matching one
+# of these stays at whatever year dateparser produced.
+_EXPLICIT_FUTURE_YEAR_RE = re.compile(
+    r"\b(?:"
+    r"(?:19|20)\d{2}"                  # 4-digit year, e.g. "2027"
+    r"|next\s+year"
+    r"|in\s+\d+\s+years?"
+    r"|(?:a|one)\s+year\s+from"        # "a year from now"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_explicit_future_year(text: str) -> bool:
+    return bool(_EXPLICIT_FUTURE_YEAR_RE.search(text or ""))
+
 _WEEKDAYS = {
     "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
     "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3, "thurs": 3,
@@ -142,7 +160,7 @@ def _parse_deadline(text: str) -> Optional[float]:
         parsed = dateparser.parse(text, settings=_DATEPARSER_SETTINGS)
     except Exception:
         return None
-    if parsed is None or parsed <= now:
+    if parsed is None:
         return None
     # Ensure UTC even if dateparser elided tzinfo somehow
     if parsed.tzinfo is None:
@@ -150,6 +168,21 @@ def _parse_deadline(text: str) -> Optional[float]:
     # If user gave a date with no explicit time, default to 21:00 UTC
     if parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0:
         parsed = parsed.replace(hour=21)
+
+    # Year-bump correction: dateparser's `PREFER_DATES_FROM: future`
+    # mis-handles "Month Day" said on or after that day in UTC — it
+    # bumps to NEXT year (e.g. "April 29" said at 02:00 UTC on
+    # April 29 → April 29, 2027 instead of 2026). When the parsed
+    # date is more than 6 months out AND the user didn't explicitly
+    # mention a future year, prefer the same-year interpretation if
+    # it's still in the future after applying the 21:00 UTC default.
+    if (parsed - now).days > 180 and not _has_explicit_future_year(text):
+        candidate = parsed.replace(year=parsed.year - 1)
+        if candidate > now:
+            parsed = candidate
+
+    if parsed <= now:
+        return None
     return parsed.timestamp()
 
 
@@ -381,6 +414,111 @@ PREDICT_SELF_TOOL = {
 }
 
 
+PREDICT_UPDATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "predict_update",
+        "description": (
+            "Revise the claim or deadline of a still-pending prediction "
+            "within 15 minutes of its creation. Past that grace window "
+            "the prediction is locked to preserve leaderboard integrity "
+            "— admins can still edit via the dashboard, but the LLM "
+            "can't.\n\n"
+            "Use this when the original logging mis-extracted something "
+            "(wrong year, wrong threshold, wrong ticker) or when the "
+            "predictor immediately wants to revise their own claim. The "
+            "predictor's identity (user_hash + label) is preserved — "
+            "this only changes WHAT was predicted, not WHO predicted "
+            "it. To change the predictor, cancel and repredict.\n\n"
+            "Pass the same `<claim> by <date>` shape as predict_self / "
+            "predict_for; the new claim re-runs through the parser so "
+            "stock-shape claims still auto-resolve.\n\n"
+            "Reject cases (returned to you as ERROR strings, not raised): "
+            "no such id, already resolved or expired, older than 15 "
+            "minutes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": (
+                        "Prediction id from the original "
+                        "`Logged prediction #N` confirmation or "
+                        "!predictions output."
+                    ),
+                },
+                "claim": {
+                    "type": "string",
+                    "description": (
+                        "Full revised prediction text including the "
+                        "deadline. Examples: \"SPY closes below $711 by "
+                        "2026-04-29\", \"TDW above $94 by May 12\"."
+                    ),
+                },
+            },
+            "required": ["id", "claim"],
+        },
+    },
+}
+
+
+PREDICT_FOR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "predict_for",
+        "description": (
+            "Log a prediction on behalf of a SPECIFIC OTHER chat member "
+            "who just stated one. Use when somebody else in the chat "
+            "commits to a forecast aloud and you want it tracked under "
+            "THEIR name (so it lands on their leaderboard row, not "
+            "yours and not the asker's).\n\n"
+            "Trigger pattern: \"<Person> just said <claim>\", or "
+            "\"<Person> says X by Y\", or the asker says \"log "
+            "<Person>'s prediction\". The prediction text comes from "
+            "what that person actually said in the group_context — "
+            "DON'T invent a claim or pick a deadline they didn't "
+            "specify. If the deadline is vague (\"tomorrow\", \"by "
+            "Friday\"), pin it to a concrete calendar date in the "
+            "claim text before calling.\n\n"
+            "Distinct from: `predict_self` (your own forecast), "
+            "`bot__predict` (logs as the asker — only correct when "
+            "the asker IS the predictor). Wrong tool choice puts the "
+            "win/loss on the wrong person's leaderboard row.\n\n"
+            "Subject can be a registered name (\"Anthony\") or a "
+            "phone tail (\"...4810\") if the person isn't named in "
+            "the registry. Free-text labels and \"this chat\" are "
+            "rejected — predictions need a real chat member."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": (
+                        "Who the prediction is FOR. Either a registered "
+                        "name as it appears in [Name, ...] brackets in "
+                        "group_context (e.g. \"Anthony\"), or the phone "
+                        "tail form (e.g. \"...4810\"). Must resolve to "
+                        "a real chat member."
+                    ),
+                },
+                "claim": {
+                    "type": "string",
+                    "description": (
+                        "Full prediction text including the deadline. "
+                        "Examples: \"SPY closes below $710 by 2026-04-29\", "
+                        "\"TDW above $94 by May 5\", \"Bitcoin under "
+                        "$80k by EOM\"."
+                    ),
+                },
+            },
+            "required": ["subject", "claim"],
+        },
+    },
+}
+
+
 class PredictCommand(BaseCommand):
     name = "predict"
     aliases = ["bet", "forecast"]
@@ -486,18 +624,28 @@ class PredictionsCommand(BaseCommand):
 class ResolveCommand(BaseCommand):
     name = "resolve"
     aliases = ["verdict"]
-    description = "Mark a prediction as right, wrong, or unclear."
+    description = "Vote to mark a prediction right, wrong, or unclear."
     usage = "!resolve <id> right|wrong|unclear [reason]"
     help_explanation = (
-        "Manually resolves a prediction. Anyone in the chat can resolve "
-        "any prediction — group accountability. Use `unclear` when the "
-        "outcome is genuinely ambiguous; it doesn't count against the "
-        "predictor's record."
+        "Cast a resolution vote. Two distinct non-predictor users "
+        "agreeing on the same verdict resolves the prediction; admins "
+        "resolve solo. Predictors can't vote on their own. The cron "
+        "auto-resolver also resolves predictions independently using "
+        "live data + Sigil's research tools."
     )
 
-    def __init__(self, store: PredictionStore, name_registry=None):
+    def __init__(
+        self,
+        store: PredictionStore,
+        name_registry=None,
+        admin_numbers: Optional[list] = None,
+    ):
         self.store = store
         self.name_registry = name_registry
+        self.admin_numbers = list(admin_numbers or [])
+
+    def _is_admin(self, sender: str) -> bool:
+        return bool(sender) and sender in self.admin_numbers
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if len(ctx.args) < 2:
@@ -517,6 +665,8 @@ class ResolveCommand(BaseCommand):
             )
         note = " ".join(ctx.args[2:]).strip() or None
 
+        # Cheap pre-check so we can give a chat-aware "wrong chat" error
+        # instead of a generic "not_found" from the vote path.
         pred = await self.store.get(pred_id)
         if pred is None:
             return CommandResult.error(f"No prediction #{pred_id}.")
@@ -524,34 +674,66 @@ class ResolveCommand(BaseCommand):
             return CommandResult.error(
                 f"#{pred_id} belongs to a different chat — resolve it there."
             )
-        if pred.status != STATUS_PENDING:
-            return CommandResult.error(
-                f"#{pred_id} is already {pred.status} ({pred.verdict or '—'})."
-            )
 
-        ok = await self.store.resolve(
+        is_admin = self._is_admin(ctx.sender)
+        result = await self.store.vote_to_resolve(
             pred_id,
+            voter_user_hash=hash_phone(ctx.sender),
             verdict=verdict,
             note=note,
-            resolver_user_hash=hash_phone(ctx.sender),
+            is_admin=is_admin,
         )
-        if not ok:
-            return CommandResult.error(f"Couldn't resolve #{pred_id}.")
+        status = result.get("status")
 
-        record = await self.store.user_record(pred.user_hash, pred.context_key)
-        record_str = ""
-        if record["accuracy"] is not None:
-            record_str = (
-                f"\n  {pred.user_label}'s record: {record['right']}/"
-                f"{record['right'] + record['wrong']} "
-                f"({int(record['accuracy'] * 100)}%)"
+        if status == "self_vote":
+            return CommandResult.error(
+                f"You can't vote on your own prediction. Wait for "
+                f"{self.store.RESOLUTION_VOTE_THRESHOLD} other users to "
+                f"agree, or for the auto-resolver to settle it at the "
+                f"deadline."
             )
-        emoji = VERDICT_EMOJI.get(verdict, "•")
-        return CommandResult.ok(
-            f"{emoji} #{pred_id} marked **{verdict}**"
-            f"{f' — {note}' if note else ''}\n"
-            f"  Claim: {pred.claim}{record_str}"
-        )
+        if status == "not_pending":
+            return CommandResult.error(
+                f"#{pred_id} is already resolved or expired."
+            )
+        if status == "not_found":
+            return CommandResult.error(f"No prediction #{pred_id}.")
+
+        if status == "resolved":
+            record = await self.store.user_record(
+                pred.user_hash, pred.context_key,
+            )
+            record_str = ""
+            if record["accuracy"] is not None:
+                record_str = (
+                    f"\n  {pred.user_label}'s record: {record['right']}/"
+                    f"{record['right'] + record['wrong']} "
+                    f"({int(record['accuracy'] * 100)}%)"
+                )
+            emoji = VERDICT_EMOJI.get(verdict, "•")
+            tag = (
+                "(admin override)" if result.get("by_admin")
+                else f"({result.get('agreeing_count', 0)}-user consensus)"
+            )
+            return CommandResult.ok(
+                f"{emoji} #{pred_id} resolved *{verdict}* {tag}"
+                f"{f' — {note}' if note else ''}\n"
+                f"  Claim: {pred.claim}{record_str}"
+            )
+
+        if status == "voted":
+            agreeing = result.get("agreeing_count", 1)
+            needed = result.get("needed", self.store.RESOLUTION_VOTE_THRESHOLD)
+            remaining = max(0, needed - agreeing)
+            tally = result.get("dissenting_summary", "")
+            tally_part = f" Tally: {tally}." if tally else ""
+            return CommandResult.ok(
+                f"Vote recorded for #{pred_id} → *{verdict}*. "
+                f"{remaining} more {'agreement' if remaining == 1 else 'agreements'} "
+                f"needed to apply.{tally_part}"
+            )
+
+        return CommandResult.error(f"Unexpected vote status: {status}")
 
 
 class LeaderboardCommand(BaseCommand):

@@ -302,7 +302,11 @@ def create_dispatcher(
         prediction_store, llm_client=llm_client, name_registry=name_registry,
     )
     predictions_cmd = PredictionsCommand(prediction_store, name_registry=name_registry)
-    resolve_cmd = ResolveCommand(prediction_store, name_registry=name_registry)
+    resolve_cmd = ResolveCommand(
+        prediction_store,
+        name_registry=name_registry,
+        admin_numbers=config.admin_numbers,
+    )
     leaderboard_cmd = LeaderboardCommand(prediction_store, name_registry=name_registry)
     for cmd in (predict_cmd, predictions_cmd, resolve_cmd, leaderboard_cmd):
         dispatcher.register(cmd)

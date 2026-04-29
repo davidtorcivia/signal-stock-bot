@@ -116,6 +116,31 @@ class PredictionStore:
                 "CREATE INDEX IF NOT EXISTS idx_pred_status_deadline "
                 "ON predictions(status, deadline_utc)"
             )
+            # Multi-user consensus voting on resolutions. Without this,
+            # any single chat member could mark any prediction however
+            # they wanted — fine for "trust everyone" groups, terrible
+            # for any chat where someone has incentive to manipulate
+            # the leaderboard. Two distinct non-predictor voters
+            # agreeing on the same verdict applies the resolution;
+            # admins resolve solo. The predictor is excluded from
+            # voting on themselves entirely.
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resolution_votes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prediction_id INTEGER NOT NULL,
+                    voter_user_hash TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    note TEXT,
+                    created_at REAL NOT NULL,
+                    UNIQUE(prediction_id, voter_user_hash)
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_resolution_votes_pred "
+                "ON resolution_votes(prediction_id)"
+            )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pred_user "
                 "ON predictions(user_hash, status)"
@@ -314,6 +339,198 @@ class PredictionStore:
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    # Number of distinct non-predictor non-admin voters who must agree
+    # on the same verdict before a resolution applies. Admins resolve
+    # solo; auto-resolver (cron) bypasses voting entirely.
+    RESOLUTION_VOTE_THRESHOLD = 2
+
+    async def vote_to_resolve(
+        self,
+        pred_id: int,
+        *,
+        voter_user_hash: str,
+        verdict: str,
+        note: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> dict:
+        """Cast a resolution vote; return a status dict.
+
+        Outcomes (returned in `status` field):
+          - "resolved"   → verdict applied (admin path OR threshold met)
+          - "voted"      → vote recorded; not enough agreeing voters yet
+          - "self_vote"  → the predictor cannot vote on themselves
+          - "not_found"  → no prediction with this id
+          - "not_pending"→ already resolved/expired
+
+        Additional fields when applicable:
+          - `agreeing_count`: distinct voters with this verdict (resolved/voted)
+          - `dissenting_summary`: string like "1 right, 2 wrong" when split
+          - `predictor_label`: convenience for response rendering
+        """
+        if verdict not in VALID_VERDICTS:
+            raise ValueError(f"invalid verdict: {verdict!r}")
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            # Lock the row group up-front so concurrent voters don't
+            # both think they're casting the threshold-meeting vote.
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "SELECT user_hash, user_label, status FROM predictions WHERE id = ?",
+                    (pred_id,),
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    await db.rollback()
+                    return {"status": "not_found"}
+                predictor_hash, predictor_label, status = row
+                if status != STATUS_PENDING:
+                    await db.rollback()
+                    return {
+                        "status": "not_pending",
+                        "predictor_label": predictor_label,
+                    }
+                if voter_user_hash == predictor_hash and not is_admin:
+                    await db.rollback()
+                    return {
+                        "status": "self_vote",
+                        "predictor_label": predictor_label,
+                    }
+
+                # Admin path: bypass voting, resolve immediately.
+                if is_admin:
+                    await db.execute(
+                        """UPDATE predictions
+                           SET status = 'resolved',
+                               verdict = ?,
+                               resolution_note = ?,
+                               resolved_at = ?,
+                               resolver_user_hash = ?
+                           WHERE id = ? AND status = 'pending'""",
+                        (verdict, note, time.time(), voter_user_hash, pred_id),
+                    )
+                    await db.commit()
+                    return {
+                        "status": "resolved",
+                        "predictor_label": predictor_label,
+                        "agreeing_count": 1,
+                        "by_admin": True,
+                    }
+
+                # Non-admin: upsert this voter's vote (replaces any
+                # prior verdict from the same voter — they're allowed
+                # to change their mind).
+                await db.execute(
+                    """INSERT INTO resolution_votes
+                       (prediction_id, voter_user_hash, verdict, note, created_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(prediction_id, voter_user_hash) DO UPDATE SET
+                           verdict = excluded.verdict,
+                           note = excluded.note,
+                           created_at = excluded.created_at""",
+                    (pred_id, voter_user_hash, verdict, note, time.time()),
+                )
+
+                # Count distinct voters per verdict for THIS prediction.
+                cursor = await db.execute(
+                    """SELECT verdict, COUNT(*) FROM resolution_votes
+                       WHERE prediction_id = ?
+                       GROUP BY verdict""",
+                    (pred_id,),
+                )
+                tally = dict(await cursor.fetchall())
+                agreeing = tally.get(verdict, 0)
+
+                if agreeing >= self.RESOLUTION_VOTE_THRESHOLD:
+                    await db.execute(
+                        """UPDATE predictions
+                           SET status = 'resolved',
+                               verdict = ?,
+                               resolution_note = ?,
+                               resolved_at = ?,
+                               resolver_user_hash = ?
+                           WHERE id = ? AND status = 'pending'""",
+                        (
+                            verdict,
+                            note or f"resolved by {agreeing}-user consensus",
+                            time.time(),
+                            voter_user_hash,
+                            pred_id,
+                        ),
+                    )
+                    await db.commit()
+                    return {
+                        "status": "resolved",
+                        "predictor_label": predictor_label,
+                        "agreeing_count": agreeing,
+                        "by_admin": False,
+                    }
+
+                await db.commit()
+                # Build a tally string for the response when there's
+                # disagreement ("1 right, 2 wrong").
+                summary_parts = sorted(
+                    f"{count} {v}" for v, count in tally.items() if count > 0
+                )
+                return {
+                    "status": "voted",
+                    "predictor_label": predictor_label,
+                    "agreeing_count": agreeing,
+                    "needed": self.RESOLUTION_VOTE_THRESHOLD,
+                    "dissenting_summary": ", ".join(summary_parts),
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
+    # Window during which a predictor (or the bot acting on their
+    # behalf) can still revise the claim. Past this point the row is
+    # locked to preserve leaderboard integrity — fixing wrong claims
+    # later requires admin intervention via the dashboard.
+    UPDATE_GRACE_SECONDS = 15 * 60
+
+    async def update_pending(
+        self,
+        pred_id: int,
+        *,
+        claim: str,
+        deadline_utc: float,
+        ticker: Optional[str] = None,
+        threshold: Optional[float] = None,
+        direction: Optional[str] = None,
+    ) -> str:
+        """Revise a pending prediction's claim/deadline within the grace
+        window. Returns a status string:
+          - "ok"           → the row was updated
+          - "not_found"    → no row with that id
+          - "not_pending"  → already resolved/expired (status check)
+          - "stale"        → past the UPDATE_GRACE_SECONDS window
+        """
+        await self._ensure_initialized()
+        now = time.time()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT status, created_at FROM predictions WHERE id = ?",
+                (pred_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return "not_found"
+            status, created_at = row[0], row[1]
+            if status != STATUS_PENDING:
+                return "not_pending"
+            if (now - (created_at or 0)) > self.UPDATE_GRACE_SECONDS:
+                return "stale"
+            await db.execute(
+                """UPDATE predictions
+                   SET claim = ?, deadline_utc = ?,
+                       ticker = ?, threshold = ?, direction = ?
+                   WHERE id = ?""",
+                (claim, deadline_utc, ticker, threshold, direction, pred_id),
+            )
+            await db.commit()
+        return "ok"
 
     async def expire(self, pred_id: int, *, note: Optional[str] = None) -> bool:
         """Mark as expired — auto-resolver tried and gave up. Doesn't count."""
