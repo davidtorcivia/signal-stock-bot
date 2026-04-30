@@ -49,6 +49,8 @@ def create_admin_blueprint(
     prediction_store=None,
     prediction_resolver=None,
     oracle_store=None,
+    portfolio_store=None,
+    portfolio_executor=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -112,6 +114,15 @@ def create_admin_blueprint(
             prediction_resolver=prediction_resolver,
             context_registry=context_registry,
             name_registry=name_registry,
+            loop=loop,
+        )
+
+    if portfolio_store is not None and portfolio_executor is not None:
+        _register_portfolio_routes(
+            bp,
+            portfolio_store=portfolio_store,
+            portfolio_executor=portfolio_executor,
+            context_registry=context_registry,
             loop=loop,
         )
 
@@ -1982,3 +1993,214 @@ def _register_live_routes(
                 "Connection": "keep-alive",
             },
         )
+
+
+def _register_portfolio_routes(
+    bp: Blueprint,
+    *,
+    portfolio_store,
+    portfolio_executor,
+    context_registry: Optional[ContextRegistry],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Paper-portfolio admin view: per-context status, recent trades,
+    recent tips, plus a destructive 'reset' button.
+
+    Read-mostly: trade execution still happens through Sigil's tools or
+    the cron worker, not from this UI.
+    """
+    import time as _time
+
+    @bp.route("/portfolios", methods=["GET"])
+    @admin_required
+    def portfolios_page():
+        if portfolio_store is None or portfolio_executor is None:
+            return render_template(
+                "portfolios.html", available=False, portfolios=[],
+            )
+
+        ctx_labels: dict[str, str] = {}
+        if context_registry is not None:
+            try:
+                policies = _run_on_loop(loop, context_registry.list())
+                for p in policies:
+                    if p.kind in ("group", "dm") and p.key:
+                        ctx_labels[f"{p.kind}:{p.key}"] = p.label or "(unlabeled)"
+            except Exception as e:
+                logger.error(f"Portfolios: context labels failed: {e}")
+
+        try:
+            keys = _run_on_loop(loop, portfolio_store.list_portfolio_keys())
+        except Exception as e:
+            logger.error(f"Portfolios: list keys failed: {e}")
+            keys = []
+
+        rendered = []
+        for ck in keys:
+            try:
+                snap = _run_on_loop(loop, portfolio_executor.status(ck))
+                trades = _run_on_loop(
+                    loop, portfolio_store.list_trades(ck, limit=15),
+                )
+                tips = _run_on_loop(
+                    loop, portfolio_store.list_tips(ck, limit=15),
+                )
+                # Recent orders across all statuses (not just pending)
+                # so admin can see fill / cancel / expired history. The
+                # `pending_orders` field on the snap is already filtered
+                # to pending; this list complements it for the
+                # activity-log section of the template.
+                from src.paper_portfolio import VALID_ORDER_STATUSES
+                recent_orders = _run_on_loop(
+                    loop,
+                    portfolio_store.list_orders_for_context(
+                        ck, statuses=set(VALID_ORDER_STATUSES), limit=20,
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"Portfolios: snapshot for {ck} failed: {e}")
+                continue
+
+            row = dict(snap)
+            row["context_key"] = ck
+            row["label"] = (
+                snap.get("label")
+                or ctx_labels.get(ck)
+                or ck
+            )
+            row["trades"] = [
+                {
+                    "ts_str": _time.strftime(
+                        "%Y-%m-%d %H:%M", _time.localtime(t.ts),
+                    ),
+                    "side": t.side,
+                    "qty": t.qty,
+                    "ticker": t.ticker,
+                    "price": t.price,
+                    "source": t.source,
+                    "realized_pnl": t.realized_pnl,
+                    "reason": t.reason,
+                }
+                for t in trades
+            ]
+            row["tips"] = [
+                {
+                    "ts_str": _time.strftime(
+                        "%Y-%m-%d %H:%M", _time.localtime(tip.ts),
+                    ),
+                    "tipper_label": tip.tipper_label,
+                    "tipper_user_hash": tip.tipper_user_hash,
+                    "amount": tip.amount,
+                    "note": tip.note,
+                }
+                for tip in tips
+            ]
+            # Order activity log — show every status (not just pending)
+            # so admins can audit fills, cancels, expiries, and
+            # failures. Sorted newest-first to match the trade log.
+            row["recent_orders"] = [
+                {
+                    "id": o.id,
+                    "ticker": o.ticker,
+                    "side": o.side,
+                    "kind": o.kind,
+                    "trigger_price": o.trigger_price,
+                    "trigger_direction": (
+                        "above"
+                        if (
+                            (o.side == "buy" and o.kind == "stop")
+                            or (o.side == "sell" and o.kind == "limit")
+                        ) else "below"
+                    ),
+                    "qty": o.qty,
+                    "dollars": o.dollars,
+                    "close_position": bool(o.close_position),
+                    "reason": o.reason,
+                    "status": o.status,
+                    "created_str": _time.strftime(
+                        "%Y-%m-%d %H:%M", _time.localtime(o.created_at),
+                    ),
+                    "filled_str": (
+                        _time.strftime(
+                            "%Y-%m-%d %H:%M", _time.localtime(o.filled_at),
+                        ) if o.filled_at else None
+                    ),
+                    "fill_price": o.fill_price,
+                    "fill_qty": o.fill_qty,
+                    "fill_note": o.fill_note,
+                }
+                for o in recent_orders
+            ]
+            rendered.append(row)
+
+        return render_template(
+            "portfolios.html",
+            available=True,
+            portfolios=rendered,
+        )
+
+    @bp.route("/portfolios/<path:context_key>/reset", methods=["POST"])
+    @admin_required
+    def portfolios_reset(context_key: str):
+        if not verify_csrf():
+            abort(400)
+        if portfolio_store is None:
+            flash("Portfolio store not configured.", "error")
+            return redirect(url_for("admin.portfolios_page"))
+        try:
+            ok = _run_on_loop(loop, portfolio_store.reset(context_key))
+        except Exception as e:
+            logger.exception(f"Portfolios: reset {context_key} failed: {e}")
+            flash(f"Reset failed: {type(e).__name__}", "error")
+            return redirect(url_for("admin.portfolios_page"))
+        if ok:
+            flash(f"Reset {context_key} to $1000 seed.", "ok")
+        else:
+            flash(f"No portfolio for {context_key}.", "error")
+        return redirect(url_for("admin.portfolios_page"))
+
+    @bp.route(
+        "/portfolios/<path:context_key>/orders/<int:order_id>/cancel",
+        methods=["POST"],
+    )
+    @admin_required
+    def portfolios_cancel_order(context_key: str, order_id: int):
+        """Admin override-cancel of a pending order. Scoped by
+        context_key (matching the LLM-facing cancel) so the URL has to
+        be valid both ways."""
+        if not verify_csrf():
+            abort(400)
+        if portfolio_store is None:
+            flash("Portfolio store not configured.", "error")
+            return redirect(url_for("admin.portfolios_page"))
+        try:
+            status = _run_on_loop(
+                loop,
+                portfolio_store.cancel_order(
+                    order_id, context_key=context_key,
+                ),
+            )
+        except Exception as e:
+            logger.exception(
+                f"Portfolios: cancel_order {order_id} failed: {e}"
+            )
+            flash(f"Cancel failed: {type(e).__name__}", "error")
+            return redirect(url_for("admin.portfolios_page"))
+        if status == "ok":
+            flash(f"Cancelled order #{order_id}.", "ok")
+        elif status == "not_found":
+            flash(f"Order #{order_id} doesn't exist.", "error")
+        elif status == "wrong_context":
+            flash(
+                f"Order #{order_id} doesn't belong to this portfolio.",
+                "error",
+            )
+        elif status == "not_pending":
+            flash(
+                f"Order #{order_id} is already filled / cancelled / "
+                f"expired — nothing to cancel.",
+                "error",
+            )
+        else:
+            flash(f"Cancel returned unexpected status: {status!r}", "error")
+        return redirect(url_for("admin.portfolios_page"))

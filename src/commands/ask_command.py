@@ -15,6 +15,7 @@ The command's registered name is always "ask"; an admin-chosen alias from
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from typing import Optional
@@ -27,8 +28,25 @@ from .predict_command import (
     _format_deadline,
     extract_prediction,
 )
+from .portfolio_command import (
+    PORTFOLIO_BUY_TOOL,
+    PORTFOLIO_CANCEL_ORDER_TOOL,
+    PORTFOLIO_JOURNAL_APPEND_TOOL,
+    PORTFOLIO_JOURNAL_READ_TOOL,
+    PORTFOLIO_PLACE_ORDER_TOOL,
+    PORTFOLIO_SELL_TOOL,
+    PORTFOLIO_STATUS_TOOL,
+    render_status,
+)
+from ..charts.portfolio import render_portfolio_image
 from ..database import hash_phone
 from ..group_log import BOT_SENDER
+from ..paper_portfolio import (
+    SOURCE_CRON,
+    SOURCE_REACTIVE,
+    VALID_SOURCES,
+)
+from ..paper_portfolio_executor import PaperPortfolioExecutor
 from ..predictions import PredictionStore
 from ..llm import (
     LLMClient,
@@ -262,6 +280,8 @@ class AskCommand(BaseCommand):
         deep_think=None,
         memory_store: Optional[MemoryStore] = None,
         prediction_store: Optional[PredictionStore] = None,
+        portfolio_executor: Optional[PaperPortfolioExecutor] = None,
+        portfolio_journal=None,
     ):
         self.llm = llm
         self.history = history
@@ -278,6 +298,19 @@ class AskCommand(BaseCommand):
         # tool letting Sigil log its own forecasts under a bot-author row
         # so its calls appear on the leaderboard alongside humans.
         self.prediction_store = prediction_store
+        # Optional paper-portfolio executor — when set and the per-context
+        # policy allows the !portfolio command, the writer LLM gets
+        # portfolio_buy / portfolio_sell / portfolio_status tools so
+        # Sigil can paper-trade reactively in chat. The cron worker
+        # holds its own executor reference for scheduled decision points.
+        self.portfolio_executor = portfolio_executor
+        # Per-portfolio markdown journal — bot's free-form notebook for
+        # narrative reflection on its trading. Surfaced as
+        # portfolio_journal_append / portfolio_journal_read tools when
+        # both the journal is wired AND the chat allows portfolio. Kept
+        # separate from MemoryStore: the journal is paragraph-style
+        # narrative, MemoryStore is structured key-value facts.
+        self.portfolio_journal = portfolio_journal
         self.subject_resolver: Optional[SubjectResolver] = None
         # Optional DeepThinkClient — when set and the per-context policy
         # allows it, exposed to the writer LLM as a `deep_think` tool.
@@ -429,6 +462,26 @@ class AskCommand(BaseCommand):
             schemas.append(PREDICT_SELF_TOOL)
             schemas.append(PREDICT_FOR_TOOL)
             schemas.append(PREDICT_UPDATE_TOOL)
+        # Paper-portfolio tools — exposed when the executor is wired AND
+        # the per-context policy allows the !portfolio command. Same
+        # gating shape as predict tools above: a chat that hasn't opted
+        # into the portfolio feature shouldn't see the trade tools.
+        if self.portfolio_executor is not None and (
+            policy is None or policy.allows_command("portfolio")
+        ):
+            schemas.append(PORTFOLIO_STATUS_TOOL)
+            schemas.append(PORTFOLIO_BUY_TOOL)
+            schemas.append(PORTFOLIO_SELL_TOOL)
+            schemas.append(PORTFOLIO_PLACE_ORDER_TOOL)
+            schemas.append(PORTFOLIO_CANCEL_ORDER_TOOL)
+            # Journal tools are gated separately because the journal
+            # store is wired independently — a deploy could have
+            # portfolio enabled but no journal directory configured,
+            # in which case we hide the tools rather than expose
+            # broken endpoints.
+            if self.portfolio_journal is not None:
+                schemas.append(PORTFOLIO_JOURNAL_APPEND_TOOL)
+                schemas.append(PORTFOLIO_JOURNAL_READ_TOOL)
         return schemas or None
 
     async def _run_tool_loop(
@@ -641,6 +694,334 @@ class AskCommand(BaseCommand):
             f"Updated prediction #{pred_id}: "
             f"\"{parsed['claim']}\" due {deadline_str}{kind_note}."
         )
+
+    async def _handle_portfolio_tool(
+        self,
+        name: str,
+        args: dict,
+        caller_ctx: CommandContext,
+        attachments: list,
+    ) -> str:
+        """Dispatch portfolio_buy / portfolio_sell / portfolio_status.
+
+        Returns a human-readable result string fed back to the LLM so it
+        can reference the fill (or rejection) in its reply. All three
+        tools are defence-in-depth gated by `policy.allows_command(
+        "portfolio")`; the schema filter in `_collect_tools` already
+        hides them from the writer when the policy disallows.
+
+        For `portfolio_status` we also append a rendered dashboard PNG
+        to `attachments` so the user sees the portfolio as an image
+        (Signal renders monospace tables badly). The text returned to
+        the LLM still includes the full structured data so the model
+        can discuss specific positions without needing vision.
+        """
+        executor = self.portfolio_executor
+        if executor is None:
+            return f"({name} unavailable: no portfolio executor wired)"
+        policy = caller_ctx.policy
+        if policy is not None and not policy.allows_command("portfolio"):
+            return f"({name} unavailable: portfolio not allowed in this chat)"
+
+        ctx_key = caller_ctx.context_key()
+        # Trade provenance: trust the cron's tag if set, otherwise
+        # default to "reactive" (a real chat message triggered this).
+        # `automation_source` is enumerated against VALID_SOURCES so
+        # an unrecognized tag silently downgrades to reactive instead
+        # of crashing inside the store's strict source check.
+        source_tag = caller_ctx.automation_source or SOURCE_REACTIVE
+        if source_tag not in VALID_SOURCES:
+            logger.warning(
+                f"unknown automation_source {source_tag!r}; "
+                f"falling back to {SOURCE_REACTIVE!r}"
+            )
+            source_tag = SOURCE_REACTIVE
+
+        if name == "portfolio_status":
+            try:
+                snap = await executor.status(ctx_key)
+            except Exception as e:
+                logger.exception(f"portfolio_status failed: {e}")
+                return f"ERROR: couldn't load portfolio status: {type(e).__name__}"
+
+            # Attach the portfolio dashboard image so the user sees the
+            # numbers in a clean PNG. Failures are non-fatal — the LLM
+            # still gets the text data and can reply without the image.
+            try:
+                image_b64 = render_portfolio_image(
+                    snap, bot_name=self._bot_label(),
+                )
+                attachments.append(image_b64)
+                image_note = (
+                    "\n\n[NOTE TO MODEL: a portfolio dashboard image is "
+                    "being attached to your reply automatically — the "
+                    "user will see the holdings, equity, and PnL "
+                    "rendered as a polished card. Do NOT reproduce "
+                    "this as a markdown table, monospace block, or "
+                    "bulleted list in your text. Reply in plain prose: "
+                    "comment on what's interesting, what you're "
+                    "watching, or what you'd change. If the user just "
+                    "asked to see the portfolio with no follow-up, a "
+                    "single short sentence is enough.]"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"portfolio_status: image render failed, "
+                    f"continuing without attachment: {e}"
+                )
+                image_note = ""
+
+            return render_status(snap, bot_name=self._bot_label()) + image_note
+
+        if name == "portfolio_buy":
+            ticker = str(args.get("ticker") or "").strip().upper()
+            reason = str(args.get("reason") or "").strip()
+            if not ticker:
+                return "ERROR: portfolio_buy requires a ticker."
+            if not reason:
+                return "ERROR: portfolio_buy requires a one-sentence reason."
+            dollars = args.get("dollars")
+            qty = args.get("qty")
+            try:
+                dollars_f = float(dollars) if dollars is not None else None
+                qty_f = float(qty) if qty is not None else None
+            except (TypeError, ValueError):
+                return "ERROR: dollars/qty must be numeric."
+            if dollars_f is not None and not math.isfinite(dollars_f):
+                return "ERROR: dollars must be a finite number."
+            if qty_f is not None and not math.isfinite(qty_f):
+                return "ERROR: qty must be a finite number."
+            try:
+                result = await executor.execute_buy(
+                    ctx_key,
+                    ticker=ticker,
+                    dollars=dollars_f,
+                    qty=qty_f,
+                    reason=reason,
+                    source=source_tag,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_buy failed: {e}")
+                return f"ERROR: buy failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'buy rejected')}"
+            return (
+                f"Bought {result['qty_after']:.4f} {ticker} "
+                f"@ ${result['price']:.2f} (cost ${result['proceeds']:,.2f}). "
+                f"Position avg ${result['avg_cost_after']:.2f}. "
+                f"Cash now ${result['cash_after']:,.2f}. "
+                f"Reason: {reason}"
+            )
+
+        if name == "portfolio_sell":
+            ticker = str(args.get("ticker") or "").strip().upper()
+            reason = str(args.get("reason") or "").strip()
+            if not ticker:
+                return "ERROR: portfolio_sell requires a ticker."
+            if not reason:
+                return "ERROR: portfolio_sell requires a one-sentence reason."
+            qty_arg = args.get("qty")
+            try:
+                result = await executor.execute_sell(
+                    ctx_key,
+                    ticker=ticker,
+                    qty=qty_arg,
+                    reason=reason,
+                    source=source_tag,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_sell failed: {e}")
+                return f"ERROR: sell failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'sell rejected')}"
+            pnl = result.get("realized_pnl") or 0.0
+            pnl_part = (
+                f" Realized P/L ${pnl:+,.2f}." if abs(pnl) > 0.005 else ""
+            )
+            remaining = result.get("qty_after") or 0.0
+            remaining_part = (
+                f" Remaining: {remaining:.4f} shares."
+                if remaining > 0 else " Position closed."
+            )
+            return (
+                f"Sold {ticker} @ ${result['price']:.2f} for "
+                f"${result['proceeds']:,.2f}.{pnl_part}{remaining_part} "
+                f"Cash now ${result['cash_after']:,.2f}. Reason: {reason}"
+            )
+
+        if name == "portfolio_place_order":
+            ticker = str(args.get("ticker") or "").strip().upper()
+            side = str(args.get("side") or "").strip().lower()
+            kind = str(args.get("kind") or "").strip().lower()
+            reason = str(args.get("reason") or "").strip()
+            if not ticker:
+                return "ERROR: portfolio_place_order requires a ticker."
+            if not reason:
+                return "ERROR: portfolio_place_order requires a one-sentence reason."
+            trigger_raw = args.get("trigger_price")
+            if trigger_raw is None:
+                return "ERROR: trigger_price is required."
+            try:
+                trigger_price = float(trigger_raw)
+            except (TypeError, ValueError):
+                return "ERROR: trigger_price must be a number."
+            qty = args.get("qty")
+            dollars = args.get("dollars")
+            close_position = bool(args.get("close_position") or False)
+            try:
+                qty_f = float(qty) if qty is not None else None
+                dollars_f = float(dollars) if dollars is not None else None
+            except (TypeError, ValueError):
+                return "ERROR: qty/dollars must be numeric."
+            expires_in_days_raw = args.get("expires_in_days")
+            try:
+                expires_in_days = (
+                    float(expires_in_days_raw)
+                    if expires_in_days_raw is not None else 30.0
+                )
+            except (TypeError, ValueError):
+                return "ERROR: expires_in_days must be a number."
+            # Clamp to a sane window — keep the LLM honest about how
+            # long stale orders should hang around.
+            expires_in_days = max(1.0, min(90.0, expires_in_days))
+            try:
+                result = await executor.place_order(
+                    ctx_key,
+                    ticker=ticker, side=side, kind=kind,
+                    trigger_price=trigger_price,
+                    qty=qty_f, dollars=dollars_f,
+                    close_position=close_position,
+                    reason=reason,
+                    expires_in_days=expires_in_days,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_place_order failed: {e}")
+                return f"ERROR: place_order failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'order rejected')}"
+            warn_part = ""
+            if result.get("warning"):
+                warn_part = f" WARNING: {result['warning']}"
+            current_part = ""
+            if result.get("current_price") is not None:
+                current_part = f" (current ${result['current_price']:.2f})"
+            return (
+                f"Placed order #{result['order_id']}: {kind}-{side} "
+                f"{ticker} @ ${result['trigger_price']:.2f}{current_part}. "
+                f"Will fire automatically when triggered (~5 min poll "
+                f"during market hours).{warn_part} Reason: {reason}"
+            )
+
+        if name == "portfolio_cancel_order":
+            order_raw = args.get("order_id")
+            if order_raw is None:
+                return "ERROR: order_id is required."
+            try:
+                order_id = int(order_raw)
+            except (TypeError, ValueError):
+                return "ERROR: order_id must be an integer."
+            if order_id <= 0:
+                return "ERROR: order_id must be positive."
+            try:
+                result = await executor.cancel_order(ctx_key, order_id)
+            except Exception as e:
+                logger.exception(f"portfolio_cancel_order failed: {e}")
+                return f"ERROR: cancel_order failed: {type(e).__name__}"
+            if not result.get("ok"):
+                err = result.get("error") or "rejected"
+                # Translate the store's status codes into something the
+                # LLM can react to without having to know the
+                # vocabulary.
+                friendly = {
+                    "not_found": f"no order #{order_id} exists",
+                    "wrong_context": (
+                        f"order #{order_id} belongs to a different chat"
+                    ),
+                    "not_pending": (
+                        f"order #{order_id} is already filled, cancelled, "
+                        f"or expired — nothing to cancel"
+                    ),
+                }.get(err, err)
+                return f"ERROR: {friendly}"
+            return f"Cancelled order #{order_id}."
+
+        return f"ERROR: unknown portfolio tool {name!r}"
+
+    async def _handle_journal_tool(
+        self,
+        name: str,
+        args: dict,
+        caller_ctx: CommandContext,
+    ) -> str:
+        """Dispatch portfolio_journal_append / portfolio_journal_read.
+
+        Same policy gate as the portfolio tools: a chat that isn't
+        opted into the portfolio feature shouldn't have a journal
+        either. Defense-in-depth — _collect_tools already filters
+        these out when the policy disallows.
+        """
+        journal = self.portfolio_journal
+        if journal is None:
+            return f"({name} unavailable: journal not configured)"
+        policy = caller_ctx.policy
+        if policy is not None and not policy.allows_command("portfolio"):
+            return f"({name} unavailable: portfolio not allowed in this chat)"
+
+        ctx_key = caller_ctx.context_key()
+
+        if name == "portfolio_journal_append":
+            entry = str(args.get("entry") or "").strip()
+            if not entry:
+                return "ERROR: portfolio_journal_append requires a non-empty entry."
+            try:
+                result = await journal.append(ctx_key, entry)
+            except Exception as e:
+                logger.exception(f"portfolio_journal_append failed: {e}")
+                return f"ERROR: journal append failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'append rejected')}"
+            return (
+                f"Journal entry saved at {result['ts']} "
+                f"(file size: {result['file_size']} bytes)."
+            )
+
+        if name == "portfolio_journal_read":
+            limit_raw = args.get("limit")
+            try:
+                limit = int(limit_raw) if limit_raw is not None else 10
+            except (TypeError, ValueError):
+                return "ERROR: limit must be an integer."
+            try:
+                result = await journal.read_recent(ctx_key, limit=limit)
+            except Exception as e:
+                logger.exception(f"portfolio_journal_read failed: {e}")
+                return f"ERROR: journal read failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'read failed')}"
+            entries = result.get("entries") or []
+            total = result.get("total_entries", 0)
+            if not entries:
+                return (
+                    "(journal is empty — no entries yet. This is your "
+                    "blank notebook; start writing.)"
+                )
+            # Render entries as plain markdown so the LLM sees them in
+            # the same shape it wrote them. Total count gives it
+            # context about what it's NOT seeing.
+            blocks = [
+                f"## {e['ts']}\n\n{e['body']}" for e in entries
+            ]
+            header = (
+                f"(showing {len(entries)} most recent of {total} total entries)"
+            )
+            return header + "\n\n" + "\n\n".join(blocks)
+
+        return f"ERROR: unknown journal tool {name!r}"
+
+    def _bot_label(self) -> str:
+        if self.name_registry is not None:
+            return self.name_registry.bot_name
+        return "Sigil"
 
     async def _handle_predict_for_tool(
         self,
@@ -901,6 +1282,20 @@ class AskCommand(BaseCommand):
         is_predict_update = (
             name == "predict_update" and self.prediction_store is not None
         )
+        is_portfolio_tool = (
+            name in (
+                "portfolio_buy",
+                "portfolio_sell",
+                "portfolio_status",
+                "portfolio_place_order",
+                "portfolio_cancel_order",
+            )
+            and self.portfolio_executor is not None
+        )
+        is_journal_tool = (
+            name in ("portfolio_journal_append", "portfolio_journal_read")
+            and self.portfolio_journal is not None
+        )
 
         try:
             if is_predict_self:
@@ -909,6 +1304,14 @@ class AskCommand(BaseCommand):
                 content = await self._handle_predict_for_tool(args, caller_ctx)
             elif is_predict_update:
                 content = await self._handle_predict_update_tool(args, caller_ctx)
+            elif is_portfolio_tool:
+                content = await self._handle_portfolio_tool(
+                    name, args, caller_ctx, attachments,
+                )
+            elif is_journal_tool:
+                content = await self._handle_journal_tool(
+                    name, args, caller_ctx,
+                )
             elif is_memory:
                 content = await self._handle_memory_tool(
                     name, args, caller_ctx
@@ -1206,6 +1609,42 @@ class AskCommand(BaseCommand):
                     "Never narrate a hexagram you didn't get from the tool."
                 )
 
+            # Journal directive: gentle nudge to use the markdown
+            # notebook at the moments where reflective writing actually
+            # helps. Surfaced only when both the journal is wired AND
+            # the chat allows portfolio (matching the gating in
+            # _collect_tools — tools the model can't call shouldn't
+            # show up in the prompt).
+            journal_directive = ""
+            if self.portfolio_journal is not None and (
+                ctx.policy is None or ctx.policy.allows_command("portfolio")
+            ):
+                journal_directive = (
+                    "Journal: you have a private markdown notebook for "
+                    "this chat's portfolio (portfolio_journal_append / "
+                    "portfolio_journal_read). It's YOUR space — chat "
+                    "members never see it. Treat it like a real "
+                    "trader's journal: paragraph-style narrative, "
+                    "honest, written for future-you. Strong moments "
+                    "to write:\n"
+                    "  - After placing a trade: thesis, what would "
+                    "    invalidate it, exit plan.\n"
+                    "  - When the order watcher pings you about a "
+                    "    fill: did the thesis work, what would you "
+                    "    do differently.\n"
+                    "  - End of trading day (cron close window): "
+                    "    summarize patterns you noticed.\n"
+                    "  - When you change your mind on a position or a "
+                    "    broader market read.\n"
+                    "Read recent entries (portfolio_journal_read) "
+                    "BEFORE checking the portfolio or making a fresh "
+                    "trade — that's how you stay coherent across "
+                    "sessions instead of restarting your reasoning "
+                    "every time. Don't journal every tick; quality "
+                    "over volume. If you have nothing real to say, "
+                    "skip."
+                )
+
             # Deep think: heavyweight delegation tool. Surface only when
             # both the client is ready AND the per-context policy allows
             # it, so the writer doesn't get told about a tool it can't
@@ -1448,6 +1887,7 @@ class AskCommand(BaseCommand):
                 _wrap_xml("recent_reactions", reactor_log_block),
                 _wrap_xml("tarot_tool", tarot_directive),
                 _wrap_xml("iching_tool", iching_directive),
+                _wrap_xml("portfolio_journal", journal_directive),
                 _wrap_xml("deep_think_tool", deep_think_directive),
                 _wrap_xml("python_tool", python_tool_directive),
                 _wrap_xml("spontaneous_reply", implicit_directive),

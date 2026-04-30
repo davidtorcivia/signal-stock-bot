@@ -25,8 +25,14 @@ import json
 import logging
 import re
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import dateparser
+
+# Day-boundary timezone for the "no same-day predictions" rule. We anchor
+# to ET because the bot's home TZ is ET (see llm/client.py) and most users
+# are US-based; there's no per-user TZ stored to do anything finer.
+_PREDICTION_DAY_TZ = ZoneInfo("America/New_York")
 
 from ..database import hash_phone
 from ..predictions import (
@@ -337,6 +343,21 @@ def _format_deadline(deadline_utc: float) -> str:
     return dt.datetime.fromtimestamp(deadline_utc, tz=dt.timezone.utc).strftime("%Y-%m-%d")
 
 
+def _deadline_is_future_day(deadline_utc: float) -> bool:
+    """True iff the deadline's ET calendar date is strictly after today's ET date.
+
+    The "same-day predictions don't count" rule: a forecast made the
+    morning of the close it's predicting isn't a forecast. The boundary
+    is the ET calendar day so 9pm-tonight predictions about
+    tomorrow's-close are still allowed (they cross midnight ET).
+    """
+    now_date = dt.datetime.now(_PREDICTION_DAY_TZ).date()
+    deadline_date = dt.datetime.fromtimestamp(
+        deadline_utc, tz=_PREDICTION_DAY_TZ,
+    ).date()
+    return deadline_date > now_date
+
+
 async def extract_prediction(text: str, llm_client=None) -> tuple[Optional[dict], Optional[str]]:
     """Public wrapper around the predict-parser pipeline.
 
@@ -364,6 +385,11 @@ async def extract_prediction(text: str, llm_client=None) -> tuple[Optional[dict]
         return None, (
             "I couldn't pin down what you're predicting or when. Try "
             "`<claim> by <date>`."
+        )
+    if not _deadline_is_future_day(parsed["deadline_utc"]):
+        return None, (
+            "Deadline must be tomorrow (ET) or later — same-day "
+            "predictions don't count. Push it out to a future date."
         )
     return parsed, None
 

@@ -26,6 +26,11 @@ class CommandContext:
     # the reactor's one-sentence justification so the writer model can decide
     # whether the inferred intent was actually right (and bail if not).
     implicit_reason: Optional[str] = None
+    # Set when this command was invoked by an automated worker rather than
+    # a real user message — currently the trading cron uses "cron". The
+    # portfolio tool handler reads this to tag trades with their actual
+    # provenance (cron vs reactive) instead of always claiming "reactive".
+    automation_source: Optional[str] = None
 
     @property
     def is_group(self) -> bool:

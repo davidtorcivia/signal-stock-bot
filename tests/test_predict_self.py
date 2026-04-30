@@ -16,6 +16,7 @@ from src.commands.predict_command import (
     PREDICT_FOR_TOOL,
     PREDICT_SELF_TOOL,
     PREDICT_UPDATE_TOOL,
+    _deadline_is_future_day,
     _has_explicit_future_year,
     _parse_deadline,
     extract_prediction,
@@ -77,6 +78,66 @@ async def test_extract_prediction_freeform_falls_through_when_llm_unavailable():
     )
     assert parsed is None
     assert err is not None
+
+
+def test_deadline_is_future_day_rejects_same_et_day():
+    """Same ET calendar day as now → False, regardless of how many hours
+    away. Anchors the rule directly without depending on the parser."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    now_et = dt.datetime.now(et)
+    # Pick noon-ET on today's date — same calendar day as now in ET.
+    same_day_noon = dt.datetime(
+        now_et.year, now_et.month, now_et.day, 12, 0, tzinfo=et,
+    )
+    assert _deadline_is_future_day(same_day_noon.timestamp()) is False
+    # Last second of the ET day — still same day, still rejected.
+    same_day_end = dt.datetime(
+        now_et.year, now_et.month, now_et.day, 23, 59, 59, tzinfo=et,
+    )
+    assert _deadline_is_future_day(same_day_end.timestamp()) is False
+
+
+def test_deadline_is_future_day_accepts_next_et_day():
+    """Tomorrow-ET-00:01 is strictly later in ET — must pass."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    tomorrow = dt.datetime.now(et) + dt.timedelta(days=1)
+    early_tomorrow = dt.datetime(
+        tomorrow.year, tomorrow.month, tomorrow.day, 0, 1, tzinfo=et,
+    )
+    assert _deadline_is_future_day(early_tomorrow.timestamp()) is True
+
+
+def test_deadline_is_future_day_handles_late_night_et_window():
+    """The whole point of the rule: predicting tomorrow's close at 9pm
+    tonight (ET) must work. Verifies a deadline crossing midnight ET
+    is treated as a different calendar day."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    # Tomorrow 16:00 ET is always strictly after today's date in ET.
+    tomorrow_close = dt.datetime.now(et).replace(
+        hour=16, minute=0, second=0, microsecond=0,
+    ) + dt.timedelta(days=1)
+    assert _deadline_is_future_day(tomorrow_close.timestamp()) is True
+
+
+@pytest.mark.asyncio
+async def test_extract_prediction_accepts_next_day_deadline():
+    """Tomorrow-ET is the earliest valid deadline. A 9pm-tonight prediction
+    about tomorrow's close must still pass through extract_prediction."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    tomorrow_et = (dt.datetime.now(et) + dt.timedelta(days=1)).date()
+    deadline_et = dt.datetime(
+        tomorrow_et.year, tomorrow_et.month, tomorrow_et.day, 16, 0, tzinfo=et,
+    )
+    iso = deadline_et.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+    parsed, err = await extract_prediction(
+        f"AAPL above $1 by {iso} UTC", llm_client=None,
+    )
+    assert err is None, f"unexpected rejection: {err}"
+    assert parsed is not None
 
 
 # ---------- PredictionStore with a bot author --------------------------------

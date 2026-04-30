@@ -312,6 +312,27 @@ def create_dispatcher(
         dispatcher.register(cmd)
         help_commands.append(cmd)
 
+    # Paper portfolio: per-context paper-trading ledger for Sigil. The
+    # store is exposed on the dispatcher so the cron worker (scheduled in
+    # build_app) can reuse the same instance. Auto-seeds $1000 per chat
+    # on first interaction; humans top up via !tip (capped per ET day).
+    from .paper_portfolio import PortfolioStore
+    from .paper_portfolio_executor import PaperPortfolioExecutor
+    from .commands import (
+        PortfolioCommand, PnlCommand, TipCommand, TradesCommand,
+    )
+    portfolio_store = PortfolioStore(config.watchlist_db_path)
+    portfolio_executor = PaperPortfolioExecutor(portfolio_store, provider_manager)
+    dispatcher.portfolio_store = portfolio_store
+    dispatcher.portfolio_executor = portfolio_executor
+    portfolio_cmd = PortfolioCommand(portfolio_executor, bot_name=config.bot_name)
+    pnl_cmd = PnlCommand(portfolio_executor, bot_name=config.bot_name)
+    tip_cmd = TipCommand(portfolio_store, name_registry=name_registry)
+    trades_cmd = TradesCommand(portfolio_store)
+    for cmd in (portfolio_cmd, pnl_cmd, tip_cmd, trades_cmd):
+        dispatcher.register(cmd)
+        help_commands.append(cmd)
+
     admin_numbers = config.admin_numbers
     metrics_cmd = MetricsCommand(admin_numbers=admin_numbers)
     cache_cmd = CacheCommand(admin_numbers=admin_numbers)
@@ -739,6 +760,19 @@ def build_app(config: Config):
     # late-bind it onto ask_command here so the writer LLM gets the
     # `predict_self` tool exposed.
     ask_command.prediction_store = dispatcher.prediction_store
+    # Same for the paper-portfolio executor: dispatcher constructed it,
+    # ask_command needs it now to expose portfolio_buy/sell/status tools
+    # to the writer LLM.
+    ask_command.portfolio_executor = dispatcher.portfolio_executor
+    # Per-portfolio markdown journal — bot's narrative notebook for
+    # tracking trade theses, reflecting on fills, planning ahead.
+    # Lives next to the SQLite DB so it gets backed up by the same
+    # data-volume mount.
+    from .portfolio_journal import PortfolioJournal
+    journal_dir = Path(config.watchlist_db_path).parent / "portfolio_notes"
+    ask_command.portfolio_journal = PortfolioJournal(
+        journal_dir, bot_name=config.bot_name,
+    )
     # Same tool adapter for the deep model — late-binding is the same
     # circular-dep workaround as ask_command's.
     deep_think_client.bot_tools = bot_tools
@@ -855,6 +889,44 @@ def build_app(config: Config):
     asyncio.run_coroutine_threadsafe(prediction_resolver.run_forever(), loop)
     logger.info("Prediction resolver scheduled")
 
+    # Trading cron — three weekday slots in ET (9:45 / 12:30 / 15:30)
+    # per portfolio. Sigil pulls portfolio_status, looks at news/quotes,
+    # decides if there's a trade, posts the result back to the chat.
+    # Idempotent across restarts via portfolio_cron_runs.
+    from .paper_portfolio_cron import TradingCronWorker
+    trading_cron = TradingCronWorker(
+        store=dispatcher.portfolio_store,
+        ask_command=ask_command,
+        signal_handler=signal_handler,
+        context_registry=context_registry,
+        bot_phone=config.signal_phone_number,
+    )
+    asyncio.run_coroutine_threadsafe(trading_cron.run_forever(), loop)
+    logger.info("Trading cron worker scheduled")
+
+    # Conditional-order watcher — every 5 min during RTH, scans
+    # portfolio_orders for triggered stops/limits and fires them via
+    # the same execute_buy/sell paths the LLM uses. Off-hours falls
+    # back to a 30-min cadence that only sweeps expired rows; no quote
+    # fetches when the market is closed. Wired with the signal handler
+    # so fills/failures get posted back to the originating chat.
+    from .paper_portfolio_orders import OrdersWorker
+    orders_worker = OrdersWorker(
+        store=dispatcher.portfolio_store,
+        executor=dispatcher.portfolio_executor,
+        signal_handler=signal_handler,
+        # When orders fill/fail, the worker fires a synthetic !ask
+        # invocation so the bot voices the resolution itself (and may
+        # decide on a follow-up trade). Same wiring shape as the
+        # trading cron: ask_command + context_registry + bot_phone
+        # let it build a CommandContext for the affected chat.
+        ask_command=ask_command,
+        context_registry=context_registry,
+        bot_phone=config.signal_phone_number,
+    )
+    asyncio.run_coroutine_threadsafe(orders_worker.run_forever(), loop)
+    logger.info("Orders watcher scheduled")
+
     # Daily oracle worker — per-context, multi-oracle. Each enabled
     # oracle fires once per day at its configured time (sunrise/sunset
     # +/- offset, or fixed clock time). On first boot of this code,
@@ -926,6 +998,8 @@ def build_app(config: Config):
         prediction_store=dispatcher.prediction_store,
         prediction_resolver=prediction_resolver,
         oracle_store=oracle_store,
+        portfolio_store=dispatcher.portfolio_store,
+        portfolio_executor=dispatcher.portfolio_executor,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

@@ -58,6 +58,12 @@ from .predict_command import (
     ResolveCommand,
     LeaderboardCommand,
 )
+from .portfolio_command import (
+    PortfolioCommand,
+    PnlCommand,
+    TipCommand,
+    TradesCommand,
+)
 
 __all__ = [
     "BaseCommand",
@@ -112,4 +118,9 @@ __all__ = [
     "PredictionsCommand",
     "ResolveCommand",
     "LeaderboardCommand",
+    # Paper portfolio
+    "PortfolioCommand",
+    "PnlCommand",
+    "TipCommand",
+    "TradesCommand",
 ]

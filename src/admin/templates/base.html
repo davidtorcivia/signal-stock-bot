@@ -99,6 +99,7 @@
             <a href="{{ url_for('admin.context_list') }}">Contexts</a>
             <a href="{{ url_for('admin.users_page') }}">Users</a>
             <a href="{{ url_for('admin.predictions_page') }}">Predictions</a>
+            <a href="{{ url_for('admin.portfolios_page') }}">Portfolios</a>
             <a href="{{ url_for('admin.live_page') }}">Live</a>
             <form method="post" action="{{ url_for('admin.logout') }}" class="inline">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

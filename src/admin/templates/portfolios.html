@@ -1,0 +1,324 @@
+{% extends "base.html" %}
+{% block title %}Portfolios{% endblock %}
+{% block content %}
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, msg in messages %}
+      <div class="{{ 'ok' if category == 'ok' else 'error' }}">{{ msg }}</div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+{% if not available %}
+<div class="panel">
+    <h1>Portfolios</h1>
+    <p class="muted">Portfolio store not configured.</p>
+</div>
+{% else %}
+
+<div class="panel">
+    <h1>Paper-trading portfolios</h1>
+    {% if not portfolios %}
+        <p class="muted">No portfolios yet — they auto-seed on first <code>!portfolio</code> or <code>!tip</code> in a chat.</p>
+    {% else %}
+        <p class="muted">{{ portfolios|length }} portfolio{{ 's' if portfolios|length != 1 else '' }}. Each chat has its own; auto-seeded with $1000.</p>
+    {% endif %}
+</div>
+
+{% for p in portfolios %}
+<div class="panel">
+    <h2>{{ p.label }}</h2>
+    <p class="muted" style="font-size: 11px;"><code>{{ p.context_key }}</code></p>
+
+    <table>
+        <tr>
+            <th>Equity</th>
+            <td>
+                <strong>${{ '%.2f'|format(p.equity) }}</strong>
+                {% if p.total_pnl >= 0 %}
+                    <span style="color: #2a7;">▲ +${{ '%.2f'|format(p.total_pnl) }} ({{ '%+.2f'|format(p.total_pnl_pct * 100) }}%)</span>
+                {% else %}
+                    <span style="color: #c33;">▼ -${{ '%.2f'|format(-p.total_pnl) }} ({{ '%+.2f'|format(p.total_pnl_pct * 100) }}%)</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Cash</th>
+            <td>${{ '%.2f'|format(p.cash) }}</td>
+        </tr>
+        <tr>
+            <th>Holdings (mark)</th>
+            <td>${{ '%.2f'|format(p.market_value) }}</td>
+        </tr>
+        <tr>
+            <th>Funded</th>
+            <td>
+                ${{ '%.2f'|format(p.total_funded) }}
+                <span class="muted" style="margin-left: 8px;">
+                    seed ${{ '%.0f'|format(p.starting_balance) }} + tips ${{ '%.2f'|format(p.tip_total) }}
+                </span>
+            </td>
+        </tr>
+        <tr>
+            <th>Realized PnL</th>
+            <td>${{ '%.2f'|format(p.realized_pnl) }}</td>
+        </tr>
+        <tr>
+            <th>Market</th>
+            <td>
+                {% if p.market_open %}
+                    <span style="color: #2a7;">open</span>
+                {% else %}
+                    <span class="muted">closed (quotes may be stale)</span>
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+
+    {# Positions #}
+    <h3 style="margin-top: 18px; font-size: 13px;">Positions</h3>
+    {% if not p.positions %}
+        <p class="muted">(none)</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Qty</th>
+                    <th>Avg cost</th>
+                    <th>Mark</th>
+                    <th>Market value</th>
+                    <th>Unrealized</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for pos in p.positions %}
+                <tr>
+                    <td><code>{{ pos.ticker }}</code></td>
+                    <td>{{ '%.4f'|format(pos.qty) }}</td>
+                    <td>${{ '%.2f'|format(pos.avg_cost) }}</td>
+                    <td>
+                        {% if pos.mark_price is none %}
+                            <span class="muted">no quote</span>
+                        {% else %}
+                            ${{ '%.2f'|format(pos.mark_price) }}
+                        {% endif %}
+                    </td>
+                    <td>${{ '%.2f'|format(pos.market_value) }}</td>
+                    <td>
+                        {% if pos.unrealized_pnl >= 0 %}
+                            <span style="color: #2a7;">+${{ '%.2f'|format(pos.unrealized_pnl) }} ({{ '%+.2f'|format(pos.unrealized_pct * 100) }}%)</span>
+                        {% else %}
+                            <span style="color: #c33;">-${{ '%.2f'|format(-pos.unrealized_pnl) }} ({{ '%+.2f'|format(pos.unrealized_pct * 100) }}%)</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    {# Open conditional orders — pending stops/limits #}
+    <h3 style="margin-top: 18px; font-size: 13px;">Open orders ({{ p.pending_orders|length }})</h3>
+    {% if not p.pending_orders %}
+        <p class="muted">(none)</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Ticker</th>
+                    <th>Side / Kind</th>
+                    <th>Trigger</th>
+                    <th>Size</th>
+                    <th>Reason</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for o in p.pending_orders %}
+                <tr>
+                    <td><span class="muted">#{{ o.id }}</span></td>
+                    <td><code>{{ o.ticker }}</code></td>
+                    <td>
+                        {% if o.trigger_direction == 'above' %}
+                            <span style="color: #2a7;">▲</span>
+                        {% else %}
+                            <span style="color: #c33;">▼</span>
+                        {% endif %}
+                        {{ o.kind }} {{ o.side }}
+                    </td>
+                    <td>${{ '%.2f'|format(o.trigger_price) }}</td>
+                    <td>
+                        {% if o.close_position %}
+                            close all
+                        {% elif o.dollars %}
+                            ${{ '%.2f'|format(o.dollars) }} (qty TBD)
+                        {% elif o.qty %}
+                            {{ '%.4f'|format(o.qty) }} sh
+                        {% else %}
+                            <span class="muted">?</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ o.reason or '' }}</td>
+                    <td>
+                        <form method="post"
+                              action="{{ url_for('admin.portfolios_cancel_order', context_key=p.context_key, order_id=o.id) }}"
+                              style="display: inline;"
+                              onsubmit="return confirm('Cancel order #{{ o.id }} ({{ o.kind }} {{ o.side }} {{ o.ticker }} @ ${{ '%.2f'|format(o.trigger_price) }})?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="secondary"
+                                    style="font-size: 11px; padding: 2px 8px;">
+                                Cancel
+                            </button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    {# Recent order activity (all statuses, newest first) #}
+    {% if p.recent_orders %}
+    <h3 style="margin-top: 18px; font-size: 13px;">Recent order activity</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Created</th>
+                <th>Order</th>
+                <th>Status</th>
+                <th>Resolved</th>
+                <th>Fill / Note</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in p.recent_orders %}
+            <tr>
+                <td><span class="muted">#{{ o.id }}</span></td>
+                <td><span class="muted">{{ o.created_str }}</span></td>
+                <td>
+                    {% if o.trigger_direction == 'above' %}<span style="color: #2a7;">▲</span>{% else %}<span style="color: #c33;">▼</span>{% endif %}
+                    {{ o.kind }} {{ o.side }} <code>{{ o.ticker }}</code> @ ${{ '%.2f'|format(o.trigger_price) }}
+                </td>
+                <td>
+                    {% if o.status == 'pending' %}
+                        <span style="color: #c80;">pending</span>
+                    {% elif o.status == 'in_flight' %}
+                        <span style="color: #c80;">in_flight</span>
+                    {% elif o.status == 'filled' %}
+                        <span style="color: #2a7;">filled</span>
+                    {% elif o.status == 'cancelled' %}
+                        <span class="muted">cancelled</span>
+                    {% elif o.status == 'expired' %}
+                        <span class="muted">expired</span>
+                    {% elif o.status == 'failed' %}
+                        <span style="color: #c33;">failed</span>
+                    {% else %}
+                        {{ o.status }}
+                    {% endif %}
+                </td>
+                <td><span class="muted">{{ o.filled_str or '' }}</span></td>
+                <td>
+                    {% if o.fill_price %}
+                        ${{ '%.2f'|format(o.fill_price) }}{% if o.fill_qty %} × {{ '%.4f'|format(o.fill_qty) }}{% endif %}
+                    {% endif %}
+                    {% if o.fill_note %}
+                        <span class="muted">{{ o.fill_note }}</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    {# Recent trades #}
+    <h3 style="margin-top: 18px; font-size: 13px;">Recent trades</h3>
+    {% if not p.trades %}
+        <p class="muted">(none)</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Ticker</th>
+                    <th>Price</th>
+                    <th>Source</th>
+                    <th>Realized</th>
+                    <th>Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in p.trades %}
+                <tr>
+                    <td><span class="muted">{{ t.ts_str }}</span></td>
+                    <td><strong>{{ t.side }}</strong></td>
+                    <td>{{ '%.4f'|format(t.qty) }}</td>
+                    <td><code>{{ t.ticker }}</code></td>
+                    <td>${{ '%.2f'|format(t.price) }}</td>
+                    <td><span class="muted">{{ t.source }}</span></td>
+                    <td>
+                        {% if t.realized_pnl is not none %}
+                            {% if t.realized_pnl >= 0 %}
+                                <span style="color: #2a7;">+${{ '%.2f'|format(t.realized_pnl) }}</span>
+                            {% else %}
+                                <span style="color: #c33;">-${{ '%.2f'|format(-t.realized_pnl) }}</span>
+                            {% endif %}
+                        {% endif %}
+                    </td>
+                    <td>{{ t.reason or '' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    {# Recent tips #}
+    <h3 style="margin-top: 18px; font-size: 13px;">Recent tips</h3>
+    {% if not p.tips %}
+        <p class="muted">(none)</p>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Tipper</th>
+                    <th>Amount</th>
+                    <th>Note</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for tip in p.tips %}
+                <tr>
+                    <td><span class="muted">{{ tip.ts_str }}</span></td>
+                    <td>{{ tip.tipper_label or tip.tipper_user_hash[:8] }}</td>
+                    <td>${{ '%.2f'|format(tip.amount) }}</td>
+                    <td>{{ tip.note or '' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    {# Reset action #}
+    <form method="post" action="{{ url_for('admin.portfolios_reset', context_key=p.context_key) }}" style="margin-top: 18px;"
+          onsubmit="return confirm('Reset {{ p.label|e }} to $1000 cash? This DELETES all positions, trades, and tips. Cannot be undone.');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="secondary" style="background: #fee; border-color: #c33; color: #c33;">
+            Reset portfolio
+        </button>
+        <span class="muted" style="margin-left: 8px; font-size: 11px;">
+            Wipes positions / trades / tips and re-seeds with $1000.
+        </span>
+    </form>
+</div>
+{% endfor %}
+
+{% endif %}
+
+{% endblock %}
