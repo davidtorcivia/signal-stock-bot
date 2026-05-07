@@ -112,9 +112,24 @@ class ConversationHistory:
                 await db.execute("ALTER TABLE conversation_turns ADD COLUMN context_key TEXT")
             if "sender_tail" not in cols:
                 await db.execute("ALTER TABLE conversation_turns ADD COLUMN sender_tail TEXT")
+            if "bot_id" not in cols:
+                # Multi-bot scoping: which bot authored the turn (assistant
+                # rows) or which bot's history this user turn belongs to.
+                # NULL on existing rows is backfilled to the seeded sigil
+                # bot. Filtering on bot_id when shared-history mode is
+                # enabled lets two bots co-exist in one context without
+                # mixing their assistant turns. Indexed alongside
+                # context_key so per-(bot,context) reads stay cheap.
+                await db.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN bot_id INTEGER"
+                )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_ctx_time "
                 "ON conversation_turns(context_key, created_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conv_bot_ctx_time "
+                "ON conversation_turns(bot_id, context_key, created_at)"
             )
             # Per-context rolling summary. `summary_through_id` is the highest
             # conversation_turns.id that's already been folded in — newer

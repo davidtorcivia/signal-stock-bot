@@ -178,6 +178,16 @@ class MemoryStore:
                     "ALTER TABLE context_memories ADD COLUMN "
                     "distinct_speakers TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "bot_id" not in cols:
+                # Multi-bot scoping: which bot learned this memory. NULL
+                # on existing rows is backfilled to the seeded sigil bot.
+                # We default to per-bot memories (different personas may
+                # extract different facts about the same context) but
+                # the read path can ignore bot_id when the install
+                # prefers shared memory.
+                await db.execute(
+                    "ALTER TABLE context_memories ADD COLUMN bot_id INTEGER"
+                )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mem_ctx_subj "
                 "ON context_memories(context_id, subject_key)"

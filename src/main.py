@@ -661,6 +661,7 @@ def build_app(config: Config):
     from .group_log import GroupMessageLog
     from .mcp_integration import MCPRegistry, MCPManager
     from .enrichment import CompositeEnricher, RichLinkExpander, TwitterExpander
+    from .bots import BotRegistry
 
     watchlist_db = WatchlistDB(config.watchlist_db_path)
     alerts_db = AlertsDB(config.watchlist_db_path)
@@ -668,6 +669,7 @@ def build_app(config: Config):
     settings_store = SettingsStore(config.watchlist_db_path)
     context_registry = ContextRegistry(config.watchlist_db_path)
     memory_store = MemoryStore(config.watchlist_db_path)
+    bot_registry = BotRegistry(config.watchlist_db_path)
     logger.info(f"Database: {config.watchlist_db_path}")
 
     mcp_registry = MCPRegistry(config.watchlist_db_path)
@@ -812,6 +814,47 @@ def build_app(config: Config):
 
     # Single shared event loop for all async work
     loop = _start_background_loop()
+
+    # Bot registry init + one-shot backfill. Must run before any traffic
+    # so the bots table exists and existing rows on consumer tables
+    # (contexts, conversation_turns, predictions, portfolios,
+    # context_memories, metric_events) get bot_id stamped to the seeded
+    # sigil row. We force every consumer store's `_ensure_initialized`
+    # first so their `bot_id` columns exist by the time backfill walks
+    # the tables. Idempotent — re-running on every boot is a cheap
+    # `UPDATE ... WHERE bot_id IS NULL` that becomes a no-op once
+    # populated. Display-name seed pulls from the live admin setting
+    # first, falling back to the env-loaded Config default.
+    seed_name = (settings_store.get("bot_name") or config.bot_name or "Sigil")
+    async def _bots_boot_init():
+        await bot_registry._ensure_initialized(default_display_name=seed_name)
+        # Force consumer-store schema creation so bot_id columns exist.
+        await context_registry._ensure_initialized()
+        await llm_history._ensure_initialized()
+        await memory_store._ensure_initialized()
+        # prediction_store and portfolio_store live on the dispatcher.
+        try:
+            await dispatcher.prediction_store._ensure_initialized()
+        except Exception as e:
+            logger.warning(f"prediction_store init for backfill: {e}")
+        try:
+            # PortfolioExecutor wraps the underlying store; reach through.
+            await dispatcher.portfolio_executor.store._ensure_initialized()
+        except Exception as e:
+            logger.warning(f"portfolio_store init for backfill: {e}")
+        # Persistent metrics store lives at module level (cache.get_metrics).
+        try:
+            from .metrics_log import get_metrics_log
+            await get_metrics_log(config.watchlist_db_path)._ensure_initialized()
+        except Exception as e:
+            logger.warning(f"metric_events init for backfill: {e}")
+        await bot_registry.backfill_consumer_tables()
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _bots_boot_init(), loop
+        ).result(timeout=15)
+    except Exception as e:
+        logger.error(f"Bot registry boot init failed: {e}")
 
     # Auto-register MCP servers we ship as defaults (e.g. pyodide). No-op
     # if they're already in the registry — admin edits survive deploys.
@@ -958,6 +1001,7 @@ def build_app(config: Config):
             ask_command=ask_command,
             signal_handler=signal_handler,
             bot_phone=config.signal_phone_number,
+            bot_name=settings_store.get("bot_name") or config.bot_name or "Bot",
         )
         asyncio.run_coroutine_threadsafe(daily_oracle.run_forever(), loop)
         logger.info("Daily oracle worker scheduled (multi-oracle)")

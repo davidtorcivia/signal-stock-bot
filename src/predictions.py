@@ -113,9 +113,15 @@ class PredictionStore:
                     verdict TEXT,
                     resolution_note TEXT,
                     resolved_at REAL,
-                    resolver_user_hash TEXT
+                    resolver_user_hash TEXT,
+                    bot_id INTEGER
                 )
             """)
+            # Pre-existing installs need the column added.
+            cursor = await db.execute("PRAGMA table_info(predictions)")
+            cols = {r[1] for r in await cursor.fetchall()}
+            if "bot_id" not in cols:
+                await db.execute("ALTER TABLE predictions ADD COLUMN bot_id INTEGER")
             # Partial indexes on pending rows. Resolved/expired predictions
             # never get scanned by the resolver cron or the upcoming-list
             # queries, so we keep them out of the index entirely. Index

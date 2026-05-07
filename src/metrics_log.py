@@ -91,10 +91,18 @@ class MetricsLog:
                         tokens_out INTEGER,
                         emoji TEXT,
                         skip_reason TEXT,
-                        error_msg TEXT
+                        error_msg TEXT,
+                        bot_id INTEGER
                     )
                     """
                 )
+                # Pre-existing installs may not yet have bot_id; add it.
+                cursor = await db.execute("PRAGMA table_info(metric_events)")
+                cols = {r[1] for r in await cursor.fetchall()}
+                if "bot_id" not in cols:
+                    await db.execute(
+                        "ALTER TABLE metric_events ADD COLUMN bot_id INTEGER"
+                    )
                 # Two indexes: one for kind-scoped windowed queries (the
                 # common dashboard shape), one for time-only prunes.
                 await db.execute(

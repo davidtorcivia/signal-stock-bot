@@ -280,10 +280,15 @@ class PortfolioStore:
                     cash REAL NOT NULL,
                     starting_balance REAL NOT NULL,
                     label TEXT,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    bot_id INTEGER
                 )
                 """
             )
+            cursor = await db.execute("PRAGMA table_info(portfolios)")
+            cols = {r[1] for r in await cursor.fetchall()}
+            if "bot_id" not in cols:
+                await db.execute("ALTER TABLE portfolios ADD COLUMN bot_id INTEGER")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS positions (

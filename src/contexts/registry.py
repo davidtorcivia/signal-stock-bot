@@ -100,6 +100,14 @@ class ContextRegistry:
                     await db.execute(
                         "ALTER TABLE contexts ADD COLUMN reactor_memory_writes INTEGER NOT NULL DEFAULT 0"
                     )
+                if "default_bot_id" not in existing_cols:
+                    # Multi-bot scoping: which bot answers in this
+                    # context when no one is mentioned. NULL = fall back
+                    # to BotRegistry.default_for_kind_sync(). Backfilled
+                    # to the seeded sigil bot post-init.
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN default_bot_id INTEGER"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_contexts_key ON contexts(key)"
                 )

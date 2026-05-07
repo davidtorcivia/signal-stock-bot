@@ -8,10 +8,10 @@ opened. Each oracle is daily-cadence; only timing/kind varies.
 
 Oracle kinds + delivery:
   tarot/iching   → call the existing command directly, replace the
-                   header with a "today's oracle from Sigil" framing,
+                   header with a "today's oracle from <bot>" framing,
                    send the rendered image as an attachment.
   market_open/close, freeform → route through ask_command.execute so
-                   Sigil's full tool kit is available (price/news/
+                   the bot's full tool kit is available (price/news/
                    etc.) and the LLM writes the post.
 
 Idempotency: `last_fired_at` is bumped after each post. On bot
@@ -58,8 +58,8 @@ _DEFAULT_ICHING_HEADERS = (
 )
 
 
-def _replace_header(body: str, oracle_label: str) -> str:
-    header = "🌅 Today's oracle from Sigil"
+def _replace_header(body: str, oracle_label: str, bot_name: str = "Bot") -> str:
+    header = f"🌅 Today's oracle from {bot_name}"
     if oracle_label:
         header = f"{header} — {oracle_label}"
     header += ":"
@@ -112,6 +112,7 @@ class DailyOracleWorker:
         ask_command,
         signal_handler,
         bot_phone: str,
+        bot_name: str = "Bot",
     ):
         self.store = oracle_store
         self.contexts = context_registry
@@ -120,6 +121,7 @@ class DailyOracleWorker:
         self.ask = ask_command
         self.signal = signal_handler
         self.bot_phone = bot_phone
+        self.bot_name = bot_name or "Bot"
 
     async def run_forever(self) -> None:
         logger.info("Daily oracle worker started")
@@ -319,7 +321,7 @@ class DailyOracleWorker:
                 f"{getattr(result, 'text', '(none)')!r}"
             )
             return
-        body = _replace_header(result.text or "", oracle.label)
+        body = _replace_header(result.text or "", oracle.label, self.bot_name)
         await self.signal.send_message(
             recipient="",
             message=body,
