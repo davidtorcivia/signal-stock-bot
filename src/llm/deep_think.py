@@ -661,6 +661,59 @@ class DeepThinkClient:
 
         return content or "(deep_think returned no content)"
 
+    async def health_check(self, prompt: Optional[str] = None) -> dict:
+        """Single round-trip connectivity test for the deep_think
+        endpoint. Bypasses the full tool loop / cap counters / event
+        bus — this is for the admin's "test connection" button, not a
+        real research call. Same return shape as `LLMClient.health_check`
+        so the admin route can render both uniformly. Never raises."""
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return {
+                "ok": False,
+                "error": "deep_think is disabled for this bot.",
+                "model": cfg.get("model") or "",
+                "latency_ms": 0,
+            }
+        missing = [
+            k for k in ("base_url", "api_key", "model") if not cfg.get(k)
+        ]
+        if missing:
+            return {
+                "ok": False,
+                "error": f"Not configured: missing {', '.join(missing)}.",
+                "model": cfg.get("model") or "",
+                "latency_ms": 0,
+            }
+        user_msg = (prompt or "").strip() or (
+            "Reply with one short sentence to confirm you're reachable."
+        )
+        started = time.time()
+        try:
+            msg = await self._chat_call(
+                messages=[
+                    {"role": "system", "content": cfg["system_prompt"]},
+                    {"role": "user", "content": user_msg},
+                ],
+                tools=None,
+                cfg=cfg,
+                sender_tail="hcheck",
+                group_id=None,
+            )
+        except RuntimeError as e:
+            return {
+                "ok": False,
+                "error": str(e),
+                "model": cfg.get("model") or "",
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+        return {
+            "ok": True,
+            "reply": (msg.get("content") or "").strip(),
+            "model": cfg["model"],
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+
     def _log_call(
         self, *, question: str, latency_ms: float, model: str,
         tokens_in: int, tokens_out: int, ok: bool, error_msg: str,

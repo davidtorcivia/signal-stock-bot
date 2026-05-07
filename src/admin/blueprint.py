@@ -10,7 +10,7 @@ import logging
 from datetime import timedelta
 from typing import Optional
 
-from flask import Blueprint, Flask, Response, abort, flash, redirect, render_template, request, session, url_for
+from flask import Blueprint, Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, url_for
 
 from ..bots import Bot, BotRegistry
 from ..bots.models import DEEP_THINK_MODES
@@ -927,6 +927,69 @@ def _register_bots_routes(
             deep_think_modes=DEEP_THINK_MODES,
             error=error,
         )
+
+    @bp.route("/bots/<int:bot_id>/test/<role>", methods=["POST"])
+    @admin_required
+    def bots_test_connection(bot_id: int, role: str):
+        """One-shot LLM connectivity test against the bot's own
+        config. Returns JSON so the form's inline JS can render the
+        result without a full page reload (LLM calls take seconds —
+        a redirect would be a poor UX).
+
+        Roles: 'writer' or 'deep_think'. Bot's own per-bot overrides
+        compose with the global keys per the resolver chain — same
+        path a real !ask would take, so a green check here means real
+        traffic should also land. Reactor isn't testable per-bot
+        because it's a global service; admins test reactor via
+        /admin/llm.
+        """
+        if role not in ("writer", "deep_think"):
+            return jsonify(
+                ok=False,
+                error=f"role must be 'writer' or 'deep_think', got {role!r}",
+            ), 400
+        if not verify_csrf():
+            return jsonify(ok=False, error="Session expired."), 403
+        if llm_factory is None:
+            return jsonify(
+                ok=False,
+                error="LLM factory unavailable (admin not fully wired).",
+            ), 503
+
+        bot = _run_on_loop(loop, registry.get(bot_id))
+        if bot is None:
+            return jsonify(ok=False, error="Bot not found."), 404
+
+        prompt = (request.form.get("prompt", "") or "").strip() or None
+        client = (
+            llm_factory.get_writer(bot_id) if role == "writer"
+            else llm_factory.get_deep_think(bot_id)
+        )
+        # Generous timeout: LAN MLX can be slow to first-token on a
+        # cold model. 90s covers most warm-up scenarios; admins
+        # waiting longer than that on a connectivity check probably
+        # have a real problem to investigate.
+        try:
+            result = _run_on_loop(loop, client.health_check(prompt), timeout=90.0)
+        except Exception as e:
+            logger.warning(f"bots_test {bot.slug}/{role} crashed: {e}")
+            return jsonify(
+                ok=False,
+                error=f"Test crashed: {type(e).__name__}: {e}",
+                model="",
+                latency_ms=0,
+            )
+        # Mirror the health_check shape with `bot_slug` + `role` for
+        # admin telemetry. Reply text is trimmed to a manageable
+        # rendering size; full text isn't useful for a connectivity
+        # signal.
+        if result.get("ok") and isinstance(result.get("reply"), str):
+            reply = result["reply"]
+            if len(reply) > 800:
+                result["reply"] = reply[:800].rstrip() + "…"
+        result["bot_slug"] = bot.slug
+        result["role"] = role
+        return jsonify(result)
 
     @bp.route("/bots/<int:bot_id>/delete", methods=["POST"])
     @admin_required

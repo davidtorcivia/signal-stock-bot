@@ -131,6 +131,23 @@
               {% endif %}
             </label>
           {% endfor %}
+
+          {% if not is_new %}
+            <div style="margin-top: 12px; padding: 12px; border: 1px dashed var(--border); border-radius: 4px;">
+              <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                <button type="button" class="secondary"
+                        data-test-role="{{ role }}"
+                        data-test-bot="{{ bot.id }}"
+                        style="background: var(--border); color: var(--text);">
+                  Test connection
+                </button>
+                <span class="muted" style="font-size: 11px;">
+                  Sends one short prompt against the saved {{ role }} config and shows the reply. Saves first if you've edited fields above.
+                </span>
+              </div>
+              <div data-test-result="{{ role }}" style="margin-top: 10px; font-size: 12px;"></div>
+            </div>
+          {% endif %}
         {% endfor %}
 
         <p style="margin-top: 24px;">
@@ -142,5 +159,73 @@
         </p>
     </form>
 </div>
+
+{% if not is_new %}
+<script>
+(function () {
+  // Test-connection buttons. One per role (writer / deep_think). Sends
+  // one short prompt against the bot's saved config and renders the
+  // reply inline. Edits NOT yet saved aren't tested — admins should
+  // hit Save first, since the route reads bot_llm_settings.
+  const csrf = "{{ csrf_token() }}";
+  const buttons = document.querySelectorAll("[data-test-role]");
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      const role = btn.getAttribute("data-test-role");
+      const botId = btn.getAttribute("data-test-bot");
+      const result = document.querySelector(
+        `[data-test-result="${role}"]`
+      );
+      btn.disabled = true;
+      btn.textContent = "Testing…";
+      result.innerHTML = '<span class="muted">Sending test prompt…</span>';
+
+      const fd = new FormData();
+      fd.append("csrf_token", csrf);
+      try {
+        const resp = await fetch(
+          `{{ url_for('admin.bots_list') }}/${botId}/test/${role}`,
+          { method: "POST", body: fd, credentials: "same-origin" }
+        );
+        const data = await resp.json();
+        result.innerHTML = renderTestResult(data);
+      } catch (e) {
+        result.innerHTML = '<span class="dot-bad">○</span> ' +
+          '<strong>Network error:</strong> ' + escapeHTML(String(e));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Test connection";
+      }
+    });
+  });
+
+  function escapeHTML(s) {
+    return String(s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function renderTestResult(data) {
+    const meta = [];
+    if (data.model) meta.push("model=<code>" + escapeHTML(data.model) + "</code>");
+    if (typeof data.latency_ms === "number")
+      meta.push(escapeHTML(data.latency_ms.toLocaleString()) + " ms");
+    const metaLine = meta.length
+      ? '<div class="muted" style="margin-top:4px;font-size:11px;">' +
+        meta.join(" · ") + "</div>"
+      : "";
+    if (data.ok) {
+      return '<span class="dot-ok">●</span> <strong>Reply:</strong> ' +
+        '<span style="white-space:pre-wrap;">' +
+        escapeHTML(data.reply || "(empty)") + "</span>" + metaLine;
+    }
+    return '<span class="dot-bad">○</span> <strong>Failed:</strong> ' +
+      escapeHTML(data.error || "unknown error") + metaLine;
+  }
+})();
+</script>
+{% endif %}
 
 {% endblock %}

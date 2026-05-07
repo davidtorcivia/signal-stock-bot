@@ -414,6 +414,60 @@ class LLMClient:
             )
             raise LLMError("Unexpected response from LLM") from e
 
+    async def health_check(self, prompt: Optional[str] = None) -> dict:
+        """Single round-trip connectivity test against the bot's own
+        config. Never raises — every failure mode (disabled,
+        unconfigured, network, auth, slow upstream, malformed reply)
+        resolves to `{ok: False, error: ...}` so the admin UI can
+        render specifics without a 500 page. Used by the test-connection
+        button on /admin/bots/<id>.
+
+        Skips response-style + history injection so the test exercises
+        the bare endpoint path. Records metrics under purpose=
+        'healthcheck' so synthetic test calls don't pollute the
+        writer's per-bot rollups."""
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return {
+                "ok": False,
+                "error": "LLM is disabled for this bot/role.",
+                "model": cfg.get("model") or "",
+                "latency_ms": 0,
+            }
+        missing = [
+            k for k in ("base_url", "api_key", "model") if not cfg.get(k)
+        ]
+        if missing:
+            return {
+                "ok": False,
+                "error": f"Not configured: missing {', '.join(missing)}.",
+                "model": cfg.get("model") or "",
+                "latency_ms": 0,
+            }
+        user_msg = (prompt or "").strip() or (
+            "Reply with one short sentence to confirm you're reachable."
+        )
+        started = time.time()
+        try:
+            msg = await self.chat_messages(
+                [{"role": "user", "content": user_msg}],
+                suppress_response_style=True,
+                purpose="healthcheck",
+            )
+        except (LLMDisabled, LLMNotConfigured, LLMError) as e:
+            return {
+                "ok": False,
+                "error": str(e),
+                "model": cfg.get("model") or "",
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+        return {
+            "ok": True,
+            "reply": (msg.get("content") or "").strip(),
+            "model": cfg["model"],
+            "latency_ms": int((time.time() - started) * 1000),
+        }
+
 
 _NY = ZoneInfo("America/New_York")
 

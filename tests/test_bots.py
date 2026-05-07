@@ -485,6 +485,174 @@ async def test_research_handoff_does_not_mutate_callers_messages():
 # ──────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────
+# Test-connection button (admin route)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _build_admin_app(tmpdb, store, registry, ctx_reg, factory, loop):
+    """Helper: spin up a Flask app with just the bot routes for tests
+    that need the actual route handler."""
+    from src.admin import auth as auth_mod
+    auth_mod.admin_required = lambda f: f
+    from flask import Flask
+    app = Flask(__name__)
+    app.secret_key = "test"
+    from src.admin.blueprint import create_admin_blueprint
+    create_admin_blueprint(
+        app=app, password_hash=b"u", settings_store=store,
+        signal_handler=None, loop=loop, admin_phone="+1555",
+        context_registry=ctx_reg, bot_registry=registry, llm_factory=factory,
+    )
+    return app
+
+
+@pytest.fixture
+def admin_app(tmpdb, store, registry):
+    """Flask app + background loop suitable for hitting bot test routes."""
+    import threading
+    from src.contexts import ContextRegistry
+    from src.llm.factory import LLMClientFactory
+
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(
+        target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()),
+        daemon=True,
+    )
+    t.start()
+    ctx_reg = ContextRegistry(tmpdb)
+    asyncio.run_coroutine_threadsafe(
+        ctx_reg._ensure_initialized(), loop
+    ).result(timeout=5)
+    factory = LLMClientFactory(store)
+    app = _build_admin_app(tmpdb, store, registry, ctx_reg, factory, loop)
+    yield app, factory
+    loop.call_soon_threadsafe(loop.stop)
+
+
+def _auth_client(app):
+    c = app.test_client()
+    with c.session_transaction() as sess:
+        sess["authenticated"] = True
+        sess["csrf_token"] = "TOKEN"
+    return c
+
+
+def test_test_connection_rejects_bad_role(admin_app, registry):
+    app, _ = admin_app
+    sigil = registry.get_by_slug_sync(SIGIL_SLUG)
+    c = _auth_client(app)
+    r = c.post(f"/admin/bots/{sigil.id}/test/garbage",
+               data={"csrf_token": "TOKEN"})
+    assert r.status_code == 400
+    assert r.json["ok"] is False
+    assert "role must be" in r.json["error"]
+
+
+def test_test_connection_rejects_bad_csrf(admin_app, registry):
+    app, _ = admin_app
+    sigil = registry.get_by_slug_sync(SIGIL_SLUG)
+    c = _auth_client(app)
+    r = c.post(f"/admin/bots/{sigil.id}/test/writer",
+               data={"csrf_token": "WRONG"})
+    assert r.status_code == 403
+
+
+def test_test_connection_404_for_unknown_bot(admin_app):
+    app, _ = admin_app
+    c = _auth_client(app)
+    r = c.post("/admin/bots/9999/test/writer",
+               data={"csrf_token": "TOKEN"})
+    assert r.status_code == 404
+
+
+def test_test_connection_disabled_short_circuits(admin_app, registry, store):
+    """When the role's enabled flag is off, the route returns ok=False
+    with a clear message — without making any network call."""
+    app, _ = admin_app
+    sigil = registry.get_by_slug_sync(SIGIL_SLUG)
+    # llm_enabled defaults to False on a fresh store; ensure it's off
+    store.set("llm_enabled", False)
+    c = _auth_client(app)
+    r = c.post(f"/admin/bots/{sigil.id}/test/writer",
+               data={"csrf_token": "TOKEN"})
+    assert r.status_code == 200
+    assert r.json["ok"] is False
+    assert "disabled" in r.json["error"].lower()
+    assert r.json["latency_ms"] == 0  # no network call attempted
+    assert r.json["bot_slug"] == "sigil"
+    assert r.json["role"] == "writer"
+
+
+def test_test_connection_reports_network_failure(admin_app, registry, store):
+    """Unreachable upstream still returns 200 + ok=False with a
+    network error message — never a 500. Latency reflects the failed
+    connect attempt."""
+    app, _ = admin_app
+    sigil = registry.get_by_slug_sync(SIGIL_SLUG)
+    store.set("llm_enabled", True)
+    store.set("llm_base_url", "http://127.0.0.1:1/v1")  # closed port
+    store.set("llm_api_key", "sk-test")
+    store.set("llm_model", "gpt-4")
+    store.set("llm_timeout_seconds", 2)
+    c = _auth_client(app)
+    r = c.post(f"/admin/bots/{sigil.id}/test/writer",
+               data={"csrf_token": "TOKEN"})
+    assert r.status_code == 200
+    assert r.json["ok"] is False
+    err = r.json["error"].lower()
+    assert "network" in err or "connect" in err
+    assert r.json["model"] == "gpt-4"
+
+
+def test_test_connection_passes_custom_prompt(admin_app, registry, store):
+    """Custom prompts in the form override the default test message.
+    We verify by hitting the disabled-config short-circuit (which
+    echoes the prompt before any network call... wait, it doesn't.
+    Better: just verify the route accepts a `prompt` form field
+    without 500ing.)"""
+    app, _ = admin_app
+    sigil = registry.get_by_slug_sync(SIGIL_SLUG)
+    store.set("llm_enabled", False)
+    c = _auth_client(app)
+    r = c.post(f"/admin/bots/{sigil.id}/test/writer",
+               data={"csrf_token": "TOKEN", "prompt": "custom"})
+    assert r.status_code == 200
+    # disabled short-circuits regardless of prompt; no crash is the test
+    assert r.json["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_health_check_unconfigured_returns_structured_error(
+    tmpdb: str,
+):
+    """A blank-slate store (no llm_enabled) returns a 'disabled' error
+    instead of attempting any network call."""
+    from src.llm.client import LLMClient
+    blank_store = SettingsStore(tmpdb + ".blank")
+    c = LLMClient(blank_store)
+    r = await c.health_check()
+    assert r["ok"] is False
+    assert "disabled" in r["error"].lower()
+    assert r["latency_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_health_check_missing_fields_lists_them(tmpdb: str):
+    """When llm_enabled is on but URL/key/model are blank, the error
+    names what's missing — admin can read it and know what to fill in."""
+    from src.llm.client import LLMClient
+    s = SettingsStore(tmpdb + ".missing")
+    s.set("llm_enabled", True)
+    # base_url, api_key, model still empty
+    c = LLMClient(s)
+    r = await c.health_check()
+    assert r["ok"] is False
+    assert "missing" in r["error"].lower()
+    assert "base_url" in r["error"]
+    assert "model" in r["error"]
+
+
 @pytest.mark.asyncio
 async def test_backfill_is_idempotent(registry: BotRegistry, tmpdb: str):
     """Re-running backfill on a populated DB updates 0 rows."""
