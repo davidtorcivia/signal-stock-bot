@@ -36,6 +36,11 @@ from typing import Optional
 import aiohttp
 
 from ..admin.events import get_bus
+from ..bots.settings import (
+    resolve_bool,
+    resolve_int,
+    resolve_setting,
+)
 from ..cache import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -84,8 +89,14 @@ class DeepThinkClient:
         settings_store,
         bot_tools=None,
         mcp_manager=None,
+        bot_id: Optional[int] = None,
     ):
         self.store = settings_store
+        # bot_id scopes config reads to bot_llm_settings(bot_id, 'deep_think', ...)
+        # before falling back to admin_settings.deep_think_* / .llm_*.
+        # None = legacy global-only read (back-compat for tests / single-bot).
+        self.bot_id = bot_id
+        self.role = "deep_think"
         # Tool plumbing — both late-bindable since bot_tools depends on the
         # dispatcher, which depends on this client via ask_command. Wired in
         # main.py after both exist. When unset (or unconfigured), think()
@@ -116,24 +127,46 @@ class DeepThinkClient:
             self._daily_per_group = {}
 
     def _config(self) -> dict:
-        """Live config with llm_* fallback for unset deep_think_* fields."""
-        store = self.store
+        """Live config with bot -> deep_think_* -> llm_* fallback chain.
 
-        def _str(key: str, fallback_key: str = "") -> str:
-            """First non-blank string value, with optional llm_* fallback."""
-            v = store.get(key)
-            if isinstance(v, str) and v.strip():
-                return v
-            if fallback_key:
-                fb = store.get(fallback_key)
-                if isinstance(fb, str) and fb.strip():
-                    return fb
+        Resolution order at each key:
+          1. bot_llm_settings(bot_id, 'deep_think', key)  — when bot_id set
+          2. admin_settings.deep_think_<key>              — global override
+          3. admin_settings.llm_<key>                     — writer fallback
+          4. code default
+        """
+        store = self.store
+        bot_id, role = self.bot_id, self.role
+
+        def _str(key: str, *globals_: str) -> str:
+            """Non-blank-string-aware resolver. The base resolve_setting
+            returns the first non-None hit; this wrapper additionally
+            skips empty strings so a blank `deep_think_model` falls
+            through to `llm_model` rather than masking it."""
+            if bot_id is not None:
+                v = store.get_bot(bot_id, role, key, default=None)
+                if isinstance(v, str) and v.strip():
+                    return v
+                if v is not None and not isinstance(v, str):
+                    return str(v)
+            for gk in globals_:
+                v = store.get(gk)
+                if isinstance(v, str) and v.strip():
+                    return v
             return ""
 
-        def _num(key: str, fallback_key: str, default: float) -> float:
-            """First non-zero numeric value, with llm_* fallback."""
-            for k in (key, fallback_key):
-                v = store.get(k)
+        def _num(key: str, default: float, *globals_: str) -> float:
+            """Skip blank-string values so they don't shadow a real
+            numeric configured at the writer level."""
+            if bot_id is not None:
+                v = store.get_bot(bot_id, role, key, default=None)
+                if v is not None and not (isinstance(v, str) and not v.strip()):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        pass
+            for gk in globals_:
+                v = store.get(gk)
                 if v is None or (isinstance(v, str) and not v.strip()):
                     continue
                 try:
@@ -142,21 +175,44 @@ class DeepThinkClient:
                     continue
             return default
 
+        sys_prompt = resolve_setting(
+            store, bot_id, role, "system_prompt",
+            global_keys=["deep_think_system_prompt"],
+        )
+
         return {
-            "enabled": store.get_bool("deep_think_enabled", False),
-            "base_url": _str("deep_think_base_url", "llm_base_url").strip().rstrip("/"),
-            "api_key": _str("deep_think_api_key", "llm_api_key").strip(),
-            "model": _str("deep_think_model", "llm_model").strip(),
-            "temperature": _num("deep_think_temperature", "llm_temperature", 0.7),
-            "max_tokens": int(_num("deep_think_max_tokens", "llm_max_tokens", 8000)),
-            "timeout": int(_num("deep_think_timeout_seconds", "llm_timeout_seconds", 120)),
-            "extra_body": _str("deep_think_extra_body", "llm_extra_body"),
-            "system_prompt": store.get("deep_think_system_prompt") or DEFAULT_DEEP_THINK_PROMPT,
-            "context_max_chars": store.get_int("deep_think_context_max_chars", 8000),
-            "max_tool_rounds": store.get_int("deep_think_max_tool_rounds", 15),
-            "caps_enabled": store.get_bool("deep_think_caps_enabled", False),
-            "user_daily_cap": store.get_int("deep_think_user_daily_cap", 0),
-            "group_daily_cap": store.get_int("deep_think_group_daily_cap", 0),
+            "enabled": resolve_bool(
+                store, bot_id, role, "enabled",
+                global_keys=["deep_think_enabled"], default=False,
+            ),
+            "base_url": _str("base_url", "deep_think_base_url", "llm_base_url").strip().rstrip("/"),
+            "api_key": _str("api_key", "deep_think_api_key", "llm_api_key").strip(),
+            "model": _str("model", "deep_think_model", "llm_model").strip(),
+            "temperature": _num("temperature", 0.7, "deep_think_temperature", "llm_temperature"),
+            "max_tokens": int(_num("max_tokens", 8000, "deep_think_max_tokens", "llm_max_tokens")),
+            "timeout": int(_num("timeout_seconds", 120, "deep_think_timeout_seconds", "llm_timeout_seconds")),
+            "extra_body": _str("extra_body", "deep_think_extra_body", "llm_extra_body"),
+            "system_prompt": sys_prompt or DEFAULT_DEEP_THINK_PROMPT,
+            "context_max_chars": resolve_int(
+                store, bot_id, role, "context_max_chars",
+                global_keys=["deep_think_context_max_chars"], default=8000,
+            ),
+            "max_tool_rounds": resolve_int(
+                store, bot_id, role, "max_tool_rounds",
+                global_keys=["deep_think_max_tool_rounds"], default=15,
+            ),
+            "caps_enabled": resolve_bool(
+                store, bot_id, role, "caps_enabled",
+                global_keys=["deep_think_caps_enabled"], default=False,
+            ),
+            "user_daily_cap": resolve_int(
+                store, bot_id, role, "user_daily_cap",
+                global_keys=["deep_think_user_daily_cap"], default=0,
+            ),
+            "group_daily_cap": resolve_int(
+                store, bot_id, role, "group_daily_cap",
+                global_keys=["deep_think_group_daily_cap"], default=0,
+            ),
         }
 
     def status(self) -> dict:

@@ -16,6 +16,13 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
+from ..bots.settings import (
+    resolve_bool,
+    resolve_float,
+    resolve_int,
+    resolve_setting,
+    resolve_stripped,
+)
 from ..cache import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -105,8 +112,22 @@ class LLMNotConfigured(LLMError):
 
 
 class LLMClient:
-    def __init__(self, settings_store):
+    def __init__(
+        self,
+        settings_store,
+        bot_id: Optional[int] = None,
+        role: str = "writer",
+    ):
         self.store = settings_store
+        # When set, every config read first looks up
+        # `bot_llm_settings(bot_id, role, key)` before falling back to
+        # the legacy global llm_* key. None preserves the original
+        # single-bot behavior — used by tests and any caller not yet
+        # bot-aware. `role` is part of the lookup tuple so a future
+        # variant (e.g. an extraction-specific writer) can share this
+        # class without colliding on settings.
+        self.bot_id = bot_id
+        self.role = role
         # Long-lived session reused across all chat calls. Without this,
         # every call (writer, reactor, deep_think extractors, augmentation)
         # opens a fresh TCP+TLS connection — a measurable hit at scale and
@@ -126,15 +147,42 @@ class LLMClient:
             self._session = None
 
     def _config(self) -> dict:
+        bot_id, role = self.bot_id, self.role
+        store = self.store
+        sys_prompt_raw = resolve_setting(
+            store, bot_id, role, "system_prompt",
+            global_keys=["llm_system_prompt"],
+        )
         return {
-            "enabled": self.store.get_bool("llm_enabled", False),
-            "base_url": self.store.get_stripped("llm_base_url").rstrip("/"),
-            "api_key": self.store.get_stripped("llm_api_key"),
-            "model": self.store.get_stripped("llm_model"),
-            "temperature": self.store.get_float("llm_temperature", 0.7),
-            "max_tokens": self.store.get_int("llm_max_tokens", 1000),
-            "system_prompt": self.store.get("llm_system_prompt") or DEFAULT_SYSTEM_PROMPT,
-            "timeout": self.store.get_int("llm_timeout_seconds", 30),
+            "enabled": resolve_bool(
+                store, bot_id, role, "enabled",
+                global_keys=["llm_enabled"], default=False,
+            ),
+            "base_url": resolve_stripped(
+                store, bot_id, role, "base_url",
+                global_keys=["llm_base_url"],
+            ).rstrip("/"),
+            "api_key": resolve_stripped(
+                store, bot_id, role, "api_key",
+                global_keys=["llm_api_key"],
+            ),
+            "model": resolve_stripped(
+                store, bot_id, role, "model",
+                global_keys=["llm_model"],
+            ),
+            "temperature": resolve_float(
+                store, bot_id, role, "temperature",
+                global_keys=["llm_temperature"], default=0.7,
+            ),
+            "max_tokens": resolve_int(
+                store, bot_id, role, "max_tokens",
+                global_keys=["llm_max_tokens"], default=1000,
+            ),
+            "system_prompt": sys_prompt_raw or DEFAULT_SYSTEM_PROMPT,
+            "timeout": resolve_int(
+                store, bot_id, role, "timeout_seconds",
+                global_keys=["llm_timeout_seconds"], default=30,
+            ),
         }
 
     def status(self) -> dict:
@@ -221,7 +269,10 @@ class LLMClient:
             # prompt that contradicts it. Default is the brevity/no-preamble
             # policy. Blank/whitespace overrides fall back to the default so
             # the admin form can't silently disable brevity by saving empty.
-            style_override = self.store.get("llm_response_style")
+            style_override = resolve_setting(
+                self.store, self.bot_id, self.role, "response_style",
+                global_keys=["llm_response_style"],
+            )
             if style_override is None or not str(style_override).strip():
                 style = DEFAULT_RESPONSE_STYLE
             else:
@@ -242,7 +293,10 @@ class LLMClient:
         # Extra body: prefer the override (raw JSON string) over the global one.
         extra_raw = overrides.get("extra_body")
         if extra_raw is None:
-            extra_raw = self.store.get("llm_extra_body") or ""
+            extra_raw = resolve_setting(
+                self.store, self.bot_id, self.role, "extra_body",
+                global_keys=["llm_extra_body"], default="",
+            ) or ""
         if isinstance(extra_raw, str) and extra_raw.strip():
             try:
                 extra = json.loads(extra_raw)
@@ -265,9 +319,18 @@ class LLMClient:
         # excluded — that path is meant to be slow/smart.
         if "provider" not in payload:
             provider = build_provider_routing(
-                order=self.store.get("llm_provider_order"),
-                only=bool(self.store.get("llm_provider_only", False)),
-                sort=self.store.get("llm_provider_sort"),
+                order=resolve_setting(
+                    self.store, self.bot_id, self.role, "provider_order",
+                    global_keys=["llm_provider_order"],
+                ),
+                only=resolve_bool(
+                    self.store, self.bot_id, self.role, "provider_only",
+                    global_keys=["llm_provider_only"], default=False,
+                ),
+                sort=resolve_setting(
+                    self.store, self.bot_id, self.role, "provider_sort",
+                    global_keys=["llm_provider_sort"],
+                ),
             )
             if provider:
                 payload["provider"] = provider

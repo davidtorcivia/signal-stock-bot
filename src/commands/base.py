@@ -4,7 +4,10 @@ Base classes for bot commands.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from ..bots import Bot
 
 
 @dataclass
@@ -16,6 +19,14 @@ class CommandContext:
     command: str             # The command (e.g., "price")
     args: list[str]          # Arguments after command
     policy: Optional[object] = None   # ContextPolicy resolved for this chat
+    # Bot whose voice this command is speaking with. Resolved by the
+    # dispatcher from the inbound message — explicit mention/quote
+    # routing in PR4, default-bot-for-context until then. AskCommand
+    # uses this in PR3 to pick the per-bot LLMClient/DeepThinkClient
+    # via the factory; commands that don't speak as the bot can
+    # ignore it. Optional only because background workers and tests
+    # synthesize CommandContexts before bot resolution exists.
+    bot: Optional["Bot"] = None
     # Quoted message info, when the user is replying to another message in
     # Signal. Surfaced as text context for the LLM so it knows what's being
     # responded to. None when the message isn't a reply.

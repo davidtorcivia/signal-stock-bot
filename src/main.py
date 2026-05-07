@@ -168,6 +168,7 @@ def create_dispatcher(
     llm_client=None,
     reactor=None,
     name_registry=None,
+    bot_registry=None,
 ) -> CommandDispatcher:
     """Create and configure command dispatcher."""
     dispatcher = CommandDispatcher(
@@ -182,6 +183,7 @@ def create_dispatcher(
         llm_client=llm_client,
         ask_command=ask_command,
         reactor=reactor,
+        bot_registry=bot_registry,
     )
 
     price_cmd = PriceCommand(provider_manager)
@@ -670,12 +672,27 @@ def build_app(config: Config):
     context_registry = ContextRegistry(config.watchlist_db_path)
     memory_store = MemoryStore(config.watchlist_db_path)
     bot_registry = BotRegistry(config.watchlist_db_path)
+    # Sync warm-up: creates bots + bot_llm_settings tables, seeds the
+    # default bot if absent, loads the in-process cache. Has to run
+    # before LLMClient/DeepThinkClient are constructed because they
+    # take the bot_id at __init__ time and route every settings read
+    # through it. The async `_bots_boot_init` below still runs the
+    # consumer-table backfill once the loop is up.
+    seed_name = (settings_store.get("bot_name") or config.bot_name or "Sigil")
+    bot_registry.warm_sync(default_display_name=seed_name)
+    default_bot = bot_registry.get_by_slug_sync("sigil")
+    default_bot_id = default_bot.id if default_bot else None
+    if default_bot_id is None:
+        logger.warning(
+            "Default bot not seeded — LLM clients will use legacy global "
+            "settings only. Check bot_registry.warm_sync logs."
+        )
     logger.info(f"Database: {config.watchlist_db_path}")
 
     mcp_registry = MCPRegistry(config.watchlist_db_path)
     mcp_manager = MCPManager(mcp_registry)
 
-    llm_client = LLMClient(settings_store)
+    llm_client = LLMClient(settings_store, bot_id=default_bot_id)
     name_registry = NameRegistry(config.watchlist_db_path, bot_name=config.bot_name)
     llm_history = ConversationHistory(
         config.watchlist_db_path,
@@ -725,6 +742,7 @@ def build_app(config: Config):
     deep_think_client = DeepThinkClient(
         settings_store,
         mcp_manager=mcp_manager,
+        bot_id=default_bot_id,
     )
 
     # ask_command is built first (without bot_tools) so the dispatcher knows
@@ -752,6 +770,7 @@ def build_app(config: Config):
         llm_client=llm_client,
         reactor=reactor,
         name_registry=name_registry,
+        bot_registry=bot_registry,
     )
 
     from .commands.tools import BotCommandTools
@@ -815,17 +834,13 @@ def build_app(config: Config):
     # Single shared event loop for all async work
     loop = _start_background_loop()
 
-    # Bot registry init + one-shot backfill. Must run before any traffic
-    # so the bots table exists and existing rows on consumer tables
-    # (contexts, conversation_turns, predictions, portfolios,
-    # context_memories, metric_events) get bot_id stamped to the seeded
-    # sigil row. We force every consumer store's `_ensure_initialized`
-    # first so their `bot_id` columns exist by the time backfill walks
-    # the tables. Idempotent — re-running on every boot is a cheap
-    # `UPDATE ... WHERE bot_id IS NULL` that becomes a no-op once
-    # populated. Display-name seed pulls from the live admin setting
-    # first, falling back to the env-loaded Config default.
-    seed_name = (settings_store.get("bot_name") or config.bot_name or "Sigil")
+    # Async backfill pass. The bots table itself was created by the
+    # sync warm_sync() above so LLMClient could be constructed with the
+    # default bot's id. This pass forces every consumer store's
+    # `_ensure_initialized` so their bot_id columns exist, then stamps
+    # historical rows. Idempotent — re-running on every boot is a
+    # cheap UPDATE WHERE col IS NULL that becomes a no-op once
+    # populated.
     async def _bots_boot_init():
         await bot_registry._ensure_initialized(default_display_name=seed_name)
         # Force consumer-store schema creation so bot_id columns exist.

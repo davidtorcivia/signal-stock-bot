@@ -16,5 +16,23 @@ metric_events) get a nullable `bot_id` column backfilled to that row.
 
 from .models import Bot
 from .registry import BotRegistry, SIGIL_SLUG
+from .settings import (
+    resolve_setting,
+    resolve_int,
+    resolve_float,
+    resolve_bool,
+    resolve_str,
+    resolve_stripped,
+)
 
-__all__ = ["Bot", "BotRegistry", "SIGIL_SLUG"]
+__all__ = [
+    "Bot",
+    "BotRegistry",
+    "SIGIL_SLUG",
+    "resolve_setting",
+    "resolve_int",
+    "resolve_float",
+    "resolve_bool",
+    "resolve_str",
+    "resolve_stripped",
+]

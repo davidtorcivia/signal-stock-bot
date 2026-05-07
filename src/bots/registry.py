@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
@@ -161,6 +162,99 @@ class BotRegistry:
                 self._cache[bot.id] = bot
                 self._slug_index[bot.slug] = bot.id
         self._cache_loaded = True
+
+    def warm_sync(self, default_display_name: str = "Sigil") -> None:
+        """Sync table creation + seed + cache load.
+
+        Mirrors `NameRegistry._warm_cache_sync` — main.py uses it during
+        the synchronous wiring phase (before the event loop starts) so
+        LLMClient / DeepThinkClient can be constructed with the seeded
+        bot's id. Idempotent: re-running is safe and effectively
+        free once the table is populated. The async `_ensure_initialized`
+        path still works alongside this for callers that don't run
+        through main.py (tests, ad-hoc scripts).
+        """
+        if self._cache_loaded:
+            return
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        slug TEXT NOT NULL UNIQUE,
+                        display_name TEXT NOT NULL,
+                        aliases TEXT NOT NULL DEFAULT '[]',
+                        persona TEXT,
+                        signal_phone TEXT,
+                        signal_api_url TEXT,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        default_for_dm INTEGER NOT NULL DEFAULT 0,
+                        default_for_group INTEGER NOT NULL DEFAULT 0,
+                        deep_think_mode TEXT NOT NULL DEFAULT 'replace',
+                        deep_think_handoff_prompt TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_llm_settings (
+                        bot_id INTEGER NOT NULL,
+                        role TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (bot_id, role, key),
+                        FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_bots_enabled ON bots(enabled)"
+                )
+                cur = conn.execute("SELECT COUNT(*) FROM bots")
+                row = cur.fetchone()
+                if row and row[0] == 0:
+                    name = (default_display_name or "Sigil").strip() or "Sigil"
+                    now = time.time()
+                    conn.execute(
+                        """INSERT INTO bots (
+                            slug, display_name, aliases, persona,
+                            signal_phone, signal_api_url, enabled,
+                            default_for_dm, default_for_group,
+                            deep_think_mode, deep_think_handoff_prompt,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, NULL, NULL, NULL, 1, 1, 1,
+                                  'replace', NULL, ?, ?)""",
+                        (SIGIL_SLUG, name, json.dumps([name]), now, now),
+                    )
+                    logger.info(
+                        f"BotRegistry.warm_sync seeded {SIGIL_SLUG!r} "
+                        f"(display={name!r})"
+                    )
+                conn.commit()
+                cur = conn.execute(
+                    f"SELECT {self._SELECT_FIELDS} FROM bots ORDER BY id"
+                )
+                rows = cur.fetchall()
+            self._cache = {}
+            self._slug_index = {}
+            for r in rows:
+                bot = self._row_to_bot(r)
+                if bot.id is not None:
+                    self._cache[bot.id] = bot
+                    self._slug_index[bot.slug] = bot.id
+            self._cache_loaded = True
+            # Mark the async initializer too: schema is already in place
+            # so `_ensure_initialized` becomes a no-op on its happy path.
+            self._initialized = True
+        except Exception as e:
+            logger.warning(f"BotRegistry.warm_sync failed: {e}")
 
     # ------------------------------------------------------------------
     # Row mapping
