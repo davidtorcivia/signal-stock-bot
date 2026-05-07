@@ -542,6 +542,79 @@ class AskCommand(BaseCommand):
             f"`Max tool-call rounds per !ask` in /admin/llm."
         )
 
+    _DEFAULT_RESEARCH_HANDOFF = (
+        "RESEARCH NOTES (from your research model — the slower, smarter "
+        "deeper-thinking sibling that just ran the tool loop on your "
+        "behalf):\n\n{notes}\n\nUse these notes to compose your reply. "
+        "Do not call tools; the research is already done. Stay in your "
+        "voice — the notes are scaffolding, not the response. If the "
+        "notes admit they couldn't answer, say so honestly rather than "
+        "fabricating."
+    )
+
+    async def _run_research_handoff(
+        self,
+        *,
+        ctx: CommandContext,
+        question: str,
+        research_input: str,
+        messages: list[dict],
+        attachments: list,
+        user_hash: str,
+    ) -> str:
+        """Two-LLM research-mode handoff: deep_think does the tool work
+        and produces structured notes, then the writer composes the
+        final reply with those notes injected. Used when
+        `ctx.bot.deep_think_mode == 'research'`. The writer gets no
+        tools — research is already done."""
+        # Run deep_think against the same context the writer would have
+        # seen. We pass the user-message block as `context` so deep_think
+        # has the full situational frame (group context, replying_to,
+        # current message). Failure modes return placeholder strings
+        # rather than raising — the writer will see them and report
+        # back honestly.
+        notes = await self.deep_think.think(
+            question,
+            context=research_input,
+            user_hash=user_hash,
+            group_id=ctx.group_id,
+            caller_ctx=ctx,
+            attachments=attachments,
+        )
+
+        # Inject notes into the system message via a final sub-block.
+        # The handoff prompt is per-bot (set in /admin/bots) so each
+        # bot can phrase the handoff in its own voice; an empty value
+        # falls back to the default scaffolding above.
+        handoff_template = (
+            getattr(ctx.bot, "deep_think_handoff_prompt", None)
+            or self._DEFAULT_RESEARCH_HANDOFF
+        )
+        # Allow either {notes} or a literal handoff prompt followed by
+        # the notes — the {notes} form gives admins control over where
+        # the notes appear; falling back to "<prompt>\n\n<notes>"
+        # avoids forcing them to remember the placeholder.
+        try:
+            handoff_block = handoff_template.format(notes=notes)
+        except (KeyError, IndexError):
+            handoff_block = f"{handoff_template}\n\n{notes}"
+
+        # Prepend to the system message in-place. Using a system role
+        # (not user) keeps the writer's framing as "compose a reply"
+        # rather than "respond to the notes."
+        if messages and messages[0].get("role") == "system":
+            existing = (messages[0].get("content") or "").rstrip()
+            messages[0] = dict(messages[0])
+            messages[0]["content"] = (
+                f"{existing}\n\n{handoff_block}" if existing else handoff_block
+            )
+        else:
+            messages.insert(0, {"role": "system", "content": handoff_block})
+
+        # Single-shot: no tools. The writer's only job is to compose.
+        assistant_msg = await self.llm.chat_messages(messages, tools=None)
+        return (assistant_msg.get("content") or "").strip()
+
     async def _handle_predict_self_tool(
         self,
         args: dict,
@@ -1954,9 +2027,48 @@ class AskCommand(BaseCommand):
 
             tools = self._collect_tools(policy=ctx.policy)
             attachments: list = []
-            # Show a typing indicator in the chat while the tool loop runs.
-            # The indicator auto-clears in ~15s, so the helper refreshes it.
-            if self.signal_handler is not None:
+
+            # Research mode: when the active bot is configured for it
+            # (Artaud), deep_think runs the entire tool loop first and
+            # returns notes; the writer LLM then composes the final
+            # reply from those notes without tool access. This pairs a
+            # locally-trained writer (which carries the persona) with a
+            # cloud research model (which has the toolset). When the
+            # bot has no per-bot LLMClient yet (PR2 single-bot path),
+            # we still go through this branch — the same llm_client
+            # composes; only the tool-vs-no-tool split changes.
+            use_research_mode = (
+                ctx.bot is not None
+                and getattr(ctx.bot, "deep_think_mode", "replace") == "research"
+                and self.deep_think is not None
+                and self.deep_think.status().get("ready")
+                and (ctx.policy is None or ctx.policy.allows_deep_think())
+            )
+
+            if use_research_mode and self.signal_handler is not None:
+                async with self.signal_handler.typing_indicator(
+                    ctx.sender, ctx.group_id
+                ):
+                    answer = await self._run_research_handoff(
+                        ctx=ctx,
+                        question=question,
+                        research_input=current_user_content,
+                        messages=messages,
+                        attachments=attachments,
+                        user_hash=user_hash,
+                    )
+            elif use_research_mode:
+                answer = await self._run_research_handoff(
+                    ctx=ctx,
+                    question=question,
+                    research_input=current_user_content,
+                    messages=messages,
+                    attachments=attachments,
+                    user_hash=user_hash,
+                )
+            elif self.signal_handler is not None:
+                # Show a typing indicator in the chat while the tool loop runs.
+                # The indicator auto-clears in ~15s, so the helper refreshes it.
                 async with self.signal_handler.typing_indicator(
                     ctx.sender, ctx.group_id
                 ):

@@ -397,48 +397,69 @@ class SignalHandler:
         
         return None
     
-    async def _is_bot_mentioned(self, data_message: dict) -> bool:
-        """
-        Check if the bot is mentioned in the message.
+    async def _resolve_addressed_bot(
+        self, data_message: dict, group_id: Optional[str], policy
+    ):
+        """Return the bot that the inbound message is addressing, or None.
 
-        Three paths count as a mention:
-          1. Signal's structured @-mention (matched by phone or UUID).
-          2. The configured bot_name appearing as a whole word in the
-             message text — e.g. "hey Sigil, what's AAPL?". Whole-word,
-             case-insensitive so casual references like "Sigil!" or
-             "Sigil," still match without grabbing substrings.
-          3. A quote-reply to one of the bot's own messages. If a user
-             swipes-to-reply on something the bot said, that's a direct
-             address even without an @-mention or name mention — treat
-             it as if the bot were mentioned so conversation flows
-             naturally. Without this, follow-ups like "expand on that"
-             or "are you sure?" would silently fall to the floor in a
-             group chat.
-        """
-        # 1) Structured @-mention
+        Mention sources, in order of strength:
+          1. Signal structured @-mention matching the bot's phone/UUID.
+             When the Signal phone is shared (initial Artaud rollout),
+             this resolves to the same bot for every receiver, so we
+             defer to alias-matching to disambiguate.
+          2. Whole-word, case-insensitive alias match in the message
+             text against the *active* bot for this context. "Active"
+             means: the bot that `_resolve_bot(policy)` would pick
+             — the pinned `default_bot_id`, or the registry's
+             default-for-kind. This enforces the "Sigil-only context
+             never answers to 'Artaud'" rule by gating alias-matching
+             on context membership rather than the global bot list.
+          3. Quote-reply to one of our previous messages (whoever the
+             phone says it was). When phone is shared and we can't tell
+             which bot wrote the quoted message, the active bot for the
+             context is the safe pick.
+
+        Returns the matched Bot (or None), and a `mentioned` boolean
+        for callers that just need a yes/no signal."""
+        # Pull the candidate bot from the dispatcher's resolver. If
+        # bot_registry isn't wired or the registry returns nothing
+        # (early boot, tests), fall back to legacy bot_name matching
+        # so this code stays useful in single-bot setups too.
+        active_bot = None
+        if self.dispatcher is not None:
+            active_bot = self.dispatcher._resolve_bot(group_id, policy=policy)
+
+        # 1) Structured @-mention — phone/UUID match means the message
+        # was directed at this Signal account. With a shared phone the
+        # mention can't disambiguate Sigil-vs-Artaud, so we treat it as
+        # "addressing the active bot" rather than failing closed.
         mentions = data_message.get("mentions") or []
         if mentions:
             if not self._bot_uuid:
                 await self.fetch_bot_uuid()
             for mention in mentions:
                 if mention.get("number", "") == self.config.phone_number:
-                    return True
+                    return active_bot, True
                 mentioned_uuid = mention.get("uuid", "")
                 if self._bot_uuid and mentioned_uuid == self._bot_uuid:
-                    return True
+                    return active_bot, True
 
-        # 2) Plain-text name reference. Pull the live bot_name off the
-        # dispatcher; it refreshes from settings on every dispatch, so
-        # the value is at most one message stale after an admin rename.
-        bot_name = (getattr(self.dispatcher, "bot_name", "") or "").strip()
+        # 2) Alias match against the active bot's alias set.
         message_text = data_message.get("message") or ""
-        if bot_name and message_text:
-            if re.search(
+        if active_bot is not None and message_text:
+            for alias in active_bot.alias_set():
+                if re.search(rf"\b{re.escape(alias)}\b", message_text, re.IGNORECASE):
+                    return active_bot, True
+        elif active_bot is None and message_text:
+            # Legacy fallback when bot_registry isn't wired: use the
+            # dispatcher's bot_name. Behaves identically to pre-PR4.
+            bot_name = (getattr(self.dispatcher, "bot_name", "") or "").strip()
+            if bot_name and re.search(
                 rf"\b{re.escape(bot_name)}\b", message_text, re.IGNORECASE
             ):
-                return True
+                return None, True
 
-        # 3) Quote-reply to a bot message
+        # 3) Quote-reply to a previous bot message.
         quote = data_message.get("quote") or {}
         quote_author_number = quote.get("authorNumber") or ""
         quote_author_uuid = quote.get("authorUuid") or quote.get("author") or ""
@@ -446,11 +467,21 @@ class SignalHandler:
             if not self._bot_uuid:
                 await self.fetch_bot_uuid()
             if quote_author_number and quote_author_number == self.config.phone_number:
-                return True
+                return active_bot, True
             if self._bot_uuid and quote_author_uuid == self._bot_uuid:
-                return True
+                return active_bot, True
 
-        return False
+        return None, False
+
+    async def _is_bot_mentioned(self, data_message: dict) -> bool:
+        """Bool-only wrapper for callers that don't need bot identity.
+        Defers to `_resolve_addressed_bot` with no context info — used
+        by legacy paths that route mention=True/False without
+        propagating which bot."""
+        _, mentioned = await self._resolve_addressed_bot(
+            data_message, group_id=None, policy=None
+        )
+        return mentioned
     
     async def handle_webhook(self, data: dict):
         """
@@ -535,13 +566,29 @@ class SignalHandler:
             or None
         )
 
-        # Check if bot is mentioned
-        is_mentioned = await self._is_bot_mentioned(data_message)
+        # Resolve the addressed bot before dispatch. The dispatcher
+        # uses `_resolve_bot` to pick a default; what mention-routing
+        # adds is the alias path — when the user says "Artaud" in an
+        # Artaud-pinned context that fact is already self-consistent,
+        # but in PR5's shared-context scenario this is what lets the
+        # right bot answer.
+        policy_for_routing = None
+        if self.dispatcher is not None and self.dispatcher.context_registry is not None:
+            try:
+                policy_for_routing = await self.dispatcher.context_registry.resolve(
+                    group_id, sender
+                )
+            except Exception as e:
+                logger.debug(f"context resolve for mention routing failed: {e}")
+        addressed_bot, is_mentioned = await self._resolve_addressed_bot(
+            data_message, group_id, policy_for_routing
+        )
 
+        bot_label = f" [→{addressed_bot.slug}]" if addressed_bot else ""
         logger.info(
             f"Received message from {sender[-4:]}: "
             f"{'[group] ' if group_id else ''}"
-            f"{'[@mentioned] ' if is_mentioned else ''}"
+            f"{'[@mentioned]' + bot_label + ' ' if is_mentioned else ''}"
             f"{message_text[:50]}..."
         )
 
@@ -554,6 +601,7 @@ class SignalHandler:
             target_timestamp=message_ts,
             quote_text=quote_text,
             quote_author=quote_author,
+            addressed_bot=addressed_bot,
         )
         
         # Send response if command was processed

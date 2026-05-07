@@ -152,16 +152,18 @@ class CommandDispatcher:
             re.IGNORECASE | re.DOTALL
         )
 
-    def _resolve_bot(self, group_id: Optional[str], policy=None):
+    def _resolve_bot(self, group_id: Optional[str], policy=None, addressed_bot=None):
         """Pick the bot whose voice this command will speak with.
 
-        Order: per-context pin (`policy.default_bot_id`) > registry's
-        default-for-kind > None when registry isn't wired. PR4 mention
-        routing layers on top — it overrides this when the message
-        explicitly addresses a different alias.
+        Order: explicit alias mention > per-context pin
+        (`policy.default_bot_id`) > registry's default-for-kind > None.
+        SignalHandler resolves the addressed bot from the inbound text
+        and passes it down; dispatcher honors it when set and enabled.
 
         A pinned bot that's been disabled or deleted falls through to
         the registry default rather than blocking the chat."""
+        if addressed_bot is not None and getattr(addressed_bot, "enabled", True):
+            return addressed_bot
         if self.bot_registry is None:
             return None
         if policy is not None:
@@ -245,6 +247,7 @@ class CommandDispatcher:
         target_timestamp: Optional[int] = None,
         quote_text: Optional[str] = None,
         quote_author: Optional[str] = None,
+        addressed_bot=None,
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
@@ -357,6 +360,7 @@ class CommandDispatcher:
                         result = await self._execute_command(
                             command, args, sender, message, group_id, policy,
                             quote_text=quote_text, quote_author=quote_author,
+                            addressed_bot=addressed_bot,
                         )
                         if result:
                             results.append(result)
@@ -372,6 +376,7 @@ class CommandDispatcher:
             return await self._execute_command(
                 command, args, sender, message, group_id, policy,
                 quote_text=quote_text, quote_author=quote_author,
+                addressed_bot=addressed_bot,
             )
 
         # Try inline symbol detection if enabled
@@ -383,6 +388,7 @@ class CommandDispatcher:
                 return await self._execute_command(
                     "price", symbols, sender, message, group_id, policy,
                     quote_text=quote_text, quote_author=quote_author,
+                    addressed_bot=addressed_bot,
                 )
         
         # Try natural language intent parsing
@@ -413,7 +419,7 @@ class CommandDispatcher:
                     command="ask",
                     args=cleaned.split(),
                     policy=policy,
-                    bot=self._resolve_bot(group_id, policy=policy),
+                    bot=self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot),
                     quote_text=quote_text,
                     quote_author=quote_author,
                 )
@@ -525,7 +531,10 @@ class CommandDispatcher:
                         chained_symbol = intent.symbols[0]
                     
                     logger.info(f"Intent parsed: {intent.command} {intent.symbols} (confidence: {intent.confidence:.2f})")
-                    result = await self._execute_command(intent.command, intent.args, sender, message, group_id, policy)
+                    result = await self._execute_command(
+                        intent.command, intent.args, sender, message, group_id,
+                        policy, addressed_bot=addressed_bot,
+                    )
                     if result:
                         results.append(result)
             
@@ -631,6 +640,7 @@ class CommandDispatcher:
         policy=None,
         quote_text: Optional[str] = None,
         quote_author: Optional[str] = None,
+        addressed_bot=None,
     ) -> CommandResult:
         """Execute a command with the given arguments."""
         # Resolve context (pronouns)
@@ -663,7 +673,7 @@ class CommandDispatcher:
             command=command,
             args=args,
             policy=policy,
-            bot=self._resolve_bot(group_id, policy=policy),
+            bot=self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot),
             quote_text=quote_text,
             quote_author=quote_author,
         )
