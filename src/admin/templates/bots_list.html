@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Bots{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>Bots</h1>
+    <p class="muted" style="font-size: 12px;">
+        One row per bot identity. Each bot has its own display name,
+        alias list (whole-word triggers from chat), and per-role LLM
+        overrides that compose with the global LLM settings page —
+        leaving an override blank inherits the global value.
+        <code>signal_phone</code> is the phone the bot sends from; blank
+        means "share the system default." A bot must be marked
+        <em>default for DM</em> or <em>default for group</em> to answer
+        in contexts that haven't been explicitly assigned.
+    </p>
+    <p>
+      <a class="btn" href="{{ url_for('admin.bots_new') }}"
+         style="display:inline-block;text-decoration:none;">+ Add bot</a>
+    </p>
+
+    {% if not bots %}
+        <p class="muted">No bots yet.</p>
+    {% else %}
+    <table>
+        <tr>
+            <th>Display name</th>
+            <th>Slug</th>
+            <th>Aliases</th>
+            <th>Phone</th>
+            <th>Default</th>
+            <th>Contexts</th>
+            <th>Enabled</th>
+            <th></th>
+        </tr>
+        {% for b in bots %}
+            <tr>
+                <td><a href="{{ url_for('admin.bots_edit', bot_id=b.id) }}">{{ b.display_name }}</a></td>
+                <td class="muted"><code>{{ b.slug }}</code></td>
+                <td class="muted">
+                    {% if b.aliases %}{{ b.aliases | join(', ') }}{% else %}—{% endif %}
+                </td>
+                <td class="muted">
+                    {% if b.signal_phone %}{{ b.signal_phone }}{% else %}<em>shared</em>{% endif %}
+                </td>
+                <td class="muted">
+                    {% if b.default_for_group %}group{% endif %}{% if b.default_for_group and b.default_for_dm %}, {% endif %}{% if b.default_for_dm %}dm{% endif %}{% if not b.default_for_group and not b.default_for_dm %}—{% endif %}
+                </td>
+                <td>{{ context_counts.get(b.id, 0) }}</td>
+                <td>
+                    {% if b.enabled %}<span class="dot-ok">●</span> yes{% else %}<span class="muted">○ no</span>{% endif %}
+                </td>
+                <td style="white-space:nowrap;">
+                    <form method="post" action="{{ url_for('admin.bots_delete', bot_id=b.id) }}" class="inline"
+                          onsubmit="return confirm('Delete {{ b.display_name }}? Contexts referencing it must be reassigned first.');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="secondary" type="submit"
+                                style="background: var(--bad); color: white;">Delete</button>
+                    </form>
+                </td>
+            </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+</div>
+
+{% endblock %}

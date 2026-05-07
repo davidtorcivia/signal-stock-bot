@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New bot{% else %}Edit {{ bot.display_name }}{% endif %}{% endblock %}
+{% block content %}
+
+<div class="panel">
+    <h1>{% if is_new %}New bot{% else %}Edit {{ bot.display_name }}{% endif %}</h1>
+    <p class="muted" style="font-size: 12px;">
+        <a href="{{ url_for('admin.bots_list') }}">← Back to bots</a>
+    </p>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <h2>Identity</h2>
+
+        <label>Slug
+          <input type="text" name="slug" value="{{ values.slug }}"
+                 {% if not is_new %}readonly{% endif %} pattern="[a-z0-9_-]+">
+          <span class="muted" style="font-size: 11px;">
+            Stable identifier (lowercase, letters/digits/_/- only).
+            Cannot be changed once set; not user-facing.
+          </span>
+        </label>
+
+        <label>Display name
+          <input type="text" name="display_name" value="{{ values.display_name }}">
+          <span class="muted" style="font-size: 11px;">
+            Shown to chat and used as the default trigger alias.
+          </span>
+        </label>
+
+        <label>Aliases
+          <textarea name="aliases" rows="3"
+                    placeholder="One per line. Defaults to the display name when blank."
+            >{{ values.aliases }}</textarea>
+          <span class="muted" style="font-size: 11px;">
+            Whole-word, case-insensitive triggers. Adding "Sig" lets
+            users say "hey Sig" and reach the bot.
+          </span>
+        </label>
+
+        <label>Persona / system-prompt prefix
+          <textarea name="persona" rows="4"
+                    placeholder="Leave blank if the model is trained to know its own persona (e.g. Artaud).">{{ values.persona }}</textarea>
+          <span class="muted" style="font-size: 11px;">
+            Layered above the global writer system prompt. Empty is
+            fine when the model itself carries the persona.
+          </span>
+        </label>
+
+        <label>Signal phone (override)
+          <input type="text" name="signal_phone" value="{{ values.signal_phone }}"
+                 placeholder="+1...  (blank = share the system default)">
+        </label>
+        <label>Signal API URL (override)
+          <input type="text" name="signal_api_url" value="{{ values.signal_api_url }}"
+                 placeholder="http://...  (blank = use SIGNAL_API_URL)">
+        </label>
+
+        <label style="display:flex;gap:8px;align-items:center;">
+          <input type="checkbox" name="enabled" value="1" {% if values.enabled %}checked{% endif %} style="width:auto;">
+          <span>Enabled</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;">
+          <input type="checkbox" name="default_for_group" value="1" {% if values.default_for_group %}checked{% endif %} style="width:auto;">
+          <span>Default bot for groups (only one bot can hold this)</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;">
+          <input type="checkbox" name="default_for_dm" value="1" {% if values.default_for_dm %}checked{% endif %} style="width:auto;">
+          <span>Default bot for DMs</span>
+        </label>
+
+        <h2 style="margin-top: 24px;">Deep think</h2>
+
+        <label>Mode
+          <select name="deep_think_mode" style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
+            {% for m in deep_think_modes %}
+              <option value="{{ m }}" {% if values.deep_think_mode == m %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+          </select>
+          <span class="muted" style="font-size: 11px;">
+            <code>replace</code>: deep_think writes the user-facing reply directly
+            (Sigil's behavior).
+            <code>research</code>: deep_think runs the tool loop and returns notes;
+            the writer composes the final reply with those notes injected as a
+            handoff prompt (Artaud's flow when paired with a locally-trained writer).
+          </span>
+        </label>
+
+        <label>Handoff prompt (research mode only)
+          <textarea name="deep_think_handoff_prompt" rows="3"
+                    placeholder="Optional. Instructs the writer how to fold the research notes into its reply.">{{ values.deep_think_handoff_prompt }}</textarea>
+        </label>
+
+        {% for role in roles %}
+          <h2 style="margin-top: 24px;">{{ role|capitalize }} LLM overrides</h2>
+          <p class="muted" style="font-size: 11px;">
+            Leave fields blank to inherit the global
+            {% if role == 'writer' %}<code>llm_*</code>{% elif role == 'reactor' %}<code>reactor_*</code> (with <code>llm_*</code> fallback){% else %}<code>deep_think_*</code> (with <code>llm_*</code> fallback){% endif %}
+            settings from the LLM page. Save with a value to pin it for this bot.
+          </p>
+
+          {% set role_vals = bot_settings.fields[role] %}
+          {% set role_secrets = bot_settings.secrets_set[role] %}
+          {% for key, kind in role_fields[role] %}
+            <label>
+              {{ key }}
+              {% if kind == 'secret' %}
+                <input type="password" name="{{ role }}__{{ key }}" value=""
+                       placeholder="{% if role_secrets[key] %}(set — type to replace){% else %}(not set){% endif %}">
+                {% if role_secrets[key] %}
+                  <label style="display:flex;gap:8px;align-items:center;margin-top:4px;font-size:11px;">
+                    <input type="checkbox" name="{{ role }}__{{ key }}__clear" value="1" style="width:auto;">
+                    <span>Clear (revert to global)</span>
+                  </label>
+                {% endif %}
+              {% elif kind == 'int' %}
+                <input type="number" step="1" name="{{ role }}__{{ key }}"
+                       value="{{ role_vals[key] }}" placeholder="(inherit global)">
+              {% elif kind == 'float' %}
+                <input type="number" step="0.01" name="{{ role }}__{{ key }}"
+                       value="{{ role_vals[key] }}" placeholder="(inherit global)">
+              {% elif kind == 'json' %}
+                <textarea name="{{ role }}__{{ key }}" rows="3"
+                          placeholder='(inherit global) — JSON object, e.g. {"top_k": 40}'>{{ role_vals[key] }}</textarea>
+              {% else %}
+                <input type="text" name="{{ role }}__{{ key }}"
+                       value="{{ role_vals[key] }}" placeholder="(inherit global)">
+              {% endif %}
+            </label>
+          {% endfor %}
+        {% endfor %}
+
+        <p style="margin-top: 24px;">
+          <button type="submit">Save</button>
+          {% if not is_new %}
+            <a href="{{ url_for('admin.bots_list') }}" class="btn secondary"
+               style="display:inline-block;text-decoration:none;margin-left:8px;">Cancel</a>
+          {% endif %}
+        </p>
+    </form>
+</div>
+
+{% endblock %}

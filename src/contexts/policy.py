@@ -50,6 +50,12 @@ class ContextPolicy:
     # privacy implications).
     memory_writes_enabled: bool = True
     reactor_memory_writes: bool = False
+    # Multi-bot scoping: which bot answers in this context when no bot
+    # is named in the message. NULL = use the registry's
+    # default_for_kind. Set to a specific bot.id to pin (e.g. an
+    # Artaud-only group). PR4 mention routing can still let a non-
+    # default bot answer when explicitly addressed by alias.
+    default_bot_id: Optional[int] = None
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()

@@ -79,6 +79,28 @@
         <p class="muted" style="font-size: 12px;">No MCP servers configured yet. Add one at <a href="{{ url_for('admin.mcp_list') }}">MCP</a>.</p>
         {% endif %}
 
+        <h2 style="margin-top: 32px;">Bot</h2>
+        <label for="default_bot_id">Default bot for this context</label>
+        <select name="default_bot_id" id="default_bot_id"
+                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
+            <option value="" {% if not values.default_bot_id %}selected{% endif %}>
+                — Inherit (use registry default for this kind) —
+            </option>
+            {% for b in all_bots %}
+                <option value="{{ b.id }}"
+                    {% if values.default_bot_id == (b.id|string) %}selected{% endif %}>
+                    {{ b.display_name }} <span class="muted">({{ b.slug }})</span>
+                </option>
+            {% endfor %}
+        </select>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Pin a specific bot to answer in this chat (e.g. an Artaud-only group).
+            Inherit means the bot flagged "default for {{ values.kind }}" on
+            <a href="{{ url_for('admin.bots_list') }}">/admin/bots</a> answers here.
+            Mention-routing in PR4 still lets a non-default bot reply when
+            explicitly addressed by alias.
+        </p>
+
         <h2 style="margin-top: 32px;">System prompt</h2>
         <label for="system_prompt">Override (leave empty to use the global LLM prompt)</label>
         <textarea name="system_prompt" id="system_prompt" rows="6"

@@ -12,6 +12,8 @@ from typing import Optional
 
 from flask import Blueprint, Flask, Response, abort, flash, redirect, render_template, request, session, url_for
 
+from ..bots import Bot, BotRegistry
+from ..bots.models import DEEP_THINK_MODES
 from ..cache import get_cache_manager, get_metrics
 from ..contexts import ContextPolicy, ContextRegistry
 from .events import get_bus
@@ -51,6 +53,7 @@ def create_admin_blueprint(
     oracle_store=None,
     portfolio_store=None,
     portfolio_executor=None,
+    bot_registry: Optional[BotRegistry] = None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -84,6 +87,15 @@ def create_admin_blueprint(
     )
     _register_llm_routes(bp, settings_store=settings_store)
 
+    if bot_registry is not None:
+        _register_bots_routes(
+            bp,
+            registry=bot_registry,
+            settings_store=settings_store,
+            context_registry=context_registry,
+            loop=loop,
+        )
+
     if mcp_registry is not None and mcp_manager is not None:
         _register_mcp_routes(
             bp,
@@ -102,6 +114,7 @@ def create_admin_blueprint(
             memory_store=memory_store,
             name_registry=name_registry,
             oracle_store=oracle_store,
+            bot_registry=bot_registry,
         )
 
     if name_registry is not None:
@@ -132,6 +145,19 @@ def create_admin_blueprint(
     @bp.context_processor
     def inject_csrf():
         return {"csrf_token": csrf_token}
+
+    # Expose the set of registered admin endpoints so base.html's nav can
+    # gate links on whether the route actually exists. Without this,
+    # disabling MCP / portfolios / predictions / etc. via missing
+    # dependencies would 500 every page that extends base.html.
+    @app.context_processor
+    def inject_endpoint_set():
+        return {
+            "admin_endpoints": {
+                rule.endpoint for rule in app.url_map.iter_rules()
+                if rule.endpoint.startswith("admin.")
+            }
+        }
 
     app.register_blueprint(bp)
     return bp
@@ -580,6 +606,335 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bots routes — identity CRUD + per-bot, per-role LLM overrides
+# ---------------------------------------------------------------------------
+
+# Per-role override fields exposed on the bot edit form. Empty submission
+# = "remove the bot-scoped row, fall back to the global llm_*/reactor_*
+# /deep_think_* setting." That's why we DELETE on blank rather than
+# storing an empty string — it preserves the bot -> global -> default
+# resolver behavior.
+_BOT_LLM_FIELDS = {
+    "writer": [
+        ("base_url", "str"),
+        ("api_key", "secret"),
+        ("model", "str"),
+        ("temperature", "float"),
+        ("max_tokens", "int"),
+        ("timeout_seconds", "int"),
+        ("system_prompt", "str"),
+        ("extra_body", "json"),
+    ],
+    "reactor": [
+        ("model", "str"),
+        ("temperature", "float"),
+        ("max_tokens", "int"),
+        ("system_prompt", "str"),
+        ("extra_body", "json"),
+    ],
+    "deep_think": [
+        ("base_url", "str"),
+        ("api_key", "secret"),
+        ("model", "str"),
+        ("temperature", "float"),
+        ("max_tokens", "int"),
+        ("timeout_seconds", "int"),
+        ("system_prompt", "str"),
+        ("extra_body", "json"),
+    ],
+}
+
+
+def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
+    """Read identity fields from the form into a Bot. Aliases come in
+    as comma- or newline-separated text; deduplicated and trimmed."""
+    raw_aliases = form.get("aliases", "") or ""
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw_aliases.replace(",", "\n").split("\n"):
+        a = chunk.strip()
+        if not a:
+            continue
+        low = a.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        aliases.append(a)
+
+    slug = (form.get("slug", "") or "").strip().lower()
+    display_name = (form.get("display_name", "") or "").strip()
+    if not slug:
+        raise ValueError("slug is required (lowercase, stable; not user-facing)")
+    if not display_name:
+        raise ValueError("display_name is required")
+    # Default the alias list to [display_name] if nothing was entered —
+    # without an alias, the bot can't be named-triggered from chat.
+    if not aliases:
+        aliases = [display_name]
+
+    deep_think_mode = (form.get("deep_think_mode", "") or "replace").strip()
+    if deep_think_mode not in DEEP_THINK_MODES:
+        raise ValueError(
+            f"deep_think_mode must be one of {DEEP_THINK_MODES}"
+        )
+
+    return Bot(
+        id=existing.id if existing else None,
+        slug=slug,
+        display_name=display_name,
+        aliases=aliases,
+        persona=(form.get("persona", "") or "").strip() or None,
+        signal_phone=(form.get("signal_phone", "") or "").strip() or None,
+        signal_api_url=(form.get("signal_api_url", "") or "").strip() or None,
+        enabled=(form.get("enabled", "") or "").lower() in ("1", "true", "yes", "on"),
+        default_for_dm=(form.get("default_for_dm", "") or "").lower() in ("1", "true", "yes", "on"),
+        default_for_group=(form.get("default_for_group", "") or "").lower() in ("1", "true", "yes", "on"),
+        deep_think_mode=deep_think_mode,
+        deep_think_handoff_prompt=(form.get("deep_think_handoff_prompt", "") or "").strip() or None,
+    )
+
+
+def _apply_bot_llm_form(
+    store: SettingsStore, bot_id: int, form
+) -> None:
+    """Persist per-bot, per-role overrides. Each input is named
+    `<role>__<key>` to avoid colliding with the identity fields. Empty
+    values DELETE the corresponding bot-scoped row so the resolver
+    falls back to the global setting on next read."""
+    import json as _json
+
+    for role, fields in _BOT_LLM_FIELDS.items():
+        for key, kind in fields:
+            field = f"{role}__{key}"
+            raw = form.get(field, "").strip()
+            if kind == "secret":
+                # Masked input: only overwrite when the operator typed
+                # something. An empty submission keeps the existing
+                # bot-scoped value. To clear an api_key, the operator
+                # uses the explicit "clear" button which posts
+                # `<role>__<key>__clear=1`.
+                if form.get(f"{field}__clear", "").strip() in ("1", "true", "yes", "on"):
+                    store.delete_bot(bot_id, role, key)
+                elif raw:
+                    store.set_bot(bot_id, role, key, raw)
+                continue
+            if not raw:
+                # Blank string for any non-secret field clears the
+                # bot-scoped row → fall back to global on next read.
+                store.delete_bot(bot_id, role, key)
+                continue
+            if kind == "int":
+                try:
+                    store.set_bot(bot_id, role, key, int(raw))
+                except ValueError:
+                    raise ValueError(
+                        f"{field} must be an integer (got {raw!r})"
+                    ) from None
+                continue
+            if kind == "float":
+                try:
+                    store.set_bot(bot_id, role, key, float(raw))
+                except ValueError:
+                    raise ValueError(
+                        f"{field} must be a number (got {raw!r})"
+                    ) from None
+                continue
+            if kind == "json":
+                try:
+                    parsed = _json.loads(raw)
+                except _json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"{field} is not valid JSON: {e.msg}"
+                    ) from None
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"{field} must be a JSON object"
+                    )
+                store.set_bot(bot_id, role, key, raw)
+                continue
+            store.set_bot(bot_id, role, key, raw)
+
+
+def _bot_llm_values(
+    store: SettingsStore, bot_id: Optional[int]
+) -> dict:
+    """Build the {role: {key: value}} dict the form pre-populates from.
+    api_keys are intentionally blanked so they aren't echoed to the
+    browser; a parallel `<role>__api_key__set` flag indicates whether
+    one is currently configured.
+
+    Top-level keys are `fields` and `secrets_set` (NOT `values` — that
+    collides with `dict.values` in Jinja and resolves to the bound
+    method instead of the data)."""
+    out: dict[str, dict] = {}
+    flags: dict[str, dict] = {}
+    if bot_id is None:
+        # New-bot form: every override field starts empty.
+        for role, fields in _BOT_LLM_FIELDS.items():
+            out[role] = {key: "" for key, _ in fields}
+            flags[role] = {key: False for key, kind in fields if kind == "secret"}
+        return {"fields": out, "secrets_set": flags}
+    bot_settings = store.list_bot(bot_id)
+    for role, fields in _BOT_LLM_FIELDS.items():
+        slot = bot_settings.get(role, {})
+        out[role] = {}
+        flags[role] = {}
+        for key, kind in fields:
+            v = slot.get(key, "")
+            if kind == "secret":
+                flags[role][key] = bool(v)
+                out[role][key] = ""
+            else:
+                # Coerce typed values back to their string form for the
+                # form input. Float "0.7" round-trips fine; True/False
+                # for booleans isn't used in the override form.
+                out[role][key] = "" if v in (None, "") else str(v)
+    return {"fields": out, "secrets_set": flags}
+
+
+def _register_bots_routes(
+    bp: Blueprint,
+    *,
+    registry: BotRegistry,
+    settings_store: SettingsStore,
+    context_registry: Optional[ContextRegistry],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    @bp.route("/bots", methods=["GET"])
+    @admin_required
+    def bots_list():
+        bots = _run_on_loop(loop, registry.list())
+        # Map context counts per bot for the list view ("answers in N
+        # contexts"). Cheap query; no N+1 because contexts is a small
+        # table.
+        context_counts: dict[int, int] = {}
+        if context_registry is not None:
+            try:
+                rows = _run_on_loop(loop, context_registry.list())
+                for r in rows:
+                    bid = getattr(r, "default_bot_id", None)
+                    if bid is not None:
+                        context_counts[bid] = context_counts.get(bid, 0) + 1
+            except Exception as e:
+                logger.warning(f"bots_list context count failed: {e}")
+        return render_template(
+            "bots_list.html",
+            bots=bots,
+            context_counts=context_counts,
+        )
+
+    @bp.route("/bots/new", methods=["GET", "POST"])
+    @admin_required
+    def bots_new():
+        error = None
+        # Pre-populate aliases default to display_name so the form
+        # doesn't render with no alias (which would make the bot
+        # un-triggerable). User can edit before submit.
+        defaults = {
+            "slug": "",
+            "display_name": "",
+            "aliases": "",
+            "persona": "",
+            "signal_phone": "",
+            "signal_api_url": "",
+            "enabled": True,
+            "default_for_dm": False,
+            "default_for_group": False,
+            "deep_think_mode": "replace",
+            "deep_think_handoff_prompt": "",
+        }
+        bot_settings = _bot_llm_values(settings_store, bot_id=None)
+        if request.method == "POST":
+            if not verify_csrf():
+                error = "Session expired, please reload the page."
+            else:
+                try:
+                    new_bot = _form_to_bot(request.form, existing=None)
+                    new_id = _run_on_loop(loop, registry.upsert(new_bot))
+                    _apply_bot_llm_form(settings_store, new_id, request.form)
+                    return redirect(url_for("admin.bots_edit", bot_id=new_id))
+                except ValueError as e:
+                    error = str(e)
+            defaults = {k: request.form.get(k, defaults[k]) for k in defaults}
+        return render_template(
+            "bots_form.html",
+            is_new=True,
+            bot=None,
+            values=defaults,
+            roles=list(_BOT_LLM_FIELDS.keys()),
+            role_fields=_BOT_LLM_FIELDS,
+            bot_settings=bot_settings,
+            deep_think_modes=DEEP_THINK_MODES,
+            error=error,
+        )
+
+    @bp.route("/bots/<int:bot_id>", methods=["GET", "POST"])
+    @admin_required
+    def bots_edit(bot_id: int):
+        error = None
+        bot = _run_on_loop(loop, registry.get(bot_id))
+        if not bot:
+            abort(404)
+
+        if request.method == "POST":
+            if not verify_csrf():
+                error = "Session expired, please reload the page."
+            else:
+                try:
+                    updated = _form_to_bot(request.form, existing=bot)
+                    _run_on_loop(loop, registry.upsert(updated))
+                    _apply_bot_llm_form(settings_store, bot_id, request.form)
+                    return redirect(url_for("admin.bots_edit", bot_id=bot_id))
+                except ValueError as e:
+                    error = str(e)
+
+        bot_settings = _bot_llm_values(settings_store, bot_id=bot_id)
+        values = {
+            "slug": bot.slug,
+            "display_name": bot.display_name,
+            "aliases": "\n".join(bot.aliases),
+            "persona": bot.persona or "",
+            "signal_phone": bot.signal_phone or "",
+            "signal_api_url": bot.signal_api_url or "",
+            "enabled": bot.enabled,
+            "default_for_dm": bot.default_for_dm,
+            "default_for_group": bot.default_for_group,
+            "deep_think_mode": bot.deep_think_mode,
+            "deep_think_handoff_prompt": bot.deep_think_handoff_prompt or "",
+        }
+        return render_template(
+            "bots_form.html",
+            is_new=False,
+            bot=bot,
+            values=values,
+            roles=list(_BOT_LLM_FIELDS.keys()),
+            role_fields=_BOT_LLM_FIELDS,
+            bot_settings=bot_settings,
+            deep_think_modes=DEEP_THINK_MODES,
+            error=error,
+        )
+
+    @bp.route("/bots/<int:bot_id>/delete", methods=["POST"])
+    @admin_required
+    def bots_delete(bot_id: int):
+        if verify_csrf():
+            try:
+                ok = _run_on_loop(loop, registry.delete(bot_id))
+                if not ok:
+                    flash("Cannot delete: bot is the default sigil row, "
+                          "or one or more contexts still reference it. "
+                          "Reassign those contexts first.")
+                else:
+                    # Wipe per-bot overrides too — the bot_id is gone
+                    # so the rows would orphan otherwise.
+                    settings_store.delete_bot(bot_id)
+            except Exception as e:
+                logger.error(f"bots_delete failed: {e}")
+                flash(f"Delete failed: {e}")
+        return redirect(url_for("admin.bots_list"))
+
+
+# ---------------------------------------------------------------------------
 # MCP routes
 # ---------------------------------------------------------------------------
 
@@ -835,6 +1190,7 @@ def _register_context_routes(
     memory_store=None,
     name_registry=None,
     oracle_store=None,
+    bot_registry: Optional[BotRegistry] = None,
 ) -> None:
     """Context CRUD + (when memory_store is wired) memory CRUD nested under
     each context. Memory routes are mounted unconditionally so the template
@@ -844,6 +1200,19 @@ def _register_context_routes(
     def context_list():
         rows = _run_on_loop(loop, registry.list())
         return render_template("context_list.html", contexts=rows)
+
+    def _bots_for_template():
+        """Return the list of enabled bots for the default_bot_id select.
+        Empty when bot_registry isn't wired so the select still renders
+        with the 'inherit' option (the only one)."""
+        if bot_registry is None:
+            return []
+        try:
+            bots = bot_registry.list_sync()
+            return [b for b in bots if b.enabled]
+        except Exception as e:
+            logger.warning(f"context page bot list failed: {e}")
+            return []
 
     @bp.route("/contexts/new", methods=["GET", "POST"])
     @admin_required
@@ -865,6 +1234,7 @@ def _register_context_routes(
             "deep_think_enabled": True,
             "memory_writes_enabled": True,
             "reactor_memory_writes": False,
+            "default_bot_id": "",
         }
         if request.method == "POST":
             if not verify_csrf():
@@ -887,6 +1257,7 @@ def _register_context_routes(
             modes=MODES,
             all_commands=all_commands,
             all_servers=all_servers,
+            all_bots=_bots_for_template(),
             error=error,
         )
 
@@ -925,6 +1296,10 @@ def _register_context_routes(
             "deep_think_enabled": policy.deep_think_enabled,
             "memory_writes_enabled": policy.memory_writes_enabled,
             "reactor_memory_writes": policy.reactor_memory_writes,
+            "default_bot_id": (
+                "" if policy.default_bot_id is None
+                else str(policy.default_bot_id)
+            ),
         }
         if request.method == "POST":
             values = _form_to_values(request.form)
@@ -952,6 +1327,7 @@ def _register_context_routes(
             modes=MODES,
             all_commands=all_commands,
             all_servers=all_servers,
+            all_bots=_bots_for_template(),
             oracles=oracles_view,
             oracle_kinds=_ORACLE_KIND_OPTIONS,
             oracle_schedule_kinds=_ORACLE_SCHEDULE_OPTIONS,
@@ -1535,6 +1911,7 @@ def _form_to_values(form) -> dict:
         "deep_think_enabled": form.get("deep_think_enabled", "") == "on",
         "memory_writes_enabled": form.get("memory_writes_enabled", "") == "on",
         "reactor_memory_writes": form.get("reactor_memory_writes", "") == "on",
+        "default_bot_id": form.get("default_bot_id", "").strip(),
     }
 
 
@@ -1558,6 +1935,16 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
     deep_think_enabled = form.get("deep_think_enabled", "") == "on"
     memory_writes_enabled = form.get("memory_writes_enabled", "") == "on"
     reactor_memory_writes = form.get("reactor_memory_writes", "") == "on"
+    raw_default_bot_id = (form.get("default_bot_id") or "").strip()
+    default_bot_id: Optional[int]
+    if raw_default_bot_id == "":
+        # Empty submission == "fall back to registry's default-for-kind".
+        default_bot_id = None
+    else:
+        try:
+            default_bot_id = int(raw_default_bot_id)
+        except ValueError:
+            raise ValueError("default_bot_id must be an integer or blank") from None
 
     if kind not in ("group", "dm", "default"):
         raise ValueError("kind must be group, dm, or default")
@@ -1585,6 +1972,7 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         deep_think_enabled=deep_think_enabled,
         memory_writes_enabled=memory_writes_enabled,
         reactor_memory_writes=reactor_memory_writes,
+        default_bot_id=default_bot_id,
     )
 
 

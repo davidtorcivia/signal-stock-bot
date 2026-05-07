@@ -92,15 +92,16 @@
         <strong>◈ Signal Stock Bot</strong>
         {% if session.get("authenticated") %}
         <nav>
-            <a href="{{ url_for('admin.dashboard') }}">Dashboard</a>
-            <a href="{{ url_for('admin.settings_page') }}">Settings</a>
-            <a href="{{ url_for('admin.llm_page') }}">LLM</a>
-            <a href="{{ url_for('admin.mcp_list') }}">MCP</a>
-            <a href="{{ url_for('admin.context_list') }}">Contexts</a>
-            <a href="{{ url_for('admin.users_page') }}">Users</a>
-            <a href="{{ url_for('admin.predictions_page') }}">Predictions</a>
-            <a href="{{ url_for('admin.portfolios_page') }}">Portfolios</a>
-            <a href="{{ url_for('admin.live_page') }}">Live</a>
+            {% if 'admin.dashboard' in admin_endpoints %}<a href="{{ url_for('admin.dashboard') }}">Dashboard</a>{% endif %}
+            {% if 'admin.settings_page' in admin_endpoints %}<a href="{{ url_for('admin.settings_page') }}">Settings</a>{% endif %}
+            {% if 'admin.llm_page' in admin_endpoints %}<a href="{{ url_for('admin.llm_page') }}">LLM</a>{% endif %}
+            {% if 'admin.bots_list' in admin_endpoints %}<a href="{{ url_for('admin.bots_list') }}">Bots</a>{% endif %}
+            {% if 'admin.mcp_list' in admin_endpoints %}<a href="{{ url_for('admin.mcp_list') }}">MCP</a>{% endif %}
+            {% if 'admin.context_list' in admin_endpoints %}<a href="{{ url_for('admin.context_list') }}">Contexts</a>{% endif %}
+            {% if 'admin.users_page' in admin_endpoints %}<a href="{{ url_for('admin.users_page') }}">Users</a>{% endif %}
+            {% if 'admin.predictions_page' in admin_endpoints %}<a href="{{ url_for('admin.predictions_page') }}">Predictions</a>{% endif %}
+            {% if 'admin.portfolios_page' in admin_endpoints %}<a href="{{ url_for('admin.portfolios_page') }}">Portfolios</a>{% endif %}
+            {% if 'admin.live_page' in admin_endpoints %}<a href="{{ url_for('admin.live_page') }}">Live</a>{% endif %}
             <form method="post" action="{{ url_for('admin.logout') }}" class="inline">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="secondary" type="submit">Logout</button>

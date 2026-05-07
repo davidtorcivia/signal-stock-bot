@@ -136,7 +136,8 @@ class ContextRegistry:
         "id, kind, key, label, command_mode, commands, "
         "mcp_mode, mcp_servers, system_prompt, llm_intent, "
         "reactor_enabled, reactor_prompt, natural_response, "
-        "deep_think_enabled, memory_writes_enabled, reactor_memory_writes"
+        "deep_think_enabled, memory_writes_enabled, reactor_memory_writes, "
+        "default_bot_id"
     )
 
     @staticmethod
@@ -158,6 +159,7 @@ class ContextRegistry:
             deep_think_enabled=bool(row[13]) if len(row) > 13 and row[13] is not None else True,
             memory_writes_enabled=bool(row[14]) if len(row) > 14 and row[14] is not None else True,
             reactor_memory_writes=bool(row[15]) if len(row) > 15 and row[15] is not None else False,
+            default_bot_id=row[16] if len(row) > 16 else None,
         )
 
     async def list(self) -> list[ContextPolicy]:
@@ -250,9 +252,9 @@ class ContextRegistry:
                         mcp_servers, system_prompt, llm_intent,
                         reactor_enabled, reactor_prompt, natural_response,
                         deep_think_enabled, memory_writes_enabled,
-                        reactor_memory_writes,
+                        reactor_memory_writes, default_bot_id,
                         first_seen, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy.kind,
                         policy.key,
@@ -269,6 +271,7 @@ class ContextRegistry:
                         1 if policy.deep_think_enabled else 0,
                         1 if policy.memory_writes_enabled else 0,
                         1 if policy.reactor_memory_writes else 0,
+                        policy.default_bot_id,
                         now,
                         now,
                     ),
@@ -285,6 +288,7 @@ class ContextRegistry:
                            deep_think_enabled = ?,
                            memory_writes_enabled = ?,
                            reactor_memory_writes = ?,
+                           default_bot_id = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -301,6 +305,7 @@ class ContextRegistry:
                         1 if policy.deep_think_enabled else 0,
                         1 if policy.memory_writes_enabled else 0,
                         1 if policy.reactor_memory_writes else 0,
+                        policy.default_bot_id,
                         now,
                         policy.id,
                     ),

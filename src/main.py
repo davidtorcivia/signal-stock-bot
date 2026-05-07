@@ -1059,6 +1059,7 @@ def build_app(config: Config):
         oracle_store=oracle_store,
         portfolio_store=dispatcher.portfolio_store,
         portfolio_executor=dispatcher.portfolio_executor,
+        bot_registry=bot_registry,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

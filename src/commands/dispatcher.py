@@ -152,16 +152,24 @@ class CommandDispatcher:
             re.IGNORECASE | re.DOTALL
         )
 
-    def _resolve_bot(self, group_id: Optional[str]):
+    def _resolve_bot(self, group_id: Optional[str], policy=None):
         """Pick the bot whose voice this command will speak with.
 
-        PR2 keeps it simple: default-bot-for-kind. PR3 adds per-context
-        assignment (contexts.default_bot_id), and PR4 adds explicit
-        mention/quote routing that lets a non-default bot answer when
-        addressed by name. Returns None if the registry isn't wired
-        (early boot, tests, oracle worker before the boot init pass)."""
+        Order: per-context pin (`policy.default_bot_id`) > registry's
+        default-for-kind > None when registry isn't wired. PR4 mention
+        routing layers on top — it overrides this when the message
+        explicitly addresses a different alias.
+
+        A pinned bot that's been disabled or deleted falls through to
+        the registry default rather than blocking the chat."""
         if self.bot_registry is None:
             return None
+        if policy is not None:
+            pinned = getattr(policy, "default_bot_id", None)
+            if pinned is not None:
+                bot = self.bot_registry.get_sync(pinned)
+                if bot and bot.enabled:
+                    return bot
         kind = "group" if group_id else "dm"
         return self.bot_registry.default_for_kind_sync(kind)
 
@@ -405,7 +413,7 @@ class CommandDispatcher:
                     command="ask",
                     args=cleaned.split(),
                     policy=policy,
-                    bot=self._resolve_bot(group_id),
+                    bot=self._resolve_bot(group_id, policy=policy),
                     quote_text=quote_text,
                     quote_author=quote_author,
                 )
@@ -655,7 +663,7 @@ class CommandDispatcher:
             command=command,
             args=args,
             policy=policy,
-            bot=self._resolve_bot(group_id),
+            bot=self._resolve_bot(group_id, policy=policy),
             quote_text=quote_text,
             quote_author=quote_author,
         )
@@ -733,7 +741,7 @@ class CommandDispatcher:
             command="ask",
             args=[message] if message else [""],
             policy=policy,
-            bot=self._resolve_bot(group_id),
+            bot=self._resolve_bot(group_id, policy=policy),
             implicit_reason=reason or "(reactor flagged this as worth a reply)",
         )
 
