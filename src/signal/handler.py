@@ -472,16 +472,6 @@ class SignalHandler:
                 return active_bot, True
 
         return None, False
-
-    async def _is_bot_mentioned(self, data_message: dict) -> bool:
-        """Bool-only wrapper for callers that don't need bot identity.
-        Defers to `_resolve_addressed_bot` with no context info — used
-        by legacy paths that route mention=True/False without
-        propagating which bot."""
-        _, mentioned = await self._resolve_addressed_bot(
-            data_message, group_id=None, policy=None
-        )
-        return mentioned
     
     async def handle_webhook(self, data: dict):
         """
@@ -592,7 +582,9 @@ class SignalHandler:
             f"{message_text[:50]}..."
         )
 
-        # Dispatch to command handler
+        # Dispatch to command handler. Policy already resolved for
+        # mention routing — pass it down so the dispatcher reuses it
+        # rather than running the same SQLite query a second time.
         result = await self.dispatcher.dispatch(
             sender=sender,
             message=message_text,
@@ -602,6 +594,7 @@ class SignalHandler:
             quote_text=quote_text,
             quote_author=quote_author,
             addressed_bot=addressed_bot,
+            policy=policy_for_routing,
         )
         
         # Send response if command was processed

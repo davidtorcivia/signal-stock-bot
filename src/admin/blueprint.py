@@ -54,6 +54,7 @@ def create_admin_blueprint(
     portfolio_store=None,
     portfolio_executor=None,
     bot_registry: Optional[BotRegistry] = None,
+    llm_factory=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -94,6 +95,7 @@ def create_admin_blueprint(
             settings_store=settings_store,
             context_registry=context_registry,
             loop=loop,
+            llm_factory=llm_factory,
         )
 
     if mcp_registry is not None and mcp_manager is not None:
@@ -610,10 +612,17 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
 # ---------------------------------------------------------------------------
 
 # Per-role override fields exposed on the bot edit form. Empty submission
-# = "remove the bot-scoped row, fall back to the global llm_*/reactor_*
-# /deep_think_* setting." That's why we DELETE on blank rather than
-# storing an empty string — it preserves the bot -> global -> default
-# resolver behavior.
+# = "remove the bot-scoped row, fall back to the global llm_*/deep_think_*
+# setting." That's why we DELETE on blank rather than storing an empty
+# string — it preserves the bot -> global -> default resolver behavior.
+#
+# The reactor role is intentionally excluded here. The reactor is a
+# single global service (one EmojiReactor per app, configured via
+# /admin/llm), not per-bot — when natural_response fires it routes the
+# implicit !ask through the appropriate bot's writer, but the reactor
+# call itself uses the global reactor_* settings. Showing reactor
+# overrides on the bot form would mislead admins into authoring rows
+# that no code path reads.
 _BOT_LLM_FIELDS = {
     "writer": [
         ("base_url", "str"),
@@ -622,13 +631,6 @@ _BOT_LLM_FIELDS = {
         ("temperature", "float"),
         ("max_tokens", "int"),
         ("timeout_seconds", "int"),
-        ("system_prompt", "str"),
-        ("extra_body", "json"),
-    ],
-    "reactor": [
-        ("model", "str"),
-        ("temperature", "float"),
-        ("max_tokens", "int"),
         ("system_prompt", "str"),
         ("extra_body", "json"),
     ],
@@ -648,6 +650,8 @@ _BOT_LLM_FIELDS = {
 def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
     """Read identity fields from the form into a Bot. Aliases come in
     as comma- or newline-separated text; deduplicated and trimmed."""
+    import re as _re
+
     raw_aliases = form.get("aliases", "") or ""
     aliases: list[str] = []
     seen: set[str] = set()
@@ -665,6 +669,15 @@ def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
     display_name = (form.get("display_name", "") or "").strip()
     if not slug:
         raise ValueError("slug is required (lowercase, stable; not user-facing)")
+    # Server-side slug validation. The HTML pattern attribute is a
+    # client-side hint only — a malicious or malformed POST could ship
+    # arbitrary text; reject anything that isn't [a-z0-9_-]+. Keeps
+    # slugs URL-safe and free of quoting hazards even though templates
+    # already auto-escape.
+    if not _re.fullmatch(r"[a-z0-9_-]+", slug):
+        raise ValueError(
+            "slug must contain only lowercase letters, digits, '_', or '-'"
+        )
     if not display_name:
         raise ValueError("display_name is required")
     # Default the alias list to [display_name] if nothing was entered —
@@ -799,6 +812,7 @@ def _register_bots_routes(
     settings_store: SettingsStore,
     context_registry: Optional[ContextRegistry],
     loop: asyncio.AbstractEventLoop,
+    llm_factory=None,
 ) -> None:
     @bp.route("/bots", methods=["GET"])
     @admin_required
@@ -925,9 +939,15 @@ def _register_bots_routes(
                           "or one or more contexts still reference it. "
                           "Reassign those contexts first.")
                 else:
-                    # Wipe per-bot overrides too — the bot_id is gone
-                    # so the rows would orphan otherwise.
+                    # Wipe per-bot overrides AND drop cached LLMClient
+                    # instances. Without forget(), the in-memory cache
+                    # would still reference the deleted bot's clients
+                    # if anyone re-creates a bot with the same id later
+                    # (autoincrement makes that unlikely but not
+                    # impossible after a manual DB edit).
                     settings_store.delete_bot(bot_id)
+                    if llm_factory is not None:
+                        llm_factory.forget(bot_id)
             except Exception as e:
                 logger.error(f"bots_delete failed: {e}")
                 flash(f"Delete failed: {e}")

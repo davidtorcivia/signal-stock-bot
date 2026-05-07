@@ -657,7 +657,7 @@ class ResolveCommand(BaseCommand):
         "agreeing on the same verdict resolves the prediction; admins "
         "resolve solo. Predictors can't vote on their own. The cron "
         "auto-resolver also resolves predictions independently using "
-        "live data + Sigil's research tools."
+        "live data + the bot's research tools."
     )
 
     def __init__(

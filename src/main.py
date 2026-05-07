@@ -692,7 +692,16 @@ def build_app(config: Config):
     mcp_registry = MCPRegistry(config.watchlist_db_path)
     mcp_manager = MCPManager(mcp_registry)
 
-    llm_client = LLMClient(settings_store, bot_id=default_bot_id)
+    # Per-bot LLMClient + DeepThinkClient cache. The default-bot
+    # clients (llm_client / deep_think_client below) come from this
+    # factory so single-bot installs stay on one shared aiohttp
+    # session; multi-bot adds clients lazily on first request from
+    # any context pinned to a different bot. ask_command holds the
+    # factory and routes per-call via ctx.bot.
+    from .llm.factory import LLMClientFactory
+    llm_factory = LLMClientFactory(settings_store)
+    llm_factory.attach_mcp_manager(mcp_manager)
+    llm_client = llm_factory.get_writer(default_bot_id)
     name_registry = NameRegistry(config.watchlist_db_path, bot_name=config.bot_name)
     llm_history = ConversationHistory(
         config.watchlist_db_path,
@@ -739,11 +748,7 @@ def build_app(config: Config):
     # context via ContextPolicy.deep_think_enabled. The deep model gets
     # the same tool kit the writer has (bot_tools wired below after the
     # dispatcher exists; mcp_manager already exists at this point).
-    deep_think_client = DeepThinkClient(
-        settings_store,
-        mcp_manager=mcp_manager,
-        bot_id=default_bot_id,
-    )
+    deep_think_client = llm_factory.get_deep_think(default_bot_id)
 
     # ask_command is built first (without bot_tools) so the dispatcher knows
     # about it, then bot_tools is built once the dispatcher is available, and
@@ -759,6 +764,7 @@ def build_app(config: Config):
         reactor=reactor,
         deep_think=deep_think_client,
         memory_store=memory_store,
+        llm_factory=llm_factory,
     )
 
     dispatcher = create_dispatcher(
@@ -776,6 +782,11 @@ def build_app(config: Config):
     from .commands.tools import BotCommandTools
     bot_tools = BotCommandTools(dispatcher)
     ask_command.bot_tools = bot_tools
+    # Backfill the factory's bot_tools so any DeepThinkClient created
+    # later (when a non-default bot is invoked for the first time)
+    # gets the same tool kit. Already-cached clients (default bot's)
+    # are updated in place by the setter.
+    llm_factory.attach_bot_tools(bot_tools)
     # PredictionStore is constructed inside create_dispatcher (so the
     # background resolver can share it via dispatcher.prediction_store);
     # late-bind it onto ask_command here so the writer LLM gets the
@@ -936,13 +947,14 @@ def build_app(config: Config):
         provider_manager=provider_manager,
         signal_handler=signal_handler,
         llm_client=llm_client,
-        # Give the resolver Sigil's full research toolkit so free-form
+        # Give the resolver the bot's full research toolkit so free-form
         # claims get verified against live data (price/news/web) instead
         # of judged from training memory. The synthetic policy inside the
         # resolver narrows this to read-only commands.
         bot_tools=bot_tools,
         mcp_manager=mcp_manager,
         bot_phone=config.signal_phone_number,
+        bot_registry=bot_registry,
     )
     asyncio.run_coroutine_threadsafe(prediction_resolver.run_forever(), loop)
     logger.info("Prediction resolver scheduled")
@@ -958,6 +970,7 @@ def build_app(config: Config):
         signal_handler=signal_handler,
         context_registry=context_registry,
         bot_phone=config.signal_phone_number,
+        bot_registry=bot_registry,
     )
     asyncio.run_coroutine_threadsafe(trading_cron.run_forever(), loop)
     logger.info("Trading cron worker scheduled")
@@ -981,6 +994,7 @@ def build_app(config: Config):
         ask_command=ask_command,
         context_registry=context_registry,
         bot_phone=config.signal_phone_number,
+        bot_registry=bot_registry,
     )
     asyncio.run_coroutine_threadsafe(orders_worker.run_forever(), loop)
     logger.info("Orders watcher scheduled")
@@ -1017,6 +1031,7 @@ def build_app(config: Config):
             signal_handler=signal_handler,
             bot_phone=config.signal_phone_number,
             bot_name=settings_store.get("bot_name") or config.bot_name or "Bot",
+            bot_registry=bot_registry,
         )
         asyncio.run_coroutine_threadsafe(daily_oracle.run_forever(), loop)
         logger.info("Daily oracle worker scheduled (multi-oracle)")
@@ -1060,6 +1075,7 @@ def build_app(config: Config):
         portfolio_store=dispatcher.portfolio_store,
         portfolio_executor=dispatcher.portfolio_executor,
         bot_registry=bot_registry,
+        llm_factory=llm_factory,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

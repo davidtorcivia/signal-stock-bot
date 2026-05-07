@@ -2,7 +2,7 @@
 Paper-portfolio commands.
 
   !portfolio          — current holdings + PnL summary
-  !tip <amount> [note]— add cash to Sigil's pot (per-user daily cap)
+  !tip <amount> [note]— add cash to the bot's pot (per-user daily cap)
   !trades [N]         — recent trades (default 10)
   !pnl                — alias for !portfolio with a numeric focus
 
@@ -172,13 +172,13 @@ def render_status(snap: dict, *, bot_name: str = "Sigil") -> str:
 class PortfolioCommand(BaseCommand):
     name = "portfolio"
     aliases = ["pf"]
-    description = "Show Sigil's paper-trading portfolio."
+    description = "Show the bot's paper-trading portfolio."
     usage = "!portfolio"
     help_explanation = (
         "Shows the bot's current paper-trading positions, cash, and "
         "PnL for this chat. The portfolio auto-seeds with $1000; "
         "members can add to it with `!tip <amount>` (capped at $20 per "
-        "user per ET day). Sigil decides trades on a cron schedule and "
+        "user per ET day). The bot decides trades on a cron schedule and "
         "in response to chat."
     )
 
@@ -219,7 +219,7 @@ class PortfolioCommand(BaseCommand):
 class PnlCommand(BaseCommand):
     name = "pnl"
     aliases = ["performance"]
-    description = "Show Sigil's portfolio PnL."
+    description = "Show the bot's portfolio PnL."
     usage = "!pnl"
     help_explanation = (
         "Same data as !portfolio, focused on the gain/loss numbers."
@@ -259,10 +259,10 @@ class PnlCommand(BaseCommand):
 class TipCommand(BaseCommand):
     name = "tip"
     aliases = ["fund"]
-    description = "Tip Sigil cash for his paper portfolio."
+    description = "Tip the bot cash for its paper portfolio."
     usage = "!tip <amount> [reason]"
     help_explanation = (
-        "Adds cash to Sigil's paper-trading portfolio for this chat. "
+        "Adds cash to the bot's paper-trading portfolio for this chat. "
         "Cap: $20 per user per ET day. Example: `!tip 5 nice call on TSLA`."
     )
 
@@ -345,11 +345,11 @@ class TipCommand(BaseCommand):
 class TradesCommand(BaseCommand):
     name = "trades"
     aliases = ["history"]
-    description = "Recent trades by Sigil's paper portfolio."
+    description = "Recent trades by the bot's paper portfolio."
     usage = "!trades [count]"
     help_explanation = (
         "Lists the most recent paper trades (default 10, max 30). Each "
-        "row shows side, qty, ticker, fill price, and Sigil's reason."
+        "row shows side, qty, ticker, fill price, and the bot's reason."
     )
 
     def __init__(self, store: PortfolioStore):
@@ -396,7 +396,7 @@ PORTFOLIO_BUY_TOOL = {
     "function": {
         "name": "portfolio_buy",
         "description": (
-            "Buy a stock with YOUR (Sigil's) paper-trading account in "
+            "Buy a stock with YOUR paper-trading account in "
             "this chat. Fills at the live quote during regular US "
             "market hours (9:30-16:00 ET). Pass EITHER `dollars` (and "
             "the executor computes fractional shares) OR `qty` (exact "
@@ -449,7 +449,7 @@ PORTFOLIO_SELL_TOOL = {
     "function": {
         "name": "portfolio_sell",
         "description": (
-            "Sell from YOUR (Sigil's) paper portfolio in this chat. "
+            "Sell from YOUR paper portfolio in this chat. "
             "Fills at live quote during regular hours. Pass `qty` for "
             "a partial close, or omit / pass `\"all\"` to close the "
             "position entirely. Always include a `reason`.\n\n"
@@ -496,7 +496,7 @@ PORTFOLIO_STATUS_TOOL = {
     "function": {
         "name": "portfolio_status",
         "description": (
-            "Read YOUR (Sigil's) current paper-portfolio state in this "
+            "Read YOUR current paper-portfolio state in this "
             "chat. Returns cash, every open position with mark-to-market, "
             "realized + unrealized PnL, total funded (seed + tips). "
             "Call this BEFORE deciding to trade so you know what you "
@@ -525,7 +525,7 @@ PORTFOLIO_PLACE_ORDER_TOOL = {
     "function": {
         "name": "portfolio_place_order",
         "description": (
-            "Register a CONDITIONAL order on YOUR (Sigil's) paper "
+            "Register a CONDITIONAL order on YOUR paper "
             "portfolio that fires automatically when the live price "
             "crosses a trigger. The order watcher polls every ~5 min "
             "during US regular hours and fills crossings via the same "
@@ -624,7 +624,7 @@ PORTFOLIO_JOURNAL_APPEND_TOOL = {
     "function": {
         "name": "portfolio_journal_append",
         "description": (
-            "Add a timestamped entry to YOUR (Sigil's) trading journal "
+            "Add a timestamped entry to YOUR trading journal "
             "for this chat. The journal is your private notebook — a "
             "free-form markdown file where you track the evolution of "
             "your thinking, acknowledge mistakes, document what worked, "
@@ -707,7 +707,7 @@ PORTFOLIO_CANCEL_ORDER_TOOL = {
     "function": {
         "name": "portfolio_cancel_order",
         "description": (
-            "Cancel one of YOUR (Sigil's) pending conditional orders by "
+            "Cancel one of YOUR pending conditional orders by "
             "id. Order ids are visible in `portfolio_status` under the "
             "Pending orders block. Cancel succeeds only on orders that "
             "are still pending — already-filled / already-cancelled / "

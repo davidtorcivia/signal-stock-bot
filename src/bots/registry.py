@@ -150,17 +150,27 @@ class BotRegistry:
 
     async def _load_cache(self) -> None:
         async with aiosqlite.connect(self.db_path) as db:
+            from ..database import apply_db_pragmas
+            await apply_db_pragmas(db)
             cursor = await db.execute(
                 f"SELECT {self._SELECT_FIELDS} FROM bots ORDER BY id"
             )
             rows = await cursor.fetchall()
-        self._cache = {}
-        self._slug_index = {}
+        # Build into local dicts then atomic rebind. Without this,
+        # concurrent get_sync / default_for_kind_sync calls (signal
+        # handler thread) would briefly observe an empty cache while
+        # the loop is running, returning None and silently dropping
+        # bot resolution for any inbound message that lands during an
+        # admin edit.
+        new_cache: dict[int, Bot] = {}
+        new_slug_index: dict[str, int] = {}
         for r in rows:
             bot = self._row_to_bot(r)
             if bot.id is not None:
-                self._cache[bot.id] = bot
-                self._slug_index[bot.slug] = bot.id
+                new_cache[bot.id] = bot
+                new_slug_index[bot.slug] = bot.id
+        self._cache = new_cache
+        self._slug_index = new_slug_index
         self._cache_loaded = True
 
     def warm_sync(self, default_display_name: str = "Sigil") -> None:
@@ -181,6 +191,7 @@ class BotRegistry:
             with sqlite3.connect(str(self.db_path)) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS bots (
@@ -242,13 +253,16 @@ class BotRegistry:
                     f"SELECT {self._SELECT_FIELDS} FROM bots ORDER BY id"
                 )
                 rows = cur.fetchall()
-            self._cache = {}
-            self._slug_index = {}
+            # Atomic rebind to keep concurrent sync readers consistent.
+            new_cache: dict[int, Bot] = {}
+            new_slug_index: dict[str, int] = {}
             for r in rows:
                 bot = self._row_to_bot(r)
                 if bot.id is not None:
-                    self._cache[bot.id] = bot
-                    self._slug_index[bot.slug] = bot.id
+                    new_cache[bot.id] = bot
+                    new_slug_index[bot.slug] = bot.id
+            self._cache = new_cache
+            self._slug_index = new_slug_index
             self._cache_loaded = True
             # Mark the async initializer too: schema is already in place
             # so `_ensure_initialized` becomes a no-op on its happy path.
@@ -333,7 +347,7 @@ class BotRegistry:
     def match_alias(self, text: str, *, candidates: Optional[list[Bot]] = None) -> Optional[Bot]:
         """Return the first bot whose alias is a whole-word match in `text`.
 
-        Matching mirrors `signal/handler.py:_is_bot_mentioned`:
+        Matching mirrors `signal/handler.py:_resolve_addressed_bot`:
         case-insensitive, whole-word boundary. Used in PR4 to decide
         which bot a "hey Sigil" / "hey Artaud" inbound is addressing.
         Restrict the search to `candidates` (e.g. bots assigned to the
@@ -389,6 +403,8 @@ class BotRegistry:
             )
         now = time.time()
         async with aiosqlite.connect(self.db_path) as db:
+            from ..database import apply_db_pragmas
+            await apply_db_pragmas(db)
             if bot.id is None:
                 cursor = await db.execute(
                     """INSERT INTO bots (
@@ -453,8 +469,23 @@ class BotRegistry:
     async def _enforce_single_default(
         db: aiosqlite.Connection, bot_id: int, bot: Bot
     ) -> None:
-        """If this bot is set as default-for-kind, clear the flag on
-        every other row. Avoids ambiguity in `default_for_kind_sync`."""
+        """Enforce two invariants on the default flags:
+
+        1. At most one bot is default-for-kind: clearing the flag on
+           every other row when this bot sets it. Without this,
+           default_for_kind_sync would return a non-deterministic
+           "first one we find" answer when multiple rows are flagged.
+
+        2. At least one ENABLED bot is default-for-kind. The check
+           reads back current state after step 1 to confirm — if this
+           bot is the would-be default and is enabled, we're fine; if
+           not, some other enabled bot must hold the flag, otherwise
+           inbound messages in that kind have no bot to answer them.
+
+        The second check is a guardrail, not validation against bad
+        intent: BotRegistry never auto-clears flags on unrelated rows
+        beyond rule 1. Callers (admin form) get a ValueError they can
+        surface to the user."""
         if bot.default_for_dm:
             await db.execute(
                 "UPDATE bots SET default_for_dm = 0 WHERE id != ?",
@@ -466,12 +497,35 @@ class BotRegistry:
                 (bot_id,),
             )
 
+        # Invariant: at least one enabled bot per kind is default.
+        # Skip the check when inserting the very first row (there's
+        # no "other" bot yet to fall back on, and seed always sets
+        # both defaults). The check looks at the state AFTER step 1
+        # so the bot we just upserted is included.
+        for col in ("default_for_dm", "default_for_group"):
+            cursor = await db.execute(
+                f"SELECT COUNT(*) FROM bots WHERE {col} = 1 AND enabled = 1"
+            )
+            row = await cursor.fetchone()
+            count = row[0] if row else 0
+            if count == 0:
+                kind = "DMs" if col == "default_for_dm" else "groups"
+                raise ValueError(
+                    f"Save would leave no default bot for {kind}. "
+                    f"At least one enabled bot must hold "
+                    f"default_for_{kind[:-1] if kind.endswith('s') else kind}. "
+                    f"Toggle the flag on another bot first, or keep this "
+                    f"one's flag set."
+                )
+
     async def delete(self, bot_id: int) -> bool:
         """Refuse to delete a bot still referenced by contexts. Caller
         should reassign first. The seeded sigil row is also protected
         (slug=='sigil') because it's the migration anchor."""
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
+            from ..database import apply_db_pragmas
+            await apply_db_pragmas(db)
             cursor = await db.execute(
                 "SELECT slug FROM bots WHERE id = ?", (bot_id,)
             )
@@ -511,6 +565,8 @@ class BotRegistry:
             logger.warning("BotRegistry backfill: no sigil row, skipping")
             return
         async with aiosqlite.connect(self.db_path) as db:
+            from ..database import apply_db_pragmas
+            await apply_db_pragmas(db)
             for table, col in CONSUMER_TABLES.items():
                 try:
                     cursor = await db.execute(f"PRAGMA table_info({table})")

@@ -113,6 +113,7 @@ class DailyOracleWorker:
         signal_handler,
         bot_phone: str,
         bot_name: str = "Bot",
+        bot_registry=None,
     ):
         self.store = oracle_store
         self.contexts = context_registry
@@ -122,6 +123,11 @@ class DailyOracleWorker:
         self.signal = signal_handler
         self.bot_phone = bot_phone
         self.bot_name = bot_name or "Bot"
+        # Optional — when wired, oracle ask calls stamp ctx.bot via the
+        # context's pinned default or the registry's default-for-group.
+        # Without it, ask_command falls back to the legacy single-bot
+        # client (still correct for single-bot installs).
+        self.bot_registry = bot_registry
 
     async def run_forever(self) -> None:
         logger.info("Daily oracle worker started")
@@ -310,7 +316,21 @@ class DailyOracleWorker:
             command=command,
             args=args or [],
             policy=policy,
+            bot=self._resolve_bot(policy),
         )
+
+    def _resolve_bot(self, policy):
+        """Mirror the dispatcher's resolution: per-context pin first,
+        then registry's default-for-group. Oracles only fire in
+        groups, so we never need the DM path."""
+        if self.bot_registry is None:
+            return None
+        pinned = getattr(policy, "default_bot_id", None)
+        if pinned is not None:
+            bot = self.bot_registry.get_sync(pinned)
+            if bot and bot.enabled:
+                return bot
+        return self.bot_registry.default_for_kind_sync("group")
 
     async def _post_command_result(
         self, result, oracle: ContextOracle, group_id: str

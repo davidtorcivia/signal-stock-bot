@@ -64,6 +64,7 @@ class OrdersWorker:
         ask_command=None,
         context_registry=None,
         bot_phone: str = "",
+        bot_registry=None,
     ):
         self.store = store
         self.executor = executor
@@ -75,6 +76,19 @@ class OrdersWorker:
         self.ask = ask_command
         self.contexts = context_registry
         self.bot_phone = bot_phone or ""
+        self.bot_registry = bot_registry
+
+    def _resolve_bot_for(self, policy):
+        """Same per-context-pin → registry-default chain as the
+        dispatcher uses; orders are group-only so we skip DM."""
+        if self.bot_registry is None:
+            return None
+        pinned = getattr(policy, "default_bot_id", None)
+        if pinned is not None:
+            bot = self.bot_registry.get_sync(pinned)
+            if bot and bot.enabled:
+                return bot
+        return self.bot_registry.default_for_kind_sync("group")
 
     async def run_forever(self) -> None:
         logger.info(
@@ -273,6 +287,7 @@ class OrdersWorker:
             command="ask",
             args=[prompt],
             policy=policy,
+            bot=self._resolve_bot_for(policy),
             # Tag any follow-up trades from this !ask as order-driven
             # so the trade ledger is honest about provenance.
             automation_source=SOURCE_ORDER,

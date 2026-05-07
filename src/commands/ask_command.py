@@ -282,8 +282,16 @@ class AskCommand(BaseCommand):
         prediction_store: Optional[PredictionStore] = None,
         portfolio_executor: Optional[PaperPortfolioExecutor] = None,
         portfolio_journal=None,
+        llm_factory=None,
     ):
         self.llm = llm
+        # Per-bot writer/deep_think router. When set (always in the real
+        # app; None only in older tests that hand-roll AskCommand),
+        # `_llm_for(ctx)` and `_deep_think_for(ctx)` resolve to the
+        # bot-scoped clients so per-bot model/temperature/extra_body
+        # actually take effect. Falls back to the constructor-supplied
+        # `llm`/`deep_think` when ctx.bot is None.
+        self.llm_factory = llm_factory
         self.history = history
         self.group_log = group_log
         self.mcp_manager = mcp_manager
@@ -341,6 +349,25 @@ class AskCommand(BaseCommand):
         # late-binding pattern as bot_tools / signal_handler).
         if name_registry is not None:
             self.subject_resolver = SubjectResolver(name_registry)
+
+    def _llm_for(self, ctx) -> "LLMClient":
+        """Resolve the writer LLMClient for this command's active bot.
+        Falls back to the constructor-supplied default when no factory
+        is wired (older tests) or no bot is set on the context. The
+        cached client persists its aiohttp session across calls."""
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if self.llm_factory is None or bot is None or bot.id is None:
+            return self.llm
+        return self.llm_factory.get_writer(bot.id)
+
+    def _deep_think_for(self, ctx):
+        """Same as _llm_for but for the deep_think role. Returns the
+        constructor-supplied default when no factory is wired or no
+        bot is set."""
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if self.llm_factory is None or bot is None or bot.id is None:
+            return self.deep_think
+        return self.llm_factory.get_deep_think(bot.id)
 
     def _live_turns(self) -> int:
         return self.llm.store.get_int("llm_history_turns", 6, min_value=0)
@@ -500,6 +527,13 @@ class AskCommand(BaseCommand):
         results — accuracy matters more than appearing helpful. Instead we
         return an honest error noting the cap and the tools the LLM tried.
         """
+        # Resolve the writer client per-bot. _llm_for handles the
+        # ctx.bot=None fallback so legacy callers (no factory wired)
+        # still hit the singleton self.llm. Each call re-resolves so a
+        # late-changed ctx.bot would still pick up the right client,
+        # but in practice ctx.bot is fixed for the lifetime of one
+        # command.
+        llm = self._llm_for(caller_ctx)
         max_rounds = self._live_max_tool_rounds()
         tool_call_history: list[str] = []
 
@@ -508,7 +542,7 @@ class AskCommand(BaseCommand):
                 f"LLM round {round_idx + 1}/{max_rounds}: "
                 f"requesting completion ({len(messages)} msgs in context)"
             )
-            assistant_msg = await self.llm.chat_messages(messages, tools=tools)
+            assistant_msg = await llm.chat_messages(messages, tools=tools)
             messages.append(assistant_msg)
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
@@ -567,13 +601,25 @@ class AskCommand(BaseCommand):
         final reply with those notes injected. Used when
         `ctx.bot.deep_think_mode == 'research'`. The writer gets no
         tools — research is already done."""
+        # Resolve per-bot deep_think + writer. For Artaud the deep_think
+        # is the cloud research model with the toolset, the writer is
+        # the local MLX model that owns the persona; routing through
+        # the factory means each invocation hits the bot's own clients.
+        deep_think = self._deep_think_for(ctx)
+        writer = self._llm_for(ctx)
+        # Defensive copy: we mutate `messages[0]` below (replacing the
+        # system message with one that includes the research notes).
+        # If the caller passed a list it intends to reuse, mutating
+        # in place would leak notes into a future call.
+        messages = list(messages)
+
         # Run deep_think against the same context the writer would have
         # seen. We pass the user-message block as `context` so deep_think
         # has the full situational frame (group context, replying_to,
         # current message). Failure modes return placeholder strings
         # rather than raising — the writer will see them and report
         # back honestly.
-        notes = await self.deep_think.think(
+        notes = await deep_think.think(
             question,
             context=research_input,
             user_hash=user_hash,
@@ -593,10 +639,13 @@ class AskCommand(BaseCommand):
         # Allow either {notes} or a literal handoff prompt followed by
         # the notes — the {notes} form gives admins control over where
         # the notes appear; falling back to "<prompt>\n\n<notes>"
-        # avoids forcing them to remember the placeholder.
+        # avoids forcing them to remember the placeholder. Catch broad
+        # because str.format raises ValueError on stray '{' too, and
+        # we don't want a malformed admin-supplied template to crash
+        # the entire !ask in chat.
         try:
             handoff_block = handoff_template.format(notes=notes)
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, ValueError):
             handoff_block = f"{handoff_template}\n\n{notes}"
 
         # Prepend to the system message in-place. Using a system role
@@ -612,7 +661,7 @@ class AskCommand(BaseCommand):
             messages.insert(0, {"role": "system", "content": handoff_block})
 
         # Single-shot: no tools. The writer's only job is to compose.
-        assistant_msg = await self.llm.chat_messages(messages, tools=None)
+        assistant_msg = await writer.chat_messages(messages, tools=None)
         return (assistant_msg.get("content") or "").strip()
 
     async def _handle_predict_self_tool(
@@ -1427,8 +1476,10 @@ class AskCommand(BaseCommand):
                     # Pass caller_ctx + attachments so the deep model gets
                     # the same tool kit (filtered by the same policy) and
                     # any attachments it produces (charts, etc.) bubble up
-                    # to the writer's attachment list.
-                    content = await self.deep_think.think(
+                    # to the writer's attachment list. Per-bot deep_think
+                    # routing here too — Artaud's deep_think config is
+                    # different from Sigil's even when called as a tool.
+                    content = await self._deep_think_for(caller_ctx).think(
                         question=str(args.get("question") or ""),
                         context=str(args.get("context") or ""),
                         user_hash=user_hash,
@@ -1979,7 +2030,12 @@ class AskCommand(BaseCommand):
             prompt_override = None
             if ctx.policy is not None and ctx.policy.system_prompt:
                 prompt_override = ctx.policy.system_prompt
-            system_prompt = self.llm._resolve_system_prompt(prompt_override, system_suffix)
+            # Per-bot system prompt: route through the bot-scoped writer
+            # so a bot's writer-role override (e.g. Artaud's persona
+            # baked into bot_llm_settings) replaces the global default.
+            system_prompt = self._llm_for(ctx)._resolve_system_prompt(
+                prompt_override, system_suffix
+            )
 
             # Trigger user-message: optional group context, optional reply
             # target, then the live message wrapped in <current_message>

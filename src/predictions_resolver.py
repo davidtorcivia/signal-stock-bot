@@ -118,6 +118,7 @@ class PredictionResolver:
         mcp_manager=None,
         bot_phone: str = "",
         interval_seconds: int = 900,  # 15 min
+        bot_registry=None,
     ):
         self.store = store
         self.providers = provider_manager
@@ -136,6 +137,13 @@ class PredictionResolver:
         # phone is the right identity here — the resolver IS the bot.
         self.bot_phone = bot_phone
         self.interval = interval_seconds
+        # Optional bot identity for the synthesized resolver context.
+        # Resolution is per-prediction-context: a prediction made in an
+        # Artaud-pinned group should have Artaud judge it. PR1-4 has
+        # only one writer wired today, so this is mostly forward-
+        # looking — but it lets the per-bot deep_think config apply
+        # when the resolver later switches to research mode.
+        self.bot_registry = bot_registry
 
     async def run_forever(self) -> None:
         logger.info(
@@ -327,6 +335,20 @@ class PredictionResolver:
             command_mode=MODE_ALLOW_LIST,
             commands=list(_RESEARCH_COMMANDS),
         )
+        # Stamp the resolving bot so per-bot writer overrides apply.
+        # If the prediction lived in a context pinned to a non-default
+        # bot, the resolver should judge in that bot's voice. Falls
+        # back to the registry's default-for-group when bot_registry
+        # is wired, or None for legacy single-bot installs.
+        # We don't have a context_registry plumbed in here, so we use
+        # the kind-based default rather than honoring per-context pins.
+        # That's fine for PR1-4 single-bot, and PR5 can wire context
+        # lookup if predictions need to be judged in a non-default
+        # bot's voice.
+        resolver_bot = None
+        if self.bot_registry is not None:
+            kind = "group" if pred.group_id else "dm"
+            resolver_bot = self.bot_registry.default_for_kind_sync(kind)
         caller_ctx = CommandContext(
             sender=self.bot_phone or "",
             group_id=pred.group_id,
@@ -334,6 +356,7 @@ class PredictionResolver:
             command="(resolver)",
             args=[],
             policy=synth_policy,
+            bot=resolver_bot,
         )
 
         tools = self._collect_resolver_tools(synth_policy)

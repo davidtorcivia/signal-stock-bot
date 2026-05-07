@@ -248,6 +248,7 @@ class CommandDispatcher:
         quote_text: Optional[str] = None,
         quote_author: Optional[str] = None,
         addressed_bot=None,
+        policy=None,
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
@@ -272,9 +273,11 @@ class CommandDispatcher:
                 f"Message too long (max {self.max_message_length} chars)."
             )
 
-        # Resolve access policy for this chat once per message.
-        policy = None
-        if self.context_registry is not None:
+        # Resolve access policy for this chat once per message. The
+        # caller (signal handler) may have already resolved it for
+        # mention routing — accept it as a kwarg to avoid the second
+        # SQLite round trip.
+        if policy is None and self.context_registry is not None:
             try:
                 policy = await self.context_registry.resolve(group_id, sender)
             except Exception as e:

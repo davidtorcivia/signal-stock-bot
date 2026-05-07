@@ -152,12 +152,27 @@ class TradingCronWorker:
         signal_handler,
         context_registry,
         bot_phone: str,
+        bot_registry=None,
     ):
         self.store = store
         self.ask = ask_command
         self.signal = signal_handler
         self.contexts = context_registry
         self.bot_phone = bot_phone
+        self.bot_registry = bot_registry
+
+    def _resolve_bot_for(self, policy):
+        """Resolve the bot whose voice this cron post should speak in.
+        Per-context pin first, then registry default-for-group. Trading
+        cron only runs in groups."""
+        if self.bot_registry is None:
+            return None
+        pinned = getattr(policy, "default_bot_id", None)
+        if pinned is not None:
+            bot = self.bot_registry.get_sync(pinned)
+            if bot and bot.enabled:
+                return bot
+        return self.bot_registry.default_for_kind_sync("group")
 
     async def run_forever(self) -> None:
         logger.info(
@@ -260,6 +275,7 @@ class TradingCronWorker:
             command="ask",
             args=[prompt],
             policy=policy,
+            bot=self._resolve_bot_for(policy),
             # Tag the trade source so portfolio tool calls inside this
             # ask invocation get logged as cron-driven, not reactive.
             automation_source=SOURCE_CRON,

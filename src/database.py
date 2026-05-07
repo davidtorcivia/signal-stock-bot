@@ -22,13 +22,18 @@ def hash_phone(phone: str) -> str:
 
 async def apply_db_pragmas(db) -> None:
     """Apply tuning pragmas. WAL is sticky on the file (set once, persists);
-    synchronous=NORMAL is per-connection. Cheap to call repeatedly in
-    `_ensure_initialized`. Concrete wins: writers no longer block readers
-    (WAL), and write fsync drops from per-commit to per-checkpoint
-    (NORMAL). Safe — NORMAL still survives crashes; only catastrophic
-    power-loss-mid-fsync can lose the *last* committed transaction."""
+    synchronous=NORMAL and foreign_keys are per-connection. Cheap to call
+    repeatedly in `_ensure_initialized`. Concrete wins: writers no longer
+    block readers (WAL), write fsync drops from per-commit to per-checkpoint
+    (NORMAL), and FK constraints declared on tables (currently
+    `bot_llm_settings.bot_id REFERENCES bots(id) ON DELETE CASCADE`) are
+    actually enforced — without `foreign_keys = ON` SQLite parses the
+    constraint then silently ignores it, leaving rows orphaned on bot
+    deletion if the app-level cleanup is ever skipped. Safe to enable
+    everywhere because it's the only FK in the schema."""
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA foreign_keys=ON")
 
 
 class _DBContext:
@@ -49,6 +54,12 @@ class _DBContext:
         await self._store._ensure_initialized()
         self._cm = aiosqlite.connect(self._store.db_path)
         self._db = await self._cm.__aenter__()
+        # Apply pragmas on every checkout. WAL is file-sticky so this
+        # is a no-op there, but `synchronous` and `foreign_keys` are
+        # per-connection — without this every db_session connection
+        # would open with foreign_keys=OFF and silently skip FK
+        # cascades.
+        await apply_db_pragmas(self._db)
         return self._db
 
     async def __aexit__(self, exc_type, exc, tb):
