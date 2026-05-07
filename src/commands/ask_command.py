@@ -805,6 +805,7 @@ class AskCommand(BaseCommand):
                 return f"ERROR: buy failed: {type(e).__name__}"
             if not result.get("ok"):
                 return f"ERROR: {result.get('error', 'buy rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
             return (
                 f"Bought {result['qty_after']:.4f} {ticker} "
                 f"@ ${result['price']:.2f} (cost ${result['proceeds']:,.2f}). "
@@ -834,6 +835,7 @@ class AskCommand(BaseCommand):
                 return f"ERROR: sell failed: {type(e).__name__}"
             if not result.get("ok"):
                 return f"ERROR: {result.get('error', 'sell rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
             pnl = result.get("realized_pnl") or 0.0
             pnl_part = (
                 f" Realized P/L ${pnl:+,.2f}." if abs(pnl) > 0.005 else ""
@@ -899,6 +901,7 @@ class AskCommand(BaseCommand):
                 return f"ERROR: place_order failed: {type(e).__name__}"
             if not result.get("ok"):
                 return f"ERROR: {result.get('error', 'order rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
             warn_part = ""
             if result.get("warning"):
                 warn_part = f" WARNING: {result['warning']}"
@@ -943,6 +946,7 @@ class AskCommand(BaseCommand):
                     ),
                 }.get(err, err)
                 return f"ERROR: {friendly}"
+            caller_ctx.portfolio_mutation_count += 1
             return f"Cancelled order #{order_id}."
 
         return f"ERROR: unknown portfolio tool {name!r}"

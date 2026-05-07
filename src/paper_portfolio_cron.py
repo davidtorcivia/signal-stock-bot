@@ -8,8 +8,10 @@ Three weekday firings in ET:
 
 Each firing builds a synthetic ask_command call with a slot-specific
 prompt. The writer LLM has the full tool kit (research + portfolio
-tools) and decides whether to trade. Output is posted to the chat so
-members see Sigil's reasoning even when he chooses to sit out.
+tools) and decides whether to trade. Output is posted to the chat
+only when the writer actually moved (buy/sell/place_order/
+cancel_order); silent sit-outs don't post — checked via
+`ctx.portfolio_mutation_count` after the ask returns.
 
 Idempotency: `portfolio_cron_runs` row per (context_key, slot) is
 stamped after each successful fire; the worker checks the ET-day
@@ -68,7 +70,11 @@ _OPEN_PROMPT = (
     "     them. Future-you will thank present-you.\n\n"
     "You're not obligated to trade every cron — quality over volume. "
     "Always include a one-sentence `reason` on every trade and order; "
-    "the chat reads those. End your message with what you did and why."
+    "the chat reads those. If you do trade, end your message with what "
+    "you did and why. If you decide to sit out (no buys, sells, or "
+    "orders), don't post anything to the chat — your reply is "
+    "suppressed automatically when no moves are made, so don't waste "
+    "tokens writing a justification no one will read."
 )
 
 _MIDDAY_PROMPT = (
@@ -84,8 +90,10 @@ _MIDDAY_PROMPT = (
     "     calls for it. Sit if there's nothing.\n"
     "  4. Journal only if something material changed in your "
     "     thinking — not every routine check. Quality over volume.\n\n"
-    "Brief, conversational post — 1-3 sentences. Lead with what you "
-    "did (or didn't), then the why."
+    "If you trade, post 1-3 brief sentences leading with what you "
+    "did and the why. If you sit out (no buys, sells, or orders), "
+    "stay silent — the chat post is suppressed automatically when "
+    "no moves are made, so don't write a justification."
 )
 
 _CLOSE_PROMPT = (
@@ -101,8 +109,12 @@ _CLOSE_PROMPT = (
     "     worked, what didn't, what patterns you noticed in the "
     "     tape. The journal is a real trading tool; this is the "
     "     window where it earns its keep.\n\n"
-    "Brief end-of-day take in 1-3 sentences for the chat after you "
-    "act — your journal entry is separate (private, paragraph-style)."
+    "If you make adjustments, post a brief 1-3 sentence end-of-day "
+    "take for the chat — your journal entry is separate (private, "
+    "paragraph-style). If you sit out (no buys, sells, or orders), "
+    "stay silent — the chat post is suppressed automatically when "
+    "no moves are made, so don't write a justification. The journal "
+    "entry can still go in regardless."
 )
 
 
@@ -266,6 +278,17 @@ class TradingCronWorker:
             )
             return False
 
+        # No buys/sells/orders this cron — stay silent. The writer was
+        # told its reply is suppressed in this case, so we skip the chat
+        # post entirely. Still return True so the slot is marked fired
+        # and we don't re-invoke the LLM on the next tick.
+        if ctx.portfolio_mutation_count == 0:
+            logger.info(
+                f"Trading cron fired silently: {ctx_key} {slot} "
+                f"(no portfolio moves)"
+            )
+            return True
+
         body = result.text or ""
         header = _HEADERS.get(slot, "🔔 Trading window")
         if not body.startswith(header):
@@ -287,6 +310,6 @@ class TradingCronWorker:
 
         logger.info(
             f"Trading cron fired: {ctx_key} {slot} "
-            f"({len(body)} chars)"
+            f"({len(body)} chars, {ctx.portfolio_mutation_count} moves)"
         )
         return True

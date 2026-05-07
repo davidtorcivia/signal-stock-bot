@@ -31,6 +31,11 @@ class CommandContext:
     # portfolio tool handler reads this to tag trades with their actual
     # provenance (cron vs reactive) instead of always claiming "reactive".
     automation_source: Optional[str] = None
+    # Incremented by the portfolio tool dispatcher each time a mutating
+    # tool (buy/sell/place_order/cancel_order) succeeds during this
+    # command. The trading cron reads this to suppress the chat post
+    # when the writer chose to sit out — no moves means no message.
+    portfolio_mutation_count: int = 0
 
     @property
     def is_group(self) -> bool:
