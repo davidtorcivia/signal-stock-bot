@@ -110,8 +110,9 @@ class DailyOracleWorker:
         tarot_command,
         iching_command,
         ask_command,
-        signal_handler,
-        bot_phone: str,
+        signal_pool=None,
+        signal_handler=None,
+        bot_phone: str = "",
         bot_name: str = "Bot",
         bot_registry=None,
     ):
@@ -120,8 +121,13 @@ class DailyOracleWorker:
         self.tarot = tarot_command
         self.iching = iching_command
         self.ask = ask_command
-        self.signal = signal_handler
-        self.bot_phone = bot_phone
+        self.signal_pool = signal_pool
+        self.signal = signal_handler or (
+            signal_pool.default() if signal_pool is not None else None
+        )
+        self.bot_phone = bot_phone or (
+            signal_pool.default_phone if signal_pool is not None else ""
+        )
         self.bot_name = bot_name or "Bot"
         # Optional — when wired, oracle ask calls stamp ctx.bot via the
         # context's pinned default or the registry's default-for-group.
@@ -239,12 +245,12 @@ class DailyOracleWorker:
     async def _fire_tarot(self, oracle, ctx_policy, group_id) -> None:
         ctx = self._synth_ctx(group_id, ctx_policy, "!tarot", "tarot")
         result = await self.tarot.execute(ctx)
-        await self._post_command_result(result, oracle, group_id)
+        await self._post_command_result(result, oracle, group_id, ctx_policy)
 
     async def _fire_iching(self, oracle, ctx_policy, group_id) -> None:
         ctx = self._synth_ctx(group_id, ctx_policy, "!iching", "iching")
         result = await self.iching.execute(ctx)
-        await self._post_command_result(result, oracle, group_id)
+        await self._post_command_result(result, oracle, group_id, ctx_policy)
 
     async def _fire_llm_oracle(self, oracle, ctx_policy, group_id) -> None:
         if self.ask is None:
@@ -270,7 +276,14 @@ class DailyOracleWorker:
         header = self._oracle_header(oracle)
         if not body.startswith(header):
             body = f"{header}\n\n{body}"
-        await self.signal.send_message(
+        sender_handler = self._sender_for(ctx_policy)
+        if sender_handler is None:
+            logger.warning(
+                f"Oracle #{oracle.id}: no signal handler available; "
+                f"skipping post"
+            )
+            return
+        await sender_handler.send_message(
             recipient="",
             message=body,
             group_id=group_id,
@@ -309,14 +322,20 @@ class DailyOracleWorker:
         command: str,
         args: Optional[list[str]] = None,
     ) -> CommandContext:
+        oracle_bot = self._resolve_bot(policy)
+        sender_phone = (
+            (oracle_bot.signal_phone if oracle_bot else None)
+            or self.bot_phone
+            or ""
+        )
         return CommandContext(
-            sender=self.bot_phone or "",
+            sender=sender_phone,
             group_id=group_id,
             raw_message=raw_message,
             command=command,
             args=args or [],
             policy=policy,
-            bot=self._resolve_bot(policy),
+            bot=oracle_bot,
         )
 
     def _resolve_bot(self, policy):
@@ -332,8 +351,16 @@ class DailyOracleWorker:
                 return bot
         return self.bot_registry.default_for_kind_sync("group")
 
+    def _sender_for(self, policy):
+        """Pick the handler that should post this oracle. Multi-phone:
+        route through the resolved bot's phone. Single-handler fallback:
+        the legacy `self.signal` from before the pool wiring landed."""
+        if self.signal_pool is not None:
+            return self.signal_pool.for_bot(self._resolve_bot(policy))
+        return self.signal
+
     async def _post_command_result(
-        self, result, oracle: ContextOracle, group_id: str
+        self, result, oracle: ContextOracle, group_id: str, policy=None
     ) -> None:
         if not result or not result.success:
             logger.warning(
@@ -342,7 +369,14 @@ class DailyOracleWorker:
             )
             return
         body = _replace_header(result.text or "", oracle.label, self.bot_name)
-        await self.signal.send_message(
+        sender_handler = self._sender_for(policy)
+        if sender_handler is None:
+            logger.warning(
+                f"Oracle #{oracle.id}: no signal handler available; "
+                f"skipping post"
+            )
+            return
+        await sender_handler.send_message(
             recipient="",
             message=body,
             group_id=group_id,

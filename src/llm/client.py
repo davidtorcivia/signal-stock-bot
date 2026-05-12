@@ -24,6 +24,12 @@ from ..bots.settings import (
     resolve_stripped,
 )
 from ..cache import get_metrics
+from .transcript import (
+    LOGGED_PURPOSES,
+    build_record,
+    get_active as get_active_transcript_context,
+    get_logger as get_transcript_logger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +123,7 @@ class LLMClient:
         settings_store,
         bot_id: Optional[int] = None,
         role: str = "writer",
+        persona_provider: Optional[callable] = None,  # type: ignore[valid-type]
     ):
         self.store = settings_store
         # When set, every config read first looks up
@@ -128,6 +135,14 @@ class LLMClient:
         # class without colliding on settings.
         self.bot_id = bot_id
         self.role = role
+        # Optional bot_id -> persona string callable. When set, the
+        # writer's system-prompt resolver consults the bot's persona
+        # column between the explicit bot_llm_settings override and
+        # the global llm_system_prompt fallback. Without this hook a
+        # non-default bot whose persona lives only in `bots.persona`
+        # would inherit the global Sigil prompt — leaking identity
+        # across bots.
+        self.persona_provider = persona_provider
         # Long-lived session reused across all chat calls. Without this,
         # every call (writer, reactor, deep_think extractors, augmentation)
         # opens a fresh TCP+TLS connection — a measurable hit at scale and
@@ -149,10 +164,29 @@ class LLMClient:
     def _config(self) -> dict:
         bot_id, role = self.bot_id, self.role
         store = self.store
-        sys_prompt_raw = resolve_setting(
-            store, bot_id, role, "system_prompt",
-            global_keys=["llm_system_prompt"],
-        )
+        # System-prompt resolution chain (first non-empty wins):
+        #   1. bot_llm_settings(bot_id, role, 'system_prompt')  — admin's
+        #      explicit per-bot writer override on /admin/bots/<id>/llm
+        #   2. bots.persona                                      — the bot's
+        #      identity text on /admin/bots/<id> (resolved via the persona
+        #      provider, so this class doesn't need a BotRegistry import)
+        #   3. admin_settings.llm_system_prompt                 — global
+        #   4. DEFAULT_SYSTEM_PROMPT                            — built-in
+        sys_prompt_raw: Optional[str] = None
+        if bot_id is not None:
+            override = store.get_bot(bot_id, role, "system_prompt", default=None)
+            if override:
+                sys_prompt_raw = override
+        if sys_prompt_raw is None and bot_id is not None and self.persona_provider is not None:
+            try:
+                persona = self.persona_provider(bot_id)
+            except Exception as e:
+                logger.debug(f"persona_provider({bot_id}) raised: {e}")
+                persona = None
+            if persona:
+                sys_prompt_raw = persona
+        if sys_prompt_raw is None:
+            sys_prompt_raw = store.get("llm_system_prompt")
         return {
             "enabled": resolve_bool(
                 store, bot_id, role, "enabled",
@@ -341,6 +375,13 @@ class LLMClient:
         url = f"{cfg['base_url']}/chat/completions"
         timeout = aiohttp.ClientTimeout(total=cfg["timeout"], connect=10)
 
+        # One-line summary of the outbound payload's shape — specifically:
+        # whether any user message uses the OpenAI multimodal parts array.
+        # Lets us confirm from logs alone that vision payloads reach the
+        # POST body in the correct form (vs. having been flattened to a
+        # plain string somewhere upstream). Cheap — just counts parts.
+        _log_payload_shape(payload, purpose=purpose, url=url)
+
         metrics = get_metrics()
         started = time.time()
 
@@ -405,6 +446,20 @@ class LLMClient:
                 tokens_in=usage.get("prompt_tokens", 0),
                 tokens_out=usage.get("completion_tokens", 0),
             )
+            # Per-context transcript capture. Only writer rounds (ask /
+            # augment) — reactor/summary/healthcheck are intentionally
+            # excluded. Fire-and-forget background task so the write
+            # never blocks the reply path.
+            self._maybe_capture_transcript(
+                purpose=purpose,
+                model=effective_model,
+                messages=messages,
+                tools=tools,
+                assistant_msg=msg,
+                payload=payload,
+                latency_ms=latency_ms,
+                usage=usage,
+            )
             return msg
         except (KeyError, IndexError, AttributeError, TypeError) as e:
             logger.error(f"Unexpected LLM response shape: {data}")
@@ -413,6 +468,65 @@ class LLMClient:
                 error_msg="Unexpected response shape",
             )
             raise LLMError("Unexpected response from LLM") from e
+
+    def _maybe_capture_transcript(
+        self,
+        *,
+        purpose: str,
+        model: str,
+        messages: list[dict],
+        tools: Optional[list[dict]],
+        assistant_msg: dict,
+        payload: dict,
+        latency_ms: float,
+        usage: dict,
+    ) -> None:
+        """Append the round to this context's JSONL — if logging is on.
+
+        Three gates: purpose must be a writer purpose, an active context
+        must be set (dispatcher set it at message entry), and that
+        context's `transcript_logging_enabled` must be True. All snapshotted
+        at message-handling start, so toggling the flag mid-flight doesn't
+        retroactively log in-progress calls.
+
+        Schedules the disk write as a background task so the reply path
+        doesn't pay for I/O serialization.
+        """
+        if purpose not in LOGGED_PURPOSES:
+            return
+        active = get_active_transcript_context()
+        if active is None or not active.transcript_logging_enabled:
+            return
+        # Snapshot params that affect the model's output (provider routing
+        # included so admins can tell which upstream served the round).
+        params = {
+            "temperature": payload.get("temperature"),
+            "max_tokens": payload.get("max_tokens"),
+        }
+        if "provider" in payload:
+            params["provider"] = payload["provider"]
+        record = build_record(
+            purpose=purpose,
+            model=model,
+            messages=messages,
+            tools=tools,
+            assistant_msg=assistant_msg,
+            params=params,
+            latency_ms=latency_ms,
+            bot_id=active.bot_id,
+            context_id=active.context_id,
+            context_label=active.context_label,
+            sender_tail=active.sender_tail,
+            group_id=active.group_id,
+            usage=usage,
+        )
+        try:
+            asyncio.create_task(
+                get_transcript_logger().append(active.context_id, record)
+            )
+        except RuntimeError:
+            # No running loop (test environment) — drop silently.
+            pass
 
     async def health_check(self, prompt: Optional[str] = None) -> dict:
         """Single round-trip connectivity test against the bot's own
@@ -470,6 +584,55 @@ class LLMClient:
 
 
 _NY = ZoneInfo("America/New_York")
+
+
+def _log_payload_shape(payload: dict, *, purpose: str, url: str) -> None:
+    """Emit a one-line summary of the chat-completions payload shape.
+
+    Records: total msg count, role breakdown, and for every user message
+    whose `content` is the OpenAI multimodal list-of-parts form — the
+    part types + image counts + total base64 length. Lets us confirm
+    from logs alone that vision payloads survive the trip from inbound
+    parsing to the HTTP body in the expected shape. Skipped silently on
+    any error so a diagnostic line never breaks the request path.
+    """
+    try:
+        messages = payload.get("messages") or []
+        roles: dict[str, int] = {}
+        multimodal_summaries: list[str] = []
+        for i, m in enumerate(messages):
+            role = m.get("role") or "?"
+            roles[role] = roles.get(role, 0) + 1
+            content = m.get("content")
+            if isinstance(content, list):
+                types: dict[str, int] = {}
+                total_image_b64 = 0
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    t = part.get("type") or "?"
+                    types[t] = types.get(t, 0) + 1
+                    if t == "image_url":
+                        url_field = (part.get("image_url") or {}).get("url") or ""
+                        total_image_b64 += len(url_field)
+                parts_str = ",".join(f"{t}x{n}" for t, n in types.items())
+                multimodal_summaries.append(
+                    f"msg[{i}]={role}({parts_str},b64={total_image_b64}b)"
+                )
+        msg_count = len(messages)
+        roles_str = ",".join(f"{r}={n}" for r, n in sorted(roles.items()))
+        endpoint = url.rsplit("/", 2)[-2] if "/" in url else url
+        if multimodal_summaries:
+            logger.info(
+                f"LLM payload [{purpose}@{endpoint}]: {msg_count} msgs "
+                f"({roles_str}) | multimodal: {' '.join(multimodal_summaries)}"
+            )
+        else:
+            logger.debug(
+                f"LLM payload [{purpose}@{endpoint}]: {msg_count} msgs ({roles_str})"
+            )
+    except Exception as e:
+        logger.debug(f"_log_payload_shape failed: {e}")
 
 
 def _inject_current_time(messages: list[dict]) -> list[dict]:

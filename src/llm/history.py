@@ -334,13 +334,22 @@ class ConversationHistory:
         content: str,
         user_hash: Optional[str] = None,
         sender_tail: Optional[str] = None,
+        turns_per_user: Optional[int] = None,
     ) -> None:
-        """Insert one turn and prune by row-cap (per context) and age (global)."""
+        """Insert one turn and prune by row-cap (per context) and age (global).
+
+        `turns_per_user` overrides the constructor default so a per-context
+        override can keep more (or fewer) rows than the global setting —
+        otherwise append-time pruning would clip whatever load() asks for.
+        """
         await self._ensure_initialized()
 
         now = time.time()
         age_cutoff = now - self._retention_seconds()
-        max_rows = self.turns_per_user * 2
+        effective_turns = (
+            turns_per_user if turns_per_user is not None else self.turns_per_user
+        )
+        max_rows = max(0, effective_turns) * 2
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(

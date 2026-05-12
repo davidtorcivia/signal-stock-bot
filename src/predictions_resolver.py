@@ -112,7 +112,8 @@ class PredictionResolver:
         *,
         store: PredictionStore,
         provider_manager,
-        signal_handler,
+        signal_pool=None,
+        signal_handler=None,
         llm_client=None,
         bot_tools=None,
         mcp_manager=None,
@@ -122,7 +123,13 @@ class PredictionResolver:
     ):
         self.store = store
         self.providers = provider_manager
-        self.signal = signal_handler
+        # Prefer the pool — per-bot phone routing — but accept a bare
+        # handler for tests and legacy single-bot wiring. When both are
+        # absent, posting is a no-op.
+        self.signal_pool = signal_pool
+        self.signal = signal_handler or (
+            signal_pool.default() if signal_pool is not None else None
+        )
         self.llm = llm_client
         # When both are wired, the LLM resolver runs as a tool-using
         # research loop instead of a single zero-shot call. bot_tools
@@ -133,16 +140,16 @@ class PredictionResolver:
         self.mcp_manager = mcp_manager
         # Sender identity for tool dispatch. Bot tools eventually route
         # through dispatcher._execute_command which expects a real phone
-        # number for hash_phone() and audit logging. The configured bot
-        # phone is the right identity here — the resolver IS the bot.
-        self.bot_phone = bot_phone
+        # number for hash_phone() and audit logging. Falls back to the
+        # pool's default phone (or the legacy bot_phone arg in tests).
+        self.bot_phone = bot_phone or (
+            signal_pool.default_phone if signal_pool is not None else ""
+        )
         self.interval = interval_seconds
-        # Optional bot identity for the synthesized resolver context.
-        # Resolution is per-prediction-context: a prediction made in an
-        # Artaud-pinned group should have Artaud judge it. PR1-4 has
-        # only one writer wired today, so this is mostly forward-
-        # looking — but it lets the per-bot deep_think config apply
-        # when the resolver later switches to research mode.
+        # Per-prediction-context: a prediction made in an Artaud-pinned
+        # group should have Artaud judge it. The resolver picks the
+        # default-for-kind today; per-context pinning can be wired in
+        # later by passing the context_registry.
         self.bot_registry = bot_registry
 
     async def run_forever(self) -> None:
@@ -349,8 +356,16 @@ class PredictionResolver:
         if self.bot_registry is not None:
             kind = "group" if pred.group_id else "dm"
             resolver_bot = self.bot_registry.default_for_kind_sync(kind)
+        # The synthetic caller phone is the resolving bot's phone so
+        # downstream tool routing (audit log, signal-cli identity)
+        # matches the persona doing the judging.
+        resolver_phone = (
+            (resolver_bot.signal_phone if resolver_bot else None)
+            or self.bot_phone
+            or ""
+        )
         caller_ctx = CommandContext(
-            sender=self.bot_phone or "",
+            sender=resolver_phone,
             group_id=pred.group_id,
             raw_message="",
             command="(resolver)",
@@ -473,9 +488,17 @@ class PredictionResolver:
             f"  {emoji} {verdict.upper()}{f' — {note}' if note else ''}"
             f"{record_str}"
         )
+        # Route the verdict post through the bot that judged it, so
+        # multi-phone installs reply from the right number. Falls back
+        # to the legacy single handler when no pool is wired.
+        sender_handler = self.signal
+        if self.signal_pool is not None and self.bot_registry is not None:
+            kind = "group" if pred.group_id else "dm"
+            resolver_bot = self.bot_registry.default_for_kind_sync(kind)
+            sender_handler = self.signal_pool.for_bot(resolver_bot)
         try:
-            if pred.group_id:
-                await self.signal.send_message(
+            if pred.group_id and sender_handler is not None:
+                await sender_handler.send_message(
                     recipient="", message=text, group_id=pred.group_id,
                 )
             else:

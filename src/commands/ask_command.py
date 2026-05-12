@@ -241,6 +241,38 @@ _DEEP_THINK_TOOL_SCHEMA = {
 }
 
 
+# Patterns that strip identifying tokens from tool-result content before
+# the model sees them. The fetch MCP echoes our outbound user-agent in
+# robots.txt errors — without scrubbing, every blocked fetch leaks the
+# legacy "Sigil" persona into in-context learning and the writer flips
+# identity. Anything resembling a useragent / version / repo tag gets
+# nuked. Keep this list narrow — overzealous scrubbing destroys
+# legitimate tool output too.
+_USERAGENT_TAG_RE = re.compile(
+    r"<useragent>[^<]*</useragent>", re.IGNORECASE
+)
+_HEADER_UA_LINE_RE = re.compile(
+    r"^[ \t]*User-Agent[ \t]*:[ \t]*[^\r\n]+",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _scrub_tool_content(content: str) -> str:
+    """Remove persona-revealing identifiers from a tool result.
+
+    Currently strips `<useragent>...</useragent>` blocks (emitted by
+    `mcp-server-fetch` on robots.txt blocks) and bare `User-Agent: ...`
+    header echoes. The bot's name appearing inside a tool error
+    response is interpreted by the writer as "this is who I am" via
+    in-context learning, so even small leaks compound across turns.
+    """
+    if not isinstance(content, str) or not content:
+        return content
+    out = _USERAGENT_TAG_RE.sub("(useragent redacted)", content)
+    out = _HEADER_UA_LINE_RE.sub("User-Agent: (redacted)", out)
+    return out
+
+
 def _wrap_xml(tag: str, body: str) -> str:
     """Wrap a block of text in semantic XML tags for the model.
 
@@ -333,6 +365,12 @@ class AskCommand(BaseCommand):
         # while the LLM tool loop runs. None is fine; the indicator is a UX
         # nicety, not a correctness requirement.
         self.signal_handler = signal_handler
+        # Set by main.py post-construction. When the pool is wired, the
+        # typing indicator and tool-loop status messages route through
+        # `pool.for_bot(ctx.bot)` so multi-phone installs do this from
+        # the right number. Falls back to `self.signal_handler` when None.
+        from typing import Any as _Any
+        self.signal_pool: _Any = None
         # Optional name registry — when set, group-context lines and the
         # current user's message are prefixed with `[Name]` instead of
         # `[...4137]` for known users.
@@ -369,7 +407,18 @@ class AskCommand(BaseCommand):
             return self.deep_think
         return self.llm_factory.get_deep_think(bot.id)
 
-    def _live_turns(self) -> int:
+    def _live_turns(self, ctx=None) -> int:
+        """Resolve turns-per-user, preferring the per-context override.
+
+        `history_turns_override = 0` is an explicit "no history" — useful
+        for one-shot chats. Only `None` means "inherit global". Bounded at
+        0 so a negative override can't crash the LIMIT clause downstream.
+        """
+        policy = getattr(ctx, "policy", None) if ctx is not None else None
+        if policy is not None:
+            override = getattr(policy, "history_turns_override", None)
+            if override is not None:
+                return max(0, int(override))
         return self.llm.store.get_int("llm_history_turns", 6, min_value=0)
 
     def _live_group_ctx(self) -> int:
@@ -419,11 +468,24 @@ class AskCommand(BaseCommand):
         raw_texts = [(m["text"] or "").strip() for m in msgs]
         enriched = await asyncio.gather(*(self._enrich(t) for t in raw_texts))
 
+        # Resolve the active bot's display name once so every BOT_SENDER
+        # line in this block is labeled with the CURRENT persona — not
+        # whatever bot wrote the row (the group_log only stores a
+        # BOT_SENDER sentinel, not which specific bot it was). Without
+        # this, Artaud answering in a chat that previously had Sigil
+        # would see prior bot turns labeled `[Sigil, Nm ago]` and
+        # contradict its own identity via in-context learning. The
+        # active-persona label also future-proofs against renames.
+        active_bot_name = self._active_bot_display(ctx)
+
         lines: list[str] = []
         for m, text in zip(msgs, enriched):
             if not text:
                 continue
-            label = self._sender_label(m["sender"])
+            if m["sender"] == BOT_SENDER:
+                label = active_bot_name
+            else:
+                label = self._sender_label(m["sender"])
             ts = m.get("created_at")
             ago = format_relative_age(now - ts) if ts is not None else None
             bracket = f"{label}, {ago}" if ago else label
@@ -431,6 +493,20 @@ class AskCommand(BaseCommand):
         if not lines:
             return ""
         return _wrap_xml("group_context", "\n".join(lines))
+
+    def _active_bot_display(self, ctx) -> str:
+        """Display name to attribute the bot's own past turns to.
+
+        Priority: the bot currently answering (`ctx.bot`) — so the model
+        sees its history in its own voice. Falls back to the seed
+        `name_registry.bot_name` (legacy single-bot path) or "Bot".
+        """
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if bot is not None and getattr(bot, "display_name", None):
+            return bot.display_name
+        if self.name_registry is not None:
+            return self.name_registry.bot_name
+        return "Bot"
 
     def _sender_label(self, phone: Optional[str]) -> str:
         if phone == BOT_SENDER:
@@ -443,7 +519,7 @@ class AskCommand(BaseCommand):
             return f"...{(phone or '')[-4:] or '????'}"
         return self.name_registry.label_for(phone)
 
-    def _collect_tools(self, policy=None) -> Optional[list[dict]]:
+    def _collect_tools(self, policy=None, bot=None) -> Optional[list[dict]]:
         schemas: list[dict] = []
         if self.bot_tools is not None:
             schemas.extend(self.bot_tools.list_tools(policy=policy))
@@ -453,14 +529,18 @@ class AskCommand(BaseCommand):
                 mcp_tools = [t for t in mcp_tools if policy.allows_mcp(t.server_name)]
             schemas.extend(t.to_openai_tool() for t in mcp_tools)
         # deep_think is exposed only when the client is wired AND the global
-        # flag is on AND the per-context policy permits. The client returns
-        # "(unavailable)" for disabled/unconfigured calls, but suppressing
-        # the schema entirely keeps the writer from wasting tool-call rounds
-        # on a guaranteed-stub when we already know it's off.
+        # flag is on AND the per-context policy permits AND the per-bot
+        # `deep_think_enabled` is True. The client returns "(unavailable)"
+        # for disabled/unconfigured calls, but suppressing the schema
+        # entirely keeps the writer from wasting tool-call rounds on a
+        # guaranteed-stub when we already know it's off. The per-bot flag
+        # is a master kill — admins flip it off when they want deep_think
+        # completely out of one bot's repertoire.
         if self.deep_think is not None:
             dt_status = self.deep_think.status()
             policy_ok = policy is None or policy.allows_deep_think()
-            if dt_status.get("ready") and policy_ok:
+            bot_ok = bot is None or getattr(bot, "deep_think_enabled", True)
+            if dt_status.get("ready") and policy_ok and bot_ok:
                 schemas.append(_DEEP_THINK_TOOL_SCHEMA)
         # Memory tools: recall is always exposed when a store is wired and
         # the policy resolves to a real (non-default) row; remember/forget
@@ -555,7 +635,9 @@ class AskCommand(BaseCommand):
             for call in tool_calls:
                 fn_name = (call.get("function") or {}).get("name") or "?"
                 tool_call_history.append(fn_name)
-                await self._execute_tool_call(call, messages, caller_ctx, attachments)
+                await self._execute_tool_call(
+                    call, messages, caller_ctx, attachments, tools=tools,
+                )
 
         # Cap hit — log the full sequence and return an honest error. We
         # deliberately do NOT make a final no-tools call: the LLM would
@@ -619,6 +701,11 @@ class AskCommand(BaseCommand):
         # current message). Failure modes return placeholder strings
         # rather than raising — the writer will see them and report
         # back honestly.
+        #
+        # Images are NOT routed through deep_think — the writer is the
+        # persona doing the talking, and when its model is vision-capable
+        # the user wants it to read pixels natively. The multimodal payload
+        # already lives on `messages[-1]` and reaches the writer below.
         notes = await deep_think.think(
             question,
             context=research_input,
@@ -1375,6 +1462,7 @@ class AskCommand(BaseCommand):
         messages: list[dict],
         caller_ctx: CommandContext,
         attachments: list,
+        tools: Optional[list[dict]] = None,
     ) -> None:
         call_id = call.get("id") or ""
         fn = call.get("function") or {}
@@ -1390,6 +1478,38 @@ class AskCommand(BaseCommand):
         else:
             log_args = json.dumps(args)[:200]
         logger.info(f"LLM tool call: {name} args={log_args}")
+
+        # Hallucinated-name guard: if the writer invents a tool not in the
+        # schemas we just sent, don't let the call hit MCP — `who__who`
+        # surfacing as "MCP server 'who' is not running" reads like real
+        # infrastructure failure to the model and derails it into apology
+        # mode. Return a corrective signal that nudges it back to plain
+        # text. Skipped when `tools=None` (legacy callers that didn't
+        # pass the schemas) so behavior stays compatible.
+        if tools:
+            valid_names = {
+                (t.get("function") or {}).get("name")
+                for t in tools
+                if isinstance(t, dict)
+            }
+            valid_names.discard(None)
+            if name and name not in valid_names:
+                logger.info(
+                    f"Rejecting hallucinated tool call {name!r}; "
+                    f"valid={sorted(n for n in valid_names if n)[:10]}..."
+                )
+                content = (
+                    f"No tool named '{name}' exists. This message is "
+                    f"conversational — no tool is needed. Respond to the "
+                    f"user directly in your own voice."
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": content,
+                })
+                return
 
         is_bot_tool = (
             self.bot_tools is not None
@@ -1446,9 +1566,15 @@ class AskCommand(BaseCommand):
                 # Policy gate is also checked when filtering schemas in
                 # _collect_tools, but a writer that hallucinates the tool
                 # call (or holds an in-flight schema across a policy
-                # change) shouldn't bypass enforcement.
+                # change) shouldn't bypass enforcement. Same logic applies
+                # to the per-bot kill switch — if the admin turned it off
+                # mid-conversation, defense-in-depth here rejects any
+                # in-flight invocation rather than running it.
                 policy = caller_ctx.policy
-                if policy is not None and not policy.allows_deep_think():
+                bot = caller_ctx.bot
+                if bot is not None and not getattr(bot, "deep_think_enabled", True):
+                    content = "(deep_think unavailable: disabled for this bot)"
+                elif policy is not None and not policy.allows_deep_think():
                     content = "(deep_think unavailable: not allowed in this chat)"
                 else:
                     # Send the writer's status message to the chat right
@@ -1457,9 +1583,10 @@ class AskCommand(BaseCommand):
                     # block the deep_think call; a typing indicator is a
                     # decent fallback.
                     status_msg = str(args.get("status_message") or "").strip()
-                    if status_msg and self.signal_handler is not None:
+                    placeholder_handler = self._handler_for_ctx(caller_ctx)
+                    if status_msg and placeholder_handler is not None:
                         try:
-                            await self.signal_handler.send_message(
+                            await placeholder_handler.send_message(
                                 recipient=caller_ctx.sender,
                                 message=status_msg,
                                 group_id=caller_ctx.group_id,
@@ -1500,12 +1627,32 @@ class AskCommand(BaseCommand):
             logger.warning(f"Tool {name} failed: {e}")
             content = f"ERROR: {e}"
 
+        # Scrub identifying tokens before the result re-enters the
+        # model's context window. Tools (especially the fetch MCP) can
+        # echo back the bot's user-agent verbatim — "Sigil signal-stock-bot
+        # ..." in the UA leaks the legacy persona into in-context
+        # learning and the writer starts answering as Sigil. Hygiene
+        # generally: don't pass raw tool errors verbatim.
+        content = _scrub_tool_content(content)
+
         messages.append({
             "role": "tool",
             "tool_call_id": call_id,
             "name": name,
             "content": content,
         })
+
+    def _handler_for_ctx(self, ctx):
+        """Route outbound sends to the bot's phone when the pool is wired.
+
+        Returns the SignalHandler that should send "as" this context's bot
+        (for typing indicators and tool-loop status messages). Falls back
+        to the legacy singleton when the pool isn't available — tests and
+        single-bot installs continue to work unchanged.
+        """
+        if self.signal_pool is not None and ctx is not None:
+            return self.signal_pool.for_bot(getattr(ctx, "bot", None))
+        return self.signal_handler
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
@@ -1543,7 +1690,7 @@ class AskCommand(BaseCommand):
             now_ts = time.time()
             prior = await self.history.load(
                 context_key,
-                turns_per_user=self._live_turns(),
+                turns_per_user=self._live_turns(ctx),
                 attribute_senders=is_group,
                 now=now_ts,
             )
@@ -2077,11 +2224,45 @@ class AskCommand(BaseCommand):
             )
             current_user_content = "\n\n".join(trigger_parts)
 
+            # Vision: when the resolved bot is vision-enabled and the
+            # inbound message carried image attachments, swap the user
+            # message from a plain string to the OpenAI multimodal array
+            # form so the writer model receives the bytes. One-shot: we
+            # never persist the images into conversation history below,
+            # so follow-up turns won't re-see them (cheaper and usually
+            # the right semantics for "describe this picture" flows).
+            inbound_images = getattr(ctx, "inbound_images", None) or []
+            vision_active = (
+                bool(inbound_images)
+                and ctx.bot is not None
+                and getattr(ctx.bot, "vision_enabled", False)
+            )
+            if vision_active:
+                parts: list[dict] = [
+                    {"type": "text", "text": current_user_content}
+                ]
+                for img in inbound_images:
+                    mime = img.get("mime") or "image/jpeg"
+                    b64 = img.get("data_b64") or ""
+                    if not b64:
+                        continue
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    })
+                logger.info(
+                    f"Vision: attaching {len(parts) - 1} image(s) to "
+                    f"writer round for bot={ctx.bot.slug}"
+                )
+                user_message_content = parts
+            else:
+                user_message_content = current_user_content
+
             messages: list[dict] = [{"role": "system", "content": system_prompt}]
             messages.extend(prior)
-            messages.append({"role": "user", "content": current_user_content})
+            messages.append({"role": "user", "content": user_message_content})
 
-            tools = self._collect_tools(policy=ctx.policy)
+            tools = self._collect_tools(policy=ctx.policy, bot=ctx.bot)
             attachments: list = []
 
             # Research mode: when the active bot is configured for it
@@ -2096,13 +2277,30 @@ class AskCommand(BaseCommand):
             use_research_mode = (
                 ctx.bot is not None
                 and getattr(ctx.bot, "deep_think_mode", "replace") == "research"
+                and getattr(ctx.bot, "deep_think_enabled", True)
                 and self.deep_think is not None
                 and self.deep_think.status().get("ready")
                 and (ctx.policy is None or ctx.policy.allows_deep_think())
             )
+            # Vision short-circuit: when the writer has images on this
+            # turn, bypass research mode and let the writer run its own
+            # tool loop. deep_think wouldn't see the pixels (its model is
+            # text-context only here), and its notes would actively
+            # mislead the writer — typical failure mode is the notes
+            # apologize "I can't see the image" and the writer parrots
+            # that even though it has the bytes in its multimodal payload.
+            # Image turns get writer-direct routing; subsequent text-only
+            # turns continue using research mode normally.
+            if use_research_mode and vision_active:
+                logger.info(
+                    "Vision active — bypassing research mode for this turn "
+                    f"(bot={ctx.bot.slug})"
+                )
+                use_research_mode = False
 
-            if use_research_mode and self.signal_handler is not None:
-                async with self.signal_handler.typing_indicator(
+            typing_handler = self._handler_for_ctx(ctx)
+            if use_research_mode and typing_handler is not None:
+                async with typing_handler.typing_indicator(
                     ctx.sender, ctx.group_id
                 ):
                     answer = await self._run_research_handoff(
@@ -2122,10 +2320,10 @@ class AskCommand(BaseCommand):
                     attachments=attachments,
                     user_hash=user_hash,
                 )
-            elif self.signal_handler is not None:
+            elif typing_handler is not None:
                 # Show a typing indicator in the chat while the tool loop runs.
                 # The indicator auto-clears in ~15s, so the helper refreshes it.
-                async with self.signal_handler.typing_indicator(
+                async with typing_handler.typing_indicator(
                     ctx.sender, ctx.group_id
                 ):
                     answer = await self._run_tool_loop(
@@ -2157,9 +2355,14 @@ class AskCommand(BaseCommand):
         try:
             # Store the raw question (no prefix) + sender_tail separately; the
             # load path re-adds the prefix when replaying in a group context.
+            # Pass the same turns-per-user value the load path uses so a
+            # context-override of 30 doesn't get clipped back to the global
+            # 6 on every write.
+            live_turns = self._live_turns(ctx)
             await self.history.append(
                 context_key, "user", question,
                 user_hash=user_hash, sender_tail=sender_tail,
+                turns_per_user=live_turns,
             )
             # Persist the addressee on the assistant row too: the load path
             # uses it to render `[to Name, time ago]` in group playback so
@@ -2167,6 +2370,7 @@ class AskCommand(BaseCommand):
             await self.history.append(
                 context_key, "assistant", answer,
                 user_hash=user_hash, sender_tail=sender_tail,
+                turns_per_user=live_turns,
             )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")

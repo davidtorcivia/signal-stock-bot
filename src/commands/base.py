@@ -3,7 +3,7 @@ Base classes for bot commands.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -47,6 +47,13 @@ class CommandContext:
     # command. The trading cron reads this to suppress the chat post
     # when the writer chose to sit out — no moves means no message.
     portfolio_mutation_count: int = 0
+    # Image attachments captured from the inbound Signal message. Each
+    # entry: {"mime": "image/jpeg", "data_b64": "<base64>", "filename": "..."}.
+    # Populated by the signal handler when the resolved bot has
+    # vision_enabled=True. Consumed by ask_command's writer-message
+    # builder, then dropped: images are one-shot per message and not
+    # written into conversation history.
+    inbound_images: list[dict] = field(default_factory=list)
 
     @property
     def is_group(self) -> bool:

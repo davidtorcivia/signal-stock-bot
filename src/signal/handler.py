@@ -3,10 +3,13 @@ Signal message handler - interfaces with signal-cli-rest-api.
 """
 
 import asyncio
+import base64
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -15,6 +18,99 @@ from ..admin.events import get_bus
 from ..commands.dispatcher import CommandDispatcher
 
 logger = logging.getLogger(__name__)
+
+
+# Vision-payload guardrails. Vision models charge per image and per
+# resolution; passing arbitrary inbound media without a cap would let
+# any user trivially burn budget. 5 MB matches the largest single image
+# Anthropic/OpenAI ingest without server-side downscaling; 4 images per
+# message covers the realistic "share a screenshot collage" case
+# without becoming a vector for spam-prompts.
+VISION_MAX_PER_IMAGE_BYTES = 5 * 1024 * 1024
+VISION_MAX_IMAGES = 4
+VISION_ALLOWED_MIMES = frozenset({
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+})
+
+# Path inside the container where signal-cli stores inbound media. Set
+# by the SIGNAL_ATTACHMENTS_DIR env var so tests can redirect.
+_DEFAULT_ATTACHMENTS_DIR = "/app/data/signal-cli/attachments"
+
+
+def _attachments_dir() -> Path:
+    return Path(os.environ.get("SIGNAL_ATTACHMENTS_DIR", _DEFAULT_ATTACHMENTS_DIR))
+
+
+def _read_inbound_image_attachments(
+    data_message: dict, *, max_images: int = VISION_MAX_IMAGES,
+) -> list[dict]:
+    """Extract image attachments referenced by an inbound dataMessage.
+
+    Returns a list of `{mime, data_b64, filename}` dicts ready to be
+    handed to a multimodal LLM. Silently skips entries that:
+      * are missing an `id`
+      * have a non-image (or unsupported) mime type
+      * point at a file that doesn't exist on disk yet (signal-cli
+        race) or that exceeds VISION_MAX_PER_IMAGE_BYTES.
+
+    Capped at `max_images` to bound payload size per round.
+    """
+    raw = data_message.get("attachments") or []
+    if not raw:
+        return []
+    out: list[dict] = []
+    base = _attachments_dir()
+    for att in raw:
+        if len(out) >= max_images:
+            break
+        if not isinstance(att, dict):
+            continue
+        mime = (att.get("contentType") or "").strip().lower()
+        if mime not in VISION_ALLOWED_MIMES:
+            continue
+        att_id = (att.get("id") or "").strip()
+        if not att_id:
+            continue
+        # signal-cli stores attachments by id; in some configs the
+        # filename includes the original extension, in others it's
+        # just the id. Try the id first, then glob for it as a
+        # fallback (rare path that costs one directory listing).
+        path = base / att_id
+        if not path.exists():
+            try:
+                matches = list(base.glob(f"{att_id}.*"))
+            except OSError:
+                matches = []
+            if not matches:
+                logger.debug(
+                    f"inbound image not on disk yet: {att_id} "
+                    f"(mime={mime}); skipping"
+                )
+                continue
+            path = matches[0]
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            logger.debug(f"inbound image stat failed: {att_id}: {e}")
+            continue
+        if size > VISION_MAX_PER_IMAGE_BYTES:
+            logger.info(
+                f"inbound image {att_id} skipped: {size} bytes exceeds "
+                f"{VISION_MAX_PER_IMAGE_BYTES} cap"
+            )
+            continue
+        try:
+            with path.open("rb") as f:
+                payload = f.read()
+        except OSError as e:
+            logger.debug(f"inbound image read failed: {att_id}: {e}")
+            continue
+        out.append({
+            "mime": mime,
+            "data_b64": base64.b64encode(payload).decode("ascii"),
+            "filename": att.get("filename") or att_id,
+        })
+    return out
 
 
 @dataclass
@@ -71,6 +167,15 @@ class SignalHandler:
         # PollVoter is injected post-construction (avoids circular deps with
         # the LLM client / group log). When None, inbound polls are ignored.
         self.poll_voter = None
+        # Set by SignalHandlerPool at construction. Empty set + is_default_phone=True
+        # means "this is the global-default handler, accept everything." Otherwise
+        # the handler dispatches only messages whose resolved bot belongs to it
+        # (so two phones in the same group don't both answer). `_known_phones`
+        # is the union of all phones the pool has handlers for — used in the
+        # filter's fallback rule (see `_owns_bot`).
+        self.served_bot_ids: set[int] = set()
+        self.is_default_phone: bool = True
+        self._known_phones: set[str] = set()
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -374,6 +479,54 @@ class SignalHandler:
         """
         return _TypingIndicator(self, recipient, group_id, refresh_interval)
 
+    def _lookup_bot_by_phone(self, phone: str):
+        """Return the bot whose signal_phone matches `phone`, or None.
+
+        Used when a structured @-mention names this handler's number —
+        with multi-phone routing, that mention uniquely identifies a
+        bot (the one that owns the phone) and overrides the context's
+        default pick.
+        """
+        if not phone:
+            return None
+        if (
+            self.dispatcher is None
+            or self.dispatcher.bot_registry is None
+        ):
+            return None
+        for bot in self.dispatcher.bot_registry.list_sync():
+            if bot.enabled and (bot.signal_phone or "") == phone:
+                return bot
+        return None
+
+    def _owns_bot(self, bot) -> bool:
+        """True if this handler should send-as the given bot.
+
+        Rules, in order:
+          * No bot resolved: only the default-phone handler proceeds —
+            otherwise an unaddressed message in a context without a
+            pinned bot would go silent on multi-phone installs.
+          * Bot has no signal_phone override: belongs to the default
+            handler.
+          * Bot's signal_phone matches this handler: claim it.
+          * Bot's signal_phone is set to a phone no handler in the pool
+            recognizes (admin pinned a bot whose number isn't deployed
+            yet): the default handler steps in as a fallback so the
+            chat isn't silent — better to answer in the wrong voice than
+            not at all.
+          * Otherwise: another handler owns this bot — drop.
+        """
+        if bot is None:
+            return self.is_default_phone
+        bot_phone = (getattr(bot, "signal_phone", None) or "").strip()
+        if not bot_phone:
+            return self.is_default_phone
+        if bot_phone == self.config.phone_number:
+            return True
+        if bot_phone not in self._known_phones and self.is_default_phone:
+            return True
+        return False
+
     async def fetch_bot_uuid(self) -> Optional[str]:
         """Fetch and cache the bot's UUID from signal-cli API."""
         if self._bot_uuid:
@@ -430,18 +583,30 @@ class SignalHandler:
             active_bot = self.dispatcher._resolve_bot(group_id, policy=policy)
 
         # 1) Structured @-mention — phone/UUID match means the message
-        # was directed at this Signal account. With a shared phone the
-        # mention can't disambiguate Sigil-vs-Artaud, so we treat it as
-        # "addressing the active bot" rather than failing closed.
+        # was directed at a Signal account we recognize. With multi-
+        # phone, the mention's target phone uniquely identifies the bot
+        # the user wants. Look it up globally (not just against this
+        # handler's phone) so the SAME mention resolves to the SAME bot
+        # in every handler; the downstream multi-phone filter then
+        # decides which handler actually dispatches. This is how a user
+        # @-mentions Artaud's number in a Sigil-pinned context to
+        # summon Artaud anyway.
         mentions = data_message.get("mentions") or []
         if mentions:
             if not self._bot_uuid:
                 await self.fetch_bot_uuid()
             for mention in mentions:
-                if mention.get("number", "") == self.config.phone_number:
-                    return active_bot, True
-                mentioned_uuid = mention.get("uuid", "")
-                if self._bot_uuid and mentioned_uuid == self._bot_uuid:
+                target_phone = mention.get("number", "")
+                target_uuid = mention.get("uuid", "")
+                mentioned_bot = self._lookup_bot_by_phone(target_phone)
+                if mentioned_bot is not None:
+                    return mentioned_bot, True
+                # Fall-back for single-bot installs without
+                # signal_phone overrides: phone/UUID match against this
+                # handler's own identity still counts as "addressing me."
+                if target_phone == self.config.phone_number or (
+                    self._bot_uuid and target_uuid == self._bot_uuid
+                ):
                     return active_bot, True
 
         # 2) Alias match against the active bot's alias set.
@@ -510,12 +675,18 @@ class SignalHandler:
             logger.debug("Skipping message: no sender or empty text")
             return
 
-        # Self-message guard: if signal-cli ever echoes our own outbound
-        # message back through the receive endpoint (has happened on
-        # certain reconnect paths), the dispatcher would treat it as
-        # input and could loop. Drop it before any further work.
-        if sender == self.config.phone_number:
-            logger.debug("Skipping own outbound echo")
+        # Self-message guard: drop envelopes whose sender is any phone
+        # this pool serves. Two flavors:
+        #   * Our own outbound echo (signal-cli has been observed to
+        #     replay outbound on reconnect; without the guard the
+        #     dispatcher would treat it as user input and could loop).
+        #   * The OTHER bot's outbound. With multi-phone, Sigil's
+        #     handler receives Artaud's group messages as regular
+        #     "user" input from `+16467699190`. Treating bot-on-bot
+        #     traffic as user input would let two bots have a
+        #     conversation with each other (token burn, chat noise).
+        if sender == self.config.phone_number or sender in self._known_phones:
+            logger.debug(f"Skipping bot-side echo from ...{sender[-4:]}")
             return
 
         # Idempotency: signal-cli replays buffered messages on websocket
@@ -574,11 +745,67 @@ class SignalHandler:
             data_message, group_id, policy_for_routing
         )
 
+        # Multi-phone routing filter. Each registered phone runs its own
+        # SignalHandler/poller; signal-cli delivers a copy of every
+        # envelope to every linked account that's in the group. Only one
+        # handler should respond — the one whose phone matches the bot
+        # that would answer. Other handlers drop silently; without this
+        # filter we'd double-respond (or worse, the wrong persona would
+        # speak using the wrong number).
+        if (
+            self.dispatcher is not None
+            and self.dispatcher.bot_registry is not None
+        ):
+            effective_bot = self.dispatcher._resolve_bot(
+                group_id, policy=policy_for_routing, addressed_bot=addressed_bot,
+            )
+            if not self._owns_bot(effective_bot):
+                logger.debug(
+                    f"Handler ...{self.config.phone_number[-4:]}: dropping "
+                    f"envelope routed to bot="
+                    f"{effective_bot.slug if effective_bot else None!r}"
+                )
+                return
+
+        # Pull inbound images when the bot answering this message has
+        # vision_enabled. Bound to the resolved bot (not all bots) so
+        # vision payload is paid for only when the receiving model can
+        # actually consume it. When no bot is resolved yet — falls back
+        # to the registry's default-for-kind via the dispatcher's
+        # _resolve_bot — we still pre-extract so the dispatcher can use
+        # them once it knows which bot will answer. Cheap: skipped
+        # entirely when the message has no attachments at all.
+        inbound_images: list[dict] = []
+        vision_candidate = addressed_bot
+        if (
+            vision_candidate is None
+            and self.dispatcher is not None
+            and self.dispatcher.bot_registry is not None
+        ):
+            kind = "group" if group_id else "dm"
+            try:
+                vision_candidate = self.dispatcher.bot_registry.default_for_kind_sync(kind)
+            except Exception as e:
+                logger.debug(f"vision: default bot lookup failed: {e}")
+        if (
+            vision_candidate is not None
+            and getattr(vision_candidate, "vision_enabled", False)
+            and data_message.get("attachments")
+        ):
+            inbound_images = _read_inbound_image_attachments(data_message)
+            if inbound_images:
+                logger.info(
+                    f"Inbound vision: {len(inbound_images)} image(s) for "
+                    f"bot={vision_candidate.slug}"
+                )
+
         bot_label = f" [→{addressed_bot.slug}]" if addressed_bot else ""
+        img_label = f" [+{len(inbound_images)} img]" if inbound_images else ""
         logger.info(
             f"Received message from {sender[-4:]}: "
             f"{'[group] ' if group_id else ''}"
             f"{'[@mentioned]' + bot_label + ' ' if is_mentioned else ''}"
+            f"{img_label} "
             f"{message_text[:50]}..."
         )
 
@@ -595,6 +822,7 @@ class SignalHandler:
             quote_author=quote_author,
             addressed_bot=addressed_bot,
             policy=policy_for_routing,
+            inbound_images=inbound_images,
         )
         
         # Send response if command was processed

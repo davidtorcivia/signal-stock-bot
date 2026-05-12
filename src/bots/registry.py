@@ -119,6 +119,22 @@ class BotRegistry:
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bots_enabled ON bots(enabled)"
                 )
+                # Upgrade path: add columns missing on pre-existing installs.
+                cursor = await db.execute("PRAGMA table_info(bots)")
+                existing_cols = {r[1] for r in await cursor.fetchall()}
+                if "vision_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE bots ADD COLUMN "
+                        "vision_enabled INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "deep_think_enabled" not in existing_cols:
+                    # Default 1 (= on) so existing installs keep their
+                    # prior behavior; admins can flip individual bots off
+                    # from /admin/bots/<id> without affecting globals.
+                    await db.execute(
+                        "ALTER TABLE bots ADD COLUMN "
+                        "deep_think_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
                 # Seed Sigil if the table is empty. Aliases default to a
                 # single-element list with the display name; admin can
                 # add more from /admin/bots in PR3.
@@ -228,6 +244,22 @@ class BotRegistry:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bots_enabled ON bots(enabled)"
                 )
+                # Upgrade path mirrors _ensure_initialized so warm_sync
+                # leaves the schema in the same shape regardless of which
+                # init path ran first.
+                existing_cols = {
+                    r[1] for r in conn.execute("PRAGMA table_info(bots)")
+                }
+                if "vision_enabled" not in existing_cols:
+                    conn.execute(
+                        "ALTER TABLE bots ADD COLUMN "
+                        "vision_enabled INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "deep_think_enabled" not in existing_cols:
+                    conn.execute(
+                        "ALTER TABLE bots ADD COLUMN "
+                        "deep_think_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
                 cur = conn.execute("SELECT COUNT(*) FROM bots")
                 row = cur.fetchone()
                 if row and row[0] == 0:
@@ -279,7 +311,7 @@ class BotRegistry:
         "signal_phone, signal_api_url, enabled, "
         "default_for_dm, default_for_group, "
         "deep_think_mode, deep_think_handoff_prompt, "
-        "created_at, updated_at"
+        "created_at, updated_at, vision_enabled, deep_think_enabled"
     )
 
     @staticmethod
@@ -305,6 +337,10 @@ class BotRegistry:
             deep_think_handoff_prompt=row[11],
             created_at=row[12] or 0.0,
             updated_at=row[13] or 0.0,
+            vision_enabled=bool(row[14]) if len(row) > 14 and row[14] is not None else False,
+            deep_think_enabled=(
+                bool(row[15]) if len(row) > 15 and row[15] is not None else True
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -412,8 +448,9 @@ class BotRegistry:
                         signal_phone, signal_api_url, enabled,
                         default_for_dm, default_for_group,
                         deep_think_mode, deep_think_handoff_prompt,
+                        vision_enabled, deep_think_enabled,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         bot.slug,
                         bot.display_name,
@@ -426,6 +463,8 @@ class BotRegistry:
                         1 if bot.default_for_group else 0,
                         bot.deep_think_mode,
                         bot.deep_think_handoff_prompt or None,
+                        1 if bot.vision_enabled else 0,
+                        1 if bot.deep_think_enabled else 0,
                         now,
                         now,
                     ),
@@ -442,6 +481,7 @@ class BotRegistry:
                            persona = ?, signal_phone = ?, signal_api_url = ?,
                            enabled = ?, default_for_dm = ?, default_for_group = ?,
                            deep_think_mode = ?, deep_think_handoff_prompt = ?,
+                           vision_enabled = ?, deep_think_enabled = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -456,6 +496,8 @@ class BotRegistry:
                         1 if bot.default_for_group else 0,
                         bot.deep_think_mode,
                         bot.deep_think_handoff_prompt or None,
+                        1 if bot.vision_enabled else 0,
+                        1 if bot.deep_think_enabled else 0,
                         now,
                         bot.id,
                     ),

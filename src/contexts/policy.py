@@ -56,6 +56,19 @@ class ContextPolicy:
     # Artaud-only group). PR4 mention routing can still let a non-
     # default bot answer when explicitly addressed by alias.
     default_bot_id: Optional[int] = None
+    # Transcript logging: when True, every writer LLM round in this chat
+    # is appended to data/transcripts/ctx_<id>.jsonl as one OpenAI-shape
+    # JSON object (messages sent + assistant reply + tool calls + params).
+    # Off by default; only writable on explicit (non-default) rows so the
+    # catch-all rows don't accumulate mixed-context training data. Used
+    # to harvest fine-tuning corpora for models trained against this
+    # harness.
+    transcript_logging_enabled: bool = False
+    # History-turns override: when set, this context uses its own value
+    # for "how many prior turn-pairs to send to the writer LLM" instead
+    # of the global `llm_history_turns`. None = inherit global. 0 = no
+    # history at all (one-shot mode — useful for oracle-only chats).
+    history_turns_override: Optional[int] = None
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()

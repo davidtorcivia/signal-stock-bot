@@ -117,6 +117,7 @@ def create_admin_blueprint(
             name_registry=name_registry,
             oracle_store=oracle_store,
             bot_registry=bot_registry,
+            settings_store=settings_store,
         )
 
     if name_registry is not None:
@@ -647,6 +648,25 @@ _BOT_LLM_FIELDS = {
 }
 
 
+def _parse_deep_think_enabled(form, existing: Optional[Bot]) -> bool:
+    """Resolve the per-bot deep_think_enabled flag from form input.
+
+    Strategy: the template stamps a hidden `_deep_think_enabled_in_form`
+    field so we know the checkbox was rendered. If present, an unchecked
+    box (absent `deep_think_enabled` value) means OFF; a checked box
+    means ON. If the marker is absent (legacy clients / API callers that
+    don't know about this field), keep the existing value or default
+    True on new bots.
+    """
+    if not form.get("_deep_think_enabled_in_form"):
+        if existing is not None:
+            return bool(getattr(existing, "deep_think_enabled", True))
+        return True
+    return (form.get("deep_think_enabled", "") or "").lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
 def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
     """Read identity fields from the form into a Bot. Aliases come in
     as comma- or newline-separated text; deduplicated and trimmed."""
@@ -704,6 +724,13 @@ def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
         default_for_group=(form.get("default_for_group", "") or "").lower() in ("1", "true", "yes", "on"),
         deep_think_mode=deep_think_mode,
         deep_think_handoff_prompt=(form.get("deep_think_handoff_prompt", "") or "").strip() or None,
+        vision_enabled=(form.get("vision_enabled", "") or "").lower() in ("1", "true", "yes", "on"),
+        # HTML checkboxes don't post anything when unchecked, so we
+        # can't tell "unchecked" from "form didn't render the field".
+        # The template always includes a hidden `_deep_think_enabled_in_form`
+        # marker; if it's present we trust the checkbox state, otherwise
+        # we preserve the existing value (or default True on new bots).
+        deep_think_enabled=_parse_deep_think_enabled(form, existing),
     )
 
 
@@ -856,6 +883,8 @@ def _register_bots_routes(
             "default_for_group": False,
             "deep_think_mode": "replace",
             "deep_think_handoff_prompt": "",
+            "vision_enabled": False,
+            "deep_think_enabled": True,
         }
         bot_settings = _bot_llm_values(settings_store, bot_id=None)
         if request.method == "POST":
@@ -915,6 +944,8 @@ def _register_bots_routes(
             "default_for_group": bot.default_for_group,
             "deep_think_mode": bot.deep_think_mode,
             "deep_think_handoff_prompt": bot.deep_think_handoff_prompt or "",
+            "vision_enabled": bot.vision_enabled,
+            "deep_think_enabled": bot.deep_think_enabled,
         }
         return render_template(
             "bots_form.html",
@@ -1274,6 +1305,7 @@ def _register_context_routes(
     name_registry=None,
     oracle_store=None,
     bot_registry: Optional[BotRegistry] = None,
+    settings_store: Optional[SettingsStore] = None,
 ) -> None:
     """Context CRUD + (when memory_store is wired) memory CRUD nested under
     each context. Memory routes are mounted unconditionally so the template
@@ -1318,6 +1350,8 @@ def _register_context_routes(
             "memory_writes_enabled": True,
             "reactor_memory_writes": False,
             "default_bot_id": "",
+            "transcript_logging_enabled": False,
+            "history_turns_override": "",
         }
         if request.method == "POST":
             if not verify_csrf():
@@ -1383,6 +1417,11 @@ def _register_context_routes(
                 "" if policy.default_bot_id is None
                 else str(policy.default_bot_id)
             ),
+            "transcript_logging_enabled": policy.transcript_logging_enabled,
+            "history_turns_override": (
+                "" if policy.history_turns_override is None
+                else str(policy.history_turns_override)
+            ),
         }
         if request.method == "POST":
             values = _form_to_values(request.form)
@@ -1402,6 +1441,22 @@ def _register_context_routes(
             except Exception as e:
                 logger.error(f"Oracle list failed for ctx #{context_id}: {e}")
 
+        # Transcript file stats (size, line count, backups). Cheap stat
+        # call — only inspects the file headers. Empty/missing files show
+        # zeros in the UI so the operator knows nothing has accumulated yet.
+        from ..llm.transcript import get_logger as _get_tx_logger
+        try:
+            transcript_stats = _get_tx_logger().stats(policy.id)
+        except Exception as e:
+            logger.debug(f"Transcript stats failed for ctx #{policy.id}: {e}")
+            transcript_stats = {
+                "exists": False, "size_bytes": 0, "line_count": 0, "backups": [],
+            }
+        global_history_turns = (
+            settings_store.get_int("llm_history_turns", 6, min_value=0)
+            if settings_store is not None else 6
+        )
+
         return render_template(
             "context_edit.html",
             is_new=False,
@@ -1416,6 +1471,8 @@ def _register_context_routes(
             oracle_schedule_kinds=_ORACLE_SCHEDULE_OPTIONS,
             oracle_kind_descriptions=_ORACLE_KIND_DESCRIPTIONS,
             oracle_schedule_descriptions=_ORACLE_SCHEDULE_DESCRIPTIONS,
+            transcript_stats=transcript_stats,
+            global_history_turns=global_history_turns,
             error=error,
         )
 
@@ -1444,6 +1501,70 @@ def _register_context_routes(
             except Exception as e:
                 logger.error(f"Context delete failed: {e}")
         return redirect(url_for("admin.context_list"))
+
+    @bp.route("/contexts/<int:context_id>/transcript.jsonl", methods=["GET"])
+    @admin_required
+    def context_transcript_download(context_id: int):
+        """Stream the active transcript file as an attachment.
+
+        Backups (.1/.2/.3) aren't auto-merged — the admin can grab them
+        individually with ?backup=N if they need the rolled-out batch.
+        """
+        from ..llm.transcript import get_logger as _get_tx_logger
+        from flask import send_file
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        tx_logger = _get_tx_logger()
+        backup_idx = request.args.get("backup", "").strip()
+        if backup_idx:
+            try:
+                idx = int(backup_idx)
+                if idx < 1:
+                    raise ValueError
+            except ValueError:
+                abort(400)
+            path = tx_logger.backup_path(context_id, idx)
+        else:
+            path = tx_logger.path_for(context_id)
+        if not path.exists():
+            abort(404)
+        # Flask's send_file resolves a relative path against the
+        # blueprint's root_path (here `/app/src/admin/`), which would
+        # mis-target `/app/src/data/transcripts/...`. Hand it an absolute
+        # path so it stat()s the actual file from CWD.
+        path = path.resolve()
+        label_slug = (policy.label or policy.key or f"ctx{context_id}")
+        # Filesystem-safe filename: strip everything but alnum/dash/underscore.
+        safe = "".join(
+            c if c.isalnum() or c in "-_" else "_" for c in label_slug
+        )[:48] or f"ctx{context_id}"
+        suffix = f".{backup_idx}" if backup_idx else ""
+        download_name = f"transcript_{safe}_ctx{context_id}{suffix}.jsonl"
+        return send_file(
+            path,
+            mimetype="application/jsonl",
+            as_attachment=True,
+            download_name=download_name,
+        )
+
+    @bp.route("/contexts/<int:context_id>/transcript/clear", methods=["POST"])
+    @admin_required
+    def context_transcript_clear(context_id: int):
+        from ..llm.transcript import get_logger as _get_tx_logger
+        if not verify_csrf():
+            return redirect(url_for("admin.context_edit", context_id=context_id))
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        try:
+            removed = _run_on_loop(loop, _get_tx_logger().clear(context_id))
+            logger.info(
+                f"Transcript clear: ctx #{context_id} — removed {removed} file(s)"
+            )
+        except Exception as e:
+            logger.error(f"Transcript clear failed for ctx #{context_id}: {e}")
+        return redirect(url_for("admin.context_edit", context_id=context_id))
 
     if oracle_store is not None:
         _register_oracle_routes(
@@ -1995,6 +2116,10 @@ def _form_to_values(form) -> dict:
         "memory_writes_enabled": form.get("memory_writes_enabled", "") == "on",
         "reactor_memory_writes": form.get("reactor_memory_writes", "") == "on",
         "default_bot_id": form.get("default_bot_id", "").strip(),
+        "transcript_logging_enabled": (
+            form.get("transcript_logging_enabled", "") == "on"
+        ),
+        "history_turns_override": form.get("history_turns_override", "").strip(),
     }
 
 
@@ -2029,6 +2154,29 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         except ValueError:
             raise ValueError("default_bot_id must be an integer or blank") from None
 
+    transcript_logging_enabled = form.get("transcript_logging_enabled", "") == "on"
+    # Force-off on default rows. Defaults catch every unregistered chat;
+    # turning logging on there would pool transcripts from many chats into
+    # one file, defeating the per-context training-corpus model.
+    if kind == "default" and transcript_logging_enabled:
+        raise ValueError(
+            "Transcript logging is not allowed on default contexts. "
+            "Register the chat as its own context first."
+        )
+    raw_history_override = (form.get("history_turns_override") or "").strip()
+    history_turns_override: Optional[int]
+    if raw_history_override == "":
+        history_turns_override = None
+    else:
+        try:
+            history_turns_override = int(raw_history_override)
+        except ValueError:
+            raise ValueError(
+                "history_turns_override must be an integer or blank"
+            ) from None
+        if history_turns_override < 0:
+            raise ValueError("history_turns_override must be 0 or positive")
+
     if kind not in ("group", "dm", "default"):
         raise ValueError("kind must be group, dm, or default")
     if not key:
@@ -2056,6 +2204,8 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         memory_writes_enabled=memory_writes_enabled,
         reactor_memory_writes=reactor_memory_writes,
         default_bot_id=default_bot_id,
+        transcript_logging_enabled=transcript_logging_enabled,
+        history_turns_override=history_turns_override,
     )
 
 

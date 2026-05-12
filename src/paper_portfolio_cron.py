@@ -149,16 +149,22 @@ class TradingCronWorker:
         *,
         store: PortfolioStore,
         ask_command,
-        signal_handler,
+        signal_pool=None,
+        signal_handler=None,
         context_registry,
-        bot_phone: str,
+        bot_phone: str = "",
         bot_registry=None,
     ):
         self.store = store
         self.ask = ask_command
-        self.signal = signal_handler
+        self.signal_pool = signal_pool
+        self.signal = signal_handler or (
+            signal_pool.default() if signal_pool is not None else None
+        )
         self.contexts = context_registry
-        self.bot_phone = bot_phone
+        self.bot_phone = bot_phone or (
+            signal_pool.default_phone if signal_pool is not None else ""
+        )
         self.bot_registry = bot_registry
 
     def _resolve_bot_for(self, policy):
@@ -268,14 +274,20 @@ class TradingCronWorker:
             )
             return False
 
+        cron_bot = self._resolve_bot_for(policy)
+        cron_phone = (
+            (cron_bot.signal_phone if cron_bot else None)
+            or self.bot_phone
+            or ""
+        )
         ctx = CommandContext(
-            sender=self.bot_phone or "",
+            sender=cron_phone,
             group_id=group_id,
             raw_message=f"!ask {prompt}",
             command="ask",
             args=[prompt],
             policy=policy,
-            bot=self._resolve_bot_for(policy),
+            bot=cron_bot,
             # Tag the trade source so portfolio tool calls inside this
             # ask invocation get logged as cron-driven, not reactive.
             automation_source=SOURCE_CRON,
@@ -310,8 +322,18 @@ class TradingCronWorker:
         if not body.startswith(header):
             body = f"{header}\n\n{body}"
 
+        sender_handler = (
+            self.signal_pool.for_bot(cron_bot)
+            if self.signal_pool is not None
+            else self.signal
+        )
+        if sender_handler is None:
+            logger.warning(
+                f"Trading cron: no signal handler for {ctx_key} {slot}; skipping"
+            )
+            return False
         try:
-            await self.signal.send_message(
+            await sender_handler.send_message(
                 recipient="",
                 message=body,
                 group_id=group_id,

@@ -41,6 +41,21 @@ class Bot:
     # PR4 fields, declared in the schema now to avoid a later ALTER.
     deep_think_mode: str = DEEP_THINK_MODE_REPLACE
     deep_think_handoff_prompt: Optional[str] = None
+    # Vision: when True, inbound image attachments are base64-encoded and
+    # passed to the writer LLM in OpenAI multimodal shape (text + image_url
+    # parts). Off by default — only flip on for bots whose writer model
+    # actually supports vision (e.g. claude-sonnet-4-5, gpt-5-vision, etc.).
+    # Images are NOT persisted into conversation_turns (one-shot per
+    # message): the next round sees only the text.
+    vision_enabled: bool = False
+    # Per-bot deep_think kill switch. When False, deep_think is fully
+    # disabled FOR THIS BOT regardless of global / per-context settings:
+    # the tool schema is hidden from the writer (so it can't invoke it)
+    # AND `deep_think_mode='research'` is treated as `'replace'` (no
+    # handoff). Default True preserves existing behavior; flip off for
+    # bots whose writer model already handles long reasoning natively or
+    # for cost containment on a single bot without changing globals.
+    deep_think_enabled: bool = True
     created_at: float = 0.0
     updated_at: float = 0.0
 

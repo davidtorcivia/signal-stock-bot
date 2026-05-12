@@ -60,6 +60,7 @@ class OrdersWorker:
         *,
         store: PortfolioStore,
         executor: PaperPortfolioExecutor,
+        signal_pool=None,
         signal_handler=None,
         ask_command=None,
         context_registry=None,
@@ -68,14 +69,19 @@ class OrdersWorker:
     ):
         self.store = store
         self.executor = executor
-        self.signal = signal_handler
+        self.signal_pool = signal_pool
+        self.signal = signal_handler or (
+            signal_pool.default() if signal_pool is not None else None
+        )
         # ask_command is optional: if wired, the worker fires a
         # synthetic !ask per affected chat so the bot voices the
         # resolution itself. If None, we fall back to a static
         # notification line.
         self.ask = ask_command
         self.contexts = context_registry
-        self.bot_phone = bot_phone or ""
+        self.bot_phone = bot_phone or (
+            signal_pool.default_phone if signal_pool is not None else ""
+        )
         self.bot_registry = bot_registry
 
     def _resolve_bot_for(self, policy):
@@ -280,14 +286,20 @@ class OrdersWorker:
             return
 
         prompt = self._build_reaction_prompt(orders)
+        order_bot = self._resolve_bot_for(policy)
+        order_phone = (
+            (order_bot.signal_phone if order_bot else None)
+            or self.bot_phone
+            or ""
+        )
         ctx = CommandContext(
-            sender=self.bot_phone,
+            sender=order_phone,
             group_id=group_id,
             raw_message=f"!ask {prompt}",
             command="ask",
             args=[prompt],
             policy=policy,
-            bot=self._resolve_bot_for(policy),
+            bot=order_bot,
             # Tag any follow-up trades from this !ask as order-driven
             # so the trade ledger is honest about provenance.
             automation_source=SOURCE_ORDER,
@@ -323,8 +335,19 @@ class OrdersWorker:
         if not body.startswith("🔔"):
             body = f"{header}\n\n{body}"
 
+        sender_handler = (
+            self.signal_pool.for_bot(order_bot)
+            if self.signal_pool is not None
+            else self.signal
+        )
+        if sender_handler is None:
+            logger.warning(
+                f"Orders watcher: no signal handler for {context_key}; "
+                f"skipping post"
+            )
+            return
         try:
-            await self.signal.send_message(
+            await sender_handler.send_message(
                 recipient="",
                 message=body,
                 group_id=group_id,
@@ -426,8 +449,23 @@ class OrdersWorker:
         a recipient, and DM-context portfolios are rare in practice."""
         if context_key.startswith("group:"):
             group_id = context_key[len("group:"):]
+            sender_handler = self.signal
+            if self.signal_pool is not None:
+                # No per-context bot lookup here (this is the static
+                # fallback path); route through the default bot's phone.
+                fallback_bot = (
+                    self.bot_registry.default_for_kind_sync("group")
+                    if self.bot_registry is not None else None
+                )
+                sender_handler = self.signal_pool.for_bot(fallback_bot)
+            if sender_handler is None:
+                logger.warning(
+                    f"Orders watcher: no signal handler for {context_key}; "
+                    f"skipping notify"
+                )
+                return
             try:
-                await self.signal.send_message(
+                await sender_handler.send_message(
                     recipient="",
                     message=message,
                     group_id=group_id,

@@ -47,14 +47,36 @@ class LLMClientFactory:
     already-cached clients and any future ones.
     """
 
-    def __init__(self, settings_store):
+    def __init__(self, settings_store, bot_registry=None):
         self.store = settings_store
+        # Optional BotRegistry — when wired, the writer's system-prompt
+        # resolver falls back to bots.persona between the explicit
+        # bot_llm_settings override and the global llm_system_prompt.
+        # Without this, a non-default bot whose identity lives only in
+        # `bots.persona` would inherit the global prompt (Sigil's text)
+        # and leak persona across bots.
+        self.bot_registry = bot_registry
         self._writers: dict[Optional[int], LLMClient] = {}
         self._deep_thinks: dict[Optional[int], DeepThinkClient] = {}
         # Late-bound; updated via attach_bot_tools / attach_mcp_manager.
         self._bot_tools = None
         self._mcp_manager = None
         self._lock = threading.RLock()
+
+    def _persona_for(self, bot_id: int) -> Optional[str]:
+        """BotRegistry-backed persona lookup. Returns None silently when
+        the registry isn't wired or the bot row is missing — the writer
+        then falls through to the global prompt as before."""
+        if self.bot_registry is None:
+            return None
+        try:
+            bot = self.bot_registry.get_sync(bot_id)
+        except Exception as e:
+            logger.debug(f"persona lookup failed for bot {bot_id}: {e}")
+            return None
+        if bot is None:
+            return None
+        return (bot.persona or "").strip() or None
 
     def get_writer(self, bot_id: Optional[int]) -> LLMClient:
         # The cache key includes None so legacy callers (no bot_id)
@@ -63,7 +85,11 @@ class LLMClientFactory:
         with self._lock:
             client = self._writers.get(bot_id)
             if client is None:
-                client = LLMClient(self.store, bot_id=bot_id)
+                client = LLMClient(
+                    self.store,
+                    bot_id=bot_id,
+                    persona_provider=self._persona_for if bot_id is not None else None,
+                )
                 self._writers[bot_id] = client
             return client
 

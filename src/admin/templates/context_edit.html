@@ -193,6 +193,88 @@
         </p>
         {% endif %}
 
+        <h2 style="margin-top: 32px;">History window</h2>
+        <label for="history_turns_override">History turns override (blank = inherit global)</label>
+        <input type="number" name="history_turns_override" id="history_turns_override"
+               min="0" step="1"
+               value="{{ values.history_turns_override }}"
+               placeholder="{% if global_history_turns is defined %}global is {{ global_history_turns }}{% else %}leave blank{% endif %}">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Number of role-pairs (one user + one assistant = one pair) of prior
+            history to send to the writer LLM in this chat.
+            {% if global_history_turns is defined %}
+                Global default is <strong>{{ global_history_turns }}</strong>.
+            {% endif %}
+            Blank means inherit. <strong>0</strong> means no history at all
+            (one-shot mode — useful for oracle-only or stateless chats).
+            Higher values give the model more context but cost more tokens
+            and slow each round; lower values clip memory of earlier turns.
+        </p>
+
+        <h2 style="margin-top: 32px;">Transcript logging</h2>
+        {% if policy is none or policy.kind == 'default' %}
+        <p class="muted" style="font-size: 12px;">
+            Transcript logging is only available on explicit (non-default)
+            contexts. Default rows fan out across every unregistered chat,
+            so logging there would pool training data from multiple chats
+            into one file.
+        </p>
+        {% else %}
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="transcript_logging_enabled"
+                   {% if values.transcript_logging_enabled %}checked{% endif %}>
+            <span>Log every writer LLM round in this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            When on, every writer call (including tool-call rounds with their
+            inputs and outputs) is appended to a per-context JSONL file in
+            OpenAI chat-completions shape. Designed to harvest fine-tuning
+            corpora for models trained against this harness. Reactor, summary,
+            and healthcheck calls are <em>not</em> captured. Files rotate
+            at 100 MB and keep 3 backups.
+        </p>
+
+        {% if transcript_stats is defined and transcript_stats %}
+        <div style="margin-top: 12px; padding: 10px 12px; background: #0b0d10; border: 1px solid var(--border); border-radius: 4px; font-size: 13px;">
+            {% if transcript_stats.exists %}
+                <strong>{{ transcript_stats.line_count }}</strong> round{{ '' if transcript_stats.line_count == 1 else 's' }} logged,
+                <strong>{{ '%.2f'|format(transcript_stats.size_bytes / 1024 / 1024) }} MB</strong> on disk.
+                <div style="margin-top: 8px;">
+                    <a href="{{ url_for('admin.context_transcript_download', context_id=policy.id) }}"
+                       style="color: var(--accent); text-decoration: underline;">
+                        ↓ Download current
+                    </a>
+                </div>
+                {% if transcript_stats.backups %}
+                <div style="margin-top: 6px; color: var(--muted); font-size: 12px;">
+                    Rotated backups:
+                    {% for b in transcript_stats.backups %}
+                        <a href="{{ url_for('admin.context_transcript_download', context_id=policy.id) }}?backup={{ b.index }}"
+                           style="color: var(--accent); text-decoration: underline; margin-right: 8px;">
+                            .{{ b.index }} ({{ '%.1f'|format(b.size_bytes / 1024 / 1024) }} MB)
+                        </a>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            {% else %}
+                <span class="muted">No transcript file yet. Enable logging above and have a conversation in this chat.</span>
+            {% endif %}
+        </div>
+
+        {% if transcript_stats.exists %}
+        <form method="post"
+              action="{{ url_for('admin.context_transcript_clear', context_id=policy.id) }}"
+              onsubmit="return confirm('Delete the transcript file and all backups for this chat? Cannot be undone.');"
+              style="margin-top: 10px;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="secondary" style="background: var(--bad); color: white;">
+                Clear transcript files
+            </button>
+        </form>
+        {% endif %}
+        {% endif %}
+        {% endif %}
+
         <h2 style="margin-top: 32px;">Deep think</h2>
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
             <input type="checkbox" name="deep_think_enabled" {% if values.deep_think_enabled %}checked{% endif %}>

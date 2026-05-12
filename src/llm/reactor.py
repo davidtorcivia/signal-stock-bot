@@ -164,6 +164,12 @@ class EmojiReactor:
         self.store = settings_store
         self.llm = llm_client
         self.signal = signal_handler
+        # Set post-construction by main.py. When wired, reactions route
+        # through `pool.for_bot(...)` so multi-phone installs send the
+        # reaction from the bot whose chat it landed in. Falls back to
+        # `self.signal` when None.
+        from typing import Any as _Any
+        self.signal_pool: _Any = None
         self.group_log = group_log
         # Optional async callable: text -> expanded text. Used to inline tweet
         # content from x.com / twitter.com URLs so the reactor can decide on
@@ -451,6 +457,7 @@ class EmojiReactor:
         target_timestamp: Optional[int],
         policy=None,
         bot_will_reply: bool = False,
+        bot=None,
     ) -> None:
         """Background task. Logs and swallows every error.
 
@@ -699,7 +706,15 @@ class EmojiReactor:
 
             if emoji_pick:
                 self._record_cooldowns(sender, group_id)
-                ok = await self.signal.send_reaction(
+                # Route the reaction through the bot's handler so multi-
+                # phone installs react from the right number.
+                react_handler = self.signal
+                if self.signal_pool is not None:
+                    react_handler = self.signal_pool.for_bot(bot)
+                if react_handler is None:
+                    logger.warning("Reactor: no signal handler for reaction")
+                    return
+                ok = await react_handler.send_reaction(
                     recipient=sender,
                     target_author=sender,
                     target_timestamp=int(target_timestamp),

@@ -11,7 +11,7 @@ Supports:
 import logging
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -19,6 +19,7 @@ from pathlib import Path
 from .base import BaseCommand, CommandContext, CommandResult
 from ..cache import get_metrics
 from ..admin.events import get_bus
+from ..llm.transcript import ActiveContext, set_active as set_active_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +141,14 @@ class CommandDispatcher:
         self.ask_command = ask_command
         self.reactor = reactor
         self.bot_registry = bot_registry
-        # Late-bound by main.py once SignalHandler exists. Used only by
-        # dispatch_implicit_ask, which fires from the reactor outside the
-        # normal request/response path and so must send its own message.
-        self.signal_handler = None
+        # Late-bound by main.py. signal_handler is the legacy
+        # single-handler ref (== signal_pool.default()); signal_pool
+        # exposes per-bot routing for multi-phone installs. Used by
+        # dispatch_implicit_ask, which fires from the reactor outside
+        # the normal request/response path and so must send its own
+        # message.
+        self.signal_handler: Any = None
+        self.signal_pool: Any = None
         self.commands: dict[str, BaseCommand] = {}
         self._rate_limiter = UserRateLimiter(limit=rate_limit)
         self._corn_cooldown: dict[str, float] = {}  # sender -> last triggered timestamp
@@ -249,6 +254,7 @@ class CommandDispatcher:
         quote_author: Optional[str] = None,
         addressed_bot=None,
         policy=None,
+        inbound_images: Optional[list[dict]] = None,
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
@@ -283,6 +289,28 @@ class CommandDispatcher:
             except Exception as e:
                 logger.error(f"Context policy lookup failed: {e}")
 
+        # Stash this context's identity in a ContextVar so the LLMClient
+        # can decide whether to write transcripts. asyncio.Task copies
+        # contextvars at create time, so child tasks (reactor, gather'd
+        # tool calls) inherit the snapshot — that's intended: a mid-message
+        # policy edit shouldn't retroactively flip logging on/off.
+        # Default rows are excluded from logging at write-time regardless
+        # of the flag value, since they fan out across unregistered chats.
+        if policy is not None and policy.id is not None:
+            bot = self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot)
+            transcript_on = (
+                bool(getattr(policy, "transcript_logging_enabled", False))
+                and policy.kind != "default"
+            )
+            set_active_transcript(ActiveContext(
+                context_id=policy.id,
+                context_label=policy.label or policy.key,
+                transcript_logging_enabled=transcript_on,
+                bot_id=getattr(bot, "id", None) if bot else None,
+                sender_tail=(sender or "")[-4:],
+                group_id=group_id,
+            ))
+
         # Fire-and-forget emoji reactor (groups only). Runs in parallel with
         # the rest of dispatch — never blocks command execution and never
         # surfaces output. The reactor itself swallows all errors.
@@ -313,6 +341,9 @@ class CommandDispatcher:
                     target_timestamp=target_timestamp,
                     policy=policy,
                     bot_will_reply=bot_will_reply,
+                    bot=self._resolve_bot(
+                        group_id, policy=policy, addressed_bot=addressed_bot,
+                    ),
                 )
             )
 
@@ -364,6 +395,7 @@ class CommandDispatcher:
                             command, args, sender, message, group_id, policy,
                             quote_text=quote_text, quote_author=quote_author,
                             addressed_bot=addressed_bot,
+                            inbound_images=inbound_images,
                         )
                         if result:
                             results.append(result)
@@ -380,6 +412,7 @@ class CommandDispatcher:
                 command, args, sender, message, group_id, policy,
                 quote_text=quote_text, quote_author=quote_author,
                 addressed_bot=addressed_bot,
+                inbound_images=inbound_images,
             )
 
         # Try inline symbol detection if enabled
@@ -392,6 +425,7 @@ class CommandDispatcher:
                     "price", symbols, sender, message, group_id, policy,
                     quote_text=quote_text, quote_author=quote_author,
                     addressed_bot=addressed_bot,
+                    inbound_images=inbound_images,
                 )
         
         # Try natural language intent parsing
@@ -425,6 +459,7 @@ class CommandDispatcher:
                     bot=self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot),
                     quote_text=quote_text,
                     quote_author=quote_author,
+                    inbound_images=inbound_images or [],
                 )
                 try:
                     return await self.ask_command.execute(synthetic_ctx)
@@ -537,6 +572,7 @@ class CommandDispatcher:
                     result = await self._execute_command(
                         intent.command, intent.args, sender, message, group_id,
                         policy, addressed_bot=addressed_bot,
+                        inbound_images=inbound_images,
                     )
                     if result:
                         results.append(result)
@@ -644,6 +680,7 @@ class CommandDispatcher:
         quote_text: Optional[str] = None,
         quote_author: Optional[str] = None,
         addressed_bot=None,
+        inbound_images: Optional[list[dict]] = None,
     ) -> CommandResult:
         """Execute a command with the given arguments."""
         # Resolve context (pronouns)
@@ -679,8 +716,9 @@ class CommandDispatcher:
             bot=self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot),
             quote_text=quote_text,
             quote_author=quote_author,
+            inbound_images=inbound_images or [],
         )
-        
+
         if handler.has_help_flag(ctx):
              return handler.get_help_result()
         
@@ -739,6 +777,25 @@ class CommandDispatcher:
             logger.info("dispatch_implicit_ask: !ask not allowed by policy; skipping")
             return
 
+        # Same ContextVar dance as dispatch(): the reactor's create_task
+        # spawned this in a child task, but the reactor itself doesn't
+        # set the transcript context (its own LLM call is not logged).
+        # Set it here so the writer round downstream picks it up.
+        if policy is not None and policy.id is not None:
+            bot = self._resolve_bot(group_id, policy=policy)
+            transcript_on = (
+                bool(getattr(policy, "transcript_logging_enabled", False))
+                and policy.kind != "default"
+            )
+            set_active_transcript(ActiveContext(
+                context_id=policy.id,
+                context_label=policy.label or policy.key,
+                transcript_logging_enabled=transcript_on,
+                bot_id=getattr(bot, "id", None) if bot else None,
+                sender_tail=(sender or "")[-4:],
+                group_id=group_id,
+            ))
+
         from .base import CommandContext
         # Pre-enrichment of the message happens inside ask_command; we feed
         # the raw message and let the existing pipeline handle it.
@@ -795,8 +852,17 @@ class CommandDispatcher:
             )
             return
 
+        # Route through the answering bot's handler so multi-phone
+        # installs send from the right number. Falls back to the
+        # legacy single handler when the pool isn't wired (tests).
+        sender_handler = self.signal_handler
+        if getattr(self, "signal_pool", None) is not None:
+            sender_handler = self.signal_pool.for_bot(ctx.bot)
+        if sender_handler is None:
+            logger.warning("Implicit ask: no signal handler available")
+            return
         try:
-            await self.signal_handler.send_message(
+            await sender_handler.send_message(
                 recipient=sender,
                 message=result.text,
                 group_id=None if result.dm_only else group_id,

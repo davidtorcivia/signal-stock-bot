@@ -94,6 +94,45 @@
                     placeholder="Optional. Instructs the writer how to fold the research notes into its reply.">{{ values.deep_think_handoff_prompt }}</textarea>
         </label>
 
+        {# Hidden marker so the backend can tell "unchecked" apart from
+           "field not in form" (legacy clients). Both `vision_enabled`
+           and `deep_think_enabled` checkboxes default-on at the DB
+           level for new bots; this lets the admin actually flip them
+           off via the form. #}
+        <input type="hidden" name="_deep_think_enabled_in_form" value="1">
+
+        <label style="display:flex;align-items:center;gap:8px;margin-top:16px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+          <input type="checkbox" name="deep_think_enabled" value="1"
+                 {% if values.deep_think_enabled %}checked{% endif %} style="width:auto;">
+          <span>Deep_think enabled for this bot</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+          Master kill switch for deep_think on this bot specifically.
+          When OFF, the <code>deep_think</code> tool is hidden from the
+          writer (it can't invoke it) AND <code>research</code> mode is
+          treated as <code>replace</code> mode (no handoff). Overrides
+          the global setting and per-context flag. Useful for bots
+          whose writer already handles long reasoning natively, or for
+          cost containment on one bot without touching globals.
+        </p>
+
+        <label style="display:flex;align-items:center;gap:8px;margin-top:16px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+          <input type="checkbox" name="vision_enabled" value="1"
+                 {% if values.vision_enabled %}checked{% endif %} style="width:auto;">
+          <span>Vision (pass inbound images to the writer LLM)</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+          When on, image attachments from inbound Signal messages are
+          base64-encoded and sent to the writer in OpenAI multimodal shape
+          (text + <code>image_url</code> parts). Only enable for bots whose
+          writer model actually supports vision — non-vision endpoints will
+          reject the request. Images are one-shot: they reach the model for
+          the round that received them and are <em>not</em> persisted into
+          conversation history, so follow-up turns won't re-see them.
+          Caps: jpeg/png/webp/gif only, 5 MB per image, max 4 images per
+          message.
+        </p>
+
         {% for role in roles %}
           <h2 style="margin-top: 24px;">{{ role|capitalize }} LLM overrides</h2>
           <p class="muted" style="font-size: 11px;">

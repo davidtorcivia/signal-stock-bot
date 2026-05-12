@@ -108,6 +108,16 @@ class ContextRegistry:
                     await db.execute(
                         "ALTER TABLE contexts ADD COLUMN default_bot_id INTEGER"
                     )
+                if "transcript_logging_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN "
+                        "transcript_logging_enabled INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "history_turns_override" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN "
+                        "history_turns_override INTEGER"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_contexts_key ON contexts(key)"
                 )
@@ -137,7 +147,7 @@ class ContextRegistry:
         "mcp_mode, mcp_servers, system_prompt, llm_intent, "
         "reactor_enabled, reactor_prompt, natural_response, "
         "deep_think_enabled, memory_writes_enabled, reactor_memory_writes, "
-        "default_bot_id"
+        "default_bot_id, transcript_logging_enabled, history_turns_override"
     )
 
     @staticmethod
@@ -160,6 +170,12 @@ class ContextRegistry:
             memory_writes_enabled=bool(row[14]) if len(row) > 14 and row[14] is not None else True,
             reactor_memory_writes=bool(row[15]) if len(row) > 15 and row[15] is not None else False,
             default_bot_id=row[16] if len(row) > 16 else None,
+            transcript_logging_enabled=(
+                bool(row[17]) if len(row) > 17 and row[17] is not None else False
+            ),
+            history_turns_override=(
+                row[18] if len(row) > 18 and row[18] is not None else None
+            ),
         )
 
     async def list(self) -> list[ContextPolicy]:
@@ -253,8 +269,9 @@ class ContextRegistry:
                         reactor_enabled, reactor_prompt, natural_response,
                         deep_think_enabled, memory_writes_enabled,
                         reactor_memory_writes, default_bot_id,
+                        transcript_logging_enabled, history_turns_override,
                         first_seen, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy.kind,
                         policy.key,
@@ -272,6 +289,8 @@ class ContextRegistry:
                         1 if policy.memory_writes_enabled else 0,
                         1 if policy.reactor_memory_writes else 0,
                         policy.default_bot_id,
+                        1 if policy.transcript_logging_enabled else 0,
+                        policy.history_turns_override,
                         now,
                         now,
                     ),
@@ -289,6 +308,8 @@ class ContextRegistry:
                            memory_writes_enabled = ?,
                            reactor_memory_writes = ?,
                            default_bot_id = ?,
+                           transcript_logging_enabled = ?,
+                           history_turns_override = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -306,6 +327,8 @@ class ContextRegistry:
                         1 if policy.memory_writes_enabled else 0,
                         1 if policy.reactor_memory_writes else 0,
                         policy.default_bot_id,
+                        1 if policy.transcript_logging_enabled else 0,
+                        policy.history_turns_override,
                         now,
                         policy.id,
                     ),

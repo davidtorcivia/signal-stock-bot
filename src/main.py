@@ -699,7 +699,7 @@ def build_app(config: Config):
     # any context pinned to a different bot. ask_command holds the
     # factory and routes per-call via ctx.bot.
     from .llm.factory import LLMClientFactory
-    llm_factory = LLMClientFactory(settings_store)
+    llm_factory = LLMClientFactory(settings_store, bot_registry=bot_registry)
     llm_factory.attach_mcp_manager(mcp_manager)
     llm_client = llm_factory.get_writer(default_bot_id)
     name_registry = NameRegistry(config.watchlist_db_path, bot_name=config.bot_name)
@@ -811,36 +811,46 @@ def build_app(config: Config):
 
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
 
-    signal_config = SignalConfig(
-        api_url=config.signal_api_url,
-        phone_number=config.signal_phone_number,
+    # SignalHandlerPool: one SignalHandler (and one poller, started below) per
+    # registered phone. Single-bot installs end up with just the default phone;
+    # multi-bot installs add a handler per `bots.signal_phone` override. The
+    # `default()` handler is what legacy single-handler callers still hold; the
+    # per-bot routing happens via `pool.for_bot(bot)`.
+    from .signal import SignalHandlerPool
+    signal_pool = SignalHandlerPool(
+        default_api_url=config.signal_api_url,
+        default_phone=config.signal_phone_number,
+        dispatcher=dispatcher,
+        bot_registry=bot_registry,
     )
-    signal_handler = SignalHandler(signal_config, dispatcher)
-    reactor.signal = signal_handler  # late binding (see comment near reactor construction)
-    # Same late-binding trick: ask_command needs the handler to drive the
-    # typing indicator while its tool loop runs.
-    ask_command.signal_handler = signal_handler
-    # Dispatcher needs the handler to send spontaneous replies fired by the
-    # reactor's should_respond tool — those run outside the normal request/
-    # response path so dispatch_implicit_ask must send its own messages.
-    dispatcher.signal_handler = signal_handler
+    signal_pool.build()
+    signal_handler = signal_pool.default()
+    reactor.signal_pool = signal_pool
+    reactor.signal = signal_handler  # legacy single-handler ref kept for compatibility
+    ask_command.signal_pool = signal_pool
+    ask_command.signal_handler = signal_handler  # legacy
+    dispatcher.signal_pool = signal_pool
+    dispatcher.signal_handler = signal_handler  # legacy
     # Reactor delegates its should_respond decisions to the dispatcher's
     # implicit-ask path. This is what makes natural responses actually fire.
     reactor.implicit_response_handler = dispatcher.dispatch_implicit_ask
 
     # Auto-vote on inbound polls. Bot picks option(s) via the LLM using
     # recent group context. No policy gate — per the user's request, every
-    # poll the bot sees gets a vote (skipping self-authored ones).
+    # poll the bot sees gets a vote (skipping self-authored ones). One
+    # voter per handler — votes are cast from the phone that received the
+    # poll envelope, so each handler owns its own.
     from .signal.poll_voter import PollVoter
-    signal_handler.poll_voter = PollVoter(
-        llm_client=llm_client,
-        signal_handler=signal_handler,
-        group_log=group_log,
-        name_registry=name_registry,
-        bot_phone=config.signal_phone_number,
-    )
-    tail = config.signal_phone_number[-4:] if config.signal_phone_number else "????"
-    logger.info(f"Signal handler configured for ...{tail}")
+    for handler in signal_pool.handlers():
+        handler.poll_voter = PollVoter(
+            llm_client=llm_client,
+            signal_handler=handler,
+            group_log=group_log,
+            name_registry=name_registry,
+            bot_phone=handler.config.phone_number,
+        )
+    phones_summary = ", ".join(f"...{p[-4:]}" for p in signal_pool.phones())
+    logger.info(f"Signal pool configured: {phones_summary}")
 
     # Single shared event loop for all async work
     loop = _start_background_loop()
@@ -945,7 +955,7 @@ def build_app(config: Config):
     prediction_resolver = PredictionResolver(
         store=dispatcher.prediction_store,
         provider_manager=provider_manager,
-        signal_handler=signal_handler,
+        signal_pool=signal_pool,
         llm_client=llm_client,
         # Give the resolver the bot's full research toolkit so free-form
         # claims get verified against live data (price/news/web) instead
@@ -953,7 +963,6 @@ def build_app(config: Config):
         # resolver narrows this to read-only commands.
         bot_tools=bot_tools,
         mcp_manager=mcp_manager,
-        bot_phone=config.signal_phone_number,
         bot_registry=bot_registry,
     )
     asyncio.run_coroutine_threadsafe(prediction_resolver.run_forever(), loop)
@@ -967,9 +976,8 @@ def build_app(config: Config):
     trading_cron = TradingCronWorker(
         store=dispatcher.portfolio_store,
         ask_command=ask_command,
-        signal_handler=signal_handler,
+        signal_pool=signal_pool,
         context_registry=context_registry,
-        bot_phone=config.signal_phone_number,
         bot_registry=bot_registry,
     )
     asyncio.run_coroutine_threadsafe(trading_cron.run_forever(), loop)
@@ -985,15 +993,14 @@ def build_app(config: Config):
     orders_worker = OrdersWorker(
         store=dispatcher.portfolio_store,
         executor=dispatcher.portfolio_executor,
-        signal_handler=signal_handler,
+        signal_pool=signal_pool,
         # When orders fill/fail, the worker fires a synthetic !ask
         # invocation so the bot voices the resolution itself (and may
         # decide on a follow-up trade). Same wiring shape as the
-        # trading cron: ask_command + context_registry + bot_phone
-        # let it build a CommandContext for the affected chat.
+        # trading cron: ask_command + context_registry let it build a
+        # CommandContext for the affected chat.
         ask_command=ask_command,
         context_registry=context_registry,
-        bot_phone=config.signal_phone_number,
         bot_registry=bot_registry,
     )
     asyncio.run_coroutine_threadsafe(orders_worker.run_forever(), loop)
@@ -1028,8 +1035,7 @@ def build_app(config: Config):
             tarot_command=tarot_cmd_for_oracle,
             iching_command=iching_cmd_for_oracle,
             ask_command=ask_command,
-            signal_handler=signal_handler,
-            bot_phone=config.signal_phone_number,
+            signal_pool=signal_pool,
             bot_name=settings_store.get("bot_name") or config.bot_name or "Bot",
             bot_registry=bot_registry,
         )
@@ -1040,15 +1046,24 @@ def build_app(config: Config):
             "Daily oracle: tarot/iching commands not registered; worker not started"
         )
 
-    # WebSocket message poller
-    poller = SignalPoller(
-        api_url=config.signal_api_url,
-        phone_number=config.signal_phone_number,
-        on_message=signal_handler.handle_webhook,
-        poll_interval=1.0,
-        loop=loop,
-    )
-    poller.start()
+    # WebSocket message pollers — one per registered phone. Each poller
+    # feeds its own handler; the handler filters envelopes so only the
+    # one whose phone matches the answering bot actually dispatches.
+    pollers: list[SignalPoller] = []
+    for handler in signal_pool.handlers():
+        p = SignalPoller(
+            api_url=handler.config.api_url,
+            phone_number=handler.config.phone_number,
+            on_message=handler.handle_webhook,
+            poll_interval=1.0,
+            loop=loop,
+        )
+        p.start()
+        pollers.append(p)
+    # Keep a primary `poller` reference for the legacy app attribute set
+    # below; the rest are tracked in `pollers` and attached to the app
+    # to keep them alive.
+    poller = pollers[0] if pollers else None
 
     admin_phone = config.admin_numbers[0] if config.admin_numbers else ""
 
@@ -1079,6 +1094,8 @@ def build_app(config: Config):
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller
+    app.signal_pollers = pollers
+    app.signal_pool = signal_pool
     app.async_loop = loop
     return app
 
