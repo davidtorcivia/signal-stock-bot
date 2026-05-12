@@ -734,6 +734,7 @@ def build_app(config: Config):
         enricher=enricher,
         name_registry=name_registry,
         memory_store=memory_store,
+        llm_factory=llm_factory,
     )
 
     summarizer = Summarizer(

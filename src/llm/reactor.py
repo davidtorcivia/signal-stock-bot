@@ -28,6 +28,12 @@ from collections import deque
 from typing import Awaitable, Callable, Optional
 
 from ..admin.events import get_bus
+from ..bots.settings import (
+    resolve_bool,
+    resolve_float,
+    resolve_int,
+    resolve_stripped,
+)
 from ..cache import get_metrics
 from ..group_log import BOT_SENDER
 from ..memory import (
@@ -160,9 +166,16 @@ class EmojiReactor:
         enricher=None,
         name_registry=None,
         memory_store=None,
+        llm_factory=None,
     ):
         self.store = settings_store
+        # Default-bot LLMClient used when `llm_factory` isn't wired (tests,
+        # legacy single-bot installs). When the factory IS wired, the
+        # reactor picks a per-bot reactor-role client per call via
+        # `_llm_for(bot)` so each bot can have its own model/api_key/
+        # base_url for the decision step.
         self.llm = llm_client
+        self.llm_factory = llm_factory
         self.signal = signal_handler
         # Set post-construction by main.py. When wired, reactions route
         # through `pool.for_bot(...)` so multi-phone installs send the
@@ -212,29 +225,96 @@ class EmojiReactor:
             return f"...{(phone or '')[-4:] or '????'}"
         return self.name_registry.label_for(phone)
 
-    def _config(self) -> dict:
+    def _config(self, bot=None) -> dict:
+        """Resolve reactor settings with per-bot override.
+
+        Lookup chain for each key (first non-empty wins):
+          1. bot_llm_settings(bot.id, 'reactor', '<key>')  — set via
+             admin/scripts to give a specific bot its own reactor
+             behaviour (quieter cooldowns, custom system prompt,
+             different model)
+          2. admin_settings.reactor_<key>                  — global
+             default applied to bots without an override
+          3. caller-supplied default (built-in)
+
+        When `bot` is None the bot-scoped lookup is skipped and the
+        function reduces to the legacy "globals only" behaviour, which
+        is what single-bot installs and tests want.
+        """
         store = self.store
+        bot_id = getattr(bot, "id", None) if bot is not None else None
+
+        def _str(key: str, global_key: str, default: str = "") -> str:
+            return resolve_stripped(
+                store, bot_id, "reactor", key,
+                global_keys=[global_key], default=default,
+            )
+
+        model = _str("model", "reactor_model")
         return {
-            "enabled": bool(store.get("reactor_enabled", False)),
-            "model": (store.get("reactor_model") or "").strip() or None,
-            "max_tokens": int(store.get("reactor_max_tokens") or 50),
-            "temperature": float(store.get("reactor_temperature") or 0.3),
-            "extra_body": store.get("reactor_extra_body") or "",
-            "system_prompt": store.get("reactor_system_prompt") or DEFAULT_REACTOR_PROMPT,
-            "min_length": int(store.get("reactor_min_length") or 0),
-            "sender_cooldown": int(store.get("reactor_sender_cooldown") or 30),
-            "group_cooldown": int(store.get("reactor_group_cooldown") or 10),
-            "context_messages": int(store.get("reactor_context_messages") or 5),
-            "natural_response_enabled": bool(
-                store.get("natural_response_enabled", False)
+            "enabled": resolve_bool(
+                store, bot_id, "reactor", "enabled",
+                global_keys=["reactor_enabled"], default=False,
             ),
-            "natural_response_cooldown": int(
-                store.get("natural_response_cooldown") or 300
+            "model": model or None,
+            "max_tokens": resolve_int(
+                store, bot_id, "reactor", "max_tokens",
+                global_keys=["reactor_max_tokens"], default=50,
             ),
-            "natural_response_extra_prompt": (
-                store.get("natural_response_extra_prompt") or ""
+            "temperature": resolve_float(
+                store, bot_id, "reactor", "temperature",
+                global_keys=["reactor_temperature"], default=0.3,
+            ),
+            "extra_body": _str("extra_body", "reactor_extra_body"),
+            "system_prompt": (
+                _str("system_prompt", "reactor_system_prompt")
+                or DEFAULT_REACTOR_PROMPT
+            ),
+            "min_length": resolve_int(
+                store, bot_id, "reactor", "min_length",
+                global_keys=["reactor_min_length"], default=0,
+            ),
+            "sender_cooldown": resolve_int(
+                store, bot_id, "reactor", "sender_cooldown",
+                global_keys=["reactor_sender_cooldown"], default=30,
+            ),
+            "group_cooldown": resolve_int(
+                store, bot_id, "reactor", "group_cooldown",
+                global_keys=["reactor_group_cooldown"], default=10,
+            ),
+            "context_messages": resolve_int(
+                store, bot_id, "reactor", "context_messages",
+                global_keys=["reactor_context_messages"], default=5,
+            ),
+            "natural_response_enabled": resolve_bool(
+                store, bot_id, "reactor", "natural_response_enabled",
+                global_keys=["natural_response_enabled"], default=False,
+            ),
+            "natural_response_cooldown": resolve_int(
+                store, bot_id, "reactor", "natural_response_cooldown",
+                global_keys=["natural_response_cooldown"], default=300,
+            ),
+            "natural_response_extra_prompt": _str(
+                "natural_response_extra_prompt",
+                "natural_response_extra_prompt",
             ),
         }
+
+    def _llm_for(self, bot):
+        """Pick the LLM client that will run the reactor decision call.
+
+        When `llm_factory` is wired, the bot's reactor-role client gives
+        per-bot api_key/base_url/timeout. Otherwise fall back to the
+        construction-time `self.llm` (default bot's writer in main.py,
+        or a hand-injected client in tests).
+        """
+        if self.llm_factory is None or bot is None or getattr(bot, "id", None) is None:
+            return self.llm
+        try:
+            return self.llm_factory.get_reactor(bot.id)
+        except Exception as e:
+            logger.debug(f"Reactor: get_reactor({bot}) failed: {e}; falling back")
+            return self.llm
 
     def _natural_response_active(self, group_id: str, cfg: dict, policy) -> bool:
         """Decide whether to expose should_respond for this evaluation.
@@ -473,7 +553,7 @@ class EmojiReactor:
             if not group_id or not target_timestamp or not message:
                 return
 
-            cfg = self._config()
+            cfg = self._config(bot)
             if not cfg["enabled"]:
                 metrics.record_reactor_skip("disabled")
                 return
@@ -561,8 +641,9 @@ class EmojiReactor:
                 f"{', +respond' if offer_should_respond else ''}): {preview!r}"
             )
 
+            llm_for_call = self._llm_for(bot)
             try:
-                assistant_msg = await self.llm.chat_messages(
+                assistant_msg = await llm_for_call.chat_messages(
                     messages,
                     tools=tools,
                     overrides=overrides,

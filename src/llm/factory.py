@@ -57,6 +57,7 @@ class LLMClientFactory:
         # and leak persona across bots.
         self.bot_registry = bot_registry
         self._writers: dict[Optional[int], LLMClient] = {}
+        self._reactors: dict[Optional[int], LLMClient] = {}
         self._deep_thinks: dict[Optional[int], DeepThinkClient] = {}
         # Late-bound; updated via attach_bot_tools / attach_mcp_manager.
         self._bot_tools = None
@@ -91,6 +92,26 @@ class LLMClientFactory:
                     persona_provider=self._persona_for if bot_id is not None else None,
                 )
                 self._writers[bot_id] = client
+            return client
+
+    def get_reactor(self, bot_id: Optional[int]) -> LLMClient:
+        """Reactor-role client per bot. Used as the HTTP plumbing for the
+        emoji/should_respond decision call. Reactor-specific values
+        (model, temperature, prompt, cooldowns) are owned by EmojiReactor
+        and passed in via `overrides`; this client only contributes
+        api_key / base_url / timeout from the bot_llm_settings(bot,
+        'reactor', *) → admin_settings.llm_* chain, so a bot that points
+        its reactor at a different provider transparently works.
+        """
+        with self._lock:
+            client = self._reactors.get(bot_id)
+            if client is None:
+                client = LLMClient(
+                    self.store,
+                    bot_id=bot_id,
+                    role="reactor",
+                )
+                self._reactors[bot_id] = client
             return client
 
     def get_deep_think(self, bot_id: Optional[int]) -> DeepThinkClient:
@@ -128,16 +149,21 @@ class LLMClientFactory:
         client."""
         with self._lock:
             self._writers.pop(bot_id, None)
+            self._reactors.pop(bot_id, None)
             self._deep_thinks.pop(bot_id, None)
 
     async def close_all(self) -> None:
         """Close every cached client's aiohttp session. Called from
         shutdown paths."""
         with self._lock:
-            writers = list(self._writers.values())
+            clients = (
+                list(self._writers.values())
+                + list(self._reactors.values())
+            )
             self._writers.clear()
+            self._reactors.clear()
             self._deep_thinks.clear()
-        for client in writers:
+        for client in clients:
             try:
                 await client.close()
             except Exception as e:
