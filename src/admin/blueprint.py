@@ -617,13 +617,16 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
 # setting." That's why we DELETE on blank rather than storing an empty
 # string — it preserves the bot -> global -> default resolver behavior.
 #
-# The reactor role is intentionally excluded here. The reactor is a
-# single global service (one EmojiReactor per app, configured via
-# /admin/llm), not per-bot — when natural_response fires it routes the
-# implicit !ask through the appropriate bot's writer, but the reactor
-# call itself uses the global reactor_* settings. Showing reactor
-# overrides on the bot form would mislead admins into authoring rows
-# that no code path reads.
+# Reactor fields fall in two groups:
+#   * LLM-call config (base_url..extra_body) — used by the bot's reactor-
+#     role LLMClient via LLMClientFactory.get_reactor(bot.id).
+#   * Reactor-behavior config (min_length..natural_response_extra_prompt)
+#     — read by EmojiReactor._config(bot) and either gates the decision
+#     (cooldowns, min_length) or shapes the prompt/tools (system_prompt,
+#     natural_response_*).
+# Both groups resolve the same way: bot_llm_settings(bot.id, 'reactor',
+# <key>) overrides the global reactor_<key> on admin_settings. Leaving a
+# field blank deletes the per-bot row so the global wins again.
 _BOT_LLM_FIELDS = {
     "writer": [
         ("base_url", "str"),
@@ -634,6 +637,23 @@ _BOT_LLM_FIELDS = {
         ("timeout_seconds", "int"),
         ("system_prompt", "str"),
         ("extra_body", "json"),
+    ],
+    "reactor": [
+        ("base_url", "str"),
+        ("api_key", "secret"),
+        ("model", "str"),
+        ("temperature", "float"),
+        ("max_tokens", "int"),
+        ("timeout_seconds", "int"),
+        ("system_prompt", "str"),
+        ("extra_body", "json"),
+        ("min_length", "int"),
+        ("sender_cooldown", "int"),
+        ("group_cooldown", "int"),
+        ("context_messages", "int"),
+        ("natural_response_enabled", "str"),
+        ("natural_response_cooldown", "int"),
+        ("natural_response_extra_prompt", "str"),
     ],
     "deep_think": [
         ("base_url", "str"),
@@ -967,17 +987,18 @@ def _register_bots_routes(
         result without a full page reload (LLM calls take seconds —
         a redirect would be a poor UX).
 
-        Roles: 'writer' or 'deep_think'. Bot's own per-bot overrides
-        compose with the global keys per the resolver chain — same
-        path a real !ask would take, so a green check here means real
-        traffic should also land. Reactor isn't testable per-bot
-        because it's a global service; admins test reactor via
-        /admin/llm.
+        Roles: 'writer', 'reactor', or 'deep_think'. Bot's own per-bot
+        overrides compose with the global keys per the resolver chain —
+        same path a real !ask / reactor evaluation would take, so a
+        green check here means real traffic should also land.
         """
-        if role not in ("writer", "deep_think"):
+        if role not in ("writer", "reactor", "deep_think"):
             return jsonify(
                 ok=False,
-                error=f"role must be 'writer' or 'deep_think', got {role!r}",
+                error=(
+                    f"role must be 'writer', 'reactor', or 'deep_think', "
+                    f"got {role!r}"
+                ),
             ), 400
         if not verify_csrf():
             return jsonify(ok=False, error="Session expired."), 403
@@ -992,10 +1013,12 @@ def _register_bots_routes(
             return jsonify(ok=False, error="Bot not found."), 404
 
         prompt = (request.form.get("prompt", "") or "").strip() or None
-        client = (
-            llm_factory.get_writer(bot_id) if role == "writer"
-            else llm_factory.get_deep_think(bot_id)
-        )
+        if role == "writer":
+            client = llm_factory.get_writer(bot_id)
+        elif role == "reactor":
+            client = llm_factory.get_reactor(bot_id)
+        else:
+            client = llm_factory.get_deep_think(bot_id)
         # Generous timeout: LAN MLX can be slow to first-token on a
         # cold model. 90s covers most warm-up scenarios; admins
         # waiting longer than that on a connectivity check probably

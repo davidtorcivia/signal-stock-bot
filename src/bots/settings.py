@@ -68,8 +68,17 @@ def _coerce_float(raw: Any, default: float) -> float:
 
 
 def _coerce_bool(raw: Any, default: bool) -> bool:
+    """Coerce a stored setting to bool.
+
+    Strings need their own truthiness rule — `bool("0")` and `bool("false")`
+    are both True in Python, which would silently invert any admin-entered
+    "0" / "false" / "no" in the per-bot form. Numbers and proper bools use
+    the standard truthiness.
+    """
     if raw is None:
         return default
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
     return bool(raw)
 
 

@@ -131,6 +131,28 @@ async def test_config_falls_back_to_default_prompt(store):
     assert cfg["system_prompt"] == DEFAULT_REACTOR_PROMPT
 
 
+@pytest.mark.asyncio
+async def test_string_zero_is_treated_as_false(store):
+    """Admin types "0" in the per-bot form to disable a bool — the
+    coercer must NOT see `bool("0") == True` (Python default). Without
+    this fix the form input would silently invert."""
+    store.set_bot(7, "reactor", "enabled", "0")
+    reactor = EmojiReactor(settings_store=store, llm_client=None, signal_handler=None)
+    cfg = reactor._config(_ctx_bot(bot_id=7))
+    assert cfg["enabled"] is False
+
+    # And "false" / "no" / "off" all read False too.
+    for val in ("false", "False", "no", "off", ""):
+        store.set_bot(7, "reactor", "enabled", val)
+        cfg = reactor._config(_ctx_bot(bot_id=7))
+        assert cfg["enabled"] is False, f"{val!r} should coerce to False"
+
+    for val in ("1", "true", "True", "yes", "on"):
+        store.set_bot(7, "reactor", "enabled", val)
+        cfg = reactor._config(_ctx_bot(bot_id=7))
+        assert cfg["enabled"] is True, f"{val!r} should coerce to True"
+
+
 # ── Reactor._llm_for ───────────────────────────────────────────────────────
 
 
