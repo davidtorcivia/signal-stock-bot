@@ -13,6 +13,7 @@ Pruning is triggered on every write:
   * global age cap:      rows older than `llm_retention_days` deleted
 """
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -122,6 +123,18 @@ class ConversationHistory:
                 # context_key so per-(bot,context) reads stay cheap.
                 await db.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN bot_id INTEGER"
+                )
+            if "image_refs" not in cols:
+                # Vision history: JSON-encoded list of
+                # {mime, data_b64, filename} dicts attached to the user
+                # turn when the inbound message carried images. NULL on
+                # text-only turns. Replay window (last N user turns)
+                # is gated in ask_command — older rows keep the column
+                # populated until they age out via the standard
+                # row-cap / retention prune, but the model only sees
+                # the last N.
+                await db.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN image_refs TEXT"
                 )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_ctx_time "
@@ -250,7 +263,8 @@ class ConversationHistory:
         n = (turns_per_user or self.turns_per_user) * 2
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT role, content, sender_tail, user_hash, created_at
+                """SELECT role, content, sender_tail, user_hash, created_at,
+                          image_refs
                    FROM conversation_turns
                    WHERE context_key = ?
                    ORDER BY created_at DESC, id DESC
@@ -260,7 +274,7 @@ class ConversationHistory:
             rows = await cursor.fetchall()
 
         turns: list[dict] = []
-        for role, content, sender_tail, user_hash, created_at in reversed(rows):
+        for role, content, sender_tail, user_hash, created_at, image_refs_json in reversed(rows):
             text = content
             if role == "user":
                 name = (
@@ -290,7 +304,20 @@ class ConversationHistory:
                     bracket = _join_bracket(f"to {name}", ago)
                     if bracket:
                         text = f"[{bracket}] {content}"
-            turns.append({"role": role, "content": text})
+            turn: dict = {"role": role, "content": text}
+            # Image attachments stored at append time. ask_command
+            # inflates these into multimodal parts for the last N user
+            # turns; older turns keep the column populated but the LLM
+            # only sees the text. Empty / malformed JSON yields no
+            # images (the row falls back to text-only safely).
+            if image_refs_json:
+                try:
+                    refs = json.loads(image_refs_json)
+                    if isinstance(refs, list) and refs:
+                        turn["image_refs"] = refs
+                except (TypeError, ValueError):
+                    pass
+            turns.append(turn)
         return turns
 
     async def latest_turn_timestamp(self, context_key: str) -> Optional[float]:
@@ -335,12 +362,19 @@ class ConversationHistory:
         user_hash: Optional[str] = None,
         sender_tail: Optional[str] = None,
         turns_per_user: Optional[int] = None,
+        image_refs: Optional[list[dict]] = None,
     ) -> None:
         """Insert one turn and prune by row-cap (per context) and age (global).
 
         `turns_per_user` overrides the constructor default so a per-context
         override can keep more (or fewer) rows than the global setting —
         otherwise append-time pruning would clip whatever load() asks for.
+
+        `image_refs` is a list of `{mime, data_b64, filename}` dicts
+        captured by the signal handler from inbound attachments. Serialized
+        to JSON in the `image_refs` column; ask_command re-inflates the
+        last N user turns' refs into OpenAI multimodal parts so follow-up
+        questions can refer back to the picture.
         """
         await self._ensure_initialized()
 
@@ -350,13 +384,23 @@ class ConversationHistory:
             turns_per_user if turns_per_user is not None else self.turns_per_user
         )
         max_rows = max(0, effective_turns) * 2
+        image_refs_json: Optional[str] = None
+        if image_refs:
+            try:
+                image_refs_json = json.dumps(image_refs)
+            except (TypeError, ValueError) as e:
+                # Malformed payload — log and persist without images
+                # rather than dropping the turn entirely.
+                logger.warning(f"history.append: image_refs serialize failed: {e}")
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """INSERT INTO conversation_turns
-                   (user_hash, context_key, sender_tail, role, content, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (user_hash, context_key, sender_tail, role, content, now),
+                   (user_hash, context_key, sender_tail, role, content,
+                    created_at, image_refs)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_hash, context_key, sender_tail, role, content,
+                 now, image_refs_json),
             )
             # Age-based purge (whole table)
             await db.execute(

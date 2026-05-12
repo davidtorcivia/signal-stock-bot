@@ -1654,6 +1654,66 @@ class AskCommand(BaseCommand):
             return self.signal_pool.for_bot(getattr(ctx, "bot", None))
         return self.signal_handler
 
+    # How many of the most-recent user turns should keep their image
+    # attachments visible to the writer. Tuned by feel: 5 covers normal
+    # follow-up ("what's the price label on that chart?", "how about the
+    # next one?") without ballooning the prompt with image tokens that
+    # the user has long since moved past. Each image is paid for per
+    # writer round, so this trades cost for coherence.
+    VISION_HISTORY_USER_TURNS = 5
+
+    def _inflate_image_history(self, prior: list[dict], ctx) -> None:
+        """Re-attach persisted images to the last N user turns in-place.
+
+        Walks `prior` (chronological order) and:
+          1. Keeps `image_refs` on the last N user turns; drops them on
+             older user turns so the writer doesn't carry stale pictures
+             round after round.
+          2. Converts kept image_refs into OpenAI multimodal `content`
+             parts (`[{type: text, ...}, {type: image_url, ...}, ...]`).
+          3. Removes the `image_refs` key from every turn so the dicts
+             are clean OpenAI message shape when extended onto `messages`.
+
+        No-op when the active bot has vision disabled — even if old
+        rows have image_refs persisted (vision was on previously), we
+        don't replay pictures to a text-only model.
+        """
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        vision_on = bool(bot and getattr(bot, "vision_enabled", False))
+        # Walk in reverse so we keep refs on the MOST RECENT N user turns,
+        # not the FIRST N. Older user turns get their refs cleared
+        # whether vision is on or off — the column stays populated in
+        # SQLite until age-prune, but the LLM only ever sees the
+        # freshest N.
+        seen_user = 0
+        for turn in reversed(prior):
+            if turn.get("role") != "user":
+                continue
+            if not vision_on or seen_user >= self.VISION_HISTORY_USER_TURNS:
+                turn.pop("image_refs", None)
+            seen_user += 1
+
+        if not vision_on:
+            return
+
+        for turn in prior:
+            refs = turn.pop("image_refs", None)
+            if not refs:
+                continue
+            text_content = turn.get("content") or ""
+            parts: list[dict] = [{"type": "text", "text": text_content}]
+            for img in refs:
+                mime = (img.get("mime") or "image/jpeg") if isinstance(img, dict) else ""
+                b64 = (img.get("data_b64") or "") if isinstance(img, dict) else ""
+                if not b64:
+                    continue
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                })
+            if len(parts) > 1:
+                turn["content"] = parts
+
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
             return CommandResult.error(
@@ -1707,6 +1767,16 @@ class AskCommand(BaseCommand):
                 )
                 for m, new_content in zip(text_msgs, enriched):
                     m["content"] = new_content
+
+            # Image-history replay: re-attach images on the last
+            # `VISION_HISTORY_USER_TURNS` user messages so follow-ups
+            # ("what was the gap on that chart?") still see the picture.
+            # Older user turns drop their refs — once the conversation
+            # has moved on a few rounds the images become dead weight
+            # in the prompt. Gated on the active bot still being
+            # vision-enabled; if vision was turned off, we don't
+            # re-surface old images regardless of what's persisted.
+            self._inflate_image_history(prior, ctx)
 
             group_ctx_block = await self._build_group_context(ctx, now_ts)
 
@@ -2359,10 +2429,18 @@ class AskCommand(BaseCommand):
             # context-override of 30 doesn't get clipped back to the global
             # 6 on every write.
             live_turns = self._live_turns(ctx)
+            # Persist inbound images on the user turn so follow-ups can
+            # re-see them (see _inflate_image_history). Only when vision
+            # was actually active this round — if the bot doesn't have
+            # vision the bytes aren't on inbound_images anyway, but we
+            # also gate explicitly so a misconfigured handler can't
+            # accidentally bloat history with bytes no one will read.
+            persisted_images = inbound_images if vision_active else None
             await self.history.append(
                 context_key, "user", question,
                 user_hash=user_hash, sender_tail=sender_tail,
                 turns_per_user=live_turns,
+                image_refs=persisted_images,
             )
             # Persist the addressee on the assistant row too: the load path
             # uses it to render `[to Name, time ago]` in group playback so
