@@ -224,7 +224,81 @@ class MassiveProvider(BaseProvider):
             # Let's assume Msec for consistency unless values suggest otherwise.
             provider="massive"
         )
-    
+
+    async def get_options_chain(
+        self,
+        underlying: str,
+        expiration: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[OptionQuote]:
+        """List contracts on `underlying` via the v3 chain snapshot.
+
+        Polygon endpoint: ``/v3/snapshot/options/{underlying}``. When
+        `expiration` (ISO YYYY-MM-DD) is set, results are filtered to
+        that single expiry. We page once and cap at `limit` rows — for
+        a chain explorer the LLM mostly wants ATM ± a few strikes, not
+        the entire tape.
+        """
+        underlying = underlying.strip().upper()
+        if not underlying:
+            raise ProviderError("get_options_chain: underlying required")
+        endpoint = f"/v3/snapshot/options/{underlying}"
+        params: Dict[str, Any] = {"limit": max(1, min(250, int(limit)))}
+        if expiration:
+            params["expiration_date"] = expiration
+        data = await self._request(endpoint, params=params)
+        rows = data.get("results") or []
+        chain: list[OptionQuote] = []
+        for res in rows:
+            details = res.get("details") or {}
+            day_stats = res.get("day") or {}
+            greeks = res.get("greeks") or {}
+            last_quote = res.get("last_quote") or {}
+            exp_date = details.get("expiration_date") or ""
+            try:
+                exp_dt = (
+                    datetime.strptime(exp_date, "%Y-%m-%d")
+                    if exp_date else datetime.now()
+                )
+            except ValueError:
+                exp_dt = datetime.now()
+            ticker = details.get("ticker") or ""
+            # Strip the Polygon "O:" prefix so the canonical OCC symbol
+            # flows out — the rest of the system expects bare OCC.
+            if ticker.startswith("O:"):
+                ticker = ticker[2:]
+            # Premium: prefer the day's close; fall back to mid of last
+            # quote (bid+ask)/2; finally 0. Polygon returns 0 for
+            # contracts with no day activity, which we surface as-is
+            # (caller can decide whether to display "no trade today").
+            price = day_stats.get("close")
+            if not price:
+                bid = last_quote.get("bid") or 0.0
+                ask = last_quote.get("ask") or 0.0
+                if bid and ask:
+                    price = (bid + ask) / 2.0
+            price = price or 0.0
+            ts_ns = res.get("updated") or 0
+            chain.append(OptionQuote(
+                symbol=ticker,
+                underlying=(res.get("underlying_asset") or {}).get("ticker", underlying),
+                expiration=exp_dt,
+                strike=float(details.get("strike_price") or 0.0),
+                type=details.get("contract_type") or "unknown",
+                price=float(price),
+                change=float(day_stats.get("change") or 0.0),
+                change_percent=float(day_stats.get("change_percent") or 0.0),
+                volume=int(day_stats.get("volume") or 0),
+                open_interest=int(res.get("open_interest") or 0),
+                implied_volatility=res.get("implied_volatility"),
+                greeks=greeks or None,
+                timestamp=(
+                    datetime.fromtimestamp(ts_ns / 1e9) if ts_ns else datetime.now()
+                ),
+                provider="massive",
+            ))
+        return chain
+
     async def get_forex_quote(self, symbol: str) -> ForexQuote:
         """
         Get Forex rate.

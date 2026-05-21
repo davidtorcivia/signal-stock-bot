@@ -60,7 +60,14 @@ SOURCE_ADMIN = "admin"
 # Used both for the trigger fill itself and for any follow-up trades
 # the bot makes inside the order-fired !ask reaction.
 SOURCE_ORDER = "order"
-VALID_SOURCES = {SOURCE_CRON, SOURCE_REACTIVE, SOURCE_ADMIN, SOURCE_ORDER}
+# Auto-settlement of expired options contracts (ITM cash-settle or OTM
+# expire-worthless). Distinguishes positions that closed via an
+# explicit bot decision from those that ran to expiration.
+SOURCE_SETTLEMENT = "settle"
+VALID_SOURCES = {
+    SOURCE_CRON, SOURCE_REACTIVE, SOURCE_ADMIN, SOURCE_ORDER,
+    SOURCE_SETTLEMENT,
+}
 
 
 def _is_valid_amount(value: float) -> bool:
@@ -123,6 +130,44 @@ class Position:
     ticker: str
     qty: float
     avg_cost: float
+
+
+@dataclass
+class OptionPosition:
+    """Long options position. Quantity is whole contracts (always > 0;
+    V1 is long-only). `multiplier` is shares-per-contract — 100 for
+    standard US equity options. `avg_premium` is per-share, so cost
+    basis = qty × multiplier × avg_premium.
+    """
+    context_key: str
+    contract_symbol: str   # canonical OCC, e.g. AAPL250620C00175000
+    underlying: str
+    option_type: str       # 'call' or 'put'
+    strike: float
+    expiration: float      # unix ts; midnight UTC of expiration date
+    qty: float
+    avg_premium: float
+    multiplier: int
+
+
+@dataclass
+class OptionTrade:
+    id: int
+    context_key: str
+    ts: float
+    contract_symbol: str
+    underlying: str
+    option_type: str
+    strike: float
+    expiration: float
+    side: str              # 'buy' / 'sell' / 'settle'
+    qty: float
+    premium: float         # per-share premium at fill (or intrinsic on settle)
+    multiplier: int
+    proceeds: float        # qty * premium * multiplier — always positive
+    realized_pnl: Optional[float]
+    reason: Optional[str]
+    source: str
 
 
 @dataclass
@@ -392,6 +437,65 @@ class PortfolioStore:
                 "CREATE INDEX IF NOT EXISTS idx_orders_context_status "
                 "ON portfolio_orders(context_key, status, created_at DESC)"
             )
+            # Options positions (long-only). One row per
+            # (context_key, contract_symbol). Contract symbol is the
+            # canonical OCC form — see src/options_symbols.py for
+            # parsing helpers. `expiration` is unix-ts at start-of-day
+            # for the expiration date so settlement can compare with
+            # ``time.time()`` directly.
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS options_positions (
+                    context_key TEXT NOT NULL,
+                    contract_symbol TEXT NOT NULL,
+                    underlying TEXT NOT NULL,
+                    option_type TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    expiration REAL NOT NULL,
+                    qty REAL NOT NULL,
+                    avg_premium REAL NOT NULL,
+                    multiplier INTEGER NOT NULL DEFAULT 100,
+                    PRIMARY KEY (context_key, contract_symbol)
+                )
+                """
+            )
+            # Speeds up the settlement worker's "what's expiring at or
+            # before now?" scan across all contexts.
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_options_pos_expiration "
+                "ON options_positions(expiration)"
+            )
+            # Options trade ledger. Mirrors `trades` but with the extra
+            # contract metadata so a single SELECT carries everything
+            # needed to display a fill without joining back to
+            # options_positions (which may already be gone for closed
+            # trades).
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS option_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    context_key TEXT NOT NULL,
+                    ts REAL NOT NULL,
+                    contract_symbol TEXT NOT NULL,
+                    underlying TEXT NOT NULL,
+                    option_type TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    expiration REAL NOT NULL,
+                    side TEXT NOT NULL,
+                    qty REAL NOT NULL,
+                    premium REAL NOT NULL,
+                    multiplier INTEGER NOT NULL DEFAULT 100,
+                    proceeds REAL NOT NULL,
+                    realized_pnl REAL,
+                    reason TEXT,
+                    source TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_option_trades_context_ts "
+                "ON option_trades(context_key, ts DESC)"
+            )
             await db.commit()
 
     # ------------------------------------------------------------------
@@ -459,6 +563,7 @@ class PortfolioStore:
                     return False
                 for table in (
                     "positions", "trades", "tips", "portfolio_cron_runs",
+                    "options_positions", "option_trades",
                 ):
                     await db.execute(
                         f"DELETE FROM {table} WHERE context_key = ?",
@@ -779,7 +884,8 @@ class PortfolioStore:
         ]
 
     async def realized_pnl_total(self, context_key: str) -> float:
-        """Sum of realized PnL across all sell trades."""
+        """Sum of realized PnL across all sell trades (equities +
+        options closes + option settlements)."""
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
@@ -788,7 +894,365 @@ class PortfolioStore:
                 (context_key,),
             )
             row = await cursor.fetchone()
-        return float(row[0]) if row else 0.0
+            equity_realized = float(row[0]) if row else 0.0
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM option_trades "
+                "WHERE context_key = ? AND realized_pnl IS NOT NULL",
+                (context_key,),
+            )
+            row = await cursor.fetchone()
+            options_realized = float(row[0]) if row else 0.0
+        return equity_realized + options_realized
+
+    # ------------------------------------------------------------------
+    # Options trading (long-only; multiplier 100 by default)
+    # ------------------------------------------------------------------
+
+    async def options_positions(self, context_key: str) -> list[OptionPosition]:
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT context_key, contract_symbol, underlying, option_type,
+                          strike, expiration, qty, avg_premium, multiplier
+                   FROM options_positions
+                   WHERE context_key = ? ORDER BY expiration, contract_symbol""",
+                (context_key,),
+            )
+            rows = await cursor.fetchall()
+        return [
+            OptionPosition(
+                context_key=r[0], contract_symbol=r[1], underlying=r[2],
+                option_type=r[3], strike=float(r[4]), expiration=float(r[5]),
+                qty=float(r[6]), avg_premium=float(r[7]), multiplier=int(r[8]),
+            ) for r in rows
+        ]
+
+    async def get_option_position(
+        self, context_key: str, contract_symbol: str,
+    ) -> Optional[OptionPosition]:
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT context_key, contract_symbol, underlying, option_type,
+                          strike, expiration, qty, avg_premium, multiplier
+                   FROM options_positions
+                   WHERE context_key = ? AND contract_symbol = ?""",
+                (context_key, contract_symbol.upper()),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return OptionPosition(
+            context_key=row[0], contract_symbol=row[1], underlying=row[2],
+            option_type=row[3], strike=float(row[4]), expiration=float(row[5]),
+            qty=float(row[6]), avg_premium=float(row[7]),
+            multiplier=int(row[8]),
+        )
+
+    async def list_options_positions_all(self) -> list[OptionPosition]:
+        """Every open options position across every context — used by
+        the settlement worker, which scans expirations globally."""
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT context_key, contract_symbol, underlying, option_type,
+                          strike, expiration, qty, avg_premium, multiplier
+                   FROM options_positions ORDER BY expiration"""
+            )
+            rows = await cursor.fetchall()
+        return [
+            OptionPosition(
+                context_key=r[0], contract_symbol=r[1], underlying=r[2],
+                option_type=r[3], strike=float(r[4]), expiration=float(r[5]),
+                qty=float(r[6]), avg_premium=float(r[7]), multiplier=int(r[8]),
+            ) for r in rows
+        ]
+
+    async def buy_option(
+        self,
+        context_key: str,
+        *,
+        contract_symbol: str,
+        underlying: str,
+        option_type: str,
+        strike: float,
+        expiration: float,
+        qty: float,
+        premium: float,
+        multiplier: int = 100,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+    ) -> dict:
+        """Open or add to a long options position. Atomically deducts
+        cost (qty × multiplier × premium) from cash, inserts an option
+        trade, upserts the position with rolling avg_premium.
+
+        Returns ``{"ok": True, "trade_id", "cash_after", "qty_after",
+        "avg_premium_after", "proceeds"}`` on success, or
+        ``{"ok": False, "error": str}`` otherwise.
+        """
+        if source not in VALID_SOURCES:
+            raise ValueError(f"invalid source: {source!r}")
+        if option_type not in ("call", "put"):
+            return {"ok": False, "error": f"option_type must be 'call' or 'put', got {option_type!r}"}
+        if not _is_valid_amount(qty) or not _is_valid_amount(premium):
+            return {"ok": False, "error": "qty and premium must be finite numbers."}
+        if qty <= 0:
+            return {"ok": False, "error": "qty must be positive."}
+        if premium <= 0:
+            return {"ok": False, "error": "premium must be positive (no zero-bid opens)."}
+        if multiplier <= 0:
+            return {"ok": False, "error": "multiplier must be positive."}
+        if strike <= 0:
+            return {"ok": False, "error": "strike must be positive."}
+        contract_symbol = contract_symbol.strip().upper()
+        underlying = underlying.strip().upper()
+        if not contract_symbol or not underlying:
+            return {"ok": False, "error": "contract_symbol and underlying are required."}
+
+        proceeds = qty * premium * multiplier
+        await self.ensure_portfolio(context_key)
+
+        async with db_session(self) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "SELECT cash FROM portfolios WHERE context_key = ?",
+                    (context_key,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await db.rollback()
+                    return {"ok": False, "error": "Portfolio not found."}
+                cash = row[0]
+                if proceeds > cash + 1e-9:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Insufficient cash: need ${proceeds:,.2f} "
+                            f"(qty {qty:g} × premium ${premium:.2f} × "
+                            f"{multiplier}), have ${cash:,.2f}."
+                        ),
+                    }
+
+                cursor = await db.execute(
+                    "SELECT qty, avg_premium FROM options_positions "
+                    "WHERE context_key = ? AND contract_symbol = ?",
+                    (context_key, contract_symbol),
+                )
+                pos_row = await cursor.fetchone()
+                if pos_row is None:
+                    new_qty = qty
+                    new_avg = premium
+                    await db.execute(
+                        """INSERT INTO options_positions
+                           (context_key, contract_symbol, underlying, option_type,
+                            strike, expiration, qty, avg_premium, multiplier)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            context_key, contract_symbol, underlying, option_type,
+                            float(strike), float(expiration), new_qty, new_avg,
+                            int(multiplier),
+                        ),
+                    )
+                else:
+                    old_qty, old_avg = pos_row[0], pos_row[1]
+                    new_qty = old_qty + qty
+                    new_avg = ((old_qty * old_avg) + (qty * premium)) / new_qty
+                    await db.execute(
+                        "UPDATE options_positions SET qty = ?, avg_premium = ? "
+                        "WHERE context_key = ? AND contract_symbol = ?",
+                        (new_qty, new_avg, context_key, contract_symbol),
+                    )
+
+                cash_after = cash - proceeds
+                await db.execute(
+                    "UPDATE portfolios SET cash = ? WHERE context_key = ?",
+                    (cash_after, context_key),
+                )
+
+                cursor = await db.execute(
+                    """INSERT INTO option_trades
+                       (context_key, ts, contract_symbol, underlying, option_type,
+                        strike, expiration, side, qty, premium, multiplier,
+                        proceeds, realized_pnl, reason, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                    (
+                        context_key, time.time(), contract_symbol, underlying,
+                        option_type, float(strike), float(expiration),
+                        SIDE_BUY, qty, premium, int(multiplier), proceeds,
+                        reason, source,
+                    ),
+                )
+                trade_id = cursor.lastrowid or 0
+                await db.commit()
+                return {
+                    "ok": True,
+                    "trade_id": trade_id,
+                    "cash_after": cash_after,
+                    "qty_after": new_qty,
+                    "avg_premium_after": new_avg,
+                    "proceeds": proceeds,
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def sell_option(
+        self,
+        context_key: str,
+        *,
+        contract_symbol: str,
+        qty: float,
+        premium: float,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+        settlement_intrinsic: Optional[float] = None,
+    ) -> dict:
+        """Close (some of) a long options position at the given premium.
+        Atomically credits cash, records the realized PnL, and
+        decrements the position (deletes the row when qty hits zero).
+
+        `settlement_intrinsic` is used by the settlement path: when set
+        the trade side is recorded as 'settle' and `premium` reflects
+        per-share intrinsic value. The default path records side='sell'.
+
+        V1 is long-only: trying to sell more than held returns an error.
+        """
+        if source not in VALID_SOURCES:
+            raise ValueError(f"invalid source: {source!r}")
+        if not _is_valid_amount(qty) or qty <= 0:
+            return {"ok": False, "error": "qty must be positive and finite."}
+        if not _is_valid_amount(premium) or premium < 0:
+            return {"ok": False, "error": "premium must be finite and non-negative."}
+        contract_symbol = contract_symbol.strip().upper()
+        if not contract_symbol:
+            return {"ok": False, "error": "contract_symbol required."}
+
+        await self.ensure_portfolio(context_key)
+        is_settlement = settlement_intrinsic is not None
+        side = "settle" if is_settlement else SIDE_SELL
+
+        async with db_session(self) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """SELECT qty, avg_premium, underlying, option_type,
+                              strike, expiration, multiplier
+                       FROM options_positions
+                       WHERE context_key = ? AND contract_symbol = ?""",
+                    (context_key, contract_symbol),
+                )
+                pos_row = await cursor.fetchone()
+                if pos_row is None:
+                    await db.rollback()
+                    return {"ok": False, "error": f"No options position in {contract_symbol}."}
+                old_qty, old_avg = pos_row[0], pos_row[1]
+                underlying = pos_row[2]
+                option_type = pos_row[3]
+                strike = float(pos_row[4])
+                expiration = float(pos_row[5])
+                multiplier = int(pos_row[6])
+                if qty > old_qty + 1e-6:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Only hold {old_qty:g} contracts of "
+                            f"{contract_symbol}; can't close {qty:g}."
+                        ),
+                    }
+                # Snap exact-close requests to the stored qty.
+                if abs(qty - old_qty) < 1e-6:
+                    qty = old_qty
+                proceeds = qty * premium * multiplier
+                realized = (premium - old_avg) * qty * multiplier
+                new_qty = old_qty - qty
+
+                if new_qty <= 1e-9:
+                    await db.execute(
+                        "DELETE FROM options_positions "
+                        "WHERE context_key = ? AND contract_symbol = ?",
+                        (context_key, contract_symbol),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE options_positions SET qty = ? "
+                        "WHERE context_key = ? AND contract_symbol = ?",
+                        (new_qty, context_key, contract_symbol),
+                    )
+
+                cursor = await db.execute(
+                    "SELECT cash FROM portfolios WHERE context_key = ?",
+                    (context_key,),
+                )
+                row = await cursor.fetchone()
+                cash = row[0] if row else 0.0
+                cash_after = cash + proceeds
+                await db.execute(
+                    "UPDATE portfolios SET cash = ? WHERE context_key = ?",
+                    (cash_after, context_key),
+                )
+
+                cursor = await db.execute(
+                    """INSERT INTO option_trades
+                       (context_key, ts, contract_symbol, underlying, option_type,
+                        strike, expiration, side, qty, premium, multiplier,
+                        proceeds, realized_pnl, reason, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        context_key, time.time(), contract_symbol, underlying,
+                        option_type, strike, expiration,
+                        side, qty, premium, multiplier, proceeds,
+                        realized, reason, source,
+                    ),
+                )
+                trade_id = cursor.lastrowid or 0
+                await db.commit()
+                return {
+                    "ok": True,
+                    "trade_id": trade_id,
+                    "cash_after": cash_after,
+                    "qty_after": new_qty if new_qty > 1e-9 else 0.0,
+                    "realized_pnl": realized,
+                    "proceeds": proceeds,
+                    "underlying": underlying,
+                    "option_type": option_type,
+                    "strike": strike,
+                    "expiration": expiration,
+                    "multiplier": multiplier,
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def list_option_trades(
+        self, context_key: str, *, limit: int = 20,
+    ) -> list[OptionTrade]:
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT id, context_key, ts, contract_symbol, underlying,
+                          option_type, strike, expiration, side, qty,
+                          premium, multiplier, proceeds, realized_pnl,
+                          reason, source
+                   FROM option_trades WHERE context_key = ?
+                   ORDER BY ts DESC LIMIT ?""",
+                (context_key, limit),
+            )
+            rows = await cursor.fetchall()
+        return [
+            OptionTrade(
+                id=r[0], context_key=r[1], ts=r[2], contract_symbol=r[3],
+                underlying=r[4], option_type=r[5], strike=float(r[6]),
+                expiration=float(r[7]), side=r[8], qty=float(r[9]),
+                premium=float(r[10]), multiplier=int(r[11]),
+                proceeds=float(r[12]),
+                realized_pnl=(float(r[13]) if r[13] is not None else None),
+                reason=r[14], source=r[15],
+            ) for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Tips

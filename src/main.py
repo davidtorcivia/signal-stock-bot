@@ -40,6 +40,7 @@ from .commands import (
     StatusCommand,
     CryptoCommand,
     OptionCommand,
+    ChainCommand,
     ForexCommand,
     FuturesCommand,
     EconomyCommand,
@@ -210,9 +211,14 @@ def create_dispatcher(
         opt_cmd = OptionCommand(provider_manager)
         dispatcher.register(opt_cmd)
         help_commands.append(opt_cmd)
+        chain_cmd = ChainCommand(provider_manager)
+        dispatcher.register(chain_cmd)
+        help_commands.append(chain_cmd)
     else:
         opt_stub = ProRequiredCommand("option", ["opt", "o"], "Get option quote", "!opt TSLA230120C00150000")
         dispatcher.register(opt_stub)
+        chain_stub = ProRequiredCommand("chain", ["chains"], "List options chain", "!chain AAPL [2026-06-20]")
+        dispatcher.register(chain_stub)
 
     eco_cmd = EconomyCommand(provider_manager, config.bot_name)
     dispatcher.register(eco_cmd)
@@ -1092,6 +1098,9 @@ def build_app(config: Config):
         portfolio_executor=dispatcher.portfolio_executor,
         bot_registry=bot_registry,
         llm_factory=llm_factory,
+        history=llm_history,
+        group_log=group_log,
+        reactor=reactor,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

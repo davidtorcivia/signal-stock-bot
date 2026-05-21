@@ -715,6 +715,74 @@ class OptionCommand(BaseCommand):
             return CommandResult.error(f"Option data unavailable: {e}")
 
 
+class ChainCommand(BaseCommand):
+    """List the options chain for an underlying ticker."""
+    name = "chain"
+    aliases = ["chains"]
+    description = "List options contracts for an underlying"
+    usage = "!chain AAPL [2026-06-20]"
+    help_explanation = (
+        "Lists available options contracts for a ticker. Pass an "
+        "optional ISO expiration date to filter to one expiry. Returns "
+        "up to ~25 contracts sorted by strike. Use !opt <OCC> to quote "
+        "a specific contract."
+    )
+
+    def __init__(self, provider_manager: ProviderManager):
+        self.providers = provider_manager
+
+    async def execute(self, ctx: CommandContext) -> CommandResult:
+        if not ctx.args:
+            return CommandResult.error(
+                f"Usage: {self.usage}\n"
+                "Provide an underlying ticker and an optional ISO "
+                "expiration date (YYYY-MM-DD)."
+            )
+        underlying = ctx.args[0].upper()
+        expiration: Optional[str] = None
+        if len(ctx.args) > 1:
+            expiration = ctx.args[1].strip()
+        try:
+            chain = await self.providers.get_options_chain(
+                underlying, expiration=expiration, limit=100,
+            )
+        except SymbolNotFoundError:
+            return CommandResult.error(f"No chain found for {underlying}.")
+        except ProviderError as e:
+            return CommandResult.error(f"Chain unavailable: {e}")
+        except NotImplementedError:
+            return CommandResult.error(
+                "No provider supports options chains in this deploy."
+            )
+        if not chain:
+            exp_part = f" expiring {expiration}" if expiration else ""
+            return CommandResult.ok(
+                f"No contracts found for {underlying}{exp_part}."
+            )
+        chain.sort(key=lambda q: (q.expiration, q.type, q.strike))
+        # Cap the chat output — the LLM tool variant returns more.
+        rows = chain[:25]
+        lines = [
+            f"⊡ {underlying} options "
+            f"({len(rows)}/{len(chain)} shown)"
+        ]
+        for q in rows:
+            otype = (q.type or "?").upper()[:1]
+            exp = q.expiration.strftime("%Y-%m-%d") if q.expiration else "?"
+            iv_part = (
+                f"  IV={q.implied_volatility:.2f}"
+                if q.implied_volatility else ""
+            )
+            lines.append(
+                f"  {otype} ${q.strike:>7.2f}  {exp}  "
+                f"prem=${q.price:.2f}  vol={q.volume} oi={q.open_interest}"
+                f"{iv_part}"
+            )
+        if len(chain) > 25:
+            lines.append(f"  …+{len(chain) - 25} more")
+        return CommandResult.ok("\n".join(lines))
+
+
 class FuturesCommand(BaseCommand):
     """Command for futures quotes"""
     name = "future"

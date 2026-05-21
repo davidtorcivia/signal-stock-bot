@@ -138,7 +138,11 @@ class OrdersWorker:
         closed = market_closed_reason()
         if closed is not None:
             # Off-hours: still expire stale orders so they don't pile up
-            # over a long weekend, then sleep deeply. No quote fetches.
+            # over a long weekend, then sleep deeply. No quote fetches
+            # for orders. We DO settle expired options here — it's the
+            # natural moment to run it (right after close on expiry day)
+            # and the settlement path needs an underlying-spot quote
+            # per distinct ticker, which is cheap.
             try:
                 n_expired = await self.store.expire_stale_orders()
                 if n_expired:
@@ -150,6 +154,7 @@ class OrdersWorker:
                 logger.warning(
                     f"Orders watcher: expire pass failed: {e}"
                 )
+            await self._settle_expired_options()
             return self.CLOSED_POLL_SECONDS
 
         # Capture the pre-tick pending set so we can correlate post-tick
@@ -184,7 +189,34 @@ class OrdersWorker:
         if stats.get("filled") or stats.get("failed"):
             await self._notify_resolutions(list(before_ids.values()))
 
+        # Options settlement runs every tick — idempotent and cheap when
+        # nothing is due (a single SELECT). Putting it on the open path
+        # in addition to closed catches positions whose 16:00 ET expiry
+        # falls inside the next 5-min tick, no need to wait for the
+        # market-closed cadence.
+        await self._settle_expired_options()
+
         return self.POLL_INTERVAL_SECONDS
+
+    async def _settle_expired_options(self) -> None:
+        """Settle every expired options position across all contexts.
+        Logged at info on activity; warn on errors. Wraps the executor
+        call so the watcher loop can stay simple."""
+        try:
+            stats = await self.executor.settle_expired_options()
+        except Exception as e:
+            logger.exception(
+                f"Orders watcher: settle_expired_options failed: {e}"
+            )
+            return
+        if stats.get("settled") or stats.get("errors"):
+            logger.info(
+                f"Orders watcher: option settlement "
+                f"checked={stats.get('checked', 0)} "
+                f"due={stats.get('due', 0)} "
+                f"settled={stats.get('settled', 0)} "
+                f"errors={stats.get('errors', 0)}"
+            )
 
     async def _notify_resolutions(self, prior_pending: list) -> None:
         """Notify chats about orders that resolved this tick.

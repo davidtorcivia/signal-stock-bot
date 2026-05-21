@@ -197,6 +197,18 @@ class BaseProvider(ABC):
         """Get option quote. Override if supported."""
         raise NotImplementedError(f"{self.name} doesn't support options")
 
+    async def get_options_chain(
+        self,
+        underlying: str,
+        expiration: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[OptionQuote]:
+        """List the options chain for an underlying ticker. When
+        `expiration` is set (ISO 'YYYY-MM-DD'), returns contracts only
+        for that expiration; otherwise returns the nearest-to-the-money
+        slice across upcoming expirations. Override if supported."""
+        raise NotImplementedError(f"{self.name} doesn't support options chains")
+
     async def get_forex_quote(self, symbol: str) -> ForexQuote:
         """Get forex quote. Override if supported."""
         raise NotImplementedError(f"{self.name} doesn't support forex")

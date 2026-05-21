@@ -60,10 +60,15 @@ def render_status_caption(snap: dict, *, bot_name: str = "Sigil") -> str:
     pnl_pct = snap.get("total_pnl_pct", 0.0)
     arrow = "▲" if pnl >= 0 else "▼"
     n_positions = len(snap.get("positions") or [])
+    n_options = len(snap.get("options_positions") or [])
     n_orders = len(snap.get("pending_orders") or [])
     pos_part = (
         f" · {n_positions} position{'s' if n_positions != 1 else ''}"
         if n_positions else ""
+    )
+    opt_part = (
+        f" · {n_options} option{'s' if n_options != 1 else ''}"
+        if n_options else ""
     )
     order_part = (
         f" · {n_orders} pending order{'s' if n_orders != 1 else ''}"
@@ -71,7 +76,8 @@ def render_status_caption(snap: dict, *, bot_name: str = "Sigil") -> str:
     )
     return (
         f"◈ {bot_name}'s portfolio{label}: {_fmt_dollars(equity)} "
-        f"{arrow} {_fmt_dollars(pnl)} ({_fmt_pct(pnl_pct)}){pos_part}{order_part}"
+        f"{arrow} {_fmt_dollars(pnl)} ({_fmt_pct(pnl_pct)})"
+        f"{pos_part}{opt_part}{order_part}"
     )
 
 
@@ -135,6 +141,7 @@ def render_status(snap: dict, *, bot_name: str = "Sigil") -> str:
         lines.append("  (market closed — quotes may be stale)")
 
     positions = snap["positions"]
+    options_positions = snap.get("options_positions") or []
     if positions:
         lines.append("")
         lines.append("Positions:")
@@ -151,8 +158,30 @@ def render_status(snap: dict, *, bot_name: str = "Sigil") -> str:
                 f"{arrow} {_fmt_dollars(p['unrealized_pnl'])} "
                 f"({_fmt_pct(p['unrealized_pct'])})"
             )
-    else:
+    elif not options_positions:
         lines.append("  (no open positions)")
+
+    if options_positions:
+        lines.append("")
+        lines.append("Options:")
+        for op in options_positions:
+            mark = (
+                f"${op['mark_premium']:.2f}/sh"
+                if op.get("mark_premium") is not None
+                else "no quote"
+            )
+            arrow = "▲" if (op.get("unrealized_pnl") or 0) >= 0 else "▼"
+            exp_dt = dt.datetime.fromtimestamp(
+                op.get("expiration") or 0,
+            ).strftime("%Y-%m-%d")
+            lines.append(
+                f"  {op.get('friendly', op.get('contract'))}   "
+                f"x{int(op.get('qty') or 0)}  "
+                f"avg ${op.get('avg_premium', 0):.2f}/sh → {mark}  "
+                f"{arrow} {_fmt_dollars(op.get('unrealized_pnl', 0))} "
+                f"({_fmt_pct(op.get('unrealized_pct', 0))})  "
+                f"exp {exp_dt}"
+            )
 
     # Pending orders — surfaced here so the LLM sees them when calling
     # portfolio_status (it gets the order ids it needs to cancel or
@@ -497,10 +526,14 @@ PORTFOLIO_STATUS_TOOL = {
         "name": "portfolio_status",
         "description": (
             "Read YOUR current paper-portfolio state in this "
-            "chat. Returns cash, every open position with mark-to-market, "
-            "realized + unrealized PnL, total funded (seed + tips). "
-            "Call this BEFORE deciding to trade so you know what you "
-            "already hold and how much cash is free.\n\n"
+            "chat. Returns cash, every open equity AND options position "
+            "with mark-to-market, realized + unrealized PnL, total "
+            "funded (seed + tips). Options positions show contract "
+            "symbol (OCC), strike, expiration, qty (contracts), avg "
+            "premium and current mark — same shape as equity rows but "
+            "with the contract metadata. Call this BEFORE deciding to "
+            "trade so you know what you already hold and how much cash "
+            "is free.\n\n"
             "IMPORTANT: When you call this in response to a user asking "
             "to see the portfolio, a polished portfolio dashboard image "
             "is automatically attached to your reply. Do NOT reproduce "
@@ -723,6 +756,196 @@ PORTFOLIO_CANCEL_ORDER_TOOL = {
                 },
             },
             "required": ["order_id"],
+        },
+    },
+}
+
+
+# --- Options tools ------------------------------------------------------
+
+PORTFOLIO_OPTIONS_CHAIN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_options_chain",
+        "description": (
+            "Look up the available options contracts on an underlying "
+            "ticker. Returns up to ~50 contracts with their strike, "
+            "expiration, premium, volume, open interest, IV, and delta. "
+            "Use this BEFORE calling portfolio_buy_option so you know "
+            "what's actually tradable — you can't buy a contract that "
+            "doesn't exist or has $0 bid.\n\n"
+            "Pass `expiration` (ISO date 'YYYY-MM-DD') to filter to a "
+            "single expiry. Omit to get a mix across nearby expirations. "
+            "The chain is sorted by the provider, typically by strike — "
+            "scan for strikes near the underlying's current spot when "
+            "picking a contract.\n\n"
+            "Contracts are returned in canonical OCC form (e.g. "
+            "'AAPL250620C00175000') — pass that string verbatim to "
+            "portfolio_buy_option."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "underlying": {
+                    "type": "string",
+                    "description": "Underlying ticker, e.g. 'AAPL'.",
+                },
+                "expiration": {
+                    "type": "string",
+                    "description": (
+                        "Optional. ISO date 'YYYY-MM-DD' to restrict "
+                        "results to one expiry. Omit for a multi-expiry "
+                        "sample."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Optional. Max contracts to return. Default 50, "
+                        "max 250."
+                    ),
+                },
+            },
+            "required": ["underlying"],
+        },
+    },
+}
+
+
+PORTFOLIO_OPTION_QUOTE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_option_quote",
+        "description": (
+            "Quote a specific options contract. Accepts either a "
+            "canonical OCC symbol ('AAPL250620C00175000') or a friendly "
+            "form ('AAPL 175C 2026-06-20', 'AAPL 2025-06-20 175 call'). "
+            "Returns the latest premium, IV, delta, and contract "
+            "metadata. Use BEFORE placing a trade so you reason about "
+            "the actual cost (qty × premium × 100) rather than guessing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "description": (
+                        "OCC symbol or friendly description of the "
+                        "contract."
+                    ),
+                },
+            },
+            "required": ["contract"],
+        },
+    },
+}
+
+
+PORTFOLIO_BUY_OPTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_buy_option",
+        "description": (
+            "Buy long options contracts with YOUR paper portfolio. "
+            "Fills at the live premium during regular US market hours. "
+            "Pass `contract` (OCC or friendly) and `qty` (whole number "
+            "of contracts). Cost = premium × 100 × qty (deducted from "
+            "cash immediately). Always include `reason` — a one-"
+            "sentence thesis.\n\n"
+            "V1 is LONG-ONLY: you can only BUY calls or puts to OPEN a "
+            "position (or add to an existing long). You CANNOT write "
+            "(sell-to-open) options — that path is not implemented to "
+            "avoid modeling margin and unlimited-loss risk in paper "
+            "trading.\n\n"
+            "Settlement: positions auto-settle at 16:00 ET on the "
+            "expiration date. ITM contracts cash-settle at intrinsic × "
+            "100 × qty (max(spot - strike, 0) for calls, max(strike - "
+            "spot, 0) for puts). OTM contracts expire worthless. You "
+            "don't need to close before expiration — but you can, by "
+            "calling portfolio_sell_option, to lock in any remaining "
+            "extrinsic value.\n\n"
+            "Don't open positions on contracts you haven't quoted via "
+            "portfolio_option_quote or portfolio_options_chain — the "
+            "premium can vary wildly across the chain and a bad pick "
+            "burns cash fast."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "description": (
+                        "OCC ('AAPL250620C00175000') or friendly "
+                        "('AAPL 175C 2026-06-20') contract spec."
+                    ),
+                },
+                "qty": {
+                    "type": "integer",
+                    "description": (
+                        "Number of contracts to buy. Whole number, "
+                        "minimum 1. Cost = qty × 100 × premium."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "One-sentence thesis (direction + catalyst + "
+                        "expiry rationale). Logged with the fill."
+                    ),
+                },
+            },
+            "required": ["contract", "qty", "reason"],
+        },
+    },
+}
+
+
+PORTFOLIO_SELL_OPTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_sell_option",
+        "description": (
+            "Close (some of) a long options position you hold. Fills "
+            "at the live premium during regular market hours. Pass "
+            "`contract` and either an explicit `qty` (contracts) or "
+            "omit/pass 'all' to close the full position. Always include "
+            "`reason`.\n\n"
+            "Use this BEFORE expiration if you want to lock in "
+            "extrinsic value or cap a loss — once a contract expires, "
+            "the settlement worker auto-cash-settles it at intrinsic "
+            "value (which may be lower than the live premium for ITM "
+            "contracts with remaining time value).\n\n"
+            "Long-only enforcement: you can only close (or partially "
+            "close) positions you actually hold. There is no "
+            "sell-to-open path."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "description": (
+                        "OCC or friendly contract spec of a position "
+                        "you hold."
+                    ),
+                },
+                "qty": {
+                    "anyOf": [
+                        {"type": "integer"},
+                        {"type": "string", "enum": ["all"]},
+                    ],
+                    "description": (
+                        "Number of contracts to close, or 'all' to "
+                        "close the full position. Default 'all' if "
+                        "omitted."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One-sentence thesis for closing.",
+                },
+            },
+            "required": ["contract", "reason"],
         },
     },
 }

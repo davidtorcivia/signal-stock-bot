@@ -21,16 +21,24 @@ import time
 from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
+from .options_symbols import (
+    friendly_name as occ_friendly_name,
+    intrinsic_value as occ_intrinsic_value,
+    normalize_contract,
+    parse_occ,
+)
 from .paper_portfolio import (
     KIND_LIMIT,
     KIND_STOP,
     Order,
     ORDER_PENDING,
+    OptionPosition,
     PortfolioStore,
     SIDE_BUY,
     SIDE_SELL,
     SOURCE_ORDER,
     SOURCE_REACTIVE,
+    SOURCE_SETTLEMENT,
     VALID_ORDER_KINDS,
     VALID_SOURCES,
 )
@@ -136,6 +144,30 @@ class PaperPortfolioExecutor:
         if price is None or price <= 0:
             return None, f"no valid quote for {ticker}"
         return float(price), None
+
+    async def _fetch_option_quote(self, contract: str):
+        """Returns (option_quote, error). Exactly one is None. `contract`
+        must already be canonical OCC — callers normalize friendly input
+        upstream so the error path here is fresh-and-clear."""
+        try:
+            quote = await self.providers.get_option_quote(contract)
+        except Exception as e:
+            return None, f"couldn't quote {contract}: {type(e).__name__}"
+        if quote is None:
+            return None, f"no option quote for {contract}"
+        return quote, None
+
+    async def _fetch_option_premium(self, contract: str) -> tuple[Optional[float], Optional[str]]:
+        """Returns (per-share premium, error). Zero/negative premiums
+        are treated as a quote miss so the executor refuses to open
+        positions on stale or empty-book contracts."""
+        quote, err = await self._fetch_option_quote(contract)
+        if err is not None or quote is None:
+            return None, err
+        premium = getattr(quote, "price", None)
+        if premium is None or premium <= 0:
+            return None, f"no valid premium for {contract}"
+        return float(premium), None
 
     async def execute_buy(
         self,
@@ -265,6 +297,7 @@ class PaperPortfolioExecutor:
         """
         portfolio = await self.store.ensure_portfolio(context_key)
         positions = await self.store.positions(context_key)
+        options_pos = await self.store.options_positions(context_key)
         tip_total = await self.store.tip_total(context_key)
         realized_total = await self.store.realized_pnl_total(context_key)
         pending_orders = await self.store.list_orders_for_context(
@@ -319,8 +352,68 @@ class PaperPortfolioExecutor:
             market_value += mv
             unrealized_total += unrealized
 
+        # Mark-to-market for options positions. Each contract's value is
+        # qty × multiplier × premium. Quote misses fall back to cost
+        # basis (same shape as equity positions above) so the snapshot
+        # never invents value, but also doesn't punish the user for a
+        # transient quote failure.
+        option_views: list[dict] = []
+        option_market_value = 0.0
+        if options_pos:
+            option_quote_results = await asyncio.gather(
+                *(self._fetch_option_premium(op.contract_symbol) for op in options_pos),
+                return_exceptions=False,
+            )
+            for op, (premium, err) in zip(options_pos, option_quote_results):
+                cost = op.qty * op.multiplier * op.avg_premium
+                friendly = occ_friendly_name(op.contract_symbol)
+                if err is not None or premium is None:
+                    logger.warning(
+                        f"status: option quote miss for {op.contract_symbol} "
+                        f"({err}); showing cost basis as fallback"
+                    )
+                    option_views.append({
+                        "contract": op.contract_symbol,
+                        "friendly": friendly,
+                        "underlying": op.underlying,
+                        "option_type": op.option_type,
+                        "strike": op.strike,
+                        "expiration": op.expiration,
+                        "qty": op.qty,
+                        "multiplier": op.multiplier,
+                        "avg_premium": op.avg_premium,
+                        "mark_premium": None,
+                        "cost_basis": cost,
+                        "market_value": cost,
+                        "unrealized_pnl": 0.0,
+                        "unrealized_pct": 0.0,
+                    })
+                    option_market_value += cost
+                    continue
+                mv = op.qty * op.multiplier * premium
+                unrealized = mv - cost
+                option_views.append({
+                    "contract": op.contract_symbol,
+                    "friendly": friendly,
+                    "underlying": op.underlying,
+                    "option_type": op.option_type,
+                    "strike": op.strike,
+                    "expiration": op.expiration,
+                    "qty": op.qty,
+                    "multiplier": op.multiplier,
+                    "avg_premium": op.avg_premium,
+                    "mark_premium": premium,
+                    "cost_basis": cost,
+                    "market_value": mv,
+                    "unrealized_pnl": unrealized,
+                    "unrealized_pct": (unrealized / cost) if cost > 0 else 0.0,
+                })
+                option_market_value += mv
+                unrealized_total += unrealized
+
         total_funded = portfolio.starting_balance + tip_total
-        equity = portfolio.cash + market_value
+        total_market_value = market_value + option_market_value
+        equity = portfolio.cash + total_market_value
         total_pnl = equity - total_funded
         total_pnl_pct = (total_pnl / total_funded) if total_funded > 0 else 0.0
 
@@ -331,13 +424,16 @@ class PaperPortfolioExecutor:
             "starting_balance": portfolio.starting_balance,
             "tip_total": tip_total,
             "total_funded": total_funded,
-            "market_value": market_value,
+            "market_value": total_market_value,
+            "equity_market_value": market_value,
+            "options_market_value": option_market_value,
             "equity": equity,
             "realized_pnl": realized_total,
             "unrealized_pnl": unrealized_total,
             "total_pnl": total_pnl,
             "total_pnl_pct": total_pnl_pct,
             "positions": position_views,
+            "options_positions": option_views,
             "pending_orders": [_order_to_view(o) for o in pending_orders],
             "market_open": market_closed_reason() is None,
         }
@@ -708,3 +804,269 @@ class PaperPortfolioExecutor:
             order.id, fill_price=fill_price, fill_qty=fill_qty,
         )
         return True, f"filled {fill_qty:.4f} @ ${fill_price:.2f}"
+
+    # ------------------------------------------------------------------
+    # Options trading (long-only, single-leg, 100x multiplier)
+    # ------------------------------------------------------------------
+
+    async def options_chain(
+        self,
+        underlying: str,
+        *,
+        expiration: Optional[str] = None,
+        limit: int = 100,
+    ) -> dict:
+        """List available contracts on `underlying`. Pure read — does
+        not check market hours (chains are publishable any time)."""
+        underlying = (underlying or "").strip().upper()
+        if not underlying:
+            return {"ok": False, "error": "underlying required"}
+        try:
+            quotes = await self.providers.get_options_chain(
+                underlying, expiration=expiration, limit=limit,
+            )
+        except NotImplementedError as e:
+            return {"ok": False, "error": f"chain not supported: {e}"}
+        except Exception as e:
+            logger.warning(f"options_chain({underlying}): {e}")
+            return {"ok": False, "error": f"chain fetch failed: {type(e).__name__}"}
+        rows = [
+            {
+                "contract": getattr(q, "symbol", ""),
+                "underlying": getattr(q, "underlying", underlying),
+                "option_type": getattr(q, "type", "unknown"),
+                "strike": float(getattr(q, "strike", 0.0) or 0.0),
+                "expiration": (
+                    q.expiration.isoformat() if getattr(q, "expiration", None)
+                    else None
+                ),
+                "premium": float(getattr(q, "price", 0.0) or 0.0),
+                "volume": int(getattr(q, "volume", 0) or 0),
+                "open_interest": int(getattr(q, "open_interest", 0) or 0),
+                "iv": getattr(q, "implied_volatility", None),
+                "delta": (getattr(q, "greeks", None) or {}).get("delta") if getattr(q, "greeks", None) else None,
+            }
+            for q in quotes
+        ]
+        return {"ok": True, "rows": rows, "count": len(rows)}
+
+    async def execute_buy_option(
+        self,
+        context_key: str,
+        *,
+        contract: str,
+        qty: int,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+        force_market_open: bool = False,
+        multiplier: int = 100,
+    ) -> dict:
+        """Open or add to a long options position. `contract` may be a
+        canonical OCC symbol or a friendly form (``"AAPL 175C
+        2026-06-20"``) — both are normalized. Quantity is whole
+        contracts (we don't trade partial options)."""
+        if source not in VALID_SOURCES:
+            return {"ok": False, "error": f"invalid source: {source!r}"}
+        if not isinstance(qty, (int, float)) or qty != int(qty) or int(qty) <= 0:
+            return {"ok": False, "error": "qty must be a positive whole number of contracts."}
+        qty_int = int(qty)
+        try:
+            occ = normalize_contract(contract)
+        except ValueError as e:
+            return {"ok": False, "error": f"contract not parseable: {e}"}
+        try:
+            parts = parse_occ(occ)
+        except ValueError as e:
+            return {"ok": False, "error": f"contract not parseable: {e}"}
+
+        if not force_market_open:
+            closed = market_closed_reason()
+            if closed:
+                return {"ok": False, "error": f"Trade rejected — {closed}."}
+
+        # Reject opening a position on an already-expired contract — the
+        # provider will happily quote an expired symbol's last-known
+        # close, but the bot would just immediately get settled out.
+        exp_ts = dt.datetime.combine(
+            parts.expiration, dt.time(16, 0), tzinfo=_ET,
+        ).timestamp()
+        if exp_ts < dt.datetime.now(_ET).timestamp():
+            return {"ok": False, "error": f"contract {occ} is already expired"}
+
+        premium, err = await self._fetch_option_premium(occ)
+        if err is not None or premium is None:
+            return {"ok": False, "error": err or "no option quote"}
+
+        result = await self.store.buy_option(
+            context_key,
+            contract_symbol=occ,
+            underlying=parts.root,
+            option_type=parts.option_type,
+            strike=parts.strike,
+            expiration=exp_ts,
+            qty=qty_int,
+            premium=premium,
+            multiplier=multiplier,
+            reason=reason,
+            source=source,
+        )
+        if result.get("ok"):
+            result["contract"] = occ
+            result["friendly"] = occ_friendly_name(occ)
+            result["premium"] = premium
+            result["multiplier"] = multiplier
+            result["underlying"] = parts.root
+            result["option_type"] = parts.option_type
+            result["strike"] = parts.strike
+            result["expiration"] = exp_ts
+        return result
+
+    async def execute_sell_option(
+        self,
+        context_key: str,
+        *,
+        contract: str,
+        qty: Union[int, str, None] = None,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+        force_market_open: bool = False,
+    ) -> dict:
+        """Close (some of) a long options position. ``qty="all"`` (or
+        None) closes the position; an integer closes that many
+        contracts. V1 is long-only — no opening-short selling here."""
+        if source not in VALID_SOURCES:
+            return {"ok": False, "error": f"invalid source: {source!r}"}
+        try:
+            occ = normalize_contract(contract)
+        except ValueError as e:
+            return {"ok": False, "error": f"contract not parseable: {e}"}
+
+        if not force_market_open:
+            closed = market_closed_reason()
+            if closed:
+                return {"ok": False, "error": f"Trade rejected — {closed}."}
+
+        sell_qty: Optional[int]
+        if qty is None or (isinstance(qty, str) and qty.strip().lower() == "all"):
+            pos = await self.store.get_option_position(context_key, occ)
+            if pos is None:
+                return {"ok": False, "error": f"No position in {occ}."}
+            sell_qty = int(round(pos.qty))
+        else:
+            try:
+                sell_qty = int(qty)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"Invalid qty: {qty!r}"}
+            if sell_qty <= 0:
+                return {"ok": False, "error": "qty must be positive."}
+
+        premium, err = await self._fetch_option_premium(occ)
+        if err is not None or premium is None:
+            return {"ok": False, "error": err or "no option quote"}
+
+        result = await self.store.sell_option(
+            context_key,
+            contract_symbol=occ,
+            qty=sell_qty,
+            premium=premium,
+            reason=reason,
+            source=source,
+        )
+        if result.get("ok"):
+            result["contract"] = occ
+            result["friendly"] = occ_friendly_name(occ)
+            result["premium"] = premium
+        return result
+
+    async def settle_expired_options(
+        self,
+        *,
+        now_ts: Optional[float] = None,
+    ) -> dict:
+        """Cash-settle every expired options position across all
+        contexts. ITM contracts close at intrinsic × multiplier × qty,
+        OTM contracts close at $0 (expire worthless). Idempotent:
+        once settled the row is deleted, so subsequent ticks no-op.
+
+        Settlement uses the underlying's current quote. For positions
+        that expired during a long weekend or while the bot was down,
+        this is the next-available close price — the best approximation
+        we have without intraday history.
+        """
+        positions = await self.store.list_options_positions_all()
+        now = now_ts if now_ts is not None else time.time()
+        # Filter to positions whose 16:00 ET expiration timestamp is in
+        # the past. The store stamps expiration this way already
+        # (execute_buy_option computes 16:00 ET of expiry day).
+        due = [op for op in positions if op.expiration <= now]
+        if not due:
+            return {"checked": len(positions), "settled": 0, "errors": 0}
+
+        # Group by underlying so we fetch each spot once even when
+        # multiple contracts of the same name expire together.
+        underlyings = sorted({op.underlying for op in due})
+        spots = await asyncio.gather(
+            *(self._fetch_price(u) for u in underlyings),
+            return_exceptions=False,
+        )
+        spot_map: dict[str, Optional[float]] = {}
+        for sym, (price, err) in zip(underlyings, spots):
+            if err is not None or price is None:
+                logger.warning(
+                    f"settle: spot quote failed for {sym} ({err}); "
+                    f"contracts on this underlying will stay open until "
+                    f"the next sweep"
+                )
+                spot_map[sym] = None
+            else:
+                spot_map[sym] = price
+
+        settled = 0
+        errors = 0
+        for op in due:
+            spot = spot_map.get(op.underlying)
+            if spot is None:
+                errors += 1
+                continue
+            intrinsic = occ_intrinsic_value(op.option_type, op.strike, spot)
+            reason = (
+                f"auto-settled at expiration: {op.option_type.upper()} "
+                f"{op.underlying} @ ${op.strike:.2f} vs spot ${spot:.2f} "
+                f"→ intrinsic ${intrinsic:.4f}/sh"
+            )
+            try:
+                result = await self.store.sell_option(
+                    op.context_key,
+                    contract_symbol=op.contract_symbol,
+                    qty=op.qty,
+                    premium=intrinsic,
+                    reason=reason,
+                    source=SOURCE_SETTLEMENT,
+                    settlement_intrinsic=intrinsic,
+                )
+            except Exception as e:
+                logger.exception(
+                    f"settle: store.sell_option raised for "
+                    f"{op.contract_symbol}: {e}"
+                )
+                errors += 1
+                continue
+            if not result.get("ok"):
+                logger.warning(
+                    f"settle: rejected for {op.contract_symbol}: "
+                    f"{result.get('error')}"
+                )
+                errors += 1
+                continue
+            settled += 1
+            logger.info(
+                f"settle: {op.contract_symbol} (ctx={op.context_key}) "
+                f"qty={op.qty:g} @ ${intrinsic:.4f}/sh "
+                f"realized=${result.get('realized_pnl') or 0:.2f}"
+            )
+        return {
+            "checked": len(positions),
+            "due": len(due),
+            "settled": settled,
+            "errors": errors,
+        }

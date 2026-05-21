@@ -327,6 +327,43 @@ class ProviderManager:
                 last_error = e
         raise last_error or ProviderError("All providers failed to return option quote")
 
+    async def get_options_chain(
+        self,
+        underlying: str,
+        expiration: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[OptionQuote]:
+        """Fetch the options chain for `underlying` from the first
+        provider whose options capability is healthy. `expiration`
+        filters to a single ISO date (YYYY-MM-DD)."""
+        providers = self._get_available_providers(ProviderCapability.OPTIONS)
+        if not providers:
+            raise ProviderError("No providers available for options")
+        last_error: Optional[Exception] = None
+        for provider in providers:
+            try:
+                return await self._call_provider(
+                    provider, 'get_options_chain',
+                    underlying, expiration, limit,
+                )
+            except RateLimitError as e:
+                self._mark_rate_limited(provider, e.retry_after or 60)
+                last_error = e
+            except NotImplementedError as e:
+                # Capability set lied about supporting chains — keep
+                # trying other providers without burying the error.
+                logger.warning(
+                    f"{provider.name} declared OPTIONS but doesn't "
+                    f"implement get_options_chain: {e}"
+                )
+                last_error = e
+            except Exception as e:
+                logger.warning(
+                    f"Error fetching options chain from {provider.name}: {e}"
+                )
+                last_error = e
+        raise last_error or ProviderError("All providers failed for options chain")
+
     async def get_forex_quote(self, symbol: str) -> ForexQuote:
         """Get forex quote with fallback"""
         providers = self._get_available_providers(ProviderCapability.FOREX)

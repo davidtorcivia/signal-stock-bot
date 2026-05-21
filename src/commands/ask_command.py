@@ -29,11 +29,15 @@ from .predict_command import (
     extract_prediction,
 )
 from .portfolio_command import (
+    PORTFOLIO_BUY_OPTION_TOOL,
     PORTFOLIO_BUY_TOOL,
     PORTFOLIO_CANCEL_ORDER_TOOL,
     PORTFOLIO_JOURNAL_APPEND_TOOL,
     PORTFOLIO_JOURNAL_READ_TOOL,
+    PORTFOLIO_OPTION_QUOTE_TOOL,
+    PORTFOLIO_OPTIONS_CHAIN_TOOL,
     PORTFOLIO_PLACE_ORDER_TOOL,
+    PORTFOLIO_SELL_OPTION_TOOL,
     PORTFOLIO_SELL_TOOL,
     PORTFOLIO_STATUS_TOOL,
     render_status,
@@ -47,6 +51,10 @@ from ..paper_portfolio import (
     VALID_SOURCES,
 )
 from ..paper_portfolio_executor import PaperPortfolioExecutor
+from ..options_symbols import (
+    friendly_name as _opt_friendly_name,
+    normalize_contract as _opt_normalize_contract,
+)
 from ..predictions import PredictionStore
 from ..llm import (
     LLMClient,
@@ -458,7 +466,14 @@ class AskCommand(BaseCommand):
         limit = self._live_group_ctx()
         if limit <= 0 or not ctx.is_group or self.group_log is None:
             return ""
-        msgs = await self.group_log.recent(ctx.group_id, limit=limit, exclude_last=1)
+        bot_floor_at = (
+            getattr(ctx.policy, "purge_floor_at", None)
+            if ctx.policy is not None else None
+        )
+        msgs = await self.group_log.recent(
+            ctx.group_id, limit=limit, exclude_last=1,
+            bot_floor_at=bot_floor_at,
+        )
         if not msgs:
             return ""
 
@@ -581,6 +596,13 @@ class AskCommand(BaseCommand):
             schemas.append(PORTFOLIO_SELL_TOOL)
             schemas.append(PORTFOLIO_PLACE_ORDER_TOOL)
             schemas.append(PORTFOLIO_CANCEL_ORDER_TOOL)
+            # Options tools — long-only buy/sell + chain/quote lookup.
+            # Same gating as the equity tools; the executor handles
+            # OCC normalization so the LLM can pass friendly strings.
+            schemas.append(PORTFOLIO_OPTIONS_CHAIN_TOOL)
+            schemas.append(PORTFOLIO_OPTION_QUOTE_TOOL)
+            schemas.append(PORTFOLIO_BUY_OPTION_TOOL)
+            schemas.append(PORTFOLIO_SELL_OPTION_TOOL)
             # Journal tools are gated separately because the journal
             # store is wired independently — a deploy could have
             # portfolio enabled but no journal directory configured,
@@ -1158,6 +1180,171 @@ class AskCommand(BaseCommand):
             caller_ctx.portfolio_mutation_count += 1
             return f"Cancelled order #{order_id}."
 
+        # ---- Options tools ----
+
+        if name == "portfolio_options_chain":
+            underlying = str(args.get("underlying") or "").strip().upper()
+            if not underlying:
+                return "ERROR: portfolio_options_chain requires an underlying ticker."
+            expiration_raw = args.get("expiration")
+            expiration = (
+                str(expiration_raw).strip() if expiration_raw else None
+            )
+            limit_raw = args.get("limit")
+            try:
+                limit = int(limit_raw) if limit_raw is not None else 50
+            except (TypeError, ValueError):
+                return "ERROR: limit must be an integer."
+            limit = max(1, min(250, limit))
+            try:
+                result = await executor.options_chain(
+                    underlying, expiration=expiration, limit=limit,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_options_chain failed: {e}")
+                return f"ERROR: chain lookup failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'chain unavailable')}"
+            rows = result.get("rows") or []
+            if not rows:
+                exp_part = f" expiring {expiration}" if expiration else ""
+                return f"No contracts found for {underlying}{exp_part}."
+            # Render compact list for the LLM. Sort by (expiration,
+            # type, strike) so the model sees a coherent layout.
+            rows.sort(key=lambda r: (
+                r.get("expiration") or "", r.get("option_type") or "",
+                r.get("strike") or 0.0,
+            ))
+            lines = [
+                f"Options chain for {underlying} "
+                f"({len(rows)} contract{'s' if len(rows) != 1 else ''}):"
+            ]
+            for r in rows[:limit]:
+                exp = r.get("expiration") or "?"
+                strike = r.get("strike") or 0.0
+                otype = (r.get("option_type") or "?").upper()[:1]
+                prem = r.get("premium") or 0.0
+                vol = r.get("volume") or 0
+                oi = r.get("open_interest") or 0
+                iv = r.get("iv")
+                iv_part = f" IV={iv:.2f}" if isinstance(iv, (int, float)) else ""
+                delta = r.get("delta")
+                delta_part = (
+                    f" Δ={delta:.2f}" if isinstance(delta, (int, float)) else ""
+                )
+                lines.append(
+                    f"  {r.get('contract', '?'):<25} {otype} ${strike:<7.2f} "
+                    f"{exp}  prem=${prem:.2f}  vol={vol} oi={oi}"
+                    f"{iv_part}{delta_part}"
+                )
+            return "\n".join(lines)
+
+        if name == "portfolio_option_quote":
+            contract_raw = str(args.get("contract") or "").strip()
+            if not contract_raw:
+                return "ERROR: portfolio_option_quote requires a contract."
+            try:
+                occ = _opt_normalize_contract(contract_raw)
+            except ValueError as e:
+                return f"ERROR: {e}"
+            try:
+                quote = await executor.providers.get_option_quote(occ)
+            except Exception as e:
+                logger.warning(f"portfolio_option_quote({occ}): {e}")
+                return f"ERROR: quote failed: {type(e).__name__}: {e}"
+            if quote is None:
+                return f"ERROR: no quote for {occ}"
+            greeks = getattr(quote, "greeks", None) or {}
+            iv = getattr(quote, "implied_volatility", None)
+            iv_part = f"  IV={iv:.2f}" if isinstance(iv, (int, float)) else ""
+            delta_part = ""
+            if isinstance(greeks.get("delta"), (int, float)):
+                delta_part = f"  Δ={greeks['delta']:.3f}"
+            lines = [
+                f"⊡ {_opt_friendly_name(occ)}  (OCC: {occ})",
+                f"  premium: ${getattr(quote, 'price', 0.0) or 0.0:.2f}/sh  "
+                f"vol={getattr(quote, 'volume', 0)}  "
+                f"oi={getattr(quote, 'open_interest', 0)}{iv_part}{delta_part}",
+                f"  estimated cost: $"
+                f"{(getattr(quote, 'price', 0.0) or 0.0) * 100:.2f} per contract",
+            ]
+            return "\n".join(lines)
+
+        if name == "portfolio_buy_option":
+            contract_raw = str(args.get("contract") or "").strip()
+            reason = str(args.get("reason") or "").strip()
+            qty_raw = args.get("qty")
+            if not contract_raw:
+                return "ERROR: portfolio_buy_option requires a contract."
+            if not reason:
+                return "ERROR: portfolio_buy_option requires a one-sentence reason."
+            try:
+                qty_int = int(qty_raw) if qty_raw is not None else 0
+            except (TypeError, ValueError):
+                return "ERROR: qty must be a positive whole number of contracts."
+            if qty_int <= 0:
+                return "ERROR: qty must be a positive whole number of contracts."
+            try:
+                result = await executor.execute_buy_option(
+                    ctx_key,
+                    contract=contract_raw,
+                    qty=qty_int,
+                    reason=reason,
+                    source=source_tag,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_buy_option failed: {e}")
+                return f"ERROR: option buy failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'buy rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
+            return (
+                f"Bought {qty_int} {result['friendly']} "
+                f"@ ${result['premium']:.2f}/sh (cost "
+                f"${result['proceeds']:,.2f}, multiplier "
+                f"{result.get('multiplier', 100)}). "
+                f"Position avg ${result['avg_premium_after']:.2f}/sh. "
+                f"Cash now ${result['cash_after']:,.2f}. "
+                f"Reason: {reason}"
+            )
+
+        if name == "portfolio_sell_option":
+            contract_raw = str(args.get("contract") or "").strip()
+            reason = str(args.get("reason") or "").strip()
+            qty_arg = args.get("qty")
+            if not contract_raw:
+                return "ERROR: portfolio_sell_option requires a contract."
+            if not reason:
+                return "ERROR: portfolio_sell_option requires a one-sentence reason."
+            try:
+                result = await executor.execute_sell_option(
+                    ctx_key,
+                    contract=contract_raw,
+                    qty=qty_arg,
+                    reason=reason,
+                    source=source_tag,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_sell_option failed: {e}")
+                return f"ERROR: option sell failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'sell rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
+            pnl = result.get("realized_pnl") or 0.0
+            pnl_part = (
+                f" Realized P/L ${pnl:+,.2f}." if abs(pnl) > 0.005 else ""
+            )
+            remaining = result.get("qty_after") or 0.0
+            remaining_part = (
+                f" Remaining: {remaining:g} contracts."
+                if remaining > 0 else " Position closed."
+            )
+            return (
+                f"Sold {result['friendly']} @ ${result['premium']:.2f}/sh "
+                f"for ${result['proceeds']:,.2f}.{pnl_part}{remaining_part} "
+                f"Cash now ${result['cash_after']:,.2f}. Reason: {reason}"
+            )
+
         return f"ERROR: unknown portfolio tool {name!r}"
 
     async def _handle_journal_tool(
@@ -1535,6 +1722,10 @@ class AskCommand(BaseCommand):
                 "portfolio_status",
                 "portfolio_place_order",
                 "portfolio_cancel_order",
+                "portfolio_options_chain",
+                "portfolio_option_quote",
+                "portfolio_buy_option",
+                "portfolio_sell_option",
             )
             and self.portfolio_executor is not None
         )
@@ -1748,11 +1939,16 @@ class AskCommand(BaseCommand):
 
         try:
             now_ts = time.time()
+            floor_at = (
+                getattr(ctx.policy, "purge_floor_at", None)
+                if ctx.policy is not None else None
+            )
             prior = await self.history.load(
                 context_key,
                 turns_per_user=self._live_turns(ctx),
                 attribute_senders=is_group,
                 now=now_ts,
+                floor_at=floor_at,
             )
             # Re-enrich each prior turn — bot/user messages stored before
             # the enricher existed (or stored with a failed enrichment)
@@ -1785,7 +1981,9 @@ class AskCommand(BaseCommand):
             # model what it is (the inner text no longer needs a prose label).
             summary_block = ""
             try:
-                summary = await self.history.get_summary(context_key)
+                summary = await self.history.get_summary(
+                    context_key, floor_at=floor_at
+                )
                 if summary and summary.get("summary"):
                     summary_text = await self._enrich(summary["summary"])
                     summary_block = summary_text
@@ -1798,7 +1996,9 @@ class AskCommand(BaseCommand):
             # empty — there's nothing to be stale about.
             staleness_block = ""
             try:
-                last_ts = await self.history.latest_turn_timestamp(context_key)
+                last_ts = await self.history.latest_turn_timestamp(
+                    context_key, floor_at=floor_at
+                )
             except Exception as e:
                 logger.debug(f"Failed to read latest turn timestamp: {e}")
                 last_ts = None
@@ -2476,7 +2676,11 @@ class AskCommand(BaseCommand):
         if self.summarizer is not None:
             try:
                 import asyncio as _aio
-                _aio.create_task(self.summarizer.maybe_summarize(context_key))
+                _aio.create_task(
+                    self.summarizer.maybe_summarize(
+                        context_key, floor_at=floor_at
+                    )
+                )
             except Exception as e:
                 logger.debug(f"Failed to schedule summarizer: {e}")
 
