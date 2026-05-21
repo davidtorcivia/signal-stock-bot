@@ -85,25 +85,40 @@ def _fmt_order_summary(o: dict) -> str:
     """One-line per-order text used in render_status' Pending Orders
     block. Format: ``#42  ▲ stop sell AAPL @ $200.00 — close all``
     The arrow encodes trigger direction (▲ above / ▼ below) so the
-    LLM can read intent at a glance without re-deriving from side+kind."""
+    LLM can read intent at a glance without re-deriving from side+kind.
+
+    Options orders show the contract's friendly name and "premium" in
+    the trigger label so the chat reader can tell at a glance that
+    the trigger is on contract premium, not the underlying price."""
     arrow = "▲" if o.get("trigger_direction") == "above" else "▼"
     side = o.get("side") or "?"
     kind = o.get("kind") or "?"
-    ticker = o.get("ticker") or "?"
     trigger = o.get("trigger_price") or 0.0
+    is_option = bool(o.get("is_option") or o.get("contract"))
+    if is_option:
+        try:
+            from ..options_symbols import friendly_name as _occ_friendly
+            label = _occ_friendly(o.get("contract") or "")
+        except Exception:
+            label = o.get("contract") or o.get("ticker") or "?"
+        trigger_label = f"premium {_fmt_dollars(trigger)}/sh"
+    else:
+        label = o.get("ticker") or "?"
+        trigger_label = _fmt_dollars(trigger)
     if o.get("close_position"):
         size_part = "close all"
     elif o.get("dollars") is not None:
         size_part = f"{_fmt_dollars(float(o['dollars']))} (qty TBD at fill)"
     elif o.get("qty") is not None:
-        size_part = f"{_fmt_qty(float(o['qty']))} sh"
+        unit = "contracts" if is_option else "sh"
+        size_part = f"{_fmt_qty(float(o['qty']))} {unit}"
     else:
         size_part = "?"
     reason = (o.get("reason") or "").strip()
     reason_part = f" — {reason}" if reason else ""
     return (
-        f"#{o.get('id')}  {arrow} {kind} {side} {ticker} "
-        f"@ {_fmt_dollars(trigger)} · {size_part}{reason_part}"
+        f"#{o.get('id')}  {arrow} {kind} {side} {label} "
+        f"@ {trigger_label} · {size_part}{reason_part}"
     )
 
 
@@ -207,8 +222,10 @@ class PortfolioCommand(BaseCommand):
         "Shows the bot's current paper-trading positions, cash, and "
         "PnL for this chat. The portfolio auto-seeds with $1000; "
         "members can add to it with `!tip <amount>` (capped at $20 per "
-        "user per ET day). The bot decides trades on a cron schedule and "
-        "in response to chat."
+        "user per ET day). The bot decides trades on a cron schedule "
+        "and in response to chat. The bot can also hold long options "
+        "(calls/puts) — settled automatically at expiration; the "
+        "image and `!trades` show both equities and options."
     )
 
     def __init__(
@@ -396,14 +413,19 @@ class TradesCommand(BaseCommand):
 
         try:
             trades = await self.store.list_trades(ctx.context_key(), limit=limit)
+            option_trades = await self.store.list_option_trades(
+                ctx.context_key(), limit=limit,
+            )
         except Exception as e:
             logger.exception(f"trades: list_trades failed: {e}")
             return CommandResult.error("Couldn't load the trade history.")
 
-        if not trades:
-            return CommandResult.ok("(no trades yet)")
-
-        lines = [f"◈ Recent trades ({len(trades)})"]
+        # Merge both ledgers, take the most-recent `limit` total. Each
+        # row carries the data needed to render in a uniform format —
+        # we keep the trade-flavored tuple (ts, kind, body) so the
+        # caller doesn't have to type-discriminate inside the
+        # rendering loop.
+        merged: list[tuple[float, str, str]] = []
         for t in trades:
             side_arrow = "↑" if t.side == "buy" else "↓"
             pnl_part = ""
@@ -411,10 +433,48 @@ class TradesCommand(BaseCommand):
                 pnl_arrow = "▲" if t.realized_pnl >= 0 else "▼"
                 pnl_part = f" {pnl_arrow} {_fmt_dollars(t.realized_pnl)}"
             reason_part = f" — {t.reason}" if t.reason else ""
-            lines.append(
+            merged.append((
+                t.ts, "equity",
                 f"  {_fmt_ts(t.ts)}  {side_arrow} {_fmt_qty(t.qty):>8} "
-                f"{t.ticker:<6} @ {_fmt_dollars(t.price)}{pnl_part}{reason_part}"
-            )
+                f"{t.ticker:<6} @ {_fmt_dollars(t.price)}{pnl_part}{reason_part}",
+            ))
+        for ot in option_trades:
+            # Auto-settlements get a distinct glyph so users can tell at
+            # a glance which closes were the bot's decision vs the
+            # settlement worker's. Buy/sell use the same up/down arrows
+            # as the equity ledger; settle uses ⌁ (lightning-style mark)
+            # so it doesn't compete visually.
+            if ot.side == "buy":
+                side_arrow = "↑"
+            elif ot.side == "sell":
+                side_arrow = "↓"
+            else:  # 'settle'
+                side_arrow = "⌁"
+            pnl_part = ""
+            if ot.realized_pnl is not None and abs(ot.realized_pnl) > 0.005:
+                pnl_arrow = "▲" if ot.realized_pnl >= 0 else "▼"
+                pnl_part = f" {pnl_arrow} {_fmt_dollars(ot.realized_pnl)}"
+            reason_part = f" — {ot.reason}" if ot.reason else ""
+            # Use friendly contract notation (e.g. "AAPL $175C 2026-06-20")
+            # so the chat reads natural, with a leading "OPT" tag so the
+            # user can distinguish from the equity rows at a glance.
+            try:
+                from ..options_symbols import friendly_name as _occ_friendly
+                friendly = _occ_friendly(ot.contract_symbol)
+            except Exception:
+                friendly = ot.contract_symbol
+            merged.append((
+                ot.ts, "option",
+                f"  {_fmt_ts(ot.ts)}  {side_arrow} {int(ot.qty):>3}× OPT "
+                f"{friendly} @ ${ot.premium:.2f}/sh{pnl_part}{reason_part}",
+            ))
+
+        merged.sort(key=lambda r: r[0], reverse=True)
+        merged = merged[:limit]
+        if not merged:
+            return CommandResult.ok("(no trades yet)")
+        lines = [f"◈ Recent trades ({len(merged)})"]
+        lines.extend(body for _, _, body in merged)
         return CommandResult.ok("\n".join(lines))
 
 
@@ -895,6 +955,98 @@ PORTFOLIO_BUY_OPTION_TOOL = {
                 },
             },
             "required": ["contract", "qty", "reason"],
+        },
+    },
+}
+
+
+PORTFOLIO_PLACE_OPTION_ORDER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_place_option_order",
+        "description": (
+            "Register a CONDITIONAL order on an options contract — the "
+            "options analogue of portfolio_place_order. The order fires "
+            "when the contract's PER-SHARE PREMIUM crosses `trigger_premium`. "
+            "The watcher polls every ~5 min during US regular hours and "
+            "fills crossings via the same path as portfolio_buy_option / "
+            "portfolio_sell_option. The chat is notified when the fill "
+            "happens.\n\n"
+            "Use for: stop-losses on long calls/puts (sell+stop fires "
+            "when the premium drops below your trigger), take-profit "
+            "limits (sell+limit fires when premium rises above your "
+            "trigger), or breakout/pullback entries on contracts you "
+            "want to enter only if their own price moves. Pick "
+            "`side`+`kind`:\n"
+            "  - sell + stop  → premium-based stop-loss (fires when premium ≤ trigger)\n"
+            "  - sell + limit → take-profit (fires when premium ≥ trigger)\n"
+            "  - buy + stop   → momentum entry (fires when premium ≥ trigger)\n"
+            "  - buy + limit  → pullback entry (fires when premium ≤ trigger)\n\n"
+            "Sizing: pass either `qty` (whole number of contracts) or "
+            "`close_position=true` (sell-only — closes the full position "
+            "at trigger time). `dollars` is NOT supported: option premiums "
+            "fluctuate, so a dollar→contracts conversion at fill is "
+            "unreliable. `reason` is required. Default expiry 30 days, "
+            "max 90.\n\n"
+            "Long-only invariant: you can only sell against options you "
+            "currently hold; place_order rejects sell triggers on "
+            "contracts with no open position."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "description": (
+                        "OCC ('AAPL250620C00175000') or friendly "
+                        "('AAPL 175C 2026-06-20') contract spec."
+                    ),
+                },
+                "side": {
+                    "type": "string",
+                    "enum": ["buy", "sell"],
+                    "description": "Direction once triggered.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["stop", "limit"],
+                    "description": (
+                        "Trigger semantics. stop = act AGAINST the "
+                        "move; limit = act WITH the move."
+                    ),
+                },
+                "trigger_premium": {
+                    "type": "number",
+                    "description": (
+                        "Per-share PREMIUM that fires the order. "
+                        "Cost-per-contract at trigger is "
+                        "(trigger_premium × 100)."
+                    ),
+                },
+                "qty": {
+                    "type": "integer",
+                    "description": (
+                        "Whole number of contracts to trade. Mutually "
+                        "exclusive with close_position."
+                    ),
+                },
+                "close_position": {
+                    "type": "boolean",
+                    "description": (
+                        "SELL ONLY — close the full position at "
+                        "trigger. Mutually exclusive with qty."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One-sentence thesis. Logged with the fill.",
+                },
+                "expires_in_days": {
+                    "type": "number",
+                    "description": "Order auto-cancels after this many days. Default 30, min 1, max 90.",
+                },
+            },
+            "required": ["contract", "side", "kind", "trigger_premium", "reason"],
         },
     },
 }

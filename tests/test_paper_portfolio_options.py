@@ -374,3 +374,152 @@ async def test_status_includes_options_positions(executor):
     assert row["unrealized_pnl"] == pytest.approx(50.0)
     # Options market value rolled into total equity.
     assert snap["options_market_value"] == pytest.approx(250.0)
+
+
+# ---------- conditional orders on options ---------------------------------
+
+@pytest.mark.asyncio
+async def test_place_option_order_creates_pending_row(executor):
+    """Placing a sell-stop on a long option position registers a pending
+    order with contract_symbol set and trigger interpreted as premium."""
+    store = executor.store
+    occ = build_occ("AAPL", dt.date(2099, 12, 31), "call", 175.0)
+    await store.ensure_portfolio(CTX)
+    await store.buy_option(
+        CTX, contract_symbol=occ, underlying="AAPL",
+        option_type="call", strike=175.0,
+        expiration=time.time() + 30 * 86400,
+        qty=2, premium=2.00,
+    )
+    # FakeProvider's option premium is $2.50. Place a stop below cost.
+    executor.providers.option_premium = 2.50
+    result = await executor.place_order(
+        CTX,
+        contract=occ,
+        side="sell",
+        kind="stop",
+        trigger_price=1.50,
+        close_position=True,
+        reason="protect downside on the AAPL call",
+    )
+    assert result["ok"], result
+    assert result["is_option"] is True
+    assert result["contract"] == occ
+    pending = await store.list_orders_for_context(CTX)
+    assert len(pending) == 1
+    assert pending[0].contract_symbol == occ
+    assert pending[0].ticker == "AAPL"
+
+
+@pytest.mark.asyncio
+async def test_place_option_order_rejects_dollars(executor):
+    """Options orders can't use the dollars-mode sizing."""
+    store = executor.store
+    occ = build_occ("AAPL", dt.date(2099, 12, 31), "call", 175.0)
+    await store.ensure_portfolio(CTX)
+    await store.buy_option(
+        CTX, contract_symbol=occ, underlying="AAPL",
+        option_type="call", strike=175.0,
+        expiration=time.time() + 30 * 86400,
+        qty=1, premium=2.00,
+    )
+    result = await executor.place_order(
+        CTX,
+        contract=occ,
+        side="buy",
+        kind="limit",
+        trigger_price=1.00,
+        dollars=200.0,
+        reason="add on a dip",
+    )
+    assert not result["ok"]
+    assert "dollars" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_place_option_order_rejects_sell_without_position(executor):
+    """Can't place a sell trigger on a contract we don't hold."""
+    occ = build_occ("AAPL", dt.date(2099, 12, 31), "call", 175.0)
+    await executor.store.ensure_portfolio(CTX)
+    result = await executor.place_order(
+        CTX,
+        contract=occ,
+        side="sell",
+        kind="stop",
+        trigger_price=1.00,
+        close_position=True,
+        reason="phantom stop",
+    )
+    assert not result["ok"]
+    assert "no" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_try_fill_pending_fires_option_sell_stop(executor):
+    """Lower the option premium below a sell-stop trigger and verify the
+    watcher fires the order through execute_sell_option, recording a
+    realized PnL on the option_trades ledger."""
+    store = executor.store
+    occ = build_occ("AAPL", dt.date(2099, 12, 31), "call", 175.0)
+    await store.ensure_portfolio(CTX)
+    await store.buy_option(
+        CTX, contract_symbol=occ, underlying="AAPL",
+        option_type="call", strike=175.0,
+        expiration=time.time() + 30 * 86400,
+        qty=2, premium=3.00,
+    )
+    # Premium opens above trigger so the order placement doesn't
+    # immediately flag "already crossed". Then drop it below to simulate
+    # a stop-loss firing.
+    executor.providers.option_premium = 3.00
+    place = await executor.place_order(
+        CTX, contract=occ, side="sell", kind="stop",
+        trigger_price=2.00, close_position=True,
+        reason="stop the bleed",
+    )
+    assert place["ok"], place
+    # Now the premium dips — watcher should fire the order.
+    executor.providers.option_premium = 1.50
+    # Force market open since the FakeProvider doesn't model RTH.
+    import unittest.mock
+    with unittest.mock.patch(
+        "src.paper_portfolio_executor.market_closed_reason",
+        return_value=None,
+    ):
+        stats = await executor.try_fill_pending()
+    assert stats["filled"] == 1
+    # Position closed; cash reflects sale at $1.50/sh × 100 × 2 = $300.
+    pos = await store.get_option_position(CTX, occ)
+    assert pos is None
+    portfolio = await store.get_portfolio(CTX)
+    # Initial 1000 - 600 (buy at $3) + 300 (sell at $1.50) = 700
+    assert portfolio.cash == pytest.approx(700.0)
+
+
+@pytest.mark.asyncio
+async def test_should_fire_options_uses_premium(executor):
+    """Sanity: order.should_fire compares against whatever price we
+    pass in — the executor uses option premium for option orders, not
+    underlying spot."""
+    store = executor.store
+    occ = build_occ("AAPL", dt.date(2099, 12, 31), "call", 175.0)
+    await store.ensure_portfolio(CTX)
+    await store.buy_option(
+        CTX, contract_symbol=occ, underlying="AAPL",
+        option_type="call", strike=175.0,
+        expiration=time.time() + 30 * 86400,
+        qty=1, premium=2.50,
+    )
+    executor.providers.option_premium = 2.50
+    await executor.place_order(
+        CTX, contract=occ, side="sell", kind="limit",
+        trigger_price=5.00, close_position=True,
+        reason="take profit at double",
+    )
+    pending = await store.list_orders_for_context(CTX)
+    order = pending[0]
+    # At premium 4.99 the take-profit sell-limit must NOT fire.
+    assert not order.should_fire(4.99)
+    # At premium 5.00+ it must fire.
+    assert order.should_fire(5.00)
+    assert order.should_fire(7.50)

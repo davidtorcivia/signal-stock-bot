@@ -199,9 +199,12 @@ class OrdersWorker:
         return self.POLL_INTERVAL_SECONDS
 
     async def _settle_expired_options(self) -> None:
-        """Settle every expired options position across all contexts.
-        Logged at info on activity; warn on errors. Wraps the executor
-        call so the watcher loop can stay simple."""
+        """Settle every expired options position across all contexts,
+        then notify the originating chats so users see WHY cash just
+        moved. Routes through `_fire_settlement_reaction` which
+        mirrors the order-fill notification path: synthetic !ask per
+        chat so the bot voices the result in its own voice, with a
+        static fallback line if ask_command isn't wired."""
         try:
             stats = await self.executor.settle_expired_options()
         except Exception as e:
@@ -217,6 +220,197 @@ class OrdersWorker:
                 f"settled={stats.get('settled', 0)} "
                 f"errors={stats.get('errors', 0)}"
             )
+
+        settlements = stats.get("settlements") or []
+        if not settlements:
+            return
+        # Group by originating context_key so multiple contracts
+        # expiring together in one chat produce ONE bot reply.
+        by_context: dict[str, list[dict]] = {}
+        for s in settlements:
+            by_context.setdefault(s["context_key"], []).append(s)
+        for ctx_key, group in by_context.items():
+            try:
+                await self._fire_settlement_reaction(ctx_key, group)
+            except Exception as e:
+                logger.exception(
+                    f"Orders watcher: settlement notify failed for "
+                    f"{ctx_key}: {e}"
+                )
+
+    async def _fire_settlement_reaction(
+        self, context_key: str, settlements: list[dict],
+    ) -> None:
+        """Mirrors `_fire_bot_reaction` but for expiration settlements.
+        Synthesizes an !ask invocation so the bot speaks the
+        resolution; falls back to a static notification when ask_command
+        isn't configured or the chat hasn't opted into portfolio."""
+        if self.signal is None:
+            return
+        if not context_key.startswith("group:"):
+            # DM contexts: log only — no recipient-number recovery from
+            # hashed phone.
+            for s in settlements:
+                logger.info(
+                    f"Orders watcher: settlement in DM context "
+                    f"{context_key}, static log fallback: "
+                    f"{self._format_settlement(s)!r}"
+                )
+            return
+
+        group_id = context_key[len("group:"):]
+
+        policy = None
+        if self.contexts is not None:
+            try:
+                policy = await self.contexts.get_by_key(group_id)
+            except Exception as e:
+                logger.warning(
+                    f"Orders watcher: policy lookup for {context_key} "
+                    f"failed: {e}"
+                )
+                return
+        if policy is None or not policy.allows_command("portfolio"):
+            logger.info(
+                f"Orders watcher: {context_key} not opted into portfolio; "
+                f"falling back to static settlement notify"
+            )
+            for s in settlements:
+                await self._send_to_context(
+                    context_key, self._format_settlement(s),
+                )
+            return
+
+        if self.ask is None:
+            for s in settlements:
+                await self._send_to_context(
+                    context_key, self._format_settlement(s),
+                )
+            return
+
+        prompt = self._build_settlement_prompt(settlements)
+        settle_bot = self._resolve_bot_for(policy)
+        settle_phone = (
+            (settle_bot.signal_phone if settle_bot else None)
+            or self.bot_phone or ""
+        )
+        ctx = CommandContext(
+            sender=settle_phone,
+            group_id=group_id,
+            raw_message=f"!ask {prompt}",
+            command="ask",
+            args=[prompt],
+            policy=policy,
+            bot=settle_bot,
+            # Settlement is its own provenance tag — distinguishes
+            # post-settle journaling from user-initiated or order-fire
+            # !ask invocations.
+            automation_source="settle",
+        )
+        try:
+            result = await self.ask.execute(ctx)
+        except Exception as e:
+            logger.exception(
+                f"Orders watcher: !ask settlement reaction failed for "
+                f"{context_key}: {e}"
+            )
+            for s in settlements:
+                await self._send_to_context(
+                    context_key, self._format_settlement(s),
+                )
+            return
+        if not result or not result.success:
+            for s in settlements:
+                await self._send_to_context(
+                    context_key, self._format_settlement(s),
+                )
+            return
+
+        n = len(settlements)
+        plural = "s" if n != 1 else ""
+        header = f"⌁ Option{plural} settled at expiration"
+        body = result.text or ""
+        if not body.startswith("⌁") and not body.startswith("🔔"):
+            body = f"{header}\n\n{body}"
+        sender_handler = (
+            self.signal_pool.for_bot(settle_bot)
+            if self.signal_pool is not None
+            else self.signal
+        )
+        if sender_handler is None:
+            logger.warning(
+                f"Orders watcher: no signal handler for {context_key}; "
+                f"skipping settlement post"
+            )
+            return
+        try:
+            await sender_handler.send_message(
+                recipient="",
+                message=body,
+                group_id=group_id,
+                attachments=result.attachments,
+                styled=getattr(result, "styled", False),
+            )
+        except Exception as e:
+            logger.error(
+                f"Orders watcher: settlement send_message failed for "
+                f"{context_key}: {e}"
+            )
+
+    @staticmethod
+    def _build_settlement_prompt(settlements: list[dict]) -> str:
+        """Compose the synthetic-!ask body briefing the bot on which
+        contracts just settled and asking for a short reaction."""
+        from .options_symbols import friendly_name as _friendly
+        lines = []
+        for s in settlements:
+            try:
+                fname = _friendly(s["contract"])
+            except Exception:
+                fname = s["contract"]
+            outcome = (
+                "ITM — cash-settled at intrinsic"
+                if s["intrinsic"] > 0 else
+                ("expired worthless" if not s.get("force_settled")
+                 else "force-settled at $0 (no quote available)")
+            )
+            lines.append(
+                f"- {fname}: {outcome}. qty={s['qty']:g} × $"
+                f"{s['intrinsic']:.4f}/sh × {100} = "
+                f"${s['proceeds']:,.2f} returned to cash. "
+                f"Realized P/L: ${s['realized_pnl']:+,.2f}"
+            )
+        body = "\n".join(lines)
+        return (
+            f"One or more of your option positions just settled at "
+            f"expiration while you weren't looking. Here's the rundown:\n\n"
+            f"{body}\n\n"
+            f"This is your moment to acknowledge the outcome. Briefly "
+            f"comment in your own voice — 1-2 sentences, conversational, "
+            f"the way a real trader announces an expiration. Mention "
+            f"whether the thesis worked. If a real lesson exists, "
+            f"`portfolio_journal_append` a short reflection. Don't pile "
+            f"on follow-up trades unless there's a real reason."
+        )
+
+    @staticmethod
+    def _format_settlement(s: dict) -> str:
+        """Static one-line notification used when ask_command isn't
+        wired or the !ask path failed."""
+        from .options_symbols import friendly_name as _friendly
+        try:
+            fname = _friendly(s["contract"])
+        except Exception:
+            fname = s["contract"]
+        if s["intrinsic"] > 0:
+            return (
+                f"⌁ {fname} settled ITM — ${s['proceeds']:,.2f} "
+                f"returned to cash (intrinsic ${s['intrinsic']:.2f}/sh, "
+                f"P/L ${s['realized_pnl']:+,.2f})"
+            )
+        return (
+            f"⌁ {fname} expired worthless (P/L ${s['realized_pnl']:+,.2f})"
+        )
 
     async def _notify_resolutions(self, prior_pending: list) -> None:
         """Notify chats about orders that resolved this tick.

@@ -58,6 +58,8 @@ _AMBER = "#FFB300"
 _WIDTH_PX = 880
 _DPI = 110
 _ROW_HEIGHT_PX = 36       # per position row
+_OPTION_ROW_PX = 32       # per options-position row (compact one-liner)
+_OPTION_HEADER_PX = 56    # space reserved for the "OPTIONS" sub-heading
 _ORDER_ROW_PX = 30        # per pending-order row (slightly tighter)
 _ORDER_HEADER_PX = 56     # space reserved for the "OPEN ORDERS" heading
 _BASE_HEIGHT_PX = 380     # header + summary block + table header + padding
@@ -91,14 +93,25 @@ def render_portfolio_image(
     matplotlib failure propagate so the caller can log + degrade.
     """
     positions = snap.get("positions") or []
+    options_positions = snap.get("options_positions") or []
     pending_orders = snap.get("pending_orders") or []
     n_positions = len(positions)
+    n_options = len(options_positions)
     n_orders = len(pending_orders)
 
     height_px = _BASE_HEIGHT_PX + max(1, n_positions) * _ROW_HEIGHT_PX
-    if n_positions == 0:
+    if n_positions == 0 and n_options == 0:
         # Reserve a single "no open positions" row.
         height_px = _BASE_HEIGHT_PX + _ROW_HEIGHT_PX
+    elif n_positions == 0:
+        # Skip the "no positions" filler when options exist — the
+        # OPTIONS section below carries the visual weight.
+        height_px = _BASE_HEIGHT_PX
+    # Options block — appended when the bot holds at least one
+    # contract. Rendered as a compact one-liner per contract (the
+    # OCC-derived friendly name needs the full row width).
+    if n_options > 0:
+        height_px += _OPTION_HEADER_PX + n_options * _OPTION_ROW_PX
     # Orders block — only added when there are pending orders. Empty
     # case keeps the card compact (the chat sees no clutter when
     # nothing's queued).
@@ -390,16 +403,85 @@ def render_portfolio_image(
 
                 row_y_px += _ROW_HEIGHT_PX
 
+        # ---- Options positions ---------------------------------------
+        # Compact one-line-per-contract section. The OCC-derived
+        # friendly name (e.g. "AAPL $175C 2026-06-20") needs the full
+        # row width, so we don't fight the equity columns — render as
+        # a single justified row with the value/P&L right-anchored.
+        options_block_y_px = (
+            (header_y_px + 38 + max(1, n_positions) * _ROW_HEIGHT_PX)
+            if n_positions
+            else (header_y_px + 38 + _ROW_HEIGHT_PX if (not options_positions) else header_y_px + 38)
+        )
+        if options_positions:
+            opt_y_px = options_block_y_px + 14
+            ax.text(
+                0.04, py(opt_y_px),
+                f"OPTIONS ({n_options})",
+                color=_DIM, fontsize=10, fontweight="bold",
+                family="DejaVu Sans", va="center", ha="left", zorder=2,
+            )
+            ax.plot(
+                [0.04, 0.96],
+                [py(opt_y_px + 14), py(opt_y_px + 14)],
+                color=_GRID, linewidth=0.8, zorder=1,
+            )
+            opt_row_y_px = opt_y_px + 32
+            for op in options_positions:
+                friendly = str(op.get("friendly") or op.get("contract") or "")
+                qty = float(op.get("qty") or 0.0)
+                avg_prem = float(op.get("avg_premium") or 0.0)
+                mark_prem = op.get("mark_premium")
+                upnl = float(op.get("unrealized_pnl") or 0.0)
+                upct = float(op.get("unrealized_pct") or 0.0)
+                row_color = _GREEN if upnl >= 0 else _RED
+                row_arrow = "▲" if upnl >= 0 else "▼"
+                # Left: contract name + qty.
+                ax.text(
+                    0.04, py(opt_row_y_px), friendly,
+                    color=_INK, fontsize=11, fontweight="bold",
+                    family="DejaVu Sans", va="center", ha="left",
+                    zorder=2,
+                )
+                ax.text(
+                    0.55, py(opt_row_y_px),
+                    f"×{_fmt_qty(qty)}  "
+                    f"${avg_prem:.2f} → "
+                    f"{'—' if mark_prem is None else f'${float(mark_prem):.2f}'}",
+                    color=(_AMBER if mark_prem is None else _INK),
+                    fontsize=10, family="DejaVu Sans",
+                    va="center", ha="left", zorder=2,
+                )
+                # Right: P/L + percent.
+                if mark_prem is None:
+                    ax.text(
+                        0.96, py(opt_row_y_px), "no quote",
+                        color=_AMBER, fontsize=10, family="DejaVu Sans",
+                        va="center", ha="right", zorder=2,
+                    )
+                else:
+                    ax.text(
+                        0.96, py(opt_row_y_px),
+                        f"{row_arrow} {_fmt_dollars(upnl)} ({_fmt_pct(upct)})",
+                        color=row_color, fontsize=11, fontweight="bold",
+                        family="DejaVu Sans", va="center", ha="right",
+                        zorder=2,
+                    )
+                opt_row_y_px += _OPTION_ROW_PX
+
         # ---- Pending orders -------------------------------------------
         # Only rendered when there are orders. Without this section the
         # card stays compact for the common "no orders" case.
         if pending_orders:
-            # Section gap + heading.
+            # Section gap + heading. Anchor depends on whether options
+            # block consumed space above us.
             orders_y_px = (
                 (header_y_px + 38 + max(1, n_positions) * _ROW_HEIGHT_PX)
                 if n_positions
                 else (header_y_px + 38 + _ROW_HEIGHT_PX)
             )
+            if options_positions:
+                orders_y_px += _OPTION_HEADER_PX + n_options * _OPTION_ROW_PX
             orders_y_px += 14  # breathing room above the heading
             ax.text(
                 0.04, py(orders_y_px),
@@ -541,6 +623,6 @@ def render_portfolio_image(
     encoded = base64.b64encode(buf.read()).decode("utf-8")
     logger.debug(
         f"Rendered portfolio image: {len(positions)} positions, "
-        f"{len(encoded)} b64 bytes"
+        f"{len(options_positions)} options, {len(encoded)} b64 bytes"
     )
     return encoded

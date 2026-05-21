@@ -38,7 +38,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a concise assistant embedded in a Signal chat bot focused on "
     "financial markets. You can use *bold* and _italic_ for emphasis (Signal "
     "renders them natively). Refer users to the bot's commands (!price, "
-    "!chart, !ta, etc.) for live data; you don't have it directly."
+    "!chart, !ta, !opt, !chain, !portfolio, etc.) for live data; you don't "
+    "have it directly. You also have paper-trading tools — including LONG "
+    "options (calls/puts) with auto-settlement at expiration — exposed via "
+    "the portfolio_* tools when this chat has opted in."
 )
 
 

@@ -305,15 +305,43 @@
         </table>
     {% endif %}
 
+    {# Options positions #}
+    {% if p.options_positions %}
+    <h3 style="margin-top: 18px; font-size: 13px;">Options positions ({{ p.options_positions|length }})</h3>
+    <table>
+        <tr><th>Contract</th><th>Qty</th><th>Avg prem</th><th>Mark</th><th>Market value</th><th>P/L</th><th>Expires</th></tr>
+        {% for op in p.options_positions %}
+        <tr>
+            <td title="{{ op.contract }}">{{ op.friendly }}</td>
+            <td>{{ "%g"|format(op.qty) }}</td>
+            <td>${{ "%.2f"|format(op.avg_premium) }}</td>
+            <td>
+                {% if op.mark_premium is none %}
+                    <span class="muted">no quote</span>
+                {% else %}
+                    ${{ "%.2f"|format(op.mark_premium) }}
+                {% endif %}
+            </td>
+            <td>${{ "%.2f"|format(op.market_value) }}</td>
+            <td class="{{ 'gain' if op.unrealized_pnl >= 0 else 'loss' }}">
+                {{ "%+,.2f"|format(op.unrealized_pnl) }}
+                ({{ "%+.2f"|format(op.unrealized_pct * 100) }}%)
+            </td>
+            <td>{{ op.expires_str }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
     {# Reset action #}
     <form method="post" action="{{ url_for('admin.portfolios_reset', context_key=p.context_key) }}" style="margin-top: 18px;"
-          onsubmit="return confirm('Reset {{ p.label|e }} to $1000 cash? This DELETES all positions, trades, and tips. Cannot be undone.');">
+          onsubmit="return confirm('Reset {{ p.label|e }} to $1000 cash? This DELETES all positions, options positions, trades, option trades, and tips. Cannot be undone.');">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="secondary" style="background: #fee; border-color: #c33; color: #c33;">
             Reset portfolio
         </button>
         <span class="muted" style="margin-left: 8px; font-size: 11px;">
-            Wipes positions / trades / tips and re-seeds with $1000.
+            Wipes positions, options, trades, tips, and orders; re-seeds with $1000.
         </span>
     </form>
 </div>

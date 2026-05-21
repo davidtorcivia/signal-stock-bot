@@ -7,6 +7,7 @@ Mounts auth + dashboard + settings under /admin/*.
 import asyncio
 import json
 import logging
+import time
 from datetime import timedelta
 from typing import Optional
 
@@ -55,6 +56,9 @@ def create_admin_blueprint(
     portfolio_executor=None,
     bot_registry: Optional[BotRegistry] = None,
     llm_factory=None,
+    history=None,
+    group_log=None,
+    reactor=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -118,6 +122,9 @@ def create_admin_blueprint(
             oracle_store=oracle_store,
             bot_registry=bot_registry,
             settings_store=settings_store,
+            history=history,
+            group_log=group_log,
+            reactor=reactor,
         )
 
     if name_registry is not None:
@@ -1329,6 +1336,9 @@ def _register_context_routes(
     oracle_store=None,
     bot_registry: Optional[BotRegistry] = None,
     settings_store: Optional[SettingsStore] = None,
+    history=None,
+    group_log=None,
+    reactor=None,
 ) -> None:
     """Context CRUD + (when memory_store is wired) memory CRUD nested under
     each context. Memory routes are mounted unconditionally so the template
@@ -1587,6 +1597,70 @@ def _register_context_routes(
             )
         except Exception as e:
             logger.error(f"Transcript clear failed for ctx #{context_id}: {e}")
+        return redirect(url_for("admin.context_edit", context_id=context_id))
+
+    @bp.route("/contexts/<int:context_id>/purge", methods=["POST"])
+    @admin_required
+    def context_purge(context_id: int):
+        """Wipe a context's rolling conversational state and stamp a
+        permanent floor so the bot can't see anything it said or
+        summarized before this moment, ever.
+
+        Wipes:
+          - conversation_turns + conversation_summaries for this context
+          - bot-authored group_messages rows (sender = __bot__)
+          - in-process reactor recent-decisions deque
+        Preserves: inbound user group_messages, context_memories,
+        per-context settings, transcripts.
+        Sets: contexts.purge_floor_at = now (read-side filter that holds
+        forever even if a pre-floor row somehow survives).
+        """
+        if not verify_csrf():
+            return redirect(url_for("admin.context_edit", context_id=context_id))
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        if policy.kind == "default":
+            # Default rows are catch-alls — their context_key doesn't
+            # correspond to a real chat so a purge is meaningless and
+            # would only stamp a floor that filters every fallback chat.
+            logger.warning(
+                f"Purge refused on default context #{context_id}"
+            )
+            return redirect(url_for("admin.context_edit", context_id=context_id))
+
+        now = time.time()
+        _run_on_loop(loop, registry.set_purge_floor(context_id, now))
+
+        turns_removed = 0
+        if history is not None:
+            try:
+                turns_removed = _run_on_loop(loop, history.clear(policy.key))
+            except Exception as e:
+                logger.error(f"Purge: history.clear failed: {e}")
+
+        bot_rows_removed = 0
+        if group_log is not None and policy.kind == "group":
+            try:
+                bot_rows_removed = _run_on_loop(
+                    loop, group_log.clear_bot_rows(policy.key)
+                )
+            except Exception as e:
+                logger.error(f"Purge: group_log.clear_bot_rows failed: {e}")
+
+        reactor_entries_cleared = 0
+        if reactor is not None and policy.kind == "group":
+            try:
+                reactor_entries_cleared = reactor.clear_recent(policy.key)
+            except Exception as e:
+                logger.error(f"Purge: reactor.clear_recent failed: {e}")
+
+        logger.info(
+            f"Purged ctx #{context_id} ({policy.kind}/{policy.key[:16]}): "
+            f"floor={now:.0f}, turns/summary={turns_removed}, "
+            f"bot_group_rows={bot_rows_removed}, "
+            f"reactor_recent={reactor_entries_cleared}"
+        )
         return redirect(url_for("admin.context_edit", context_id=context_id))
 
     if oracle_store is not None:
@@ -2712,8 +2786,22 @@ def _register_portfolio_routes(
                 or ctx_labels.get(ck)
                 or ck
             )
-            row["trades"] = [
-                {
+            # Merge equity + option trades into a single time-ordered
+            # log so the admin sees the full activity without scanning
+            # two sections.
+            try:
+                option_trades = _run_on_loop(
+                    loop, portfolio_store.list_option_trades(ck, limit=15),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Portfolios: option trades for {ck} failed: {e}"
+                )
+                option_trades = []
+            trade_views: list[dict] = []
+            for t in trades:
+                trade_views.append({
+                    "ts": t.ts,
                     "ts_str": _time.strftime(
                         "%Y-%m-%d %H:%M", _time.localtime(t.ts),
                     ),
@@ -2724,9 +2812,36 @@ def _register_portfolio_routes(
                     "source": t.source,
                     "realized_pnl": t.realized_pnl,
                     "reason": t.reason,
-                }
-                for t in trades
-            ]
+                    "kind": "equity",
+                })
+            for ot in option_trades:
+                trade_views.append({
+                    "ts": ot.ts,
+                    "ts_str": _time.strftime(
+                        "%Y-%m-%d %H:%M", _time.localtime(ot.ts),
+                    ),
+                    "side": ot.side,
+                    "qty": ot.qty,
+                    "ticker": ot.contract_symbol,
+                    "price": ot.premium,
+                    "source": ot.source,
+                    "realized_pnl": ot.realized_pnl,
+                    "reason": ot.reason,
+                    "kind": "option",
+                    "multiplier": ot.multiplier,
+                })
+            trade_views.sort(key=lambda r: r["ts"], reverse=True)
+            row["trades"] = trade_views[:15]
+            # Pre-format options expiration for the template (it has
+            # no datetimeformat filter handy). status() returns a unix
+            # ts; the admin view wants a calendar string.
+            for op in (row.get("options_positions") or []):
+                if op.get("expiration"):
+                    op["expires_str"] = _time.strftime(
+                        "%Y-%m-%d", _time.localtime(op["expiration"]),
+                    )
+                else:
+                    op["expires_str"] = "—"
             row["tips"] = [
                 {
                     "ts_str": _time.strftime(
@@ -2746,6 +2861,8 @@ def _register_portfolio_routes(
                 {
                     "id": o.id,
                     "ticker": o.ticker,
+                    "contract": o.contract_symbol,
+                    "is_option": bool(o.contract_symbol),
                     "side": o.side,
                     "kind": o.kind,
                     "trigger_price": o.trigger_price,

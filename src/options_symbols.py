@@ -78,9 +78,9 @@ def parse_occ(symbol: str) -> ContractParts:
     if not m:
         raise ValueError(f"not an OCC contract symbol: {symbol!r}")
     yy = int(m.group("yy"))
-    # OCC uses 2-digit years. Standard rollover convention: 00-49 → 20xx,
-    # 50-99 → 19xx. We never trade pre-2000 contracts in practice, so
-    # the rollover is purely defensive.
+    # OCC uses 2-digit years. We pivot at 70: yy < 70 → 20xx, yy >= 70 → 19xx.
+    # Real contracts only exist post-2000, so the 19xx branch is purely
+    # defensive against malformed input — by 2070 we'll need a new pivot.
     year = 2000 + yy if yy < 70 else 1900 + yy
     expiration = dt.date(year, int(m.group("mm")), int(m.group("dd")))
     cp = m.group("cp")
@@ -117,6 +117,7 @@ _FRIENDLY_DATE_PATTERNS = (
     "%m/%d/%Y",
     "%m-%d-%Y",
     "%m/%d/%y",
+    "%m-%d-%y",
 )
 
 
@@ -142,14 +143,24 @@ def normalize_contract(symbol_or_friendly: str) -> str:
     """
     if not symbol_or_friendly or not symbol_or_friendly.strip():
         raise ValueError("empty contract symbol")
-    raw = symbol_or_friendly.strip()
+    # Cap input length so a runaway LLM prompt can't feed megabytes
+    # to the regex engine.
+    raw = symbol_or_friendly.strip()[:128]
     if is_occ(raw):
         # Drop any O: prefix and re-canonicalize uppercase. Round-tripping
         # through parse + build also catches malformed roots and dates.
         parts = parse_occ(raw)
         return build_occ(parts.root, parts.expiration, parts.option_type, parts.strike)
 
-    tokens = [t for t in re.split(r"[\s,]+", raw) if t]
+    raw_tokens = [t for t in re.split(r"[\s,]+", raw) if t]
+    # Strip stray punctuation per token so the LLM can write the dollar-
+    # signed strikes it naturally emits ("$175C", "$175") and the
+    # `friendly_name()` output (which includes a $) round-trips cleanly.
+    tokens: list[str] = []
+    for t in raw_tokens:
+        t = t.strip("$()[]'\"")
+        if t:
+            tokens.append(t)
     if len(tokens) < 3:
         raise ValueError(
             f"can't parse contract {symbol_or_friendly!r}; expected "
@@ -161,15 +172,28 @@ def normalize_contract(symbol_or_friendly: str) -> str:
     strike: Optional[float] = None
     opt_type: Optional[str] = None
 
+    # Two-pass: first identify the underlying as the first multi-char
+    # alpha token (or fall back to a single-letter alpha token only if
+    # nothing longer exists). This avoids greedily consuming "C" /
+    # "P" as the option-type word and stealing them from the root
+    # slot — Citigroup (C) and ProShares (P) are real one-letter
+    # tickers.
+    multi_alpha = [t for t in tokens if t.isalpha() and 2 <= len(t) <= 6 and t.upper() not in ("CALL", "PUT")]
+    if multi_alpha:
+        root = multi_alpha[0].upper()
+    else:
+        # Fallback: a single-letter alpha token, taken as root only if
+        # there's an UNAMBIGUOUS strike+type combo elsewhere (so we
+        # know `C`/`P` here is the root, not the type word).
+        single_letter = [t for t in tokens if t.isalpha() and len(t) == 1]
+        has_strike_letter = any(_STRIKE_WITH_LETTER_RE.match(t) for t in tokens)
+        if single_letter and has_strike_letter:
+            root = single_letter[0].upper()
+
     for tok in tokens:
         upper = tok.upper()
-        # Underlying — must come before strike/date but parsers tolerate
-        # any order. Match the first alpha-only token.
-        if root is None and upper.isalpha() and len(upper) <= 6:
-            if upper in ("CALL", "PUT", "C", "P"):
-                opt_type = "call" if upper.startswith("C") else "put"
-                continue
-            root = upper
+        # Skip the token we already assigned as root.
+        if root is not None and upper == root:
             continue
         # Combined strike+type like "175C" or "175.5p"
         m = _STRIKE_WITH_LETTER_RE.match(tok)
@@ -191,8 +215,8 @@ def normalize_contract(symbol_or_friendly: str) -> str:
         if opt_type is None and upper in ("CALL", "PUT", "C", "P"):
             opt_type = "call" if upper.startswith("C") else "put"
             continue
-        # Anything else: ignore (lets descriptive words like "weekly"
-        # slip through without breaking parse).
+        # Multi-char alpha token that wasn't already picked as root —
+        # ignore (lets descriptive words like "weekly" slip through).
 
     missing = [
         n for n, v in (

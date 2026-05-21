@@ -201,12 +201,19 @@ class Order:
     """Conditional order awaiting a price trigger.
 
     Exactly one of (`qty`, `dollars`, `close_position=True`) is set:
-      - `qty`: exact share count (buy or sell)
+      - `qty`: exact share count (buy or sell) — or contract count for
+        options orders
       - `dollars`: dollar amount (BUY ONLY — converted to qty at fill
-        using the trigger-time quote)
+        using the trigger-time quote). NOT supported for options.
       - `close_position`: SELL ONLY — fill against the entire current
-        position at trigger time (handles shares accumulated/trimmed
-        between order placement and fill)
+        position at trigger time
+
+    Options vs equity discrimination: `contract_symbol` is None for
+    equity orders (where `ticker` is the security and `trigger_price`
+    is the equity share price). For options orders, `contract_symbol`
+    holds the OCC symbol, `ticker` holds the UNDERLYING (for grouping
+    in admin/status views), and `trigger_price` is the per-share
+    PREMIUM at which the order fires.
     """
     id: int
     context_key: str
@@ -225,6 +232,7 @@ class Order:
     fill_price: Optional[float]
     fill_qty: Optional[float]
     fill_note: Optional[str]   # error reason on status='failed'
+    contract_symbol: Optional[str] = None  # None for equity orders
 
     def should_fire(self, current_price: float) -> bool:
         """True iff the trigger has been crossed by `current_price`.
@@ -400,6 +408,10 @@ class PortfolioStore:
             # Conditional orders. Exactly one of (qty, dollars,
             # close_position) is set per row. Watcher polls
             # status='pending' rows every ~5 min during market hours.
+            # `contract_symbol` is NULL for equity orders (ticker is
+            # the security) and the OCC contract for options orders
+            # (ticker is the UNDERLYING; trigger_price is the per-share
+            # option premium).
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS portfolio_orders (
@@ -419,10 +431,20 @@ class PortfolioStore:
                     filled_at REAL,
                     fill_price REAL,
                     fill_qty REAL,
-                    fill_note TEXT
+                    fill_note TEXT,
+                    contract_symbol TEXT
                 )
                 """
             )
+            # Migrate: add contract_symbol column if upgrading from a
+            # schema that didn't have it. Match the bot_id migration
+            # pattern in this file.
+            cursor = await db.execute("PRAGMA table_info(portfolio_orders)")
+            order_cols = {r[1] for r in await cursor.fetchall()}
+            if "contract_symbol" not in order_cols:
+                await db.execute(
+                    "ALTER TABLE portfolio_orders ADD COLUMN contract_symbol TEXT"
+                )
             # Hot path for the watcher: "give me all pending orders, in
             # arrival order". Status filter is selective (most rows go
             # filled/cancelled within their lifetime), so a partial
@@ -951,13 +973,42 @@ class PortfolioStore:
 
     async def list_options_positions_all(self) -> list[OptionPosition]:
         """Every open options position across every context — used by
-        the settlement worker, which scans expirations globally."""
+        admin tooling and debug paths. The settlement worker should
+        prefer `list_options_positions_due` which uses the
+        `idx_options_pos_expiration` index to filter in SQL."""
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT context_key, contract_symbol, underlying, option_type,
                           strike, expiration, qty, avg_premium, multiplier
                    FROM options_positions ORDER BY expiration"""
+            )
+            rows = await cursor.fetchall()
+        return [
+            OptionPosition(
+                context_key=r[0], contract_symbol=r[1], underlying=r[2],
+                option_type=r[3], strike=float(r[4]), expiration=float(r[5]),
+                qty=float(r[6]), avg_premium=float(r[7]), multiplier=int(r[8]),
+            ) for r in rows
+        ]
+
+    async def list_options_positions_due(
+        self, now_ts: float,
+    ) -> list[OptionPosition]:
+        """Open options positions whose expiration is at or before
+        `now_ts`. Used by the settlement worker as the hot path —
+        leverages `idx_options_pos_expiration` so this stays O(due)
+        even when the table accumulates many future-dated positions.
+        """
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT context_key, contract_symbol, underlying, option_type,
+                          strike, expiration, qty, avg_premium, multiplier
+                   FROM options_positions
+                   WHERE expiration <= ?
+                   ORDER BY expiration""",
+                (float(now_ts),),
             )
             rows = await cursor.fetchall()
         return [
@@ -1448,7 +1499,8 @@ class PortfolioStore:
     _ORDER_COLUMNS = (
         "id, context_key, ticker, side, kind, trigger_price, qty, "
         "dollars, close_position, reason, status, created_at, "
-        "expires_at, filled_at, fill_price, fill_qty, fill_note"
+        "expires_at, filled_at, fill_price, fill_qty, fill_note, "
+        "contract_symbol"
     )
 
     @staticmethod
@@ -1471,6 +1523,7 @@ class PortfolioStore:
             fill_price=(float(r[14]) if r[14] is not None else None),
             fill_qty=(float(r[15]) if r[15] is not None else None),
             fill_note=r[16],
+            contract_symbol=(r[17] if len(r) > 17 else None),
         )
 
     async def create_order(
@@ -1486,17 +1539,30 @@ class PortfolioStore:
         close_position: bool = False,
         reason: Optional[str] = None,
         expires_at: Optional[float] = None,
+        contract_symbol: Optional[str] = None,
         now_ts: Optional[float] = None,
     ) -> int:
         """Insert a pending order. Validates inputs at the persistence
         boundary as defence-in-depth — the executor does its own checks
-        but the store is the last line so SQL never sees garbage."""
+        but the store is the last line so SQL never sees garbage.
+
+        `contract_symbol` (when set) marks this as an options order:
+        ticker is the underlying, trigger_price is the per-share
+        premium, and `dollars` is forbidden (premium fluctuation makes
+        the dollar→qty conversion at fill unreliable for options).
+        """
         if side not in (SIDE_BUY, SIDE_SELL):
             raise ValueError(f"invalid side {side!r}")
         if kind not in VALID_ORDER_KINDS:
             raise ValueError(f"invalid kind {kind!r}")
         if not _is_valid_amount(trigger_price) or trigger_price <= 0:
             raise ValueError("trigger_price must be a positive finite number")
+        is_option = contract_symbol is not None
+        if is_option and dollars is not None:
+            raise ValueError(
+                "dollars is not supported on options orders — pass qty "
+                "(contracts) or close_position instead"
+            )
         # Exactly one of qty / dollars / close_position must be set.
         # `close_position` is sell-only; `dollars` is buy-only (we don't
         # know fill price at registration so we can't safely convert
@@ -1518,6 +1584,8 @@ class PortfolioStore:
         if qty is not None:
             if not _is_valid_amount(qty) or qty <= 0:
                 raise ValueError("qty must be a positive finite number")
+            if is_option and qty != int(qty):
+                raise ValueError("qty must be a whole number of contracts")
         if close_position and side != SIDE_SELL:
             raise ValueError("close_position is only valid on sell orders")
 
@@ -1528,12 +1596,13 @@ class PortfolioStore:
                 """INSERT INTO portfolio_orders
                    (context_key, ticker, side, kind, trigger_price,
                     qty, dollars, close_position, reason, status,
-                    created_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, expires_at, contract_symbol)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     context_key, ticker, side, kind, float(trigger_price),
                     qty, dollars, 1 if close_position else 0,
                     reason, ORDER_PENDING, ts, expires_at,
+                    contract_symbol,
                 ),
             )
             await db.commit()

@@ -426,7 +426,7 @@ class HelpCommand(BaseCommand):
     CATEGORIES: list[tuple[str, list[str]]] = [
         ("Markets", [
             "price", "quote", "info", "market", "crypto", "forex", "futures",
-            "option", "status",
+            "option", "chain", "status",
         ]),
         ("Charts & TA", [
             "chart", "ta", "tldr", "rsi", "sma", "macd", "support",
@@ -667,24 +667,37 @@ class OptionCommand(BaseCommand):
     name = "option"
     aliases = ["opt", "o"]
     description = "Get option quote"
-    usage = "!opt TSLA230120C00150000"
-    
+    usage = "!opt TSLA230120C00150000  (or: !opt AAPL 175C 2026-06-20)"
+    help_explanation = (
+        "Quote a specific options contract. Accepts either the canonical "
+        "OCC symbol (e.g. AAPL250620C00175000) or a friendly form like "
+        "`AAPL 175C 2026-06-20`. Returns premium, IV, delta, volume, and "
+        "open interest. Use `!chain <ticker>` to discover contracts."
+    )
+
     def __init__(self, provider_manager: ProviderManager):
         self.providers = provider_manager
-    
+
     async def execute(self, ctx: CommandContext) -> CommandResult:
         if not ctx.args:
             return CommandResult.error(
                 f"Usage: {self.usage}\n"
-                "Provide the full OCC symbol (e.g. AAPL230616C00150000)"
+                "Provide the OCC symbol or a friendly form like "
+                "'AAPL 175C 2026-06-20'."
             )
-        
-        symbol = ctx.args[0].upper()
-        # Ensure O: prefix for Massive if using standard strings or pass as is? 
-        # Manually prepending O: if not present might be safer for MassiveProvider logic.
-        # But MassiveProvider logic tries to handle it.
-        # Let's pass as is.
-        
+
+        # Accept both canonical OCC and the loose friendly forms the
+        # users type in chat. `normalize_contract` is the same parser
+        # the LLM tool uses, so the surface is consistent.
+        raw_arg = " ".join(ctx.args).strip()
+        try:
+            from ..options_symbols import normalize_contract
+            symbol = normalize_contract(raw_arg)
+        except ValueError as e:
+            return CommandResult.error(
+                f"Couldn't parse contract: {e}"
+            )
+
         try:
             q = await self.providers.get_option_quote(symbol)
             

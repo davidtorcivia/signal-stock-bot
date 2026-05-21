@@ -36,6 +36,7 @@ from .portfolio_command import (
     PORTFOLIO_JOURNAL_READ_TOOL,
     PORTFOLIO_OPTION_QUOTE_TOOL,
     PORTFOLIO_OPTIONS_CHAIN_TOOL,
+    PORTFOLIO_PLACE_OPTION_ORDER_TOOL,
     PORTFOLIO_PLACE_ORDER_TOOL,
     PORTFOLIO_SELL_OPTION_TOOL,
     PORTFOLIO_SELL_TOOL,
@@ -603,6 +604,7 @@ class AskCommand(BaseCommand):
             schemas.append(PORTFOLIO_OPTION_QUOTE_TOOL)
             schemas.append(PORTFOLIO_BUY_OPTION_TOOL)
             schemas.append(PORTFOLIO_SELL_OPTION_TOOL)
+            schemas.append(PORTFOLIO_PLACE_OPTION_ORDER_TOOL)
             # Journal tools are gated separately because the journal
             # store is wired independently — a deploy could have
             # portfolio enabled but no journal directory configured,
@@ -1308,6 +1310,73 @@ class AskCommand(BaseCommand):
                 f"Reason: {reason}"
             )
 
+        if name == "portfolio_place_option_order":
+            contract_raw = str(args.get("contract") or "").strip()
+            side = str(args.get("side") or "").strip().lower()
+            kind = str(args.get("kind") or "").strip().lower()
+            reason = str(args.get("reason") or "").strip()
+            if not contract_raw:
+                return "ERROR: portfolio_place_option_order requires a contract."
+            if not reason:
+                return "ERROR: portfolio_place_option_order requires a one-sentence reason."
+            trigger_raw = args.get("trigger_premium")
+            if trigger_raw is None:
+                return "ERROR: trigger_premium is required."
+            try:
+                trigger_premium = float(trigger_raw)
+            except (TypeError, ValueError):
+                return "ERROR: trigger_premium must be a number."
+            qty = args.get("qty")
+            close_position = bool(args.get("close_position") or False)
+            try:
+                qty_f = float(qty) if qty is not None else None
+            except (TypeError, ValueError):
+                return "ERROR: qty must be numeric."
+            expires_in_days_raw = args.get("expires_in_days")
+            try:
+                expires_in_days = (
+                    float(expires_in_days_raw)
+                    if expires_in_days_raw is not None else 30.0
+                )
+            except (TypeError, ValueError):
+                return "ERROR: expires_in_days must be a number."
+            expires_in_days = max(1.0, min(90.0, expires_in_days))
+            try:
+                result = await executor.place_order(
+                    ctx_key,
+                    contract=contract_raw, side=side, kind=kind,
+                    trigger_price=trigger_premium,
+                    qty=qty_f, close_position=close_position,
+                    reason=reason,
+                    expires_in_days=expires_in_days,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_place_option_order failed: {e}")
+                return f"ERROR: place_option_order failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'order rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
+            warn_part = ""
+            if result.get("warning"):
+                warn_part = f" WARNING: {result['warning']}"
+            current_part = ""
+            if result.get("current_price") is not None:
+                current_part = (
+                    f" (current premium ${result['current_price']:.2f}/sh)"
+                )
+            try:
+                friendly = _opt_friendly_name(result.get("contract") or contract_raw)
+            except Exception:
+                friendly = result.get("contract") or contract_raw
+            return (
+                f"Placed option order #{result['order_id']}: "
+                f"{kind}-{side} {friendly} @ premium "
+                f"${result['trigger_price']:.2f}/sh{current_part}. "
+                f"Will fire automatically when the contract's premium "
+                f"crosses the trigger (~5 min poll during market hours)."
+                f"{warn_part} Reason: {reason}"
+            )
+
         if name == "portfolio_sell_option":
             contract_raw = str(args.get("contract") or "").strip()
             reason = str(args.get("reason") or "").strip()
@@ -1721,6 +1790,7 @@ class AskCommand(BaseCommand):
                 "portfolio_sell",
                 "portfolio_status",
                 "portfolio_place_order",
+                "portfolio_place_option_order",
                 "portfolio_cancel_order",
                 "portfolio_options_chain",
                 "portfolio_option_quote",

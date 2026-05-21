@@ -32,7 +32,6 @@ from .paper_portfolio import (
     KIND_STOP,
     Order,
     ORDER_PENDING,
-    OptionPosition,
     PortfolioStore,
     SIDE_BUY,
     SIDE_SELL,
@@ -86,6 +85,21 @@ _MAX_PENDING_ORDERS_PER_CONTEXT = 25
 _MAX_TICKER_LEN = 16          # generous: real tickers are 1-5, ETFs use suffixes
 _MAX_REASON_LEN = 500
 _MAX_TRIGGER_PRICE = 1_000_000.0  # no equity priced > $1M/share is realistic
+# Options-specific caps. Per-fill: 10k contracts at $1 premium = $1M
+# cost — far past any reasonable paper-portfolio budget but cheap to
+# enforce. Per-context: 200 distinct open positions covers an active
+# strategy without letting a runaway LLM mint thousands of unique
+# rows the settlement worker has to iterate every tick.
+_MAX_OPTION_CONTRACTS_PER_FILL = 10_000
+_MAX_OPTION_POSITIONS_PER_CONTEXT = 200
+# Settlement poison-row policy. When the underlying's quote stays
+# unavailable for more than this many seconds past expiration, the
+# settle path force-closes the contract at $0 (expired worthless) so
+# the row doesn't sit in options_positions forever, retried on every
+# tick of the worker. Realized PnL records the full premium loss —
+# worst-case for the user but the honest outcome when we can't
+# determine intrinsic.
+_SETTLEMENT_STALE_GRACE_SECONDS = 86400  # 24 hours
 
 
 def _order_to_view(order: Order) -> dict:
@@ -95,6 +109,8 @@ def _order_to_view(order: Order) -> dict:
     return {
         "id": order.id,
         "ticker": order.ticker,
+        "contract": order.contract_symbol,
+        "is_option": bool(order.contract_symbol),
         "side": order.side,
         "kind": order.kind,
         "trigger_price": order.trigger_price,
@@ -135,15 +151,26 @@ class PaperPortfolioExecutor:
         self.providers = provider_manager
 
     async def _fetch_price(self, ticker: str) -> tuple[Optional[float], Optional[str]]:
-        """Returns (price, error). Exactly one is None."""
+        """Returns (price, error). Exactly one is None.
+
+        NaN/Inf are explicitly rejected — `price <= 0` is False for
+        NaN, so without this check a poisoned quote (provider bug,
+        delisted stub) would slip through into downstream math.
+        """
         try:
             quote = await self.providers.get_quote(ticker)
         except Exception as e:
             return None, f"couldn't quote {ticker}: {type(e).__name__}"
         price = getattr(quote, "price", None)
-        if price is None or price <= 0:
+        if price is None:
             return None, f"no valid quote for {ticker}"
-        return float(price), None
+        try:
+            price_f = float(price)
+        except (TypeError, ValueError):
+            return None, f"non-numeric quote for {ticker}"
+        if not math.isfinite(price_f) or price_f <= 0:
+            return None, f"no valid quote for {ticker} (got {price_f!r})"
+        return price_f, None
 
     async def _fetch_option_quote(self, contract: str):
         """Returns (option_quote, error). Exactly one is None. `contract`
@@ -168,6 +195,102 @@ class PaperPortfolioExecutor:
         if premium is None or premium <= 0:
             return None, f"no valid premium for {contract}"
         return float(premium), None
+
+    async def _fetch_option_premiums_batched(
+        self, options_pos,
+    ) -> list[tuple[Optional[float], Optional[str]]]:
+        """Mark-to-market premium for each position, grouped by
+        underlying so multiple contracts on the same name share one
+        chain fetch. Result order matches input order so the caller
+        can zip directly against `options_pos`.
+
+        Single-contract underlyings fall back to per-contract quotes
+        (the chain endpoint returns up to 250 rows; querying it for
+        one strike wastes bandwidth and the provider's quota).
+        """
+        from collections import defaultdict
+        groups: dict[str, list[int]] = defaultdict(list)
+        for i, op in enumerate(options_pos):
+            groups[op.underlying].append(i)
+
+        results: list[tuple[Optional[float], Optional[str]]] = [
+            (None, "unfilled") for _ in options_pos
+        ]
+
+        # Schedule fetches: chain for any underlying with ≥2 holdings,
+        # per-contract otherwise. asyncio.gather runs them all in
+        # parallel.
+        tasks: list = []
+        task_meta: list[tuple[str, list[int]]] = []  # (kind, indices)
+        for underlying, indices in groups.items():
+            if len(indices) >= 2:
+                tasks.append(self._safe_chain_lookup(underlying))
+                task_meta.append(("chain", indices))
+            else:
+                idx = indices[0]
+                tasks.append(self._fetch_option_premium(
+                    options_pos[idx].contract_symbol,
+                ))
+                task_meta.append(("single", indices))
+
+        responses = await asyncio.gather(*tasks, return_exceptions=False)
+
+        for response, (kind, indices) in zip(responses, task_meta):
+            if kind == "single":
+                # Direct quote result is already (premium, err).
+                results[indices[0]] = response
+                continue
+            # Chain result: {contract_symbol -> premium}. Missing
+            # contracts get a fallback per-contract quote.
+            chain_map, chain_err = response
+            missing: list[int] = []
+            for idx in indices:
+                contract = options_pos[idx].contract_symbol
+                if chain_err is not None:
+                    missing.append(idx)
+                    continue
+                premium = chain_map.get(contract)
+                if premium is None or premium <= 0:
+                    missing.append(idx)
+                else:
+                    results[idx] = (float(premium), None)
+            if missing:
+                fallbacks = await asyncio.gather(*(
+                    self._fetch_option_premium(
+                        options_pos[idx].contract_symbol,
+                    ) for idx in missing
+                ), return_exceptions=False)
+                for idx, premium_err in zip(missing, fallbacks):
+                    results[idx] = premium_err
+
+        return results
+
+    async def _safe_chain_lookup(
+        self, underlying: str,
+    ) -> tuple[dict, Optional[str]]:
+        """Fetch the options chain for an underlying and reduce to a
+        {contract_symbol -> premium} map. Errors are swallowed and
+        surfaced as the `error` half so the caller can fall back to
+        per-contract quotes instead of failing the whole snapshot."""
+        try:
+            chain = await self.providers.get_options_chain(
+                underlying, expiration=None, limit=250,
+            )
+        except Exception as e:
+            logger.debug(
+                f"status: chain fetch for {underlying} failed "
+                f"({type(e).__name__}); will fall back to per-contract quotes"
+            )
+            return {}, str(e)
+        out: dict[str, float] = {}
+        for q in chain:
+            symbol = getattr(q, "symbol", "")
+            if symbol.startswith("O:"):
+                symbol = symbol[2:]
+            premium = getattr(q, "price", 0.0) or 0.0
+            if symbol and premium > 0:
+                out[symbol] = float(premium)
+        return out, None
 
     async def execute_buy(
         self,
@@ -357,13 +480,18 @@ class PaperPortfolioExecutor:
         # basis (same shape as equity positions above) so the snapshot
         # never invents value, but also doesn't punish the user for a
         # transient quote failure.
+        #
+        # Performance: when the portfolio holds multiple contracts on
+        # the same underlying (typical: a long-call + protective put
+        # on one name, or several strikes), prefer ONE chain fetch
+        # per underlying over N per-contract quotes. Single-position
+        # underlyings still use the direct quote — the chain endpoint
+        # returns up to 250 rows, wasted bandwidth for a one-strike
+        # case.
         option_views: list[dict] = []
         option_market_value = 0.0
         if options_pos:
-            option_quote_results = await asyncio.gather(
-                *(self._fetch_option_premium(op.contract_symbol) for op in options_pos),
-                return_exceptions=False,
-            )
+            option_quote_results = await self._fetch_option_premiums_batched(options_pos)
             for op, (premium, err) in zip(options_pos, option_quote_results):
                 cost = op.qty * op.multiplier * op.avg_premium
                 friendly = occ_friendly_name(op.contract_symbol)
@@ -442,7 +570,8 @@ class PaperPortfolioExecutor:
         self,
         context_key: str,
         *,
-        ticker: str,
+        ticker: Optional[str] = None,
+        contract: Optional[str] = None,
         side: str,
         kind: str,
         trigger_price: float,
@@ -455,14 +584,38 @@ class PaperPortfolioExecutor:
         """Register a conditional order. Validation happens here so the
         store sees only well-formed inputs.
 
+        Two modes — discriminated by which of `ticker` / `contract` is
+        set:
+          - Equity: pass `ticker`. trigger_price = equity share price.
+          - Options: pass `contract` (OCC or friendly). trigger_price =
+            per-share PREMIUM the order fires on. `dollars` is not
+            supported for options; `qty` is whole contracts.
+
         Returns dict with `ok=True` and `order_id` on success, or
-        `ok=False` + `error` on rejection. Does NOT require market hours
-        — orders persist across the closed window and the watcher only
-        fires them during RTH.
+        `ok=False` + `error` on rejection. Does NOT require market
+        hours — orders persist across the closed window and the watcher
+        only fires them during RTH.
         """
-        ticker = (ticker or "").strip().upper()
+        # Discriminate equity vs options. Caller passes one or the
+        # other; `contract` takes precedence if both somehow arrive.
+        contract_symbol: Optional[str] = None
+        is_option = bool(contract and contract.strip())
+        if is_option:
+            try:
+                contract_symbol = normalize_contract(contract or "")
+            except ValueError as e:
+                return {"ok": False, "error": f"contract not parseable: {e}"}
+            try:
+                parts = parse_occ(contract_symbol)
+            except ValueError as e:
+                return {"ok": False, "error": f"contract not parseable: {e}"}
+            # ticker column stores the underlying — used as the
+            # grouping/display key in admin and chat views.
+            ticker = parts.root
+        else:
+            ticker = (ticker or "").strip().upper()
         if not ticker:
-            return {"ok": False, "error": "Ticker required."}
+            return {"ok": False, "error": "Ticker (or contract) required."}
         if len(ticker) > _MAX_TICKER_LEN:
             return {
                 "ok": False,
@@ -501,6 +654,14 @@ class PaperPortfolioExecutor:
                 ),
             }
         if dollars is not None:
+            if is_option:
+                return {
+                    "ok": False,
+                    "error": (
+                        "dollars is not supported for options orders. "
+                        "Pass qty (number of contracts) or close_position."
+                    ),
+                }
             if side != SIDE_BUY:
                 return {"ok": False, "error": "dollars is only valid on buy orders."}
             if not _finite(dollars) or dollars <= 0:
@@ -508,6 +669,11 @@ class PaperPortfolioExecutor:
         if qty is not None:
             if not _finite(qty) or qty <= 0:
                 return {"ok": False, "error": "qty must be a positive finite number."}
+            if is_option and qty != int(qty):
+                return {
+                    "ok": False,
+                    "error": "qty must be a whole number of contracts.",
+                }
         if close_position and side != SIDE_SELL:
             return {"ok": False, "error": "close_position is sell-only."}
         if not reason:
@@ -536,29 +702,47 @@ class PaperPortfolioExecutor:
                 ),
             }
 
-        # Reject sell orders for tickers we don't currently hold. Without
-        # this, the bot can sit on a stale sell-stop forever for a name
-        # it never bought, which is dead state and surprises the chat.
+        # Reject sell orders for positions we don't currently hold.
+        # For equities check the share position; for options check the
+        # specific contract position. Either way, sitting on a stale
+        # sell-stop forever for something never opened is dead state.
         if side == SIDE_SELL:
-            pos = await self.store.get_position(context_key, ticker)
-            if pos is None:
-                return {
-                    "ok": False,
-                    "error": (
-                        f"No {ticker} position to sell against. Place a "
-                        f"buy order first or buy at market."
-                    ),
-                }
+            if is_option and contract_symbol is not None:
+                opt_pos = await self.store.get_option_position(
+                    context_key, contract_symbol,
+                )
+                if opt_pos is None:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"No {contract_symbol} options position to "
+                            f"sell against. Buy contracts first."
+                        ),
+                    }
+            else:
+                pos = await self.store.get_position(context_key, ticker)
+                if pos is None:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"No {ticker} position to sell against. Place a "
+                            f"buy order first or buy at market."
+                        ),
+                    }
 
-        # Sanity-check the trigger against the current quote. If the
-        # trigger has already crossed, the watcher will fire the order
-        # on its next tick — flag it in the result so the LLM knows
-        # what's about to happen instead of being surprised by an
-        # immediate fill. Quote failures are non-fatal: register
-        # anyway, watcher will retry quoting.
+        # Sanity-check the trigger against the current quote. For
+        # options the "quote" is the per-share premium; for equities
+        # it's the share price. If the trigger has already crossed,
+        # the watcher will fire the order on its next tick — flag it
+        # in the result so the LLM knows what's about to happen instead
+        # of being surprised by an immediate fill. Quote failures are
+        # non-fatal: register anyway, watcher will retry quoting.
         warning: Optional[str] = None
         try:
-            current_price, qerr = await self._fetch_price(ticker)
+            if is_option and contract_symbol is not None:
+                current_price, qerr = await self._fetch_option_premium(contract_symbol)
+            else:
+                current_price, qerr = await self._fetch_price(ticker)
         except Exception as e:
             current_price, qerr = None, str(e)
         if current_price is not None:
@@ -589,6 +773,7 @@ class PaperPortfolioExecutor:
                 trigger_price=float(trigger_price),
                 qty=qty, dollars=dollars, close_position=close_position,
                 reason=reason, expires_at=expires_at,
+                contract_symbol=contract_symbol,
             )
         except ValueError as e:
             return {"ok": False, "error": str(e)}
@@ -600,6 +785,8 @@ class PaperPortfolioExecutor:
             "ok": True,
             "order_id": order_id,
             "ticker": ticker,
+            "contract": contract_symbol,
+            "is_option": is_option,
             "side": side,
             "kind": kind,
             "trigger_price": float(trigger_price),
@@ -628,12 +815,14 @@ class PaperPortfolioExecutor:
 
     async def try_fill_pending(self) -> dict:
         """Scan all pending orders, fire those whose triggers have
-        crossed. One quote per ticker (regardless of how many orders
-        reference it). Returns a stats dict for the worker to log.
+        crossed.
 
-        Caller is expected to have already gated on market hours and to
-        run this on a multi-minute cadence — there is no debouncing
-        inside this method.
+        For equity orders the trigger compares against the underlying
+        equity quote (one quote per ticker). For options orders the
+        trigger compares against the per-share option premium (one
+        quote per contract). Both kinds of quotes are fetched in
+        parallel; each order references whichever applies via its
+        `contract_symbol` field.
         """
         # Expire stale orders up front so they don't waste a quote slot.
         n_expired = await self.store.expire_stale_orders()
@@ -645,29 +834,50 @@ class PaperPortfolioExecutor:
                 "tickers_quoted": 0,
             }
 
-        unique_tickers = sorted({o.ticker for o in orders})
-        # Parallel quote fetch — same shape as status()'s mark-to-market
-        # call. Each quote is independent so a slow ticker doesn't
-        # block the rest.
-        quote_results = await asyncio.gather(
+        equity_orders = [o for o in orders if not o.contract_symbol]
+        option_orders = [o for o in orders if o.contract_symbol]
+        unique_tickers = sorted({o.ticker for o in equity_orders})
+        unique_contracts = sorted({o.contract_symbol for o in option_orders if o.contract_symbol})
+
+        # Parallel quote fetches: equity quotes for unique_tickers and
+        # option premiums for unique_contracts. asyncio.gather preserves
+        # order so we can split the result list back into the two maps.
+        all_tasks = [
             *(self._fetch_price(t) for t in unique_tickers),
-            return_exceptions=False,
-        )
-        prices: dict[str, Optional[float]] = {}
-        for ticker, (price, err) in zip(unique_tickers, quote_results):
+            *(self._fetch_option_premium(c) for c in unique_contracts),
+        ]
+        all_results = await asyncio.gather(*all_tasks, return_exceptions=False)
+        eq_results = all_results[:len(unique_tickers)]
+        opt_results = all_results[len(unique_tickers):]
+
+        eq_prices: dict[str, Optional[float]] = {}
+        for ticker, (price, err) in zip(unique_tickers, eq_results):
             if err is not None or price is None:
                 logger.warning(
-                    f"orders watcher: quote miss for {ticker} ({err}); "
-                    f"orders on this ticker stay pending this tick"
+                    f"orders watcher: equity quote miss for {ticker} "
+                    f"({err}); orders on this ticker stay pending this tick"
                 )
-                prices[ticker] = None
+                eq_prices[ticker] = None
             else:
-                prices[ticker] = price
+                eq_prices[ticker] = price
+        opt_prices: dict[str, Optional[float]] = {}
+        for contract, (price, err) in zip(unique_contracts, opt_results):
+            if err is not None or price is None:
+                logger.warning(
+                    f"orders watcher: option quote miss for {contract} "
+                    f"({err}); orders on this contract stay pending this tick"
+                )
+                opt_prices[contract] = None
+            else:
+                opt_prices[contract] = price
 
         n_filled = 0
         n_failed = 0
         for order in orders:
-            price = prices.get(order.ticker)
+            if order.contract_symbol:
+                price = opt_prices.get(order.contract_symbol)
+            else:
+                price = eq_prices.get(order.ticker)
             if price is None:
                 continue
             if not order.should_fire(price):
@@ -687,7 +897,7 @@ class PaperPortfolioExecutor:
             "filled": n_filled,
             "failed": n_failed,
             "expired": n_expired,
-            "tickers_quoted": len(unique_tickers),
+            "tickers_quoted": len(unique_tickers) + len(unique_contracts),
         }
 
     async def _fire_order(
@@ -721,23 +931,36 @@ class PaperPortfolioExecutor:
             f"[order #{order.id}: {order.kind}-{order.side} @ "
             f"${order.trigger_price:.2f}] {order.reason or ''}"
         ).strip()
+        is_option_order = bool(order.contract_symbol)
         # Captured before the fill for close_position=True orders so
         # the order ledger records the actual sold qty (post-sell the
         # position is gone and we lose the number).
         close_qty: Optional[float] = None
         if order.side == SIDE_BUY:
             try:
-                result = await self.execute_buy(
-                    order.context_key,
-                    ticker=order.ticker,
-                    dollars=order.dollars,
-                    qty=order.qty,
-                    reason=reason,
-                    source=SOURCE_ORDER,  # order watcher drove this fill
-                )
+                if is_option_order:
+                    # contract_symbol is guaranteed set when
+                    # is_option_order is True — guarded above.
+                    result = await self.execute_buy_option(
+                        order.context_key,
+                        contract=str(order.contract_symbol),
+                        qty=int(order.qty or 0),
+                        reason=reason,
+                        source=SOURCE_ORDER,
+                    )
+                else:
+                    result = await self.execute_buy(
+                        order.context_key,
+                        ticker=order.ticker,
+                        dollars=order.dollars,
+                        qty=order.qty,
+                        reason=reason,
+                        source=SOURCE_ORDER,  # order watcher drove this fill
+                    )
             except Exception as e:
                 await self.store.mark_order_failed(
-                    order.id, note=f"execute_buy raised: {type(e).__name__}",
+                    order.id,
+                    note=f"execute_buy raised: {type(e).__name__}",
                 )
                 return False, f"execute_buy raised: {e}"
         else:
@@ -746,10 +969,16 @@ class PaperPortfolioExecutor:
             # not a 0 sentinel. Done outside execute_sell because the
             # sell itself zeroes the position.
             if order.close_position:
-                pos = await self.store.get_position(
-                    order.context_key, order.ticker,
-                )
-                close_qty = pos.qty if pos is not None else None
+                if is_option_order:
+                    opt_pos = await self.store.get_option_position(
+                        order.context_key, order.contract_symbol or "",
+                    )
+                    close_qty = opt_pos.qty if opt_pos is not None else None
+                else:
+                    pos = await self.store.get_position(
+                        order.context_key, order.ticker,
+                    )
+                    close_qty = pos.qty if pos is not None else None
             try:
                 # close_position=True → sell entire position; otherwise
                 # sell the exact qty the order specified. This handles
@@ -761,16 +990,34 @@ class PaperPortfolioExecutor:
                     qty_arg = "all"
                 else:
                     qty_arg = order.qty
-                result = await self.execute_sell(
-                    order.context_key,
-                    ticker=order.ticker,
-                    qty=qty_arg,
-                    reason=reason,
-                    source=SOURCE_ORDER,
-                )
+                if is_option_order:
+                    # Options sell qty is an integer of contracts.
+                    option_qty_arg: Union[int, str, None]
+                    if order.close_position:
+                        option_qty_arg = "all"
+                    elif order.qty is not None:
+                        option_qty_arg = int(order.qty)
+                    else:
+                        option_qty_arg = None
+                    result = await self.execute_sell_option(
+                        order.context_key,
+                        contract=str(order.contract_symbol),
+                        qty=option_qty_arg,
+                        reason=reason,
+                        source=SOURCE_ORDER,
+                    )
+                else:
+                    result = await self.execute_sell(
+                        order.context_key,
+                        ticker=order.ticker,
+                        qty=qty_arg,
+                        reason=reason,
+                        source=SOURCE_ORDER,
+                    )
             except Exception as e:
                 await self.store.mark_order_failed(
-                    order.id, note=f"execute_sell raised: {type(e).__name__}",
+                    order.id,
+                    note=f"execute_sell raised: {type(e).__name__}",
                 )
                 return False, f"execute_sell raised: {e}"
 
@@ -782,7 +1029,13 @@ class PaperPortfolioExecutor:
         # Fill price comes from the executor's actual fill, NOT the
         # trigger — slippage between trigger crossing and quote fetch
         # is real, and the trade record reflects what actually filled.
-        fill_price = float(result.get("price") or current_price)
+        # For options, the executor returns `premium`; for equities,
+        # `price`.
+        fill_price = float(
+            result.get("price")
+            or result.get("premium")
+            or current_price
+        )
         # Reconstruct fill_qty from the order's original intent, since
         # buy/sell results return position state rather than fill
         # delta. For close_position=True we captured the pre-fill qty
@@ -836,8 +1089,11 @@ class PaperPortfolioExecutor:
                 "underlying": getattr(q, "underlying", underlying),
                 "option_type": getattr(q, "type", "unknown"),
                 "strike": float(getattr(q, "strike", 0.0) or 0.0),
+                # Date-only ISO (YYYY-MM-DD) so the LLM can copy this
+                # back into `expiration` on a subsequent chain call
+                # without the parser rejecting a timestamp form.
                 "expiration": (
-                    q.expiration.isoformat() if getattr(q, "expiration", None)
+                    q.expiration.date().isoformat() if getattr(q, "expiration", None)
                     else None
                 ),
                 "premium": float(getattr(q, "price", 0.0) or 0.0),
@@ -867,9 +1123,29 @@ class PaperPortfolioExecutor:
         contracts (we don't trade partial options)."""
         if source not in VALID_SOURCES:
             return {"ok": False, "error": f"invalid source: {source!r}"}
-        if not isinstance(qty, (int, float)) or qty != int(qty) or int(qty) <= 0:
+        # Strict qty validation. Order matters: math.isfinite ruled out
+        # before int() so NaN/Inf don't escape as uncaught exceptions
+        # ("cannot convert float NaN to integer").
+        if not isinstance(qty, (int, float)):
             return {"ok": False, "error": "qty must be a positive whole number of contracts."}
+        if not math.isfinite(qty):
+            return {"ok": False, "error": "qty must be a finite number."}
+        if qty != int(qty) or int(qty) <= 0:
+            return {"ok": False, "error": "qty must be a positive whole number of contracts."}
+        if int(qty) > _MAX_OPTION_CONTRACTS_PER_FILL:
+            return {
+                "ok": False,
+                "error": (
+                    f"qty {int(qty)} exceeds sanity cap "
+                    f"{_MAX_OPTION_CONTRACTS_PER_FILL}; split into smaller fills."
+                ),
+            }
         qty_int = int(qty)
+        # Apply the same reason-length truncation that the equity
+        # place_order path uses, so a verbose LLM can't fill the table
+        # with multi-kilobyte reasons.
+        if reason and len(reason) > _MAX_REASON_LEN:
+            reason = reason[:_MAX_REASON_LEN]
         try:
             occ = normalize_contract(contract)
         except ValueError as e:
@@ -892,6 +1168,24 @@ class PaperPortfolioExecutor:
         ).timestamp()
         if exp_ts < dt.datetime.now(_ET).timestamp():
             return {"ok": False, "error": f"contract {occ} is already expired"}
+
+        # Cap distinct open positions per context. Existing position on
+        # this contract counts as 0 new — only the (qty>0, position-
+        # didn't-exist) case is rejected. This stops a runaway loop
+        # opening hundreds of one-strike positions; adding to one is
+        # always allowed.
+        existing = await self.store.get_option_position(context_key, occ)
+        if existing is None:
+            current = await self.store.options_positions(context_key)
+            if len(current) >= _MAX_OPTION_POSITIONS_PER_CONTEXT:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Too many open option positions in this chat "
+                        f"({len(current)}/{_MAX_OPTION_POSITIONS_PER_CONTEXT}). "
+                        f"Close some before opening new contracts."
+                    ),
+                }
 
         premium, err = await self._fetch_option_premium(occ)
         if err is not None or premium is None:
@@ -936,6 +1230,8 @@ class PaperPortfolioExecutor:
         contracts. V1 is long-only — no opening-short selling here."""
         if source not in VALID_SOURCES:
             return {"ok": False, "error": f"invalid source: {source!r}"}
+        if reason and len(reason) > _MAX_REASON_LEN:
+            reason = reason[:_MAX_REASON_LEN]
         try:
             occ = normalize_contract(contract)
         except ValueError as e:
@@ -953,12 +1249,19 @@ class PaperPortfolioExecutor:
                 return {"ok": False, "error": f"No position in {occ}."}
             sell_qty = int(round(pos.qty))
         else:
-            try:
-                sell_qty = int(qty)
-            except (TypeError, ValueError):
-                return {"ok": False, "error": f"Invalid qty: {qty!r}"}
-            if sell_qty <= 0:
-                return {"ok": False, "error": "qty must be positive."}
+            # Mirror the strict-int validation from execute_buy_option:
+            # NaN/Inf are screened before int() conversion, and
+            # fractional qty is rejected instead of silently truncated.
+            if not isinstance(qty, (int, float)):
+                return {"ok": False, "error": f"qty must be a whole number, got {qty!r}"}
+            if not math.isfinite(qty):
+                return {"ok": False, "error": "qty must be a finite number."}
+            if qty != int(qty) or int(qty) <= 0:
+                return {
+                    "ok": False,
+                    "error": "qty must be a positive whole number of contracts.",
+                }
+            sell_qty = int(qty)
 
         premium, err = await self._fetch_option_premium(occ)
         if err is not None or premium is None:
@@ -992,15 +1295,25 @@ class PaperPortfolioExecutor:
         that expired during a long weekend or while the bot was down,
         this is the next-available close price — the best approximation
         we have without intraday history.
+
+        Returns a stats dict plus a ``settlements`` list of per-position
+        outcomes (context_key, contract, side, intrinsic, realized_pnl,
+        underlying, option_type, strike) so the caller can notify the
+        originating chats. Failed-quote positions are NOT included in
+        the settlements list (they stay open for the next tick).
         """
-        positions = await self.store.list_options_positions_all()
+        # Push the expiration filter into SQL when available so we don't
+        # scan every open option position across every context each tick.
         now = now_ts if now_ts is not None else time.time()
-        # Filter to positions whose 16:00 ET expiration timestamp is in
-        # the past. The store stamps expiration this way already
-        # (execute_buy_option computes 16:00 ET of expiry day).
-        due = [op for op in positions if op.expiration <= now]
+        if hasattr(self.store, "list_options_positions_due"):
+            due = await self.store.list_options_positions_due(now)
+            checked = len(due)  # approximation — we didn't fetch the rest
+        else:
+            positions = await self.store.list_options_positions_all()
+            due = [op for op in positions if op.expiration <= now]
+            checked = len(positions)
         if not due:
-            return {"checked": len(positions), "settled": 0, "errors": 0}
+            return {"checked": checked, "settled": 0, "errors": 0, "settlements": []}
 
         # Group by underlying so we fetch each spot once even when
         # multiple contracts of the same name expire together.
@@ -1023,17 +1336,40 @@ class PaperPortfolioExecutor:
 
         settled = 0
         errors = 0
+        settlements: list[dict] = []
         for op in due:
             spot = spot_map.get(op.underlying)
+            # Poison-row mitigation: if the underlying has been
+            # un-quotable for too long (delisted, ticker renamed,
+            # persistent provider failure), force-settle at $0 so the
+            # row doesn't sit in options_positions forever, retried on
+            # every tick. We approximate "too long" with how stale the
+            # expiration is relative to now — anything expired more
+            # than 24h ago with no quote is treated as worthless.
             if spot is None:
-                errors += 1
-                continue
-            intrinsic = occ_intrinsic_value(op.option_type, op.strike, spot)
-            reason = (
-                f"auto-settled at expiration: {op.option_type.upper()} "
-                f"{op.underlying} @ ${op.strike:.2f} vs spot ${spot:.2f} "
-                f"→ intrinsic ${intrinsic:.4f}/sh"
-            )
+                stale_seconds = now - op.expiration
+                if stale_seconds > _SETTLEMENT_STALE_GRACE_SECONDS:
+                    logger.warning(
+                        f"settle: underlying {op.underlying} unquotable "
+                        f"and contract expired {stale_seconds/3600:.1f}h "
+                        f"ago — force-settling at $0 (poison-row mitigation)"
+                    )
+                    intrinsic = 0.0
+                    reason = (
+                        f"force-settled at $0: underlying {op.underlying} "
+                        f"unquotable for {stale_seconds/3600:.1f}h after "
+                        f"expiration. Treated as expired worthless."
+                    )
+                else:
+                    errors += 1
+                    continue
+            else:
+                intrinsic = occ_intrinsic_value(op.option_type, op.strike, spot)
+                reason = (
+                    f"auto-settled at expiration: {op.option_type.upper()} "
+                    f"{op.underlying} @ ${op.strike:.2f} vs spot ${spot:.2f} "
+                    f"→ intrinsic ${intrinsic:.4f}/sh"
+                )
             try:
                 result = await self.store.sell_option(
                     op.context_key,
@@ -1059,14 +1395,29 @@ class PaperPortfolioExecutor:
                 errors += 1
                 continue
             settled += 1
+            settlements.append({
+                "context_key": op.context_key,
+                "contract": op.contract_symbol,
+                "underlying": op.underlying,
+                "option_type": op.option_type,
+                "strike": op.strike,
+                "expiration": op.expiration,
+                "qty": op.qty,
+                "intrinsic": intrinsic,
+                "spot": spot,
+                "realized_pnl": result.get("realized_pnl") or 0.0,
+                "proceeds": result.get("proceeds") or 0.0,
+                "force_settled": spot is None,
+            })
             logger.info(
                 f"settle: {op.contract_symbol} (ctx={op.context_key}) "
                 f"qty={op.qty:g} @ ${intrinsic:.4f}/sh "
                 f"realized=${result.get('realized_pnl') or 0:.2f}"
             )
         return {
-            "checked": len(positions),
+            "checked": checked,
             "due": len(due),
             "settled": settled,
             "errors": errors,
+            "settlements": settlements,
         }

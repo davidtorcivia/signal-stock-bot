@@ -4,6 +4,7 @@ Supports Stocks, Options, Futures, Forex, Crypto, and Economy data.
 """
 
 import logging
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -237,16 +238,40 @@ class MassiveProvider(BaseProvider):
         `expiration` (ISO YYYY-MM-DD) is set, results are filtered to
         that single expiry. We page once and cap at `limit` rows — for
         a chain explorer the LLM mostly wants ATM ± a few strikes, not
-        the entire tape.
+        the entire tape. Logs a WARNING if Polygon returned a paginated
+        `next_url` we didn't follow, so deep-chain truncation is at
+        least visible in logs.
         """
         underlying = underlying.strip().upper()
-        if not underlying:
-            raise ProviderError("get_options_chain: underlying required")
+        # Strict alpha + dot validation: the underlying is interpolated
+        # straight into the URL path, so any character that yarl /
+        # aiohttp would parse as a path or query separator could let
+        # the caller steer the request to unintended endpoints. Real
+        # tickers are letters (+ rare dots for class shares).
+        if not underlying or not re.match(r"^[A-Z][A-Z.]{0,9}$", underlying):
+            raise ProviderError(
+                f"get_options_chain: invalid underlying {underlying!r}; "
+                f"expected 1-10 alphabetic chars"
+            )
+        # Expiration filter: must be a strict ISO date — Polygon accepts
+        # 'YYYY-MM-DD' on this endpoint. Reject anything else before it
+        # hits the URL builder.
+        if expiration:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", expiration):
+                raise ProviderError(
+                    f"get_options_chain: invalid expiration {expiration!r}; "
+                    f"expected YYYY-MM-DD"
+                )
         endpoint = f"/v3/snapshot/options/{underlying}"
         params: Dict[str, Any] = {"limit": max(1, min(250, int(limit)))}
         if expiration:
             params["expiration_date"] = expiration
         data = await self._request(endpoint, params=params)
+        if data.get("next_url"):
+            logger.warning(
+                f"get_options_chain({underlying}): Polygon returned a "
+                f"next_url; chain may be truncated at limit={params['limit']}"
+            )
         rows = data.get("results") or []
         chain: list[OptionQuote] = []
         for res in rows:
