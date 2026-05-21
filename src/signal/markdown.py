@@ -5,9 +5,12 @@ bbernhard/signal-cli-rest-api accepts when sent with text_mode="styled".
 The REST API's parser (utils/textstyleparser.go) is the authority:
   **bold**     → BOLD
   *italic*     → ITALIC
-  ~strike~     → STRIKETHROUGH
   `mono`       → MONOSPACE
   ||spoiler||  → SPOILER
+
+Strikethrough (`~strike~`) is intentionally not emitted: the bot never
+needs it, and the parser was incidentally striking through stray
+`~…~`-like fragments in normal output.
 
 Critically, single-underscore `_italic_` is NOT recognised by this parser
 — it gets sent verbatim. So GFM-style underscore italics need rewriting
@@ -49,8 +52,6 @@ _BOLD_UND_RE = re.compile(r"__(?!\s)([^_\n]+?)(?<!\s)__")
 # delimiter ensure we don't match part of a still-untouched bold marker.
 _ITALIC_STAR_RE = re.compile(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![*\w])")
 _ITALIC_UND_RE = re.compile(r"(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
-
-_STRIKE_RE = re.compile(r"~~(?!\s)([^~\n]+?)(?<!\s)~~")
 
 
 def to_signal_styled(text: str) -> str:
@@ -99,12 +100,11 @@ def to_signal_styled(text: str) -> str:
     # Links: "text (url)" so users still see the URL.
     text = _LINK_RE.sub(r"\1 (\2)", text)
 
-    # ── Step 4: bold first (with placeholders), then italic, then strike ──
+    # ── Step 4: bold first (with placeholders), then italic ──
     text = _BOLD_STAR_RE.sub(rf"{_BOLD_OPEN}\1{_BOLD_CLOSE}", text)
     text = _BOLD_UND_RE.sub(rf"{_BOLD_OPEN}\1{_BOLD_CLOSE}", text)
     text = _ITALIC_STAR_RE.sub(rf"{_ITALIC_OPEN}\1{_ITALIC_CLOSE}", text)
     text = _ITALIC_UND_RE.sub(rf"{_ITALIC_OPEN}\1{_ITALIC_CLOSE}", text)
-    text = _STRIKE_RE.sub(r"~\1~", text)
 
     # ── Step 5: swap placeholders to Signal syntax ──
     # Bold uses **double**, italic uses *single*. The asterisk count is the
