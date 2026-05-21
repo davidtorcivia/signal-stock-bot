@@ -324,6 +324,7 @@ class AskCommand(BaseCommand):
         portfolio_executor: Optional[PaperPortfolioExecutor] = None,
         portfolio_journal=None,
         llm_factory=None,
+        bot_registry=None,
     ):
         self.llm = llm
         # Per-bot writer/deep_think router. When set (always in the real
@@ -333,6 +334,12 @@ class AskCommand(BaseCommand):
         # actually take effect. Falls back to the constructor-supplied
         # `llm`/`deep_think` when ctx.bot is None.
         self.llm_factory = llm_factory
+        # Bot registry — used to resolve other bots' display names when
+        # rendering multi-bot group context, and to enumerate enabled
+        # bots' aliases for cross-bot addressing. Optional: when None
+        # (legacy tests) the renderer falls back to the active bot's
+        # display name for all bot turns.
+        self.bot_registry = bot_registry
         self.history = history
         self.group_log = group_log
         self.mcp_manager = mcp_manager
@@ -484,22 +491,36 @@ class AskCommand(BaseCommand):
         raw_texts = [(m["text"] or "").strip() for m in msgs]
         enriched = await asyncio.gather(*(self._enrich(t) for t in raw_texts))
 
-        # Resolve the active bot's display name once so every BOT_SENDER
-        # line in this block is labeled with the CURRENT persona — not
-        # whatever bot wrote the row (the group_log only stores a
-        # BOT_SENDER sentinel, not which specific bot it was). Without
-        # this, Artaud answering in a chat that previously had Sigil
-        # would see prior bot turns labeled `[Sigil, Nm ago]` and
-        # contradict its own identity via in-context learning. The
-        # active-persona label also future-proofs against renames.
+        # Multi-bot attribution: each BOT_SENDER row carries the writing
+        # bot's id (or NULL on legacy rows). The renderer looks up that
+        # bot's display_name so a multi-bot group reads naturally — bot
+        # A sees bot B's prior turns labeled `[Sigil, 5m ago]` as if
+        # Sigil were a participant. The bot itself doesn't know (and
+        # shouldn't know) the other speaker is a bot.
         active_bot_name = self._active_bot_display(ctx)
+        active_bot_id = getattr(getattr(ctx, "bot", None), "id", None)
+
+        def _bot_row_label(row_bot_id) -> str:
+            if row_bot_id is None:
+                # Legacy bot row (pre-multi-bot column). Attribute to
+                # the active bot for back-compat — those rows pre-date
+                # any co-bot in this context.
+                return active_bot_name
+            if self.bot_registry is not None:
+                try:
+                    bot = self.bot_registry.get_sync(row_bot_id)
+                except Exception:
+                    bot = None
+                if bot is not None and getattr(bot, "display_name", None):
+                    return bot.display_name
+            return active_bot_name
 
         lines: list[str] = []
         for m, text in zip(msgs, enriched):
             if not text:
                 continue
             if m["sender"] == BOT_SENDER:
-                label = active_bot_name
+                label = _bot_row_label(m.get("bot_id"))
             else:
                 label = self._sender_label(m["sender"])
             ts = m.get("created_at")
@@ -523,6 +544,36 @@ class AskCommand(BaseCommand):
         if self.name_registry is not None:
             return self.name_registry.bot_name
         return "Bot"
+
+    def _build_identity_block(self, ctx) -> str:
+        """One-line identity reminder so the writer doesn't answer to
+        another participant's name. Lists the active bot's display name
+        and any alias slugs it responds to.
+
+        Other bots in the room are deliberately NOT mentioned — they
+        appear in <group_context> as labeled participant utterances,
+        and the writer should treat them like any other speaker.
+        """
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if bot is None or not getattr(bot, "display_name", None):
+            return ""
+        aliases = getattr(bot, "aliases", None) or []
+        # Display name first, then any non-empty aliases distinct from it.
+        names = [bot.display_name]
+        for a in aliases:
+            a = (a or "").strip()
+            if a and a.lower() != bot.display_name.lower() and a not in names:
+                names.append(a)
+        also = (
+            f" (you also answer to: {', '.join(names[1:])})"
+            if len(names) > 1 else ""
+        )
+        return (
+            f"Your name is {bot.display_name}{also}. "
+            f"When someone in chat addresses a different name, that's a "
+            f"different participant — do not respond as them or assume "
+            f"their identity. Speak only as yourself."
+        )
 
     def _sender_label(self, phone: Optional[str]) -> str:
         if phone == BOT_SENDER:
@@ -956,7 +1007,15 @@ class AskCommand(BaseCommand):
         if policy is not None and not policy.allows_command("portfolio"):
             return f"({name} unavailable: portfolio not allowed in this chat)"
 
-        ctx_key = caller_ctx.context_key()
+        # Multi-bot scoping: each bot in a multi-bot group has its own
+        # portfolio so they can compete. The store keys on the scoped
+        # form `<chat_ctx>@bot:<id>` so all reads/writes naturally
+        # land in the right bowl.
+        from ..paper_portfolio import portfolio_context_key
+        ctx_key = portfolio_context_key(
+            caller_ctx.context_key(),
+            caller_ctx.bot.id if getattr(caller_ctx, "bot", None) is not None else None,
+        )
         # Trade provenance: trust the cron's tag if set, otherwise
         # default to "reactive" (a real chat message triggered this).
         # `automation_source` is enumerated against VALID_SOURCES so
@@ -1436,7 +1495,14 @@ class AskCommand(BaseCommand):
         if policy is not None and not policy.allows_command("portfolio"):
             return f"({name} unavailable: portfolio not allowed in this chat)"
 
-        ctx_key = caller_ctx.context_key()
+        # Same per-bot scoping as the portfolio tools above — each bot
+        # in a multi-bot group has its own journal file so they don't
+        # cross-contaminate reflections.
+        from ..paper_portfolio import portfolio_context_key
+        ctx_key = portfolio_context_key(
+            caller_ctx.context_key(),
+            caller_ctx.bot.id if getattr(caller_ctx, "bot", None) is not None else None,
+        )
 
         if name == "portfolio_journal_append":
             entry = str(args.get("entry") or "").strip()
@@ -1632,6 +1698,14 @@ class AskCommand(BaseCommand):
         if name == "recall":
             subject_hint = (args.get("subject") or "").strip()
             query = (args.get("query") or "").strip()
+            # Multi-bot scoping: each bot recalls only its own memories
+            # (plus legacy NULL-bot rows). Other bots' impressions of
+            # the same chat/people stay private to them.
+            recall_bot_id = (
+                caller_ctx.bot.id
+                if getattr(caller_ctx, "bot", None) is not None
+                else None
+            )
             if subject_hint and resolver is not None:
                 key, _ = resolver.resolve(
                     subject_hint, sender_phone=sender_phone
@@ -1641,6 +1715,7 @@ class AskCommand(BaseCommand):
                 rows = await store.list_for_subject(
                     context_id=policy.id,
                     subject_key=key,
+                    bot_id=recall_bot_id,
                 )
                 if query:
                     ql = query.lower()
@@ -1648,6 +1723,7 @@ class AskCommand(BaseCommand):
             elif query:
                 rows = await store.search(
                     context_id=policy.id, query=query, limit=12,
+                    bot_id=recall_bot_id,
                 )
             else:
                 rows = await store.list_for_context(
@@ -1690,6 +1766,11 @@ class AskCommand(BaseCommand):
                 source=SOURCE_EXPLICIT,
                 source_user_hash=sender_user_hash,
                 source_message_at=time.time(),
+                bot_id=(
+                    caller_ctx.bot.id
+                    if getattr(caller_ctx, "bot", None) is not None
+                    else None
+                ),
             )
             if mem_id is None:
                 return "(memory not saved — invalid input)"
@@ -2013,12 +2094,20 @@ class AskCommand(BaseCommand):
                 getattr(ctx.policy, "purge_floor_at", None)
                 if ctx.policy is not None else None
             )
+            # Multi-bot scoping: pass ctx.bot.id so the load filter
+            # returns user turns shared with co-bots + this bot's own
+            # assistant turns. Other bots' replies surface separately
+            # via group_log → <group_context>, attributed by writer.
+            history_bot_id = (
+                ctx.bot.id if getattr(ctx, "bot", None) is not None else None
+            )
             prior = await self.history.load(
                 context_key,
                 turns_per_user=self._live_turns(ctx),
                 attribute_senders=is_group,
                 now=now_ts,
                 floor_at=floor_at,
+                bot_id=history_bot_id,
             )
             # Re-enrich each prior turn — bot/user messages stored before
             # the enricher existed (or stored with a failed enrichment)
@@ -2491,11 +2580,24 @@ class AskCommand(BaseCommand):
                             if is_group else None,
                         current_message_text=question,
                         name_registry=self.name_registry,
+                        bot_id=(
+                            ctx.bot.id
+                            if getattr(ctx, "bot", None) is not None
+                            else None
+                        ),
                     )
                 except Exception as e:
                     logger.debug(f"Memory preamble build failed: {e}")
 
+            # Identity block: clarifies which name belongs to THIS bot so
+            # a multi-bot group doesn't confuse the model into answering
+            # to another bot's name. Other bots in the room appear as
+            # regular participants in <group_context> — the writer
+            # should NOT treat them differently from human speakers.
+            identity_block = self._build_identity_block(ctx)
+
             system_suffix_parts = [
+                _wrap_xml("your_identity", identity_block),
                 _wrap_xml("attribution_rules", attribution_rules),
                 _wrap_xml("identity_note", names_directive),
                 _wrap_xml("reactor_reflex", reactor_directive),
@@ -2706,11 +2808,21 @@ class AskCommand(BaseCommand):
             # also gate explicitly so a misconfigured handler can't
             # accidentally bloat history with bytes no one will read.
             persisted_images = inbound_images if vision_active else None
+            # bot_id pins multi-bot history: user turns get tagged with
+            # the responding bot's id so load() can scope a bot's view to
+            # its own conversation arc. Assistant turns get the same tag
+            # so each bot's API alternation only includes its own
+            # replies — other bots' replies surface in <group_context>
+            # via the group_log path, labeled with the writer's name.
+            bot_id_for_turn = (
+                ctx.bot.id if getattr(ctx, "bot", None) is not None else None
+            )
             await self.history.append(
                 context_key, "user", question,
                 user_hash=user_hash, sender_tail=sender_tail,
                 turns_per_user=live_turns,
                 image_refs=persisted_images,
+                bot_id=bot_id_for_turn,
             )
             # Persist the addressee on the assistant row too: the load path
             # uses it to render `[to Name, time ago]` in group playback so
@@ -2719,6 +2831,7 @@ class AskCommand(BaseCommand):
                 context_key, "assistant", answer,
                 user_hash=user_hash, sender_tail=sender_tail,
                 turns_per_user=live_turns,
+                bot_id=bot_id_for_turn,
             )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")
@@ -2735,7 +2848,18 @@ class AskCommand(BaseCommand):
             and self._live_group_ctx() > 0
         ):
             try:
-                await self.group_log.append_bot(ctx.group_id, answer)
+                # Stamp the row with the writing bot's id so the renderer
+                # can attribute the line to the correct bot in a multi-
+                # bot group. Other bots reading group_context later see
+                # this as a participant utterance under that bot's
+                # display_name.
+                bot_id_for_log = (
+                    ctx.bot.id if getattr(ctx, "bot", None) is not None
+                    else None
+                )
+                await self.group_log.append_bot(
+                    ctx.group_id, answer, bot_id=bot_id_for_log,
+                )
             except Exception as e:
                 logger.error(f"Failed to append bot reply to group log: {e}")
 

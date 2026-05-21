@@ -609,15 +609,44 @@ class SignalHandler:
                 ):
                     return active_bot, True
 
-        # 2) Alias match against the active bot's alias set.
+        # 2) Alias match — search across ALL enabled bots, not just the
+        # active one. In a multi-bot group, saying "Artaud, …" should
+        # summon Artaud even if Sigil is the pinned default. Active-bot
+        # match keeps priority via list ordering when both names appear.
         message_text = data_message.get("message") or ""
-        if active_bot is not None and message_text:
+        bot_registry = getattr(self.dispatcher, "bot_registry", None)
+        if message_text and bot_registry is not None:
+            # Build the candidate list with the active bot FIRST so its
+            # alias wins if a message says e.g. "Sigil and Artaud" — the
+            # message is primarily addressed to the active bot in that
+            # ambiguous case.
+            all_bots = [
+                b for b in bot_registry.list_sync()
+                if getattr(b, "enabled", True)
+            ]
+            ordered: list = []
+            if active_bot is not None and active_bot in all_bots:
+                ordered.append(active_bot)
+                ordered.extend(b for b in all_bots if b is not active_bot)
+            else:
+                ordered = all_bots
+            for bot in ordered:
+                for alias in bot.alias_set():
+                    if re.search(
+                        rf"\b{re.escape(alias)}\b",
+                        message_text, re.IGNORECASE,
+                    ):
+                        return bot, True
+        elif active_bot is not None and message_text:
+            # Registry not wired (early-boot / tests) — fall back to the
+            # active bot's own alias set so the legacy single-bot path
+            # still works.
             for alias in active_bot.alias_set():
                 if re.search(rf"\b{re.escape(alias)}\b", message_text, re.IGNORECASE):
                     return active_bot, True
         elif active_bot is None and message_text:
-            # Legacy fallback when bot_registry isn't wired: use the
-            # dispatcher's bot_name. Behaves identically to pre-PR4.
+            # Pre-PR4 single-bot fallback when neither registry nor
+            # active bot is available.
             bot_name = (getattr(self.dispatcher, "bot_name", "") or "").strip()
             if bot_name and re.search(
                 rf"\b{re.escape(bot_name)}\b", message_text, re.IGNORECASE

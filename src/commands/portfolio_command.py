@@ -19,7 +19,7 @@ import math
 
 from ..charts.portfolio import render_portfolio_image
 from ..database import hash_phone
-from ..paper_portfolio import PortfolioStore
+from ..paper_portfolio import PortfolioStore, portfolio_context_key
 from ..paper_portfolio_executor import PaperPortfolioExecutor
 from .base import BaseCommand, CommandContext, CommandResult
 
@@ -238,8 +238,15 @@ class PortfolioCommand(BaseCommand):
         self.bot_name = bot_name
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
+        # Per-bot scoping: each bot in a multi-bot chat has its own
+        # portfolio so they can compete. _scoped_key wraps the chat
+        # context with the responding bot's id.
+        ctx_key = portfolio_context_key(
+            ctx.context_key(),
+            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
+        )
         try:
-            snap = await self.executor.status(ctx.context_key())
+            snap = await self.executor.status(ctx_key)
         except Exception as e:
             logger.exception(f"portfolio: status failed: {e}")
             return CommandResult.error("Couldn't load the portfolio.")
@@ -281,8 +288,12 @@ class PnlCommand(BaseCommand):
         self.bot_name = bot_name
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
+        ctx_key = portfolio_context_key(
+            ctx.context_key(),
+            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
+        )
         try:
-            snap = await self.executor.status(ctx.context_key())
+            snap = await self.executor.status(ctx_key)
         except Exception as e:
             logger.exception(f"pnl: status failed: {e}")
             return CommandResult.error("Couldn't load the portfolio.")
@@ -351,9 +362,16 @@ class TipCommand(BaseCommand):
         tipper_hash = hash_phone(ctx.sender)
         tipper_label = self._label(ctx.sender)
 
+        # !tip routes to the bot currently active in this chat — the
+        # tipper is funding THAT bot's portfolio. Per-bot scoping lets
+        # users tip individual bots in a multi-bot group.
+        tip_ctx_key = portfolio_context_key(
+            ctx.context_key(),
+            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
+        )
         try:
             result = await self.store.tip(
-                ctx.context_key(),
+                tip_ctx_key,
                 tipper_user_hash=tipper_hash,
                 tipper_label=tipper_label,
                 amount=amount,
@@ -411,10 +429,14 @@ class TradesCommand(BaseCommand):
                     f"`{ctx.args[0]}` isn't a number. Try `!trades 20`."
                 )
 
+        trades_ctx_key = portfolio_context_key(
+            ctx.context_key(),
+            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
+        )
         try:
-            trades = await self.store.list_trades(ctx.context_key(), limit=limit)
+            trades = await self.store.list_trades(trades_ctx_key, limit=limit)
             option_trades = await self.store.list_option_trades(
-                ctx.context_key(), limit=limit,
+                trades_ctx_key, limit=limit,
             )
         except Exception as e:
             logger.exception(f"trades: list_trades failed: {e}")

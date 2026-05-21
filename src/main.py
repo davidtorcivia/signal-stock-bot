@@ -772,6 +772,7 @@ def build_app(config: Config):
         deep_think=deep_think_client,
         memory_store=memory_store,
         llm_factory=llm_factory,
+        bot_registry=bot_registry,
     )
 
     dispatcher = create_dispatcher(
@@ -848,9 +849,27 @@ def build_app(config: Config):
     # voter per handler — votes are cast from the phone that received the
     # poll envelope, so each handler owns its own.
     from .signal.poll_voter import PollVoter
+    # Per-bot LLM: each phone's PollVoter routes through the bot that
+    # OWNS that phone, so non-default bots in a multi-phone deploy use
+    # their own writer settings instead of inheriting the default's
+    # model/temperature/system_prompt.
+    def _bot_for_phone(phone: str):
+        if not phone:
+            return None
+        for b in bot_registry.list_sync():
+            if (getattr(b, "signal_phone", None) or "") == phone:
+                return b
+        return bot_registry.default_for_kind_sync("group")
+
     for handler in signal_pool.handlers():
+        handler_bot = _bot_for_phone(handler.config.phone_number)
+        per_bot_llm = (
+            llm_factory.get_writer(handler_bot.id)
+            if handler_bot is not None and llm_factory is not None
+            else llm_client
+        )
         handler.poll_voter = PollVoter(
-            llm_client=llm_client,
+            llm_client=per_bot_llm,
             signal_handler=handler,
             group_log=group_log,
             name_registry=name_registry,
@@ -892,6 +911,16 @@ def build_app(config: Config):
         except Exception as e:
             logger.warning(f"metric_events init for backfill: {e}")
         await bot_registry.backfill_consumer_tables()
+        # One-time portfolio migration: legacy unscoped context_keys
+        # are rewritten to carry the default bot's id so multi-bot
+        # scoping reads the right rows. Idempotent on subsequent boots.
+        if default_bot is not None and dispatcher.portfolio_store is not None:
+            try:
+                await dispatcher.portfolio_store.migrate_to_bot_scope(
+                    default_bot.id,
+                )
+            except Exception as e:
+                logger.error(f"Portfolio scope migration failed: {e}")
     try:
         asyncio.run_coroutine_threadsafe(
             _bots_boot_init(), loop

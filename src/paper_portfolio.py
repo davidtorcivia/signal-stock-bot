@@ -51,6 +51,43 @@ logger = logging.getLogger(__name__)
 _TIP_CAP_TZ = ZoneInfo("America/New_York")
 
 
+# Marker embedded in context_key to scope a portfolio to a specific bot
+# in a multi-bot group. Each bot in a chat thus has its own cash,
+# positions, options, orders, trades, tips, and journal — battle bots
+# can co-exist. Legacy single-bot context_keys (no marker) continue to
+# work unchanged for back-compat; the migration in
+# `migrate_portfolios_to_bot_scope` rewrites them on startup.
+_BOT_SCOPE_DELIM = "@bot:"
+
+
+def portfolio_context_key(context_key: str, bot_id: Optional[int]) -> str:
+    """Combine a chat context_key with the responding bot's id so each
+    bot gets its own portfolio. Returns the input unchanged when
+    `bot_id` is None — that path is used by legacy single-bot tests
+    that don't know about the multi-bot scoping.
+    """
+    if bot_id is None or not context_key:
+        return context_key
+    # Don't double-scope an already-scoped key. Defensive — callers
+    # should pass the raw chat key but tests occasionally round-trip.
+    if _BOT_SCOPE_DELIM in context_key:
+        return context_key
+    return f"{context_key}{_BOT_SCOPE_DELIM}{bot_id}"
+
+
+def parse_portfolio_key(scoped_key: str) -> tuple[str, Optional[int]]:
+    """Inverse of `portfolio_context_key`. Returns (chat_context_key,
+    bot_id_or_none). For unscoped legacy keys returns (key, None).
+    """
+    if not scoped_key or _BOT_SCOPE_DELIM not in scoped_key:
+        return scoped_key, None
+    chat_key, _, bot_part = scoped_key.rpartition(_BOT_SCOPE_DELIM)
+    try:
+        return chat_key, int(bot_part)
+    except ValueError:
+        return scoped_key, None
+
+
 SOURCE_CRON = "cron"
 SOURCE_REACTIVE = "reactive"
 SOURCE_ADMIN = "admin"
@@ -1424,6 +1461,53 @@ class PortfolioStore:
     # ------------------------------------------------------------------
     # Cron tracking (used by TradingCronWorker)
     # ------------------------------------------------------------------
+
+    async def migrate_to_bot_scope(self, default_bot_id: int) -> int:
+        """One-time migration: rewrite legacy unscoped context_keys
+        across every portfolio table so they carry a bot scope. Returns
+        the number of rows updated (across all tables).
+
+        Idempotent — rows already carrying `@bot:N` are skipped. Safe to
+        call on every startup. The `default_bot_id` is used as the
+        owner for every legacy row; multi-bot installs that had a
+        different bot acting in a context will see those rows as the
+        default bot's, which matches the de-facto pre-migration state
+        (only one bot was active per chat then).
+        """
+        if not default_bot_id:
+            return 0
+        await self._ensure_initialized()
+        suffix = f"{_BOT_SCOPE_DELIM}{default_bot_id}"
+        updated_total = 0
+        # Tables whose primary key includes context_key (UPDATE OR
+        # IGNORE handles the rare collision where an already-scoped
+        # row exists alongside a legacy row for the same context).
+        tables = (
+            "portfolios", "positions", "trades", "tips",
+            "portfolio_cron_runs", "portfolio_orders",
+            "options_positions", "option_trades",
+        )
+        async with db_session(self) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                for table in tables:
+                    cursor = await db.execute(
+                        f"""UPDATE {table}
+                            SET context_key = context_key || ?
+                            WHERE context_key NOT LIKE '%' || ? || '%'""",
+                        (suffix, _BOT_SCOPE_DELIM),
+                    )
+                    updated_total += cursor.rowcount or 0
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        if updated_total:
+            logger.info(
+                f"PortfolioStore: migrated {updated_total} legacy "
+                f"row(s) to bot scope @bot:{default_bot_id}"
+            )
+        return updated_total
 
     async def list_portfolio_keys(self) -> list[str]:
         """Every existing portfolio's context_key — used by the cron

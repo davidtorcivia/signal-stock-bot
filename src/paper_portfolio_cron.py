@@ -244,12 +244,19 @@ class TradingCronWorker:
     async def _fire_for_context(self, ctx_key: str, slot: str) -> bool:
         """Run one firing for one context+slot. Returns True if a post
         actually went out (so the caller can stamp `mark_cron_fired`)."""
-        if not ctx_key.startswith("group:"):
+        # Unwrap per-bot scope so group_id routing + policy lookup
+        # operate on the raw chat key. The embedded bot_id (when
+        # present) is used below to route the synthetic !ask through
+        # the correct bot — each bot has its own portfolio + cron arc
+        # in a multi-bot group.
+        from .paper_portfolio import parse_portfolio_key
+        chat_key, scope_bot_id = parse_portfolio_key(ctx_key)
+        if not chat_key.startswith("group:"):
             logger.info(
                 f"Trading cron: {ctx_key} is not a group context; skipping"
             )
             return False
-        group_id = ctx_key[len("group:"):]
+        group_id = chat_key[len("group:"):]
 
         policy = None
         if self.contexts is not None:
@@ -284,7 +291,16 @@ class TradingCronWorker:
             )
             return False
 
-        cron_bot = self._resolve_bot_for(policy)
+        # Scoped-key bot_id wins so each bot in a multi-bot group runs
+        # its own cron arc with its own portfolio.
+        cron_bot = None
+        if scope_bot_id is not None and self.bot_registry is not None:
+            try:
+                cron_bot = self.bot_registry.get_sync(scope_bot_id)
+            except Exception:
+                cron_bot = None
+        if cron_bot is None:
+            cron_bot = self._resolve_bot_for(policy)
         cron_phone = (
             (cron_bot.signal_phone if cron_bot else None)
             or self.bot_phone

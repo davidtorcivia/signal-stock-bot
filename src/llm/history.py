@@ -162,11 +162,19 @@ class ConversationHistory:
             await db.commit()
         self._initialized = True
 
-    async def get_summary(self, context_key: str) -> Optional[dict]:
+    async def get_summary(
+        self, context_key: str, floor_at: Optional[float] = None
+    ) -> Optional[dict]:
         """Return the rolling summary for a context, or None if absent.
 
         Shape: {summary: str, summary_through_id: int, turns_summarized: int,
                 updated_at: float}.
+
+        `floor_at` is the context's purge floor. A summary written before
+        the floor is invisible — it was built from pre-purge turns and
+        would re-inject the very state the purge was meant to erase. The
+        purge action also DELETEs the summary row directly, but this
+        filter is the defense-in-depth that makes the floor hold forever.
         """
         async with db_session(self) as db:
             cursor = await db.execute(
@@ -176,6 +184,8 @@ class ConversationHistory:
             )
             row = await cursor.fetchone()
         if not row:
+            return None
+        if floor_at is not None and (row[3] or 0) < floor_at:
             return None
         return {
             "summary": row[0],
@@ -206,13 +216,23 @@ class ConversationHistory:
             await db.commit()
 
     async def turns_to_summarize(
-        self, context_key: str, summary_through_id: int, keep_recent: int
+        self,
+        context_key: str,
+        summary_through_id: int,
+        keep_recent: int,
+        floor_at: Optional[float] = None,
     ) -> list[dict]:
         """Return turns that should be folded into the summary.
 
         Excludes the most recent `keep_recent` rows (kept verbatim) and rows
         already covered by the existing summary. Used by the summarizer to
         decide what fresh material to feed the LLM.
+
+        `floor_at` (the context's purge floor) further excludes any turn
+        whose `created_at` precedes the floor — even though the purge
+        action also DELETEs pre-floor rows, the filter is the
+        defense-in-depth that prevents stale/replayed pre-floor rows from
+        leaking back into the summary.
         """
         async with db_session(self) as db:
             cursor = await db.execute(
@@ -227,14 +247,19 @@ class ConversationHistory:
             recent_floor = max_id - keep_recent
             if recent_floor <= summary_through_id:
                 return []
+            params: list = [context_key, summary_through_id, recent_floor]
+            floor_clause = ""
+            if floor_at is not None:
+                floor_clause = " AND created_at >= ?"
+                params.append(floor_at)
             cursor = await db.execute(
-                """SELECT id, role, content, sender_tail, user_hash
+                f"""SELECT id, role, content, sender_tail, user_hash
                    FROM conversation_turns
                    WHERE context_key = ?
                      AND id > ?
-                     AND id <= ?
+                     AND id <= ?{floor_clause}
                    ORDER BY id ASC""",
-                (context_key, summary_through_id, recent_floor),
+                tuple(params),
             )
             rows = await cursor.fetchall()
         return [
@@ -249,6 +274,8 @@ class ConversationHistory:
         turns_per_user: Optional[int] = None,
         attribute_senders: bool = False,
         now: Optional[float] = None,
+        floor_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
     ) -> list[dict]:
         """Return the last 2*N rows for this context in chronological order.
 
@@ -258,18 +285,47 @@ class ConversationHistory:
         When `now` is provided, user messages also carry a relative-time
         suffix in the same bracket (`[David, 2h ago]`, `[3d ago]` in DMs)
         so the model can tell which turns are fresh vs. days old.
+
+        `floor_at` is the context's purge floor — rows with
+        `created_at < floor_at` are filtered out so a purge can't be
+        undone by stale or replayed pre-floor data.
+
+        Multi-bot scoping (`bot_id` set): the returned alternation
+        includes ALL user turns (they're shared across bots in the
+        chat) but only the calling bot's own assistant turns. Legacy
+        rows with bot_id IS NULL are treated as the calling bot's own
+        — they were written before the column existed and must replay
+        as the bot's own past for backward compat. Other bots' prior
+        replies surface in the `<group_context>` block instead, where
+        the renderer labels them with each writer's display name.
         """
         await self._ensure_initialized()
         n = (turns_per_user or self.turns_per_user) * 2
         async with aiosqlite.connect(self.db_path) as db:
+            params: list = [context_key]
+            floor_clause = ""
+            if floor_at is not None:
+                floor_clause = " AND created_at >= ?"
+                params.append(floor_at)
+            bot_clause = ""
+            if bot_id is not None:
+                # All user turns + this bot's assistant turns + legacy
+                # (bot_id IS NULL) assistant turns. Two-bot groups thus
+                # see their own conversation arc cleanly without other
+                # bots' replies polluting the assistant-role slot.
+                bot_clause = (
+                    " AND (role = 'user' OR bot_id = ? OR bot_id IS NULL)"
+                )
+                params.append(bot_id)
+            params.append(n)
             cursor = await db.execute(
-                """SELECT role, content, sender_tail, user_hash, created_at,
+                f"""SELECT role, content, sender_tail, user_hash, created_at,
                           image_refs
                    FROM conversation_turns
-                   WHERE context_key = ?
+                   WHERE context_key = ?{floor_clause}{bot_clause}
                    ORDER BY created_at DESC, id DESC
                    LIMIT ?""",
-                (context_key, n),
+                tuple(params),
             )
             rows = await cursor.fetchall()
 
@@ -320,17 +376,31 @@ class ConversationHistory:
             turns.append(turn)
         return turns
 
-    async def latest_turn_timestamp(self, context_key: str) -> Optional[float]:
+    async def latest_turn_timestamp(
+        self, context_key: str, floor_at: Optional[float] = None
+    ) -> Optional[float]:
         """Return the unix timestamp of the most recent turn, or None if empty.
 
         Used by the prompt builder to decide whether the prior conversation
         is stale enough to warrant an explicit advisory to the model.
+
+        `floor_at` is the context's purge floor — turns older than the
+        floor are invisible, so the staleness check operates on what the
+        LLM will actually see.
         """
         async with db_session(self) as db:
-            cursor = await db.execute(
-                "SELECT MAX(created_at) FROM conversation_turns WHERE context_key = ?",
-                (context_key,),
-            )
+            if floor_at is not None:
+                cursor = await db.execute(
+                    "SELECT MAX(created_at) FROM conversation_turns "
+                    "WHERE context_key = ? AND created_at >= ?",
+                    (context_key, floor_at),
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT MAX(created_at) FROM conversation_turns "
+                    "WHERE context_key = ?",
+                    (context_key,),
+                )
             row = await cursor.fetchone()
         return row[0] if row and row[0] is not None else None
 
@@ -363,6 +433,7 @@ class ConversationHistory:
         sender_tail: Optional[str] = None,
         turns_per_user: Optional[int] = None,
         image_refs: Optional[list[dict]] = None,
+        bot_id: Optional[int] = None,
     ) -> None:
         """Insert one turn and prune by row-cap (per context) and age (global).
 
@@ -397,10 +468,10 @@ class ConversationHistory:
             await db.execute(
                 """INSERT INTO conversation_turns
                    (user_hash, context_key, sender_tail, role, content,
-                    created_at, image_refs)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, image_refs, bot_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_hash, context_key, sender_tail, role, content,
-                 now, image_refs_json),
+                 now, image_refs_json, bot_id),
             )
             # Age-based purge (whole table)
             await db.execute(

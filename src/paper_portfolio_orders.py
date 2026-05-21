@@ -32,7 +32,9 @@ import asyncio
 import logging
 
 from .commands.base import CommandContext
-from .paper_portfolio import PortfolioStore, SOURCE_ORDER
+from .paper_portfolio import (
+    PortfolioStore, SOURCE_ORDER, parse_portfolio_key,
+)
 from .paper_portfolio_executor import (
     PaperPortfolioExecutor,
     market_closed_reason,
@@ -247,7 +249,12 @@ class OrdersWorker:
         isn't configured or the chat hasn't opted into portfolio."""
         if self.signal is None:
             return
-        if not context_key.startswith("group:"):
+        # Unwrap multi-bot scope so group_id extraction and policy
+        # lookup operate on the raw chat key. The embedded bot_id (when
+        # present) overrides the resolved-bot below so the synthetic
+        # !ask runs as the bot that owns this settlement.
+        chat_key, scope_bot_id = parse_portfolio_key(context_key)
+        if not chat_key.startswith("group:"):
             # DM contexts: log only — no recipient-number recovery from
             # hashed phone.
             for s in settlements:
@@ -258,7 +265,7 @@ class OrdersWorker:
                 )
             return
 
-        group_id = context_key[len("group:"):]
+        group_id = chat_key[len("group:"):]
 
         policy = None
         if self.contexts is not None:
@@ -289,7 +296,18 @@ class OrdersWorker:
             return
 
         prompt = self._build_settlement_prompt(settlements)
-        settle_bot = self._resolve_bot_for(policy)
+        # Scoped-key bot_id (when present) wins over the policy default
+        # so the synthetic !ask runs as the bot that actually owns the
+        # settled position — multi-bot groups need this to credit the
+        # right portfolio.
+        settle_bot = None
+        if scope_bot_id is not None and self.bot_registry is not None:
+            try:
+                settle_bot = self.bot_registry.get_sync(scope_bot_id)
+            except Exception:
+                settle_bot = None
+        if settle_bot is None:
+            settle_bot = self._resolve_bot_for(policy)
         settle_phone = (
             (settle_bot.signal_phone if settle_bot else None)
             or self.bot_phone or ""
@@ -473,7 +491,10 @@ class OrdersWorker:
         Skips DM contexts (we don't have a path from hashed phone back
         to a real number). Group contexts get the message routed to
         their group_id."""
-        if not context_key.startswith("group:"):
+        # Unwrap multi-bot scope: chat_key drives all routing; bot_id
+        # (when present) overrides the policy default for who speaks.
+        chat_key, scope_bot_id = parse_portfolio_key(context_key)
+        if not chat_key.startswith("group:"):
             # DM-context portfolios can't be reached without a recipient
             # number; fall back to the static path so logs at least
             # capture the resolution.
@@ -485,7 +506,7 @@ class OrdersWorker:
                 )
             return
 
-        group_id = context_key[len("group:"):]
+        group_id = chat_key[len("group:"):]
 
         # Resolve the policy so the !ask invocation respects the same
         # gates the chat normally has (portfolio allowed, deep_think
@@ -512,7 +533,16 @@ class OrdersWorker:
             return
 
         prompt = self._build_reaction_prompt(orders)
-        order_bot = self._resolve_bot_for(policy)
+        # Same per-bot routing as settlements: scoped-key bot_id wins so
+        # the order-fire !ask runs as the bot that owns the position.
+        order_bot = None
+        if scope_bot_id is not None and self.bot_registry is not None:
+            try:
+                order_bot = self.bot_registry.get_sync(scope_bot_id)
+            except Exception:
+                order_bot = None
+        if order_bot is None:
+            order_bot = self._resolve_bot_for(policy)
         order_phone = (
             (order_bot.signal_phone if order_bot else None)
             or self.bot_phone
@@ -673,8 +703,10 @@ class OrdersWorker:
         send to directly (Signal needs the real number). For DMs we
         simply log — there's no current path from hashed phone back to
         a recipient, and DM-context portfolios are rare in practice."""
-        if context_key.startswith("group:"):
-            group_id = context_key[len("group:"):]
+        # Strip the multi-bot scope so group_id is the raw Signal id.
+        chat_key, _ = parse_portfolio_key(context_key)
+        if chat_key.startswith("group:"):
+            group_id = chat_key[len("group:"):]
             sender_handler = self.signal
             if self.signal_pool is not None:
                 # No per-context bot lookup here (this is the static

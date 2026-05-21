@@ -1,9 +1,15 @@
 """
-Rolling log of inbound group chat messages.
+Rolling log of group chat messages — inbound user posts AND the bot's own
+replies (stored under the BOT_SENDER sentinel via `append_bot`).
 
-Used as LLM context when !ask is invoked inside a group. Only inbound
-user messages are stored — no bot replies. Sender is masked to the last
-4 digits before being handed to the LLM.
+Used as LLM context when !ask is invoked inside a group, and by the
+reactor when evaluating new messages. Sender is masked to the last 4
+digits before being handed to the LLM.
+
+Bot rows can be filtered by the context's purge floor on read so that a
+purged context never re-anchors on its pre-purge voice. Inbound user
+rows are NOT gated — wiping the room's chatter would defeat situational
+awareness for unrelated reasons.
 """
 
 import logging
@@ -77,10 +83,21 @@ class GroupMessageLog:
                     group_id TEXT NOT NULL,
                     sender TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    bot_id INTEGER
                 )
                 """
             )
+            # Migration: add bot_id column for existing installs. NULL on
+            # legacy bot rows is fine — the renderer falls back to the
+            # default-bot display name when bot_id is missing, so the
+            # pre-multi-bot single-bot experience is preserved.
+            cursor = await db.execute("PRAGMA table_info(group_messages)")
+            cols = {r[1] for r in await cursor.fetchall()}
+            if "bot_id" not in cols:
+                await db.execute(
+                    "ALTER TABLE group_messages ADD COLUMN bot_id INTEGER"
+                )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_group_msgs_time "
                 "ON group_messages(group_id, created_at)"
@@ -129,6 +146,26 @@ class GroupMessageLog:
             )
             await db.commit()
 
+    async def clear_bot_rows(self, group_id: str) -> int:
+        """Delete every BOT_SENDER row in `group_id`. Returns rowcount.
+
+        Called by the admin purge action; the purge floor on the context
+        is the long-term guarantee, but deleting the rows up front keeps
+        the DB clean and means readers don't have to filter the bulk of
+        what's there. User-authored rows are untouched.
+        """
+        if not group_id:
+            return 0
+        await self._ensure_initialized()
+        async with db_session(self) as db:
+            cursor = await db.execute(
+                "DELETE FROM group_messages "
+                "WHERE group_id = ? AND sender = ?",
+                (group_id, BOT_SENDER),
+            )
+            await db.commit()
+            return cursor.rowcount or 0
+
     async def find_recent_sender_by_tail(
         self, group_id: str, tail: str, *, limit: int = 200
     ) -> Optional[str]:
@@ -157,8 +194,20 @@ class GroupMessageLog:
             row = await cursor.fetchone()
         return row[0] if row else None
 
-    async def append_bot(self, group_id: str, text: str) -> None:
+    async def append_bot(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        bot_id: Optional[int] = None,
+    ) -> None:
         """Record one of the bot's own replies under the BOT_SENDER sentinel.
+
+        `bot_id` (when provided) records WHICH bot in a multi-bot group
+        wrote the row — used by the renderer to attribute history with
+        the writer's display name rather than the active bot's. Legacy
+        callers that don't know the bot id pass None; the renderer
+        falls back to the active bot for those.
 
         Same row-cap and age purges as `append`, but skips the enricher —
         bot answers come out of the writer LLM already enriched, and any
@@ -172,9 +221,10 @@ class GroupMessageLog:
         age_cutoff = now - self._retention_seconds()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO group_messages (group_id, sender, text, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (group_id, BOT_SENDER, text, now),
+                "INSERT INTO group_messages "
+                "(group_id, sender, text, created_at, bot_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (group_id, BOT_SENDER, text, now, bot_id),
             )
             await db.execute(
                 "DELETE FROM group_messages WHERE created_at < ?",
@@ -193,25 +243,46 @@ class GroupMessageLog:
             )
             await db.commit()
 
-    async def recent(self, group_id: str, limit: int, exclude_last: int = 0) -> list[dict]:
+    async def recent(
+        self,
+        group_id: str,
+        limit: int,
+        exclude_last: int = 0,
+        bot_floor_at: Optional[float] = None,
+    ) -> list[dict]:
         """
         Return up to `limit` recent messages for a group in chronological order.
 
         `exclude_last` skips the N newest rows — used by !ask so the current
         command itself isn't echoed into its own context.
+
+        `bot_floor_at` is the context's purge floor. Bot-authored rows
+        (sender = BOT_SENDER) older than the floor are filtered out
+        client-side after the fetch. User rows are never filtered — the
+        purge wipes the bot's voice, not the room's chatter.
         """
         if limit <= 0 or not group_id:
             return []
         async with db_session(self) as db:
             cursor = await db.execute(
-                """SELECT sender, text, created_at FROM group_messages
+                """SELECT sender, text, created_at, bot_id FROM group_messages
                    WHERE group_id = ?
                    ORDER BY created_at DESC, id DESC
                    LIMIT ? OFFSET ?""",
                 (group_id, limit, exclude_last),
             )
             rows = await cursor.fetchall()
-        return [
-            {"sender": r[0], "text": r[1], "created_at": r[2]}
+        # bot_id is None for user rows AND for legacy bot rows from
+        # before the column existed — both are valid; the renderer
+        # decides display.
+        result = [
+            {"sender": r[0], "text": r[1], "created_at": r[2], "bot_id": r[3]}
             for r in reversed(rows)
         ]
+        if bot_floor_at is not None:
+            result = [
+                m for m in result
+                if m["sender"] != BOT_SENDER
+                or (m["created_at"] or 0) >= bot_floor_at
+            ]
+        return result

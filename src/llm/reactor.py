@@ -359,6 +359,7 @@ class EmojiReactor:
         sender: str,
         target_timestamp: Optional[int],
         args: dict,
+        bot=None,
     ) -> None:
         """Write a single reactor-sourced memory. Errors are logged + swallowed."""
         store = self.memory_store
@@ -392,11 +393,13 @@ class EmojiReactor:
             # the WHERE clause there, so they slip through as duplicates.
             # Looser threshold here is the right knob for a passive,
             # low-confidence learning loop.
+            reactor_bot_id = getattr(bot, "id", None) if bot is not None else None
             try:
                 existing = await store.find_similar_for_subject(
                     context_id=policy.id,
                     subject_key=key,
                     content=content,
+                    bot_id=reactor_bot_id,
                 )
             except Exception as e:
                 logger.debug(f"Reactor: dedup lookup failed: {e}")
@@ -429,6 +432,7 @@ class EmojiReactor:
                 source=SOURCE_REACTOR,
                 source_user_hash=sender_hash,
                 source_message_at=msg_at,
+                bot_id=reactor_bot_id,
             )
             if mem_id is not None:
                 logger.info(
@@ -471,6 +475,17 @@ class EmojiReactor:
             self._recent[group_id] = log
         log.append((time.time(), sender_label, snippet, emoji))
 
+    def clear_recent(self, group_id: str) -> int:
+        """Drop the in-process reactor-decision log for `group_id`.
+
+        Called from the admin purge action so the writer can't be re-
+        anchored on its own pre-purge reactions via the
+        `<recent_reactions>` block. Returns the number of entries that
+        were cleared (0 when nothing was logged for this group).
+        """
+        log = self._recent.pop(group_id, None)
+        return len(log) if log is not None else 0
+
     def recent_reactions(self, group_id: str, limit: int = 5) -> list[dict]:
         """Return the most recent reactions in `group_id`, newest-first.
 
@@ -490,14 +505,20 @@ class EmojiReactor:
         ]
 
     async def _build_user_content(
-        self, sender: str, message: str, group_id: str, ctx_count: int
+        self,
+        sender: str,
+        message: str,
+        group_id: str,
+        ctx_count: int,
+        bot_floor_at: Optional[float] = None,
     ) -> str:
         sender_label = self._sender_label(sender)
         ctx_lines: list[str] = []
         if self.group_log is not None and ctx_count > 0:
             try:
                 msgs = await self.group_log.recent(
-                    group_id, limit=ctx_count, exclude_last=1
+                    group_id, limit=ctx_count, exclude_last=1,
+                    bot_floor_at=bot_floor_at,
                 )
                 for m in msgs:
                     label = self._sender_label(m["sender"])
@@ -616,8 +637,13 @@ class EmojiReactor:
             if offer_note_memory:
                 tools.append(NOTE_MEMORY_TOOL)
 
+            bot_floor_at = (
+                getattr(policy, "purge_floor_at", None)
+                if policy is not None else None
+            )
             user_content = await self._build_user_content(
-                sender, text, group_id, cfg["context_messages"]
+                sender, text, group_id, cfg["context_messages"],
+                bot_floor_at=bot_floor_at,
             )
 
             messages = [
@@ -750,6 +776,7 @@ class EmojiReactor:
                         sender=sender,
                         target_timestamp=target_timestamp,
                         args=note,
+                        bot=bot,
                     )
 
             if respond_reason and offer_should_respond:

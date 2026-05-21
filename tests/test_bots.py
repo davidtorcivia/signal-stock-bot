@@ -258,12 +258,15 @@ def test_resolve_with_bot_id_none_skips_bot_lookup(store: SettingsStore):
 
 
 @pytest.mark.asyncio
-async def test_alias_routing_is_context_gated(
+async def test_alias_routing_cross_bot(
     registry: BotRegistry,
 ):
-    """Sigil-pinned context never reacts to 'Artaud'; Artaud-pinned
-    never reacts to 'Sigil'. This is the core "not co-tenant"
-    invariant from the user's plan."""
+    """Multi-bot groups: any enabled bot can be summoned by name.
+    "Sigil, …" in an Artaud-pinned context routes to Sigil; "Artaud,
+    …" in a Sigil-pinned context routes to Artaud. This is the
+    multi-bot battle semantic the user wants. The pinned default
+    still gets priority when AMBIGUOUS (multiple names matched in
+    one message) via candidate ordering."""
     artaud_id = await registry.upsert(Bot(
         id=None, slug="artaud", display_name="Artaud", aliases=["Artaud"],
     ))
@@ -281,26 +284,35 @@ async def test_alias_routing_is_context_gated(
     cfg = SignalConfig(api_url="http://x", phone_number="+15551111111")
     h = SignalHandler(cfg, disp)
 
-    # Artaud's name in Artaud's context: matches
+    # Artaud's name in Artaud's context: matches Artaud (default)
     bot, mentioned = await h._resolve_addressed_bot(
         {"message": "hey Artaud help"}, "!ARTAUD_GROUP", pol_artaud,
     )
     assert mentioned is True
     assert bot.slug == "artaud"
 
-    # Sigil's name in Artaud's context: NO match
+    # Sigil's name in Artaud's context: routes to Sigil now (NEW
+    # behavior — cross-bot addressing in multi-bot groups).
     bot, mentioned = await h._resolve_addressed_bot(
         {"message": "hey Sigil help"}, "!ARTAUD_GROUP", pol_artaud,
     )
-    assert mentioned is False
-    assert bot is None
+    assert mentioned is True
+    assert bot.slug == "sigil"
 
-    # Sigil's name in Sigil's context: matches
+    # Sigil's name in Sigil's context: still matches Sigil (default).
     bot, mentioned = await h._resolve_addressed_bot(
         {"message": "Sigil?"}, "!SIGIL_GROUP", pol_sigil,
     )
     assert mentioned is True
     assert bot.slug == "sigil"
+
+    # Both names present: active/default bot wins (candidate ordering).
+    bot, mentioned = await h._resolve_addressed_bot(
+        {"message": "Sigil and Artaud are both here"},
+        "!ARTAUD_GROUP", pol_artaud,
+    )
+    assert mentioned is True
+    assert bot.slug == "artaud"
 
 
 @pytest.mark.asyncio

@@ -211,6 +211,7 @@ class MemoryStore:
         source: str = SOURCE_EXPLICIT,
         source_user_hash: str = "",
         source_message_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
     ) -> Optional[int]:
         """Insert or corroborate a memory. Returns the row id, or None on bad input.
 
@@ -241,12 +242,28 @@ class MemoryStore:
             # so a concurrent writer waits instead of read-then-double-insert.
             await db.execute("BEGIN IMMEDIATE")
             try:
+                # Dedup scope: each bot maintains its own mental model of
+                # the chat, so the (context, subject, kind) corroboration
+                # check is also keyed on bot_id. NULL-bot rows (legacy
+                # single-bot installs) are shared — a writer with a
+                # bot_id sees them but won't corroborate them (a re-add
+                # creates a per-bot row instead, preserving the legacy
+                # one). When bot_id is None on the write, we match
+                # NULL-only so the legacy code path stays exactly the
+                # same.
+                if bot_id is None:
+                    bot_clause = " AND bot_id IS NULL"
+                    bot_params: tuple = ()
+                else:
+                    bot_clause = " AND bot_id = ?"
+                    bot_params = (bot_id,)
                 cursor = await db.execute(
-                    """SELECT id, content, confidence, corroborations, source,
+                    f"""SELECT id, content, confidence, corroborations, source,
                               distinct_speakers
                        FROM context_memories
-                       WHERE context_id = ? AND subject_key = ? AND kind = ?""",
-                    (context_id, subject_key, kind),
+                       WHERE context_id = ? AND subject_key = ? AND kind = ?"""
+                    + bot_clause,
+                    (context_id, subject_key, kind) + bot_params,
                 )
                 existing = await cursor.fetchall()
 
@@ -294,13 +311,13 @@ class MemoryStore:
                        (context_id, subject_key, subject_label, kind, content,
                         confidence, source, source_user_hash,
                         source_message_at, distinct_speakers, corroborations,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                        created_at, updated_at, bot_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
                     (
                         context_id, subject_key, subject_label, kind, content,
                         confidence, source, speaker, source_message_at,
                         json.dumps([speaker] if speaker else []),
-                        now, now,
+                        now, now, bot_id,
                     ),
                 )
                 await db.commit()
@@ -322,7 +339,13 @@ class MemoryStore:
         subject_key: str,
         kinds: Optional[tuple] = None,
         min_confidence: float = 0.0,
+        bot_id: Optional[int] = None,
     ) -> list[dict]:
+        """Per-bot scoping (`bot_id` set): returns rows owned by this
+        bot plus legacy NULL-bot rows (shared from before the column
+        existed). When `bot_id` is None, returns ALL rows regardless
+        of bot_id — used by admin views and legacy single-bot reads.
+        """
         await self._ensure_initialized()
         sql = (
             f"SELECT {self._SELECT_COLS} "
@@ -333,6 +356,9 @@ class MemoryStore:
         if kinds:
             sql += f" AND kind IN ({','.join('?' * len(kinds))})"
             params.extend(kinds)
+        if bot_id is not None:
+            sql += " AND (bot_id = ? OR bot_id IS NULL)"
+            params.append(bot_id)
         sql += " ORDER BY confidence DESC, updated_at DESC"
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(sql, params)
@@ -361,6 +387,7 @@ class MemoryStore:
         subject_key: str,
         content: str,
         threshold: float = 0.5,
+        bot_id: Optional[int] = None,
     ) -> Optional[dict]:
         """Return the first stored memory for `subject_key` whose content
         is a near-duplicate of `content`, regardless of kind. None if
@@ -381,14 +408,23 @@ class MemoryStore:
         """
         if not content or not subject_key:
             return None
+        # Same bot-scoping rule as add(): match same-bot rows + legacy
+        # NULL-bot rows so the dedup decision uses the right slice.
+        bot_clause = ""
+        params: tuple = (context_id, subject_key)
+        if bot_id is not None:
+            bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
+            params = params + (bot_id,)
         async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}
                     FROM context_memories
-                    WHERE context_id = ? AND subject_key = ?
+                    WHERE context_id = ? AND subject_key = ?"""
+                + bot_clause +
+                """
                     ORDER BY updated_at DESC
                     LIMIT 50""",
-                (context_id, subject_key),
+                params,
             )
             rows = await cursor.fetchall()
         for r in rows:
@@ -403,24 +439,37 @@ class MemoryStore:
         context_id: int,
         query: str,
         limit: int = 12,
+        bot_id: Optional[int] = None,
     ) -> list[dict]:
         """Substring match across subject_label and content. Best-effort
         fuzzy retrieval for the `recall` tool — real ranking is the LLM's job.
+
+        `bot_id` (when set): restrict results to memories owned by this
+        bot, plus legacy NULL-bot rows. Other bots' memories are hidden
+        so each bot recalls its own mental model.
         """
         await self._ensure_initialized()
         q = (query or "").strip()
         if not q:
             return []
         like = f"%{q}%"
+        bot_clause = ""
+        params: tuple = (context_id, like, like)
+        if bot_id is not None:
+            bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
+            params = params + (bot_id,)
+        params = params + (limit,)
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}
                     FROM context_memories
                     WHERE context_id = ?
-                      AND (subject_label LIKE ? OR content LIKE ?)
+                      AND (subject_label LIKE ? OR content LIKE ?)"""
+                + bot_clause +
+                """
                     ORDER BY confidence DESC, updated_at DESC
                     LIMIT ?""",
-                (context_id, like, like, limit),
+                params,
             )
             rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -774,6 +823,7 @@ async def build_preamble(
     current_message_text: str = "",
     name_registry=None,
     recent_subject_keys: Optional[list[str]] = None,
+    bot_id: Optional[int] = None,
 ) -> str:
     """Build the memory preamble for the writer LLM's system suffix.
 
@@ -823,6 +873,7 @@ async def build_preamble(
             context_id=context_id,
             subject_key=key,
             min_confidence=MIN_PREAMBLE_CONFIDENCE,
+            bot_id=bot_id,
         )
         if not rows:
             continue
