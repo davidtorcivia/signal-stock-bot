@@ -62,7 +62,7 @@ _OPTION_ROW_PX = 32       # per options-position row (compact one-liner)
 _OPTION_HEADER_PX = 56    # space reserved for the "OPTIONS" sub-heading
 _ORDER_ROW_PX = 30        # per pending-order row (slightly tighter)
 _ORDER_HEADER_PX = 56     # space reserved for the "OPEN ORDERS" heading
-_BASE_HEIGHT_PX = 380     # header + summary block + table header + padding
+_BASE_HEIGHT_PX = 440     # header + summary block + table header + padding
 
 
 def _fmt_dollars(amount: float) -> str:
@@ -232,13 +232,20 @@ def render_portfolio_image(
         )
 
         # ---- Stat strip: Cash | Holdings | Funded ----------------------
+        # Pixel-based row anchors via py() — the earlier figure-relative
+        # offsets (+0.024 / -0.008 / -0.044) collapsed on shorter
+        # images, letting the 9pt LABEL overlap the 15pt VALUE. Each row
+        # gets a fixed pixel-from-top center so spacing stays the same
+        # regardless of how tall the card grows.
         cash = float(snap.get("cash", 0.0))
         market_value = float(snap.get("market_value", 0.0))
         funded = float(snap.get("total_funded", 0.0))
         starting = float(snap.get("starting_balance", 0.0))
         tip_total = float(snap.get("tip_total", 0.0))
 
-        strip_y = py(210)
+        label_y_px = 208
+        value_y_px = 238   # 30 px below label (9pt + gap + 15pt bold)
+        sub_y_px = 268     # 30 px below value (15pt + gap + 8pt)
         for col_x, label, value, sub in (
             (0.04, "CASH", _fmt_dollars(cash), None),
             (0.36, "HOLDINGS", _fmt_dollars(market_value), None),
@@ -250,7 +257,7 @@ def render_portfolio_image(
             ),
         ):
             ax.text(
-                col_x, strip_y + 0.024,
+                col_x, py(label_y_px),
                 label,
                 color=_DIM,
                 fontsize=9,
@@ -259,7 +266,7 @@ def render_portfolio_image(
                 zorder=2,
             )
             ax.text(
-                col_x, strip_y - 0.008,
+                col_x, py(value_y_px),
                 value,
                 color=_INK,
                 fontsize=15,
@@ -270,7 +277,7 @@ def render_portfolio_image(
             )
             if sub:
                 ax.text(
-                    col_x, strip_y - 0.044,
+                    col_x, py(sub_y_px),
                     sub,
                     color=_DIM,
                     fontsize=8,
@@ -280,11 +287,13 @@ def render_portfolio_image(
                 )
 
         # ---- Realized PnL strip (only if non-zero) ---------------------
+        # Pushed down to clear the FUNDED sub-text (which now sits at
+        # py(268) under the larger strip layout).
         realized = float(snap.get("realized_pnl", 0.0))
         if abs(realized) > 0.005:
             r_color = _GREEN if realized >= 0 else _RED
             ax.text(
-                0.04, py(268),
+                0.04, py(298),
                 f"Realized P/L: {_fmt_dollars(realized)}",
                 color=r_color,
                 fontsize=10,
@@ -304,7 +313,7 @@ def render_portfolio_image(
             "pl": 0.80,
             "pct": 0.96,
         }
-        header_y_px = 308
+        header_y_px = 340
         ax.text(col_x["ticker"], py(header_y_px), "TICKER",
                 color=_DIM, fontsize=9, family="DejaVu Sans",
                 va="center", ha="left", zorder=2)
