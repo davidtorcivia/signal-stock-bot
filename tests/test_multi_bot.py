@@ -396,3 +396,80 @@ def test_predict_self_bot_hash_differs_per_bot():
     assert sigil_hash != artaud_hash
     assert sigil_hash != legacy_hash
     assert artaud_hash != legacy_hash
+
+
+# ---------- parse_portfolio_key defense (final-pass audit) ------------------
+
+def test_parse_portfolio_key_rejects_double_scoped():
+    """`group:X@bot:1@bot:2` is never a legitimate scoped key (defense
+    in depth). Reject by returning bot_id=None so downstream falls
+    back to policy default instead of treating the embedded scope as
+    a real chat key."""
+    chat_key, bot_id = parse_portfolio_key("group:X@bot:1@bot:2")
+    # chat_key still has the leftover @bot:1 embedded but bot_id
+    # is None — caller treats this as unscoped/orphan.
+    assert bot_id is None
+
+
+def test_parse_portfolio_key_rejects_negative_bot_id():
+    """Negative bot_ids never legitimately exist (autoincrement starts
+    at 1). Reject them so routing doesn't get confused."""
+    chat_key, bot_id = parse_portfolio_key("group:X@bot:-1")
+    assert bot_id is None
+    assert chat_key == "group:X"
+
+
+def test_parse_portfolio_key_rejects_zero_bot_id():
+    """bot_id=0 is the conversation_summaries legacy sentinel — never
+    a real bot row."""
+    _, bot_id = parse_portfolio_key("group:X@bot:0")
+    assert bot_id is None
+
+
+# ---------- migration rejects bad default_bot_id ----------------------------
+
+@pytest.mark.asyncio
+async def test_migrate_rejects_non_positive_default(tmp_path):
+    """migrate_to_bot_scope must refuse 0 and negative ids — those are
+    never real bot rows."""
+    store = PortfolioStore(db_path=str(tmp_path / "p.db"))
+    await store.ensure_portfolio(CTX, label="legacy")
+    assert await store.migrate_to_bot_scope(default_bot_id=0) == 0
+    assert await store.migrate_to_bot_scope(default_bot_id=-1) == 0
+    # Legacy portfolio is untouched.
+    p = await store.get_portfolio(CTX)
+    assert p is not None
+    assert p.label == "legacy"
+
+
+# ---------- per-bot summarizer max_id scoping (M4) --------------------------
+
+@pytest.mark.asyncio
+async def test_turns_to_summarize_max_id_scoped_per_bot(tmp_path):
+    """When bot B is chatty, bot A's recent-floor must be computed
+    against bot A's own turns + user turns — not the global MAX(id)
+    that would include all of B's writes."""
+    h = ConversationHistory(
+        db_path=str(tmp_path / "h.db"), turns_per_user=100,
+    )
+    # Bot A writes 3 turns early.
+    for i in range(3):
+        await h.append(CTX, "user", f"q to A {i}", bot_id=1)
+        await h.append(CTX, "assistant", f"A reply {i}", bot_id=1)
+    # Bot B floods with 20 turns AFTER.
+    for i in range(20):
+        await h.append(CTX, "user", f"q to B {i}", bot_id=2)
+        await h.append(CTX, "assistant", f"B reply {i}", bot_id=2)
+    # Bot A's summarizer with keep_recent=2 must operate on bot A's own
+    # scope, not B's. recent_floor should be near A's own MAX(id).
+    pending = await h.turns_to_summarize(
+        CTX, summary_through_id=0, keep_recent=2, bot_id=1,
+    )
+    # Without the fix, the global MAX(id) would put recent_floor well
+    # above any of A's turns → empty list. With the fix, A's own turns
+    # are in the pending set.
+    a_assistant_contents = [
+        t["content"] for t in pending
+        if t["role"] == "assistant"
+    ]
+    assert any("A reply" in c for c in a_assistant_contents)

@@ -78,23 +78,34 @@ def portfolio_context_key(context_key: str, bot_id: Optional[int]) -> str:
 def parse_portfolio_key(scoped_key: str) -> tuple[str, Optional[int]]:
     """Inverse of `portfolio_context_key`. Returns (chat_context_key,
     bot_id_or_none). For unscoped legacy keys returns (key, None).
-    For malformed scoped keys (`@bot:` present but suffix isn't an int)
-    returns (chat_key, None) so downstream routing operates on the
-    cleaned-up prefix rather than a corrupted full string."""
+    For malformed scoped keys (`@bot:` present but suffix isn't an int,
+    or double-scoped) returns (chat_key, None) so downstream routing
+    operates on the cleaned-up prefix rather than a corrupted full
+    string."""
     if not scoped_key:
         # Coerce None / "" defensively — callers do `chat_key.startswith(...)`.
         return "", None
     if _BOT_SCOPE_DELIM not in scoped_key:
         return scoped_key, None
     chat_key, _, bot_part = scoped_key.rpartition(_BOT_SCOPE_DELIM)
+    # Double-scope guard: a value like `group:X@bot:1@bot:2` would
+    # rpartition cleanly to ("group:X@bot:1", 2), but the chat_key
+    # still carries an embedded scope — that's never legitimate.
+    # Treat as malformed and reject the bot_id.
+    if _BOT_SCOPE_DELIM in chat_key:
+        return chat_key, None
     try:
-        return chat_key, int(bot_part)
+        bot_id = int(bot_part)
     except ValueError:
         # Malformed suffix — return the rpartition prefix (chat_key)
         # rather than the full scoped_key so downstream `startswith`
         # / send routing operates on the cleaned-up chat key. The
         # bot_id is None so callers fall back to policy/default.
         return chat_key, None
+    # Reject negative bot_ids — autoincrement guarantees ids start at 1.
+    if bot_id <= 0:
+        return chat_key, None
+    return chat_key, bot_id
 
 
 SOURCE_CRON = "cron"
@@ -1492,7 +1503,9 @@ class PortfolioStore:
         transactions: partial progress sticks if one table fails, so
         a single bad row doesn't roll back every other table's fix.
         """
-        if not default_bot_id:
+        # Reject 0 (the legacy sentinel) and any non-positive id —
+        # bots.id is autoincrement so real ids are always >= 1.
+        if not default_bot_id or default_bot_id <= 0:
             return 0
         await self._ensure_initialized()
         suffix = f"{_BOT_SCOPE_DELIM}{default_bot_id}"

@@ -300,12 +300,33 @@ class OrdersWorker:
         # so the synthetic !ask runs as the bot that actually owns the
         # settled position — multi-bot groups need this to credit the
         # right portfolio.
+        #
+        # Orphan-bot guard: if the scope explicitly names a bot that no
+        # longer exists in the registry (deleted/disabled), do NOT fall
+        # through to the policy default. That would run the !ask as a
+        # DIFFERENT bot whose portfolio_key() lands elsewhere; any
+        # follow-up trades inside the reaction would credit the wrong
+        # portfolio. Static-notify instead so cash routing stays
+        # honest.
         settle_bot = None
-        if scope_bot_id is not None and self.bot_registry is not None:
-            try:
-                settle_bot = self.bot_registry.get_sync(scope_bot_id)
-            except Exception:
-                settle_bot = None
+        if scope_bot_id is not None:
+            if self.bot_registry is not None:
+                try:
+                    settle_bot = self.bot_registry.get_sync(scope_bot_id)
+                except Exception:
+                    settle_bot = None
+            if settle_bot is None:
+                logger.warning(
+                    f"Orders watcher: settlement scope refers to "
+                    f"bot_id={scope_bot_id} which is gone from the "
+                    f"registry; falling back to static notify so the "
+                    f"!ask doesn't run as a different bot"
+                )
+                for s in settlements:
+                    await self._send_to_context(
+                        context_key, self._format_settlement(s),
+                    )
+                return
         if settle_bot is None:
             settle_bot = self._resolve_bot_for(policy)
         settle_phone = (
@@ -535,12 +556,28 @@ class OrdersWorker:
         prompt = self._build_reaction_prompt(orders)
         # Same per-bot routing as settlements: scoped-key bot_id wins so
         # the order-fire !ask runs as the bot that owns the position.
+        # Orphan-bot guard (same rationale as _fire_settlement_reaction):
+        # if the scope names a deleted bot, refuse to fall through to a
+        # different bot's voice — cash would misroute on any follow-up
+        # trade inside the reaction. Static-notify instead.
         order_bot = None
-        if scope_bot_id is not None and self.bot_registry is not None:
-            try:
-                order_bot = self.bot_registry.get_sync(scope_bot_id)
-            except Exception:
-                order_bot = None
+        if scope_bot_id is not None:
+            if self.bot_registry is not None:
+                try:
+                    order_bot = self.bot_registry.get_sync(scope_bot_id)
+                except Exception:
+                    order_bot = None
+            if order_bot is None:
+                logger.warning(
+                    f"Orders watcher: order scope refers to "
+                    f"bot_id={scope_bot_id} which is gone from the "
+                    f"registry; falling back to static notify"
+                )
+                for o in orders:
+                    await self._send_to_context(
+                        context_key, self._format_resolution(o),
+                    )
+                return
         if order_bot is None:
             order_bot = self._resolve_bot_for(policy)
         order_phone = (

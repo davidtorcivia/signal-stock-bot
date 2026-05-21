@@ -293,12 +293,28 @@ class TradingCronWorker:
 
         # Scoped-key bot_id wins so each bot in a multi-bot group runs
         # its own cron arc with its own portfolio.
+        #
+        # Orphan-bot guard: if the scoped portfolio names a bot the
+        # registry no longer knows about (admin deleted it without
+        # cascading the portfolio), do NOT fall back to the policy
+        # default — a different bot answering would book trades into
+        # ITS OWN scoped portfolio while the orphan's cron-fired
+        # stamp marks the wrong row as "fired today". Stamp + skip.
         cron_bot = None
-        if scope_bot_id is not None and self.bot_registry is not None:
-            try:
-                cron_bot = self.bot_registry.get_sync(scope_bot_id)
-            except Exception:
-                cron_bot = None
+        if scope_bot_id is not None:
+            if self.bot_registry is not None:
+                try:
+                    cron_bot = self.bot_registry.get_sync(scope_bot_id)
+                except Exception:
+                    cron_bot = None
+            if cron_bot is None:
+                logger.warning(
+                    f"Trading cron: {ctx_key} scope refers to "
+                    f"bot_id={scope_bot_id} which is gone from the "
+                    f"registry; skipping firing this portfolio "
+                    f"(admin: reset or cascade the orphan)"
+                )
+                return False
         if cron_bot is None:
             cron_bot = self._resolve_bot_for(policy)
         cron_phone = (

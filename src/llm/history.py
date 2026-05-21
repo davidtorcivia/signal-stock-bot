@@ -289,10 +289,25 @@ class ConversationHistory:
         so each bot's summary captures only its own conversation arc.
         """
         async with db_session(self) as db:
-            cursor = await db.execute(
-                "SELECT MAX(id) FROM conversation_turns WHERE context_key = ?",
-                (context_key,),
-            )
+            # MAX(id) must be scoped to the SAME filter the summarizer
+            # will consume — otherwise bot A's recent_floor is computed
+            # off bot B's chatty turns, and bot A's summary either
+            # bloats with unrelated content (if floor falls below A's
+            # turns) or skips A's own recent turns (if floor sits above
+            # them). Scope MAX by `(role='user' OR bot_id=? OR bot_id
+            # IS NULL)` for per-bot summaries.
+            if bot_id is not None:
+                cursor = await db.execute(
+                    "SELECT MAX(id) FROM conversation_turns "
+                    "WHERE context_key = ? "
+                    "  AND (role = 'user' OR bot_id = ? OR bot_id IS NULL)",
+                    (context_key, bot_id),
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT MAX(id) FROM conversation_turns WHERE context_key = ?",
+                    (context_key,),
+                )
             max_row = await cursor.fetchone()
             max_id = (max_row[0] or 0) if max_row else 0
             if max_id == 0:

@@ -145,7 +145,14 @@
                 {% for o in p.pending_orders %}
                 <tr>
                     <td><span class="muted">#{{ o.id }}</span></td>
-                    <td><code>{{ o.ticker }}</code></td>
+                    <td>
+                        {% if o.is_option %}
+                            <span class="muted" style="font-size:10px;">OPT</span>
+                            <code title="{{ o.contract }}">{{ o.contract or o.ticker }}</code>
+                        {% else %}
+                            <code>{{ o.ticker }}</code>
+                        {% endif %}
+                    </td>
                     <td>
                         {% if o.trigger_direction == 'above' %}
                             <span style="color: #2a7;">▲</span>
@@ -154,14 +161,16 @@
                         {% endif %}
                         {{ o.kind }} {{ o.side }}
                     </td>
-                    <td>${{ '%.2f'|format(o.trigger_price) }}</td>
+                    <td>
+                        {% if o.is_option %}${{ '%.2f'|format(o.trigger_price) }}/sh{% else %}${{ '%.2f'|format(o.trigger_price) }}{% endif %}
+                    </td>
                     <td>
                         {% if o.close_position %}
                             close all
                         {% elif o.dollars %}
                             ${{ '%.2f'|format(o.dollars) }} (qty TBD)
                         {% elif o.qty %}
-                            {{ '%.4f'|format(o.qty) }} sh
+                            {{ '%.4f'|format(o.qty) }}{% if o.is_option %} contracts{% else %} sh{% endif %}
                         {% else %}
                             <span class="muted">?</span>
                         {% endif %}
@@ -206,7 +215,14 @@
                 <td><span class="muted">{{ o.created_str }}</span></td>
                 <td>
                     {% if o.trigger_direction == 'above' %}<span style="color: #2a7;">▲</span>{% else %}<span style="color: #c33;">▼</span>{% endif %}
-                    {{ o.kind }} {{ o.side }} <code>{{ o.ticker }}</code> @ ${{ '%.2f'|format(o.trigger_price) }}
+                    {{ o.kind }} {{ o.side }}
+                    {% if o.is_option %}
+                        <span class="muted" style="font-size:10px;">OPT</span>
+                        <code title="{{ o.contract }}">{{ o.contract or o.ticker }}</code>
+                        @ ${{ '%.2f'|format(o.trigger_price) }}/sh
+                    {% else %}
+                        <code>{{ o.ticker }}</code> @ ${{ '%.2f'|format(o.trigger_price) }}
+                    {% endif %}
                 </td>
                 <td>
                     {% if o.status == 'pending' %}
@@ -263,9 +279,21 @@
                 <tr>
                     <td><span class="muted">{{ t.ts_str }}</span></td>
                     <td><strong>{{ t.side }}</strong></td>
-                    <td>{{ '%.4f'|format(t.qty) }}</td>
-                    <td><code>{{ t.ticker }}</code></td>
-                    <td>${{ '%.2f'|format(t.price) }}</td>
+                    <td>
+                        {{ '%.4f'|format(t.qty) }}
+                        {% if t.kind == 'option' %}
+                            <span class="muted" style="font-size:10px;">×{{ t.multiplier or 100 }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if t.kind == 'option' %}
+                            <span class="muted" style="font-size:10px;">OPT</span>
+                            <code title="{{ t.ticker }}">{{ t.ticker }}</code>
+                        {% else %}
+                            <code>{{ t.ticker }}</code>
+                        {% endif %}
+                    </td>
+                    <td>${{ '%.2f'|format(t.price) }}{% if t.kind == 'option' %}/sh{% endif %}</td>
                     <td><span class="muted">{{ t.source }}</span></td>
                     <td>
                         {% if t.realized_pnl is not none %}

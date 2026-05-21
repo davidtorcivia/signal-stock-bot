@@ -561,9 +561,18 @@ class BotRegistry:
                 )
 
     async def delete(self, bot_id: int) -> bool:
-        """Refuse to delete a bot still referenced by contexts. Caller
-        should reassign first. The seeded sigil row is also protected
-        (slug=='sigil') because it's the migration anchor."""
+        """Refuse to delete a bot still referenced by contexts OR by
+        scoped portfolios (`@bot:N` in context_key). Caller should
+        reassign/reset first. The seeded sigil row is also protected
+        (slug=='sigil') because it's the migration anchor.
+
+        Cascading scoped portfolios is unsafe: silent rewrite would
+        merge two bots' positions into one, and silent abandonment
+        leaves the cron + orders + settlement workers polling rows
+        that resolve to a deleted bot. We require explicit admin
+        intervention (reset the portfolio first) so cash routing
+        stays honest.
+        """
         await self._ensure_initialized()
         async with aiosqlite.connect(self.db_path) as db:
             from ..database import apply_db_pragmas
@@ -583,8 +592,40 @@ class BotRegistry:
             ref = await cursor.fetchone()
             if ref and ref[0] > 0:
                 return False
+            # Scoped portfolios sanity check. The portfolio store lives
+            # in the same SQLite database, so we can query its table
+            # directly. If portfolios doesn't exist yet (fresh install,
+            # consumer not initialized), there's nothing to protect.
+            try:
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM portfolios "
+                    "WHERE context_key LIKE '%@bot:' || ? || '%'",
+                    (str(bot_id),),
+                )
+                scoped_ref = await cursor.fetchone()
+                if scoped_ref and scoped_ref[0] > 0:
+                    logger.warning(
+                        f"BotRegistry.delete({bot_id}): refusing — "
+                        f"{scoped_ref[0]} scoped portfolio(s) still "
+                        f"reference @bot:{bot_id}. Reset those "
+                        f"portfolios first."
+                    )
+                    return False
+            except Exception:
+                # portfolios table doesn't exist yet — no cascade
+                # concern.
+                pass
             cursor = await db.execute(
                 "DELETE FROM bots WHERE id = ?", (bot_id,)
+            )
+            # Defense in depth: even though we checked for context refs
+            # above, NULL out any stale pin in case there's a row that
+            # wasn't enforced (older schema without FK). Cheap and
+            # idempotent.
+            await db.execute(
+                "UPDATE contexts SET default_bot_id = NULL "
+                "WHERE default_bot_id = ?",
+                (bot_id,),
             )
             await db.commit()
         await self._load_cache()

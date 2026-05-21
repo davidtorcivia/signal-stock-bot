@@ -913,6 +913,7 @@ class AskCommand(BaseCommand):
                 ticker=parsed.get("ticker"),
                 threshold=parsed.get("threshold"),
                 direction=parsed.get("direction"),
+                bot_id=caller_ctx.bot_id,
             )
         except Exception as e:
             logger.exception(f"predict_self: store.create failed: {e}")

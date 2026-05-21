@@ -219,16 +219,24 @@ class PredictionStore:
         ticker: Optional[str] = None,
         threshold: Optional[float] = None,
         direction: Optional[str] = None,
+        bot_id: Optional[int] = None,
     ) -> int:
+        """`bot_id` (when set) records the bot that authored a SELF
+        prediction. Required to distinguish bot A's vs bot B's
+        self-predictions on the leaderboard now that multiple bots can
+        coexist in one chat. The column is also populated for human
+        predictions (with the responding bot's id) so the resolver can
+        scope its 'who voted on this' lookups per-bot."""
         async with db_session(self) as db:
             cursor = await db.execute(
                 """INSERT INTO predictions
                    (user_hash, user_label, group_id, context_key, claim,
                     deadline_utc, created_at, ticker, threshold, direction,
-                    status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                    status, bot_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
                 (user_hash, user_label, group_id, context_key, claim,
-                 deadline_utc, time.time(), ticker, threshold, direction),
+                 deadline_utc, time.time(), ticker, threshold, direction,
+                 bot_id),
             )
             await db.commit()
             return cursor.lastrowid or 0
