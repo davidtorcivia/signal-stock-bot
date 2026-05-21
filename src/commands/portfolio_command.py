@@ -19,7 +19,7 @@ import math
 
 from ..charts.portfolio import render_portfolio_image
 from ..database import hash_phone
-from ..paper_portfolio import PortfolioStore, portfolio_context_key
+from ..paper_portfolio import PortfolioStore
 from ..paper_portfolio_executor import PaperPortfolioExecutor
 from .base import BaseCommand, CommandContext, CommandResult
 
@@ -239,28 +239,36 @@ class PortfolioCommand(BaseCommand):
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
         # Per-bot scoping: each bot in a multi-bot chat has its own
-        # portfolio so they can compete. _scoped_key wraps the chat
-        # context with the responding bot's id.
-        ctx_key = portfolio_context_key(
-            ctx.context_key(),
-            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
+        # portfolio so they can compete.
+        ctx_key = ctx.portfolio_key()
+        # Caption / image must reflect the BOT THAT'S ANSWERING, not the
+        # ctor's fallback bot_name. In a multi-bot group, Artaud running
+        # !portfolio should produce a card titled "Artaud's portfolio",
+        # not the registry's default.
+        display_name = (
+            ctx.bot.display_name
+            if getattr(ctx, "bot", None) is not None
+               and getattr(ctx.bot, "display_name", None)
+            else self.bot_name
         )
         try:
-            snap = await self.executor.status(ctx_key)
+            snap = await self.executor.status(
+                ctx_key, label_hint=display_name,
+            )
         except Exception as e:
             logger.exception(f"portfolio: status failed: {e}")
             return CommandResult.error("Couldn't load the portfolio.")
 
-        caption = render_status_caption(snap, bot_name=self.bot_name)
+        caption = render_status_caption(snap, bot_name=display_name)
         # Beautiful PNG dashboard is the primary surface in chat. If
         # rendering fails (matplotlib hiccup, weird snap shape) fall
         # back to the legacy plain-text layout so the user still gets
         # their portfolio rather than a generic error.
         try:
-            image_b64 = render_portfolio_image(snap, bot_name=self.bot_name)
+            image_b64 = render_portfolio_image(snap, bot_name=display_name)
         except Exception as e:
             logger.warning(f"portfolio: image render failed, falling back to text: {e}")
-            return CommandResult.ok(render_status(snap, bot_name=self.bot_name))
+            return CommandResult.ok(render_status(snap, bot_name=display_name))
 
         return CommandResult(
             text=caption,
@@ -288,12 +296,17 @@ class PnlCommand(BaseCommand):
         self.bot_name = bot_name
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
-        ctx_key = portfolio_context_key(
-            ctx.context_key(),
-            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
+        ctx_key = ctx.portfolio_key()
+        display_name = (
+            ctx.bot.display_name
+            if getattr(ctx, "bot", None) is not None
+               and getattr(ctx.bot, "display_name", None)
+            else self.bot_name
         )
         try:
-            snap = await self.executor.status(ctx_key)
+            snap = await self.executor.status(
+                ctx_key, label_hint=display_name,
+            )
         except Exception as e:
             logger.exception(f"pnl: status failed: {e}")
             return CommandResult.error("Couldn't load the portfolio.")
@@ -304,7 +317,7 @@ class PnlCommand(BaseCommand):
         pnl_pct = snap["total_pnl_pct"]
         arrow = "▲" if pnl >= 0 else "▼"
         lines = [
-            f"◈ {self.bot_name}'s PnL",
+            f"◈ {display_name}'s PnL",
             f"  {arrow} {_fmt_dollars(pnl)} ({_fmt_pct(pnl_pct)})",
             f"  Equity: {_fmt_dollars(equity)}  Funded: {_fmt_dollars(funded)}",
             f"  Realized: {_fmt_dollars(snap['realized_pnl'])}  "
@@ -365,10 +378,7 @@ class TipCommand(BaseCommand):
         # !tip routes to the bot currently active in this chat — the
         # tipper is funding THAT bot's portfolio. Per-bot scoping lets
         # users tip individual bots in a multi-bot group.
-        tip_ctx_key = portfolio_context_key(
-            ctx.context_key(),
-            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
-        )
+        tip_ctx_key = ctx.portfolio_key()
         try:
             result = await self.store.tip(
                 tip_ctx_key,
@@ -429,10 +439,7 @@ class TradesCommand(BaseCommand):
                     f"`{ctx.args[0]}` isn't a number. Try `!trades 20`."
                 )
 
-        trades_ctx_key = portfolio_context_key(
-            ctx.context_key(),
-            ctx.bot.id if getattr(ctx, "bot", None) is not None else None,
-        )
+        trades_ctx_key = ctx.portfolio_key()
         try:
             trades = await self.store.list_trades(trades_ctx_key, limit=limit)
             option_trades = await self.store.list_option_trades(

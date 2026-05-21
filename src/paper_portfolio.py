@@ -78,14 +78,23 @@ def portfolio_context_key(context_key: str, bot_id: Optional[int]) -> str:
 def parse_portfolio_key(scoped_key: str) -> tuple[str, Optional[int]]:
     """Inverse of `portfolio_context_key`. Returns (chat_context_key,
     bot_id_or_none). For unscoped legacy keys returns (key, None).
-    """
-    if not scoped_key or _BOT_SCOPE_DELIM not in scoped_key:
+    For malformed scoped keys (`@bot:` present but suffix isn't an int)
+    returns (chat_key, None) so downstream routing operates on the
+    cleaned-up prefix rather than a corrupted full string."""
+    if not scoped_key:
+        # Coerce None / "" defensively — callers do `chat_key.startswith(...)`.
+        return "", None
+    if _BOT_SCOPE_DELIM not in scoped_key:
         return scoped_key, None
     chat_key, _, bot_part = scoped_key.rpartition(_BOT_SCOPE_DELIM)
     try:
         return chat_key, int(bot_part)
     except ValueError:
-        return scoped_key, None
+        # Malformed suffix — return the rpartition prefix (chat_key)
+        # rather than the full scoped_key so downstream `startswith`
+        # / send routing operates on the cleaned-up chat key. The
+        # bot_id is None so callers fall back to policy/default.
+        return chat_key, None
 
 
 SOURCE_CRON = "cron"
@@ -1462,46 +1471,51 @@ class PortfolioStore:
     # Cron tracking (used by TradingCronWorker)
     # ------------------------------------------------------------------
 
+    # Single source of truth for tables whose primary key (or de-facto
+    # uniqueness contract) includes `context_key`. Used by both the
+    # migration and any future "wipe by context" helpers.
+    _BOT_SCOPED_TABLES: tuple[str, ...] = (
+        "portfolios", "positions", "trades", "tips",
+        "portfolio_cron_runs", "portfolio_orders",
+        "options_positions", "option_trades",
+    )
+
     async def migrate_to_bot_scope(self, default_bot_id: int) -> int:
         """One-time migration: rewrite legacy unscoped context_keys
         across every portfolio table so they carry a bot scope. Returns
         the number of rows updated (across all tables).
 
-        Idempotent — rows already carrying `@bot:N` are skipped. Safe to
-        call on every startup. The `default_bot_id` is used as the
-        owner for every legacy row; multi-bot installs that had a
-        different bot acting in a context will see those rows as the
-        default bot's, which matches the de-facto pre-migration state
-        (only one bot was active per chat then).
+        Idempotent — rows already carrying `@bot:N` are skipped. Uses
+        `UPDATE OR IGNORE` so the rare collision (an already-scoped row
+        exists for the same scope) silently drops the duplicate legacy
+        row instead of aborting the whole migration. Per-table
+        transactions: partial progress sticks if one table fails, so
+        a single bad row doesn't roll back every other table's fix.
         """
         if not default_bot_id:
             return 0
         await self._ensure_initialized()
         suffix = f"{_BOT_SCOPE_DELIM}{default_bot_id}"
         updated_total = 0
-        # Tables whose primary key includes context_key (UPDATE OR
-        # IGNORE handles the rare collision where an already-scoped
-        # row exists alongside a legacy row for the same context).
-        tables = (
-            "portfolios", "positions", "trades", "tips",
-            "portfolio_cron_runs", "portfolio_orders",
-            "options_positions", "option_trades",
-        )
-        async with db_session(self) as db:
-            await db.execute("BEGIN IMMEDIATE")
+        for table in self._BOT_SCOPED_TABLES:
             try:
-                for table in tables:
+                async with db_session(self) as db:
                     cursor = await db.execute(
-                        f"""UPDATE {table}
+                        f"""UPDATE OR IGNORE {table}
                             SET context_key = context_key || ?
                             WHERE context_key NOT LIKE '%' || ? || '%'""",
                         (suffix, _BOT_SCOPE_DELIM),
                     )
+                    await db.commit()
                     updated_total += cursor.rowcount or 0
-                await db.commit()
-            except Exception:
-                await db.rollback()
-                raise
+            except Exception as e:
+                # Per-table failure should not roll back other tables —
+                # log loudly so the operator notices, but keep going so
+                # the other tables get migrated.
+                logger.error(
+                    f"PortfolioStore migration: {table} failed: "
+                    f"{type(e).__name__}: {e}"
+                )
         if updated_total:
             logger.info(
                 f"PortfolioStore: migrated {updated_total} legacy "

@@ -25,6 +25,7 @@ Design:
 import asyncio
 import json
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -107,12 +108,27 @@ class Summarizer:
             return ""
         return f"[{role}] {content}"
 
-    async def maybe_summarize(self, context_key: str) -> bool:
+    async def maybe_summarize(
+        self,
+        context_key: str,
+        floor_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
+    ) -> bool:
         """Fold pending turns into the rolling summary if thresholds met.
 
         Returns True if a new summary was written. Errors are logged and
         swallowed — the summary is best-effort and must never break the
         ask path.
+
+        `floor_at` is the context's purge floor. When set, an existing
+        summary written before the floor is treated as absent (so the
+        new summary builds from post-floor turns only) and turns older
+        than the floor are excluded from the input batch.
+
+        `bot_id` (when set) scopes both the summary row and the source
+        turns to one bot — multi-bot groups thus get one summary per
+        bot, so bot A's compressed memory never leaks into bot B's
+        prompt.
         """
         cfg = self._config()
         if not cfg["enabled"]:
@@ -120,20 +136,31 @@ class Summarizer:
         if not context_key:
             return False
 
-        lock = self._lock_for(context_key)
+        # Per-bot lock key so concurrent !ask invocations by different
+        # bots in the same chat each get to summarize independently.
+        lock_key = f"{context_key}::{bot_id or 0}"
+        lock = self._lock_for(lock_key)
         if lock.locked():
-            # Another summarization is already running for this context; skip.
+            # Another summarization is already running for this (context,bot); skip.
             return False
 
         async with lock:
             try:
-                return await self._do_summarize(context_key, cfg)
+                return await self._do_summarize(context_key, cfg, floor_at, bot_id)
             except Exception as e:
                 logger.warning(f"Summarizer failed for {context_key[:24]}: {e}")
                 return False
 
-    async def _do_summarize(self, context_key: str, cfg: dict) -> bool:
-        existing = await self.history.get_summary(context_key)
+    async def _do_summarize(
+        self,
+        context_key: str,
+        cfg: dict,
+        floor_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
+    ) -> bool:
+        existing = await self.history.get_summary(
+            context_key, floor_at=floor_at, bot_id=bot_id,
+        )
         through_id = existing["summary_through_id"] if existing else 0
         prior_summary = existing["summary"] if existing else ""
 
@@ -141,6 +168,8 @@ class Summarizer:
             context_key,
             summary_through_id=through_id,
             keep_recent=cfg["keep_recent"],
+            floor_at=floor_at,
+            bot_id=bot_id,
         )
         if len(pending) < cfg["min_new_turns"]:
             return False
@@ -203,6 +232,7 @@ class Summarizer:
             summary=new_summary,
             summary_through_id=new_max_id,
             turns_summarized=prior_count + len(pending),
+            bot_id=bot_id,
         )
         logger.info(
             f"Summarizer: updated {context_key[:24]} (+{len(pending)} turns, "

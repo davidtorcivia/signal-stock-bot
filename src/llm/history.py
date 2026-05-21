@@ -144,28 +144,57 @@ class ConversationHistory:
                 "CREATE INDEX IF NOT EXISTS idx_conv_bot_ctx_time "
                 "ON conversation_turns(bot_id, context_key, created_at)"
             )
-            # Per-context rolling summary. `summary_through_id` is the highest
-            # conversation_turns.id that's already been folded in — newer
-            # turns above that are still verbatim in conversation_turns and
-            # haven't been compressed yet.
+            # Per-(context, bot) rolling summary. `summary_through_id`
+            # is the highest conversation_turns.id that's already been
+            # folded in — newer turns above that are still verbatim in
+            # conversation_turns and haven't been compressed yet.
+            # Composite PK on (context_key, bot_id) so each bot in a
+            # multi-bot group has its OWN compressed memory — otherwise
+            # bot A's summary blob leaks into bot B's prompt, defeating
+            # the per-bot history filter on conversation_turns.
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversation_summaries (
-                    context_key TEXT PRIMARY KEY,
+                    context_key TEXT NOT NULL,
+                    bot_id INTEGER NOT NULL DEFAULT 0,
                     summary TEXT NOT NULL,
                     summary_through_id INTEGER NOT NULL DEFAULT 0,
                     turns_summarized INTEGER NOT NULL DEFAULT 0,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (context_key, bot_id)
                 )
                 """
             )
+            # Migration: legacy summaries lived as one row per
+            # context_key with no bot_id column. Add the column and
+            # promote those rows to bot_id=0 (the "shared / legacy"
+            # sentinel — every bot's reader passes 0 as a fallback
+            # when the per-bot row is missing).
+            cursor = await db.execute(
+                "PRAGMA table_info(conversation_summaries)"
+            )
+            summ_cols = {r[1] for r in await cursor.fetchall()}
+            if "bot_id" not in summ_cols:
+                await db.execute(
+                    "ALTER TABLE conversation_summaries "
+                    "ADD COLUMN bot_id INTEGER NOT NULL DEFAULT 0"
+                )
             await db.commit()
         self._initialized = True
 
     async def get_summary(
-        self, context_key: str, floor_at: Optional[float] = None
+        self,
+        context_key: str,
+        floor_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
     ) -> Optional[dict]:
-        """Return the rolling summary for a context, or None if absent.
+        """Return the rolling summary for a (context, bot) pair, or None
+        if absent. Each bot in a multi-bot group has its OWN summary so
+        bot A's compressed memory never leaks into bot B's prompt.
+
+        Reader fallback: if a per-bot row is missing, fall through to
+        the legacy `bot_id=0` row (pre-migration single-bot summary).
+        This keeps single-bot installs unaffected.
 
         Shape: {summary: str, summary_through_id: int, turns_summarized: int,
                 updated_at: float}.
@@ -176,13 +205,27 @@ class ConversationHistory:
         purge action also DELETEs the summary row directly, but this
         filter is the defense-in-depth that makes the floor hold forever.
         """
+        bid = bot_id if bot_id is not None else 0
         async with db_session(self) as db:
             cursor = await db.execute(
                 """SELECT summary, summary_through_id, turns_summarized, updated_at
-                   FROM conversation_summaries WHERE context_key = ?""",
-                (context_key,),
+                   FROM conversation_summaries
+                   WHERE context_key = ? AND bot_id = ?""",
+                (context_key, bid),
             )
             row = await cursor.fetchone()
+            # Fallback: per-bot row missing → try the legacy bot_id=0
+            # row (pre-multi-bot single-bot summary). Each bot reads
+            # the same legacy blob exactly once before generating its
+            # own.
+            if row is None and bid != 0:
+                cursor = await db.execute(
+                    """SELECT summary, summary_through_id, turns_summarized, updated_at
+                       FROM conversation_summaries
+                       WHERE context_key = ? AND bot_id = 0""",
+                    (context_key,),
+                )
+                row = await cursor.fetchone()
         if not row:
             return None
         if floor_at is not None and (row[3] or 0) < floor_at:
@@ -200,18 +243,24 @@ class ConversationHistory:
         summary: str,
         summary_through_id: int,
         turns_summarized: int,
+        bot_id: Optional[int] = None,
     ) -> None:
+        bid = bot_id if bot_id is not None else 0
         async with db_session(self) as db:
             await db.execute(
                 """INSERT INTO conversation_summaries
-                   (context_key, summary, summary_through_id, turns_summarized, updated_at)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(context_key) DO UPDATE SET
+                   (context_key, bot_id, summary, summary_through_id,
+                    turns_summarized, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(context_key, bot_id) DO UPDATE SET
                      summary = excluded.summary,
                      summary_through_id = excluded.summary_through_id,
                      turns_summarized = excluded.turns_summarized,
                      updated_at = excluded.updated_at""",
-                (context_key, summary, summary_through_id, turns_summarized, time.time()),
+                (
+                    context_key, bid, summary, summary_through_id,
+                    turns_summarized, time.time(),
+                ),
             )
             await db.commit()
 
@@ -221,6 +270,7 @@ class ConversationHistory:
         summary_through_id: int,
         keep_recent: int,
         floor_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
     ) -> list[dict]:
         """Return turns that should be folded into the summary.
 
@@ -233,6 +283,10 @@ class ConversationHistory:
         action also DELETEs pre-floor rows, the filter is the
         defense-in-depth that prevents stale/replayed pre-floor rows from
         leaking back into the summary.
+
+        `bot_id` (when set) restricts to user turns + this bot's
+        assistant turns + legacy-NULL rows — same scoping as `load()`,
+        so each bot's summary captures only its own conversation arc.
         """
         async with db_session(self) as db:
             cursor = await db.execute(
@@ -252,12 +306,18 @@ class ConversationHistory:
             if floor_at is not None:
                 floor_clause = " AND created_at >= ?"
                 params.append(floor_at)
+            bot_clause = ""
+            if bot_id is not None:
+                bot_clause = (
+                    " AND (role = 'user' OR bot_id = ? OR bot_id IS NULL)"
+                )
+                params.append(bot_id)
             cursor = await db.execute(
                 f"""SELECT id, role, content, sender_tail, user_hash
                    FROM conversation_turns
                    WHERE context_key = ?
                      AND id > ?
-                     AND id <= ?{floor_clause}
+                     AND id <= ?{floor_clause}{bot_clause}
                    ORDER BY id ASC""",
                 tuple(params),
             )
@@ -478,18 +538,42 @@ class ConversationHistory:
                 "DELETE FROM conversation_turns WHERE created_at < ?",
                 (age_cutoff,),
             )
-            # Per-context row cap
-            await db.execute(
-                """DELETE FROM conversation_turns
-                   WHERE context_key = ?
-                     AND id NOT IN (
-                         SELECT id FROM conversation_turns
-                         WHERE context_key = ?
-                         ORDER BY created_at DESC, id DESC
-                         LIMIT ?
-                     )""",
-                (context_key, context_key, max_rows),
-            )
+            # Row-cap purge: per (context_key, role-or-bot) so a chatty
+            # bot in a multi-bot group can't evict another bot's history
+            # by burning the per-context budget. We compute two pools:
+            #   - assistant rows scoped to THIS bot_id (or NULL bot row)
+            #   - user rows (which are shared but tagged with the asker's
+            #     bot turn — they're scoped here by bot_id too so each
+            #     bot's "asker history" stays whole)
+            # Falls back to the legacy per-context prune for any rows
+            # whose bot_id is NULL (pre-migration) so the existing
+            # row-cap semantics still apply to legacy data.
+            if bot_id is not None:
+                await db.execute(
+                    """DELETE FROM conversation_turns
+                       WHERE context_key = ?
+                         AND bot_id = ?
+                         AND id NOT IN (
+                             SELECT id FROM conversation_turns
+                             WHERE context_key = ? AND bot_id = ?
+                             ORDER BY created_at DESC, id DESC
+                             LIMIT ?
+                         )""",
+                    (context_key, bot_id, context_key, bot_id, max_rows),
+                )
+            else:
+                # Legacy single-bot prune path.
+                await db.execute(
+                    """DELETE FROM conversation_turns
+                       WHERE context_key = ?
+                         AND id NOT IN (
+                             SELECT id FROM conversation_turns
+                             WHERE context_key = ?
+                             ORDER BY created_at DESC, id DESC
+                             LIMIT ?
+                         )""",
+                    (context_key, context_key, max_rows),
+                )
             await db.commit()
 
     async def clear(self, context_key: str) -> int:

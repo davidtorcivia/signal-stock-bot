@@ -28,7 +28,12 @@
 
 {% for p in portfolios %}
 <div class="panel">
-    <h2>{{ p.label }}</h2>
+    <h2>
+        {{ p.label }}
+        {% if p.bot_label %}
+            <span class="muted" style="font-size: 12px;">(bot: {{ p.bot_label }})</span>
+        {% endif %}
+    </h2>
     <p class="muted" style="font-size: 11px;"><code>{{ p.context_key }}</code></p>
 
     <table>

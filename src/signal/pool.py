@@ -159,6 +159,39 @@ class SignalHandlerPool:
             raise RuntimeError("SignalHandlerPool: no handlers registered")
         return handler
 
+    def refresh_known_phones(self) -> int:
+        """Rebuild every handler's `_known_phones` set from the current
+        bot registry. Call this after the admin adds/removes/edits a
+        bot at runtime — without it, the anti-bot-to-bot loop guard
+        and the "is the resolved bot's phone reachable?" check both
+        use a stale snapshot from boot. Returns the size of the new
+        set."""
+        if not self._built:
+            self.build()
+            return len(self._handlers)
+        # Refresh from the registry rather than just our own handlers:
+        # a bot might be registered with a phone we DON'T have a
+        # handler for yet (e.g. partially-configured), and we still
+        # want the existing handlers to NOT dispatch as that bot's
+        # outbound and not loop on it. Pull the live registry phone
+        # list from the dispatcher's bot_registry.
+        bot_registry = getattr(self._dispatcher, "bot_registry", None)
+        phones: set[str] = set(self._handlers.keys())
+        if bot_registry is not None:
+            try:
+                for b in bot_registry.list_sync():
+                    phone = (getattr(b, "signal_phone", None) or "").strip()
+                    if phone:
+                        phones.add(phone)
+            except Exception as e:
+                logger.warning(
+                    f"SignalHandlerPool.refresh_known_phones: registry "
+                    f"read failed: {e}"
+                )
+        for handler in self._handlers.values():
+            handler._known_phones = phones
+        return len(phones)
+
     def handlers(self) -> Iterable[SignalHandler]:
         if not self._built:
             self.build()

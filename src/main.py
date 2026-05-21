@@ -856,9 +856,32 @@ def build_app(config: Config):
     def _bot_for_phone(phone: str):
         if not phone:
             return None
-        for b in bot_registry.list_sync():
-            if (getattr(b, "signal_phone", None) or "") == phone:
-                return b
+        matches = [
+            b for b in bot_registry.list_sync()
+            if (getattr(b, "signal_phone", None) or "") == phone
+               and getattr(b, "enabled", True)
+        ]
+        if len(matches) > 1:
+            # Shared-phone deploy: log loudly so the operator notices
+            # the routing ambiguity. We pick the registry's
+            # default-for-group bot if it's in the matches; otherwise
+            # the first match (with a warning) so behavior is at least
+            # deterministic.
+            default_group = bot_registry.default_for_kind_sync("group")
+            preferred = (
+                default_group
+                if default_group is not None and default_group in matches
+                else matches[0]
+            )
+            logger.warning(
+                f"PollVoter: {len(matches)} bots share phone "
+                f"{phone[-4:] if phone else '?'} "
+                f"({[b.slug for b in matches]}); using "
+                f"{preferred.slug}"
+            )
+            return preferred
+        if matches:
+            return matches[0]
         return bot_registry.default_for_kind_sync("group")
 
     for handler in signal_pool.handlers():
@@ -1130,6 +1153,7 @@ def build_app(config: Config):
         history=llm_history,
         group_log=group_log,
         reactor=reactor,
+        signal_pool=signal_pool,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

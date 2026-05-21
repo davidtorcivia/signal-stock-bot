@@ -44,6 +44,10 @@ def create_app(
     portfolio_executor=None,
     bot_registry=None,
     llm_factory=None,
+    history=None,
+    group_log=None,
+    reactor=None,
+    signal_pool=None,
 ) -> Flask:
     """
     Create Flask application with webhook endpoint and optional admin UI.
@@ -128,6 +132,10 @@ def create_app(
             portfolio_executor=portfolio_executor,
             bot_registry=bot_registry,
             llm_factory=llm_factory,
+            history=history,
+            group_log=group_log,
+            reactor=reactor,
+            signal_pool=signal_pool,
         )
         logger.info("Admin UI mounted at /admin")
     else:

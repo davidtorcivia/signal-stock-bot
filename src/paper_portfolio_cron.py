@@ -30,6 +30,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from .commands.base import CommandContext
+from .paper_portfolio import parse_portfolio_key
 from .paper_portfolio import PortfolioStore, SOURCE_CRON
 
 logger = logging.getLogger(__name__)
@@ -249,7 +250,6 @@ class TradingCronWorker:
         # present) is used below to route the synthetic !ask through
         # the correct bot — each bot has its own portfolio + cron arc
         # in a multi-bot group.
-        from .paper_portfolio import parse_portfolio_key
         chat_key, scope_bot_id = parse_portfolio_key(ctx_key)
         if not chat_key.startswith("group:"):
             logger.info(

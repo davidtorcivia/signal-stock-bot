@@ -196,6 +196,15 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_mem_ctx_kind "
                 "ON context_memories(context_id, kind)"
             )
+            # Composite index covering the per-bot dedup query in add()
+            # — `WHERE context_id=? AND subject_key=? AND kind=? AND
+            # (bot_id=? OR bot_id IS NULL)`. With multi-bot writes,
+            # the per-(context, subject) slice grows linearly in
+            # active bots; this index keeps the dedup seek fast.
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mem_ctx_subj_kind_bot "
+                "ON context_memories(context_id, subject_key, kind, bot_id)"
+            )
             await db.commit()
         self._initialized = True
 
@@ -243,19 +252,21 @@ class MemoryStore:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 # Dedup scope: each bot maintains its own mental model of
-                # the chat, so the (context, subject, kind) corroboration
-                # check is also keyed on bot_id. NULL-bot rows (legacy
-                # single-bot installs) are shared — a writer with a
-                # bot_id sees them but won't corroborate them (a re-add
-                # creates a per-bot row instead, preserving the legacy
-                # one). When bot_id is None on the write, we match
-                # NULL-only so the legacy code path stays exactly the
-                # same.
+                # the chat, but legacy NULL-bot rows (pre-multi-bot
+                # installs and admin-added rows without a bot tag) are
+                # treated as shared — a per-bot writer that finds a
+                # near-duplicate NULL-bot row corroborates it (keeping
+                # one row that all bots see) rather than creating a
+                # duplicate. Without this, list_for_subject would
+                # return BOTH rows to the per-bot reader because the
+                # read path is `(bot_id = ? OR bot_id IS NULL)`. When
+                # bot_id is None on the write we match NULL-only so the
+                # legacy code path stays exactly the same.
                 if bot_id is None:
                     bot_clause = " AND bot_id IS NULL"
                     bot_params: tuple = ()
                 else:
-                    bot_clause = " AND bot_id = ?"
+                    bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
                     bot_params = (bot_id,)
                 cursor = await db.execute(
                     f"""SELECT id, content, confidence, corroborations, source,
@@ -366,16 +377,25 @@ class MemoryStore:
         return [_row_to_dict(r) for r in rows]
 
     async def list_for_context(
-        self, context_id: int, limit: int = 500
+        self, context_id: int, limit: int = 500,
+        bot_id: Optional[int] = None,
     ) -> list[dict]:
+        """List every memory in a context. `bot_id=None` returns ALL
+        rows (admin/audit view); `bot_id=N` scopes to bot N's view
+        (own rows + legacy NULL-bot rows)."""
+        bot_clause = ""
+        params: tuple = (context_id,)
+        if bot_id is not None:
+            bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
+            params = params + (bot_id,)
         async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}
                     FROM context_memories
-                    WHERE context_id = ?
+                    WHERE context_id = ?""" + bot_clause + """
                     ORDER BY subject_label, kind, updated_at DESC
                     LIMIT ?""",
-                (context_id, limit),
+                params + (limit,),
             )
             rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]

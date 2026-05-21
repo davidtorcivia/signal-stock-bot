@@ -197,16 +197,21 @@ class EmojiReactor:
         self._subject_resolver: Optional[SubjectResolver] = None
         if name_registry is not None:
             self._subject_resolver = SubjectResolver(name_registry)
-        self._sender_last: dict[str, float] = {}
-        self._group_last: dict[str, float] = {}
+        # Composite keys: (sender_or_group_id, bot_id_or_0). Per-bot
+        # scoping so each bot in a multi-bot group has its own cooldown
+        # arc — bot A's reply doesn't gate bot B's.
+        self._sender_last: dict[tuple, float] = {}
+        self._group_last: dict[tuple, float] = {}
         # Rolling per-group log of (timestamp, sender_label, target_snippet,
         # emoji) so the writing LLM can reference what it reacted to and why
         # when users ask. In-memory only; survives until process restart.
-        self._recent: dict[str, deque] = {}
+        self._recent: dict[tuple, deque] = {}
         # Per-group cooldown for natural-response (spontaneous text replies).
         # Kept separate from emoji cooldowns because writes are louder than
         # reactions and want a longer minimum gap.
-        self._implicit_response_last: dict[str, float] = {}
+        # Composite (group_id, bot_id_or_0) so multi-bot cooldowns
+        # don't mute each other.
+        self._implicit_response_last: dict[tuple, float] = {}
         # Late-bound async handler invoked when the LLM calls should_respond.
         # Signature: (sender, message, group_id, target_timestamp, policy,
         # reason) -> Awaitable[None]. Wired in main.py to dispatcher.
@@ -316,12 +321,17 @@ class EmojiReactor:
             logger.debug(f"Reactor: get_reactor({bot}) failed: {e}; falling back")
             return self.llm
 
-    def _natural_response_active(self, group_id: str, cfg: dict, policy) -> bool:
+    def _natural_response_active(
+        self, group_id: str, cfg: dict, policy,
+        bot_id: Optional[int] = None,
+    ) -> bool:
         """Decide whether to expose should_respond for this evaluation.
 
-        Three gates: global flag, per-context flag, and the per-group
-        cooldown since the last spontaneous reply. Mentions/quotes route
-        through the dispatcher's normal path and don't touch this cooldown.
+        Three gates: global flag, per-context flag, and the per-(group,
+        bot) cooldown since this bot's last spontaneous reply. Per-bot
+        scoping so bot A's natural response doesn't mute bot B in a
+        multi-bot group. Mentions/quotes route through the dispatcher's
+        normal path and don't touch this cooldown.
         """
         if not cfg["natural_response_enabled"]:
             return False
@@ -329,7 +339,9 @@ class EmojiReactor:
             return False
         if self.implicit_response_handler is None:
             return False
-        last = self._implicit_response_last.get(group_id, 0.0)
+        last = self._implicit_response_last.get(
+            self._gb_key(group_id, bot_id), 0.0,
+        )
         if time.time() - last < cfg["natural_response_cooldown"]:
             return False
         return True
@@ -442,59 +454,93 @@ class EmojiReactor:
         except Exception as e:
             logger.debug(f"Reactor note_memory persist failed: {e}")
 
-    def mark_implicit_response(self, group_id: str) -> None:
+    @staticmethod
+    def _gb_key(group_id: str, bot_id: Optional[int] = None) -> tuple:
+        """Composite key (group_id, bot_id_or_0) used across reactor
+        in-memory dicts so each bot in a multi-bot group has its own
+        cooldowns + recent-reactions log. Bot_id None → 0 (legacy
+        single-bot sentinel)."""
+        return (group_id, int(bot_id) if bot_id is not None else 0)
+
+    def mark_implicit_response(
+        self, group_id: str, bot_id: Optional[int] = None,
+    ) -> None:
         """Record that a spontaneous reply just fired (or is about to).
 
         Called early — before ask_command runs — so concurrent reactor
         evaluations see the cooldown advanced and don't double-fire.
+        Per-(group, bot) so one bot's natural reply doesn't mute the
+        other bot in a multi-bot group.
         """
-        self._implicit_response_last[group_id] = time.time()
+        self._implicit_response_last[self._gb_key(group_id, bot_id)] = time.time()
 
-    def _within_cooldown(self, sender: str, group_id: str, cfg: dict) -> bool:
+    def _within_cooldown(
+        self, sender: str, group_id: str, cfg: dict,
+        bot_id: Optional[int] = None,
+    ) -> bool:
+        # sender_last is keyed by (sender, bot_id) so bot A's "I just
+        # reacted to ...4810" doesn't gate bot B's reaction to the
+        # same sender. group_last is keyed by (group_id, bot_id) for
+        # the same reason at the group level.
         now = time.time()
-        if now - self._sender_last.get(sender, 0) < cfg["sender_cooldown"]:
+        sender_key = (sender, int(bot_id) if bot_id is not None else 0)
+        if now - self._sender_last.get(sender_key, 0) < cfg["sender_cooldown"]:
             return True
-        if now - self._group_last.get(group_id, 0) < cfg["group_cooldown"]:
+        gkey = self._gb_key(group_id, bot_id)
+        if now - self._group_last.get(gkey, 0) < cfg["group_cooldown"]:
             return True
         return False
 
-    def _record_cooldowns(self, sender: str, group_id: str) -> None:
+    def _record_cooldowns(
+        self, sender: str, group_id: str, bot_id: Optional[int] = None,
+    ) -> None:
         now = time.time()
-        self._sender_last[sender] = now
-        self._group_last[group_id] = now
+        sender_key = (sender, int(bot_id) if bot_id is not None else 0)
+        self._sender_last[sender_key] = now
+        self._group_last[self._gb_key(group_id, bot_id)] = now
 
     def _record_recent(
-        self, *, group_id: str, sender_label: str, target_text: str, emoji: str
+        self, *, group_id: str, sender_label: str, target_text: str,
+        emoji: str, bot_id: Optional[int] = None,
     ) -> None:
         snippet = (target_text or "").replace("\n", " ").strip()
         if len(snippet) > RECENT_TARGET_SNIPPET_LEN:
             snippet = snippet[: RECENT_TARGET_SNIPPET_LEN - 1].rstrip() + "…"
-        log = self._recent.get(group_id)
+        gkey = self._gb_key(group_id, bot_id)
+        log = self._recent.get(gkey)
         if log is None:
             log = deque(maxlen=RECENT_REACTIONS_PER_GROUP)
-            self._recent[group_id] = log
+            self._recent[gkey] = log
         log.append((time.time(), sender_label, snippet, emoji))
 
     def clear_recent(self, group_id: str) -> int:
-        """Drop the in-process reactor-decision log for `group_id`.
+        """Drop the in-process reactor-decision log for ALL bots in
+        `group_id`. Admin-purge driven — wipes every bot's reaction
+        memory in the group so the writer can't be re-anchored on
+        pre-purge reactions via `<recent_reactions>`. Returns the
+        total count cleared across all bots."""
+        # Iterate snapshot of keys so we can mutate during iteration.
+        cleared = 0
+        for key in list(self._recent.keys()):
+            if isinstance(key, tuple) and key[0] == group_id:
+                log = self._recent.pop(key, None)
+                cleared += len(log) if log is not None else 0
+        return cleared
 
-        Called from the admin purge action so the writer can't be re-
-        anchored on its own pre-purge reactions via the
-        `<recent_reactions>` block. Returns the number of entries that
-        were cleared (0 when nothing was logged for this group).
+    def recent_reactions(
+        self, group_id: str, limit: int = 5,
+        bot_id: Optional[int] = None,
+    ) -> list[dict]:
+        """Return the most recent reactions placed BY the calling bot in
+        `group_id`, newest-first. Per-bot scoping so bot B doesn't see
+        bot A's reactions presented as "Recent emoji reactions YOU
+        placed in this chat".
+
+        Used by the writing LLM so it can answer "why did you react with
+        X?" without confabulating. Empty list when nothing is logged
+        (feature off, restart-fresh, or no qualifying messages yet).
         """
-        log = self._recent.pop(group_id, None)
-        return len(log) if log is not None else 0
-
-    def recent_reactions(self, group_id: str, limit: int = 5) -> list[dict]:
-        """Return the most recent reactions in `group_id`, newest-first.
-
-        Used by the writing LLM so it can answer "why did you react with X?"
-        without confabulating. Empty list when nothing is logged for the
-        group (including: feature off, restart-fresh, or no qualifying
-        messages yet).
-        """
-        log = self._recent.get(group_id)
+        log = self._recent.get(self._gb_key(group_id, bot_id))
         if not log:
             return []
         items = list(log)[-max(1, limit):]
@@ -588,7 +634,8 @@ class EmojiReactor:
                 metrics.record_reactor_skip("short")
                 return
 
-            if self._within_cooldown(sender, group_id, cfg):
+            bot_id_for_scope = getattr(bot, "id", None) if bot is not None else None
+            if self._within_cooldown(sender, group_id, cfg, bot_id=bot_id_for_scope):
                 metrics.record_reactor_skip("cooldown")
                 return
 
@@ -619,7 +666,9 @@ class EmojiReactor:
             tools = [REACT_TOOL]
             offer_should_respond = (
                 not bot_will_reply
-                and self._natural_response_active(group_id, cfg, policy)
+                and self._natural_response_active(
+                    group_id, cfg, policy, bot_id=bot_id_for_scope,
+                )
             )
             if offer_should_respond:
                 tools.append(SHOULD_RESPOND_TOOL)
@@ -780,10 +829,11 @@ class EmojiReactor:
                     )
 
             if respond_reason and offer_should_respond:
-                # Mark cooldown first so concurrent reactor calls in the same
-                # group see it advanced and don't pile on. Cooldown stands
-                # even if the writer model bails — one decision per window.
-                self.mark_implicit_response(group_id)
+                # Mark cooldown first so concurrent reactor calls for
+                # THIS bot in the same group see it advanced and don't
+                # pile on. Cooldown stands even if the writer model
+                # bails — one decision per window per bot.
+                self.mark_implicit_response(group_id, bot_id=bot_id_for_scope)
                 metrics.record_reactor_response()
                 logger.info(
                     f"Reactor: triggered should_respond on ...{sender_tail} "
@@ -813,7 +863,7 @@ class EmojiReactor:
                 return
 
             if emoji_pick:
-                self._record_cooldowns(sender, group_id)
+                self._record_cooldowns(sender, group_id, bot_id=bot_id_for_scope)
                 # Route the reaction through the bot's handler so multi-
                 # phone installs react from the right number.
                 react_handler = self.signal
@@ -840,6 +890,7 @@ class EmojiReactor:
                         sender_label=self._sender_label(sender),
                         target_text=text,
                         emoji=emoji_pick,
+                        bot_id=bot_id_for_scope,
                     )
                     get_bus().publish(
                         "reactor",

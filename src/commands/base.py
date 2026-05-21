@@ -70,6 +70,26 @@ class CommandContext:
             return f"group:{self.group_id}"
         return f"dm:{hash_phone(self.sender)}"
 
+    def portfolio_key(self) -> str:
+        """`context_key` scoped to the responding bot — so each bot in
+        a multi-bot group has its own portfolio/journal/cron arc.
+
+        Centralizes the pattern repeated across every portfolio
+        entry point (LLM tool dispatch, chat commands, cron worker).
+        Returns the raw context_key when ctx.bot is None — that path
+        is used by legacy tests / single-bot DM contexts where the
+        scoping is a no-op anyway.
+        """
+        from ..paper_portfolio import portfolio_context_key
+        bot_id = getattr(self.bot, "id", None) if self.bot is not None else None
+        return portfolio_context_key(self.context_key(), bot_id)
+
+    @property
+    def bot_id(self) -> Optional[int]:
+        """Convenience: ctx.bot.id with the None guard pre-applied.
+        Most multi-bot scoping sites need just the integer."""
+        return getattr(self.bot, "id", None) if self.bot is not None else None
+
 
 @dataclass
 class CommandResult:

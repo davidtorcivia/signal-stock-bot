@@ -409,16 +409,27 @@ class PaperPortfolioExecutor:
             result["ticker"] = ticker
         return result
 
-    async def status(self, context_key: str) -> dict:
+    async def status(
+        self, context_key: str, *, label_hint: Optional[str] = None,
+    ) -> dict:
         """Snapshot for !portfolio / portfolio_status tool. Includes
         cash, positions with mark-to-market, total PnL.
+
+        `label_hint` (when set) is passed through to ensure_portfolio
+        for first-time creation only — `INSERT OR IGNORE` means an
+        existing portfolio's label isn't overwritten. Callers pass the
+        bot's display_name so newly-seeded per-bot portfolios get
+        named (otherwise the caption and admin view show empty labels
+        forever).
 
         Quote failures on individual positions don't block the snapshot
         — those positions show `mark_price=None` and contribute their
         cost basis to total value (a conservative fallback that doesn't
         invent gains). Logged at warn level.
         """
-        portfolio = await self.store.ensure_portfolio(context_key)
+        portfolio = await self.store.ensure_portfolio(
+            context_key, label=label_hint,
+        )
         positions = await self.store.positions(context_key)
         options_pos = await self.store.options_positions(context_key)
         tip_total = await self.store.tip_total(context_key)

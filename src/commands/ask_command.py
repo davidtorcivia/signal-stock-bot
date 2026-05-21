@@ -550,6 +550,14 @@ class AskCommand(BaseCommand):
         another participant's name. Lists the active bot's display name
         and any alias slugs it responds to.
 
+        Persona precedence: if the bot's persona/system_prompt already
+        names the character (case-insensitive substring match), we
+        DROP the "Your name is X" lead and keep only the "you also
+        answer to" + cross-bot guard. This avoids a contradiction when
+        the admin sets a persona like "You are Marvin, …" but the
+        display_name is "Sigil". The cross-bot guidance still applies
+        either way.
+
         Other bots in the room are deliberately NOT mentioned — they
         appear in <group_context> as labeled participant utterances,
         and the writer should treat them like any other speaker.
@@ -568,6 +576,24 @@ class AskCommand(BaseCommand):
             f" (you also answer to: {', '.join(names[1:])})"
             if len(names) > 1 else ""
         )
+        # Persona-named check: skip the "Your name is X" lead-in if the
+        # display_name already appears in the persona text (case-
+        # insensitive, whole word). The cross-bot anti-impersonation
+        # guidance still applies — that's purely about NOT responding
+        # to other names, doesn't conflict with persona content.
+        persona = (getattr(bot, "persona", None) or "").strip()
+        persona_names_bot = bool(persona) and re.search(
+            rf"\b{re.escape(bot.display_name)}\b",
+            persona,
+            re.IGNORECASE,
+        )
+        if persona_names_bot:
+            return (
+                f"You also answer to: {', '.join(names)}. "
+                f"When someone in chat addresses a different name, "
+                f"that's a different participant — do not respond as "
+                f"them or assume their identity. Speak only as yourself."
+            )
         return (
             f"Your name is {bot.display_name}{also}. "
             f"When someone in chat addresses a different name, that's a "
@@ -857,14 +883,28 @@ class AskCommand(BaseCommand):
             return f"ERROR: {err}"
         assert parsed is not None  # extract_prediction post-condition
 
-        bot_label = (
-            self.name_registry.bot_name
-            if self.name_registry is not None
-            else "Bot"
-        )
+        # Multi-bot: each bot gets its own leaderboard identity. Without
+        # this, Sigil and Artaud both write predictions with
+        # user_hash=hash_phone(BOT_SENDER) and label=name_registry's
+        # single bot_name — collapsing onto one leaderboard row. Per-bot
+        # sentinel derives a distinct hash, and we prefer the bot's
+        # display_name as the label so the leaderboard reads correctly.
+        active_bot = getattr(caller_ctx, "bot", None)
+        if active_bot is not None:
+            bot_label = (
+                getattr(active_bot, "display_name", None)
+                or (self.name_registry.bot_name if self.name_registry else "Bot")
+            )
+            bot_user_hash = hash_phone(f"{BOT_SENDER}:{active_bot.id}")
+        else:
+            bot_label = (
+                self.name_registry.bot_name
+                if self.name_registry is not None else "Bot"
+            )
+            bot_user_hash = hash_phone(BOT_SENDER)
         try:
             pred_id = await store.create(
-                user_hash=hash_phone(BOT_SENDER),
+                user_hash=bot_user_hash,
                 user_label=bot_label,
                 group_id=caller_ctx.group_id,
                 context_key=caller_ctx.context_key(),
@@ -1008,14 +1048,9 @@ class AskCommand(BaseCommand):
             return f"({name} unavailable: portfolio not allowed in this chat)"
 
         # Multi-bot scoping: each bot in a multi-bot group has its own
-        # portfolio so they can compete. The store keys on the scoped
-        # form `<chat_ctx>@bot:<id>` so all reads/writes naturally
-        # land in the right bowl.
-        from ..paper_portfolio import portfolio_context_key
-        ctx_key = portfolio_context_key(
-            caller_ctx.context_key(),
-            caller_ctx.bot.id if getattr(caller_ctx, "bot", None) is not None else None,
-        )
+        # portfolio so they can compete. `ctx.portfolio_key()` wraps
+        # the chat context with the responding bot's id.
+        ctx_key = caller_ctx.portfolio_key()
         # Trade provenance: trust the cron's tag if set, otherwise
         # default to "reactive" (a real chat message triggered this).
         # `automation_source` is enumerated against VALID_SOURCES so
@@ -1031,7 +1066,15 @@ class AskCommand(BaseCommand):
 
         if name == "portfolio_status":
             try:
-                snap = await executor.status(ctx_key)
+                snap = await executor.status(
+                    ctx_key,
+                    label_hint=(
+                        caller_ctx.bot.display_name
+                        if getattr(caller_ctx, "bot", None) is not None
+                           and getattr(caller_ctx.bot, "display_name", None)
+                        else None
+                    ),
+                )
             except Exception as e:
                 logger.exception(f"portfolio_status failed: {e}")
                 return f"ERROR: couldn't load portfolio status: {type(e).__name__}"
@@ -1041,7 +1084,7 @@ class AskCommand(BaseCommand):
             # still gets the text data and can reply without the image.
             try:
                 image_b64 = render_portfolio_image(
-                    snap, bot_name=self._bot_label(),
+                    snap, bot_name=self._bot_label(caller_ctx),
                 )
                 attachments.append(image_b64)
                 image_note = (
@@ -1063,7 +1106,7 @@ class AskCommand(BaseCommand):
                 )
                 image_note = ""
 
-            return render_status(snap, bot_name=self._bot_label()) + image_note
+            return render_status(snap, bot_name=self._bot_label(caller_ctx)) + image_note
 
         if name == "portfolio_buy":
             ticker = str(args.get("ticker") or "").strip().upper()
@@ -1498,11 +1541,7 @@ class AskCommand(BaseCommand):
         # Same per-bot scoping as the portfolio tools above — each bot
         # in a multi-bot group has its own journal file so they don't
         # cross-contaminate reflections.
-        from ..paper_portfolio import portfolio_context_key
-        ctx_key = portfolio_context_key(
-            caller_ctx.context_key(),
-            caller_ctx.bot.id if getattr(caller_ctx, "bot", None) is not None else None,
-        )
+        ctx_key = caller_ctx.portfolio_key()
 
         if name == "portfolio_journal_append":
             entry = str(args.get("entry") or "").strip()
@@ -1553,7 +1592,14 @@ class AskCommand(BaseCommand):
 
         return f"ERROR: unknown journal tool {name!r}"
 
-    def _bot_label(self) -> str:
+    def _bot_label(self, ctx=None) -> str:
+        """Display name to render for the bot in user-visible output
+        (portfolio caption, image header, etc). Prefer the ctx.bot's
+        display_name in a multi-bot group; fall back to the registry's
+        seed name for single-bot installs."""
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if bot is not None and getattr(bot, "display_name", None):
+            return bot.display_name
         if self.name_registry is not None:
             return self.name_registry.bot_name
         return "Sigil"
@@ -1702,9 +1748,7 @@ class AskCommand(BaseCommand):
             # (plus legacy NULL-bot rows). Other bots' impressions of
             # the same chat/people stay private to them.
             recall_bot_id = (
-                caller_ctx.bot.id
-                if getattr(caller_ctx, "bot", None) is not None
-                else None
+                caller_ctx.bot_id
             )
             if subject_hint and resolver is not None:
                 key, _ = resolver.resolve(
@@ -1726,8 +1770,11 @@ class AskCommand(BaseCommand):
                     bot_id=recall_bot_id,
                 )
             else:
+                # Per-bot scope so the wildcard browse doesn't cross
+                # into another bot's mental model.
                 rows = await store.list_for_context(
                     policy.id, limit=20,
+                    bot_id=recall_bot_id,
                 )
             return render_recall_results(rows, name_registry=self.name_registry)
 
@@ -1767,9 +1814,7 @@ class AskCommand(BaseCommand):
                 source_user_hash=sender_user_hash,
                 source_message_at=time.time(),
                 bot_id=(
-                    caller_ctx.bot.id
-                    if getattr(caller_ctx, "bot", None) is not None
-                    else None
+                    caller_ctx.bot_id
                 ),
             )
             if mem_id is None:
@@ -2099,7 +2144,7 @@ class AskCommand(BaseCommand):
             # assistant turns. Other bots' replies surface separately
             # via group_log → <group_context>, attributed by writer.
             history_bot_id = (
-                ctx.bot.id if getattr(ctx, "bot", None) is not None else None
+                ctx.bot_id
             )
             prior = await self.history.load(
                 context_key,
@@ -2140,8 +2185,14 @@ class AskCommand(BaseCommand):
             # model what it is (the inner text no longer needs a prose label).
             summary_block = ""
             try:
+                summary_bot_id = (
+                    ctx.bot.id if getattr(ctx, "bot", None) is not None
+                    else None
+                )
                 summary = await self.history.get_summary(
-                    context_key, floor_at=floor_at
+                    context_key,
+                    floor_at=floor_at,
+                    bot_id=summary_bot_id,
                 )
                 if summary and summary.get("summary"):
                     summary_text = await self._enrich(summary["summary"])
@@ -2441,7 +2492,12 @@ class AskCommand(BaseCommand):
             ):
                 try:
                     recent_rxns = self.reactor.recent_reactions(
-                        ctx.group_id, limit=5
+                        ctx.group_id, limit=5,
+                        bot_id=(
+                            ctx.bot.id
+                            if getattr(ctx, "bot", None) is not None
+                            else None
+                        ),
                     )
                 except Exception as e:
                     logger.debug(f"Failed to fetch recent reactions: {e}")
@@ -2815,7 +2871,7 @@ class AskCommand(BaseCommand):
             # replies — other bots' replies surface in <group_context>
             # via the group_log path, labeled with the writer's name.
             bot_id_for_turn = (
-                ctx.bot.id if getattr(ctx, "bot", None) is not None else None
+                ctx.bot_id
             )
             await self.history.append(
                 context_key, "user", question,
@@ -2872,7 +2928,13 @@ class AskCommand(BaseCommand):
                 import asyncio as _aio
                 _aio.create_task(
                     self.summarizer.maybe_summarize(
-                        context_key, floor_at=floor_at
+                        context_key,
+                        floor_at=floor_at,
+                        bot_id=(
+                            ctx.bot.id
+                            if getattr(ctx, "bot", None) is not None
+                            else None
+                        ),
                     )
                 )
             except Exception as e:

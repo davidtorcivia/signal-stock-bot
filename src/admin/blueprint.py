@@ -59,6 +59,7 @@ def create_admin_blueprint(
     history=None,
     group_log=None,
     reactor=None,
+    signal_pool=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -100,6 +101,7 @@ def create_admin_blueprint(
             context_registry=context_registry,
             loop=loop,
             llm_factory=llm_factory,
+            signal_pool=signal_pool,
         )
 
     if mcp_registry is not None and mcp_manager is not None:
@@ -147,6 +149,7 @@ def create_admin_blueprint(
             portfolio_executor=portfolio_executor,
             context_registry=context_registry,
             loop=loop,
+            bot_registry=bot_registry,
         )
 
     _register_live_routes(bp, name_registry=name_registry, loop=loop)
@@ -867,7 +870,21 @@ def _register_bots_routes(
     context_registry: Optional[ContextRegistry],
     loop: asyncio.AbstractEventLoop,
     llm_factory=None,
+    signal_pool=None,
 ) -> None:
+    def _refresh_pool() -> None:
+        """Refresh the SignalHandlerPool's per-handler `_known_phones`
+        snapshot after a bot mutation. Without this, an admin who adds
+        a bot with a new phone has existing handlers (boot-time) that
+        don't recognize it — bot-to-bot anti-loop guard fails and the
+        new bot's outbound triggers the existing bots' pipelines.
+        """
+        if signal_pool is None:
+            return
+        try:
+            signal_pool.refresh_known_phones()
+        except Exception as e:
+            logger.warning(f"signal_pool.refresh_known_phones failed: {e}")
     @bp.route("/bots", methods=["GET"])
     @admin_required
     def bots_list():
@@ -922,6 +939,7 @@ def _register_bots_routes(
                     new_bot = _form_to_bot(request.form, existing=None)
                     new_id = _run_on_loop(loop, registry.upsert(new_bot))
                     _apply_bot_llm_form(settings_store, new_id, request.form)
+                    _refresh_pool()
                     return redirect(url_for("admin.bots_edit", bot_id=new_id))
                 except ValueError as e:
                     error = str(e)
@@ -954,6 +972,7 @@ def _register_bots_routes(
                     updated = _form_to_bot(request.form, existing=bot)
                     _run_on_loop(loop, registry.upsert(updated))
                     _apply_bot_llm_form(settings_store, bot_id, request.form)
+                    _refresh_pool()
                     return redirect(url_for("admin.bots_edit", bot_id=bot_id))
                 except ValueError as e:
                     error = str(e)
@@ -1072,6 +1091,7 @@ def _register_bots_routes(
                     settings_store.delete_bot(bot_id)
                     if llm_factory is not None:
                         llm_factory.forget(bot_id)
+                    _refresh_pool()
             except Exception as e:
                 logger.error(f"bots_delete failed: {e}")
                 flash(f"Delete failed: {e}")
@@ -2720,6 +2740,7 @@ def _register_portfolio_routes(
     portfolio_executor,
     context_registry: Optional[ContextRegistry],
     loop: asyncio.AbstractEventLoop,
+    bot_registry=None,
 ) -> None:
     """Paper-portfolio admin view: per-context status, recent trades,
     recent tips, plus a destructive 'reset' button.
@@ -2779,12 +2800,36 @@ def _register_portfolio_routes(
                 logger.error(f"Portfolios: snapshot for {ck} failed: {e}")
                 continue
 
+            # Parse the per-bot scope so the admin view can show a
+            # legible "<chat label> — <bot display_name>" instead of
+            # the raw `group:base64@bot:N` string.
+            from src.paper_portfolio import parse_portfolio_key
+            chat_key, bot_id_for_row = parse_portfolio_key(ck)
+            bot_label: Optional[str] = None
+            if bot_id_for_row is not None and bot_registry is not None:
+                try:
+                    b = bot_registry.get_sync(bot_id_for_row)
+                    if b is not None:
+                        bot_label = getattr(b, "display_name", None)
+                except Exception:
+                    bot_label = None
+                if not bot_label:
+                    bot_label = f"bot#{bot_id_for_row}"
+
+            chat_label_resolved = (
+                snap.get("label")
+                or ctx_labels.get(chat_key)
+                or chat_key
+            )
             row = dict(snap)
             row["context_key"] = ck
+            row["chat_key"] = chat_key
+            row["bot_id"] = bot_id_for_row
+            row["bot_label"] = bot_label
             row["label"] = (
-                snap.get("label")
-                or ctx_labels.get(ck)
-                or ck
+                f"{chat_label_resolved} — {bot_label}"
+                if bot_label
+                else (snap.get("label") or chat_label_resolved or ck)
             )
             # Merge equity + option trades into a single time-ordered
             # log so the admin sees the full activity without scanning
