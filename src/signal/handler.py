@@ -567,10 +567,14 @@ class SignalHandler:
              default-for-kind. This enforces the "Sigil-only context
              never answers to 'Artaud'" rule by gating alias-matching
              on context membership rather than the global bot list.
-          3. Quote-reply to one of our previous messages (whoever the
-             phone says it was). When phone is shared and we can't tell
-             which bot wrote the quoted message, the active bot for the
-             context is the safe pick.
+          3. Quote-reply to one of our previous messages. With
+             multi-phone, the quoted author's phone uniquely
+             identifies the bot that wrote the quoted message, so the
+             reply routes to that same bot — quoting Sigil's message
+             summons Sigil even in an Artaud-pinned context. With a
+             shared phone we can't tell which bot wrote the quoted
+             message, so the active bot for the context is the safe
+             pick.
 
         Returns the matched Bot (or None), and a `mentioned` boolean
         for callers that just need a yes/no signal."""
@@ -660,6 +664,20 @@ class SignalHandler:
         if quote_author_number or quote_author_uuid:
             if not self._bot_uuid:
                 await self.fetch_bot_uuid()
+            # Multi-phone: the quoted author's phone names a specific
+            # bot. Look it up globally (not just against this handler's
+            # phone) so the SAME quote resolves to the SAME bot in every
+            # handler — the downstream multi-phone filter then picks who
+            # actually answers. Without this, quoting bot B in a context
+            # where bot A is the active default either summons A
+            # (single-phone) or silently drops because no handler
+            # recognized B's phone as its own (multi-phone).
+            quoted_bot = self._lookup_bot_by_phone(quote_author_number)
+            if quoted_bot is not None:
+                return quoted_bot, True
+            # Shared-phone fallback: quote author matches this handler's
+            # own phone/UUID but we can't tell which persona wrote it —
+            # defer to the active bot for the context.
             if quote_author_number and quote_author_number == self.config.phone_number:
                 return active_bot, True
             if self._bot_uuid and quote_author_uuid == self._bot_uuid:

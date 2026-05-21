@@ -316,6 +316,48 @@ async def test_alias_routing_cross_bot(
 
 
 @pytest.mark.asyncio
+async def test_quote_reply_routes_to_quoted_bot(registry: BotRegistry):
+    """Quoting bot B in a context where bot A is the active default
+    summons B (the bot that wrote the quoted message), not A. Without
+    this, multi-phone quote-replies either dropped silently or replied
+    in the wrong persona."""
+    artaud_id = await registry.upsert(Bot(
+        id=None, slug="artaud", display_name="Artaud", aliases=["Artaud"],
+        signal_phone="+15552220000",
+    ))
+    sigil = registry.get_by_slug_sync(SIGIL_SLUG)
+    await registry.upsert(Bot(
+        id=sigil.id, slug=sigil.slug, display_name=sigil.display_name,
+        aliases=sigil.aliases, signal_phone="+15551110000",
+        default_for_dm=sigil.default_for_dm,
+        default_for_group=sigil.default_for_group,
+    ))
+
+    pol_artaud = ContextPolicy(
+        id=1, kind="group", key="!G", default_bot_id=artaud_id,
+    )
+
+    from src.commands.dispatcher import CommandDispatcher
+    disp = CommandDispatcher(bot_registry=registry)
+    # This handler owns Artaud's phone, but the quote was authored
+    # by Sigil — the lookup-by-phone path should still return Sigil
+    # so the multi-phone filter can route to Sigil's handler.
+    h = SignalHandler(
+        SignalConfig(api_url="http://x", phone_number="+15552220000"), disp,
+    )
+
+    bot, mentioned = await h._resolve_addressed_bot(
+        {
+            "message": "what did you mean by that?",
+            "quote": {"authorNumber": "+15551110000", "text": "..."},
+        },
+        "!G", pol_artaud,
+    )
+    assert mentioned is True
+    assert bot.slug == SIGIL_SLUG
+
+
+@pytest.mark.asyncio
 async def test_alias_substring_does_not_trigger(registry: BotRegistry):
     """'Art' as a whole word fires; 'artist' does not."""
     artaud_id = await registry.upsert(Bot(
