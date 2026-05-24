@@ -612,6 +612,37 @@ class AskCommand(BaseCommand):
             return f"...{(phone or '')[-4:] or '????'}"
         return self.name_registry.label_for(phone)
 
+    def _reply_target_label(self, ctx) -> str:
+        """Label for the author of the message being quote-replied to.
+
+        Active bot's own phone → "you" — reads naturally from the
+        writer's own perspective ("you're being replied to") and keeps
+        attribution unambiguous when the user quotes the bot.
+        Another known bot's phone → that bot's display_name, matching
+        what <group_context> uses for that bot's rows so the writer
+        sees the same name in both places.
+        Anyone else → the regular sender label.
+        """
+        phone = ctx.quote_author if ctx is not None else None
+        if not phone:
+            return "earlier message"
+        active_bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if (
+            active_bot is not None
+            and (getattr(active_bot, "signal_phone", None) or "") == phone
+        ):
+            return "you"
+        if self.bot_registry is not None:
+            try:
+                for bot in self.bot_registry.list_sync():
+                    if (getattr(bot, "signal_phone", None) or "") == phone:
+                        name = getattr(bot, "display_name", None)
+                        if name:
+                            return name
+            except Exception:
+                pass
+        return self._sender_label(phone)
+
     def _collect_tools(self, policy=None, bot=None) -> Optional[list[dict]]:
         schemas: list[dict] = []
         if self.bot_tools is not None:
@@ -2694,17 +2725,20 @@ class AskCommand(BaseCommand):
                 trigger_parts.append(group_ctx_block)
 
             if ctx.quote_text:
-                quoted_label = (
-                    self._sender_label(ctx.quote_author)
-                    if ctx.quote_author
-                    else "earlier"
-                )
-                quoted = (await self._enrich(ctx.quote_text)).replace("\n", " ").strip()
-                if len(quoted) > 400:
-                    quoted = quoted[:399].rstrip() + "…"
-                trigger_parts.append(
-                    f'<replying_to from="{quoted_label}">\n{quoted}\n</replying_to>'
-                )
+                # Flag this turn as a quote-reply but DON'T embed the
+                # quoted text. The original message is already in
+                # <group_context> above with its real author/timestamp
+                # label; embedding it here a second time duplicated
+                # content and — worse — used a different label format
+                # (phone-tail for bot quotes via _sender_label, vs.
+                # display_name in group_context) so the writer saw the
+                # same line twice attributed to two different speakers.
+                # That scrambled who-said-what and sometimes caused the
+                # writer to decide the thread was already resolved and
+                # stay silent. The label resolver below uses the same
+                # naming scheme as group_context.
+                quoted_label = self._reply_target_label(ctx)
+                trigger_parts.append(f'<replying_to from="{quoted_label}"/>')
 
             sender_label = self._sender_label(ctx.sender) if is_group else "user"
             # For implicit / spontaneous asks the closing instruction softens
