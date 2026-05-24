@@ -118,6 +118,11 @@ class ContextRegistry:
                         "ALTER TABLE contexts ADD COLUMN "
                         "history_turns_override INTEGER"
                     )
+                if "purge_floor_at" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN "
+                        "purge_floor_at REAL"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_contexts_key ON contexts(key)"
                 )
@@ -147,7 +152,8 @@ class ContextRegistry:
         "mcp_mode, mcp_servers, system_prompt, llm_intent, "
         "reactor_enabled, reactor_prompt, natural_response, "
         "deep_think_enabled, memory_writes_enabled, reactor_memory_writes, "
-        "default_bot_id, transcript_logging_enabled, history_turns_override"
+        "default_bot_id, transcript_logging_enabled, history_turns_override, "
+        "purge_floor_at"
     )
 
     @staticmethod
@@ -175,6 +181,9 @@ class ContextRegistry:
             ),
             history_turns_override=(
                 row[18] if len(row) > 18 and row[18] is not None else None
+            ),
+            purge_floor_at=(
+                row[19] if len(row) > 19 and row[19] is not None else None
             ),
         )
 
@@ -335,6 +344,24 @@ class ContextRegistry:
                 )
                 await db.commit()
                 return policy.id
+
+    async def set_purge_floor(self, context_id: int, ts: float) -> bool:
+        """Stamp the purge floor on a context row.
+
+        Read paths (history, group_log, summarizer) filter out anything
+        with `created_at < purge_floor_at`. The floor is intentionally
+        not exposed in the admin upsert path — only this method mutates
+        it, so an admin-form bug can't accidentally clear or backdate it.
+        """
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE contexts SET purge_floor_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (ts, time.time(), context_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     async def delete(self, context_id: int) -> bool:
         """Delete a row. Default rows are protected — deleting them re-seeds."""

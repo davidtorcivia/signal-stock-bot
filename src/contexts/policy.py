@@ -69,6 +69,17 @@ class ContextPolicy:
     # of the global `llm_history_turns`. None = inherit global. 0 = no
     # history at all (one-shot mode — useful for oracle-only chats).
     history_turns_override: Optional[int] = None
+    # Purge floor: a hard cutoff timestamp. Conversation turns, summaries,
+    # and bot-authored group_log rows older than this are invisible to
+    # all read paths that assemble LLM context — even if the underlying
+    # rows haven't been deleted yet. Set by the admin "Purge context"
+    # button; the purge action also DELETEs pre-floor rows for cleanup,
+    # but the floor is what guarantees the bot can't see its pre-purge
+    # voice forever going forward.
+    # None = no floor (the default). Inbound user messages in group_log
+    # and context_memories are NOT gated by the floor — they're durable
+    # by design.
+    purge_floor_at: Optional[float] = None
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()
