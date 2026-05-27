@@ -299,6 +299,7 @@ class LLMClient:
             raise LLMNotConfigured("LLM base URL, API key, and model must all be set")
 
         messages = _inject_current_time(list(messages))
+        messages = _ensure_reasoning_content(messages)
 
         if not suppress_response_style:
             # Always append the configured response style — last in the system
@@ -636,6 +637,46 @@ def _log_payload_shape(payload: dict, *, purpose: str, url: str) -> None:
             )
     except Exception as e:
         logger.debug(f"_log_payload_shape failed: {e}")
+
+
+def _ensure_reasoning_content(messages: list[dict]) -> list[dict]:
+    """Mirror OpenRouter's `reasoning` / `reasoning_details` onto each
+    assistant turn's `reasoning_content`.
+
+    DeepSeek's thinking-mode API requires the prior assistant turn's
+    `reasoning_content` to be present on round-trip (rounds 2+ of any
+    tool loop). OpenRouter exposes the same thing on response as
+    `reasoning` (string) or `reasoning_details` (provider-structured
+    array), but does NOT translate it back when `llm_provider_only=true`
+    routes direct to DeepSeek. Without this mirror, every tool loop
+    dies on round 2 with HTTP 400 "reasoning_content in the thinking
+    mode must be passed back to the API".
+
+    Shallow-copies any message we touch so the caller's list (often the
+    in-memory tool-loop state) keeps its original shape.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if (
+            m.get("role") != "assistant"
+            or m.get("reasoning_content")
+            or not (m.get("reasoning") or m.get("reasoning_details"))
+        ):
+            out.append(m)
+            continue
+        text = m.get("reasoning") or ""
+        if not text and isinstance(m.get("reasoning_details"), list):
+            parts = []
+            for d in m["reasoning_details"]:
+                if isinstance(d, dict):
+                    t = d.get("text") or d.get("content")
+                    if t:
+                        parts.append(str(t))
+            text = "\n".join(parts)
+        copy = dict(m)
+        copy["reasoning_content"] = text or ""
+        out.append(copy)
+    return out
 
 
 def _inject_current_time(messages: list[dict]) -> list[dict]:
