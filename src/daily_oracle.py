@@ -221,11 +221,11 @@ class DailyOracleWorker:
 
         try:
             if oracle.kind == "tarot":
-                await self._fire_tarot(oracle, ctx_policy, group_id)
+                posted = await self._fire_tarot(oracle, ctx_policy, group_id)
             elif oracle.kind == "iching":
-                await self._fire_iching(oracle, ctx_policy, group_id)
+                posted = await self._fire_iching(oracle, ctx_policy, group_id)
             elif oracle.kind in ("market_open", "market_close", "freeform"):
-                await self._fire_llm_oracle(oracle, ctx_policy, group_id)
+                posted = await self._fire_llm_oracle(oracle, ctx_policy, group_id)
             else:
                 logger.warning(
                     f"Oracle #{oracle.id}: unknown kind {oracle.kind!r}"
@@ -235,6 +235,13 @@ class DailyOracleWorker:
             logger.exception(f"Oracle #{oracle.id} fire failed: {e}")
             return
 
+        # Only stamp the slot when a post actually went out. A transient
+        # LLM/provider failure (e.g. DeepSeek HTTP 520) returns False from
+        # the inner helper after logging a warning; leaving last_fired_at
+        # untouched lets the next worker tick retry within the late-fire
+        # grace window instead of silently burning the day's slot.
+        if not posted:
+            return
         await self.store.mark_fired(oracle.id, dt.datetime.now(dt.timezone.utc).timestamp())
 
     async def _lookup_context_for_oracle(self, oracle: ContextOracle):
@@ -242,22 +249,22 @@ class DailyOracleWorker:
             return None
         return await self.contexts.get(oracle.context_id)
 
-    async def _fire_tarot(self, oracle, ctx_policy, group_id) -> None:
+    async def _fire_tarot(self, oracle, ctx_policy, group_id) -> bool:
         ctx = self._synth_ctx(group_id, ctx_policy, "!tarot", "tarot")
         result = await self.tarot.execute(ctx)
-        await self._post_command_result(result, oracle, group_id, ctx_policy)
+        return await self._post_command_result(result, oracle, group_id, ctx_policy)
 
-    async def _fire_iching(self, oracle, ctx_policy, group_id) -> None:
+    async def _fire_iching(self, oracle, ctx_policy, group_id) -> bool:
         ctx = self._synth_ctx(group_id, ctx_policy, "!iching", "iching")
         result = await self.iching.execute(ctx)
-        await self._post_command_result(result, oracle, group_id, ctx_policy)
+        return await self._post_command_result(result, oracle, group_id, ctx_policy)
 
-    async def _fire_llm_oracle(self, oracle, ctx_policy, group_id) -> None:
+    async def _fire_llm_oracle(self, oracle, ctx_policy, group_id) -> bool:
         if self.ask is None:
             logger.warning(
                 f"Oracle #{oracle.id}: ask_command not wired, skipping"
             )
-            return
+            return False
         prompt = self._llm_prompt_for(oracle)
         ctx = self._synth_ctx(
             group_id, ctx_policy, f"!ask {prompt}", "ask",
@@ -269,7 +276,7 @@ class DailyOracleWorker:
                 f"Oracle #{oracle.id}: ask returned unsuccessful: "
                 f"{getattr(result, 'text', '(none)')!r}"
             )
-            return
+            return False
         body = result.text or ""
         # Headline so the chat sees this is a scheduled oracle, not a
         # passing comment.
@@ -282,7 +289,7 @@ class DailyOracleWorker:
                 f"Oracle #{oracle.id}: no signal handler available; "
                 f"skipping post"
             )
-            return
+            return False
         await sender_handler.send_message(
             recipient="",
             message=body,
@@ -293,6 +300,7 @@ class DailyOracleWorker:
         logger.info(
             f"Oracle #{oracle.id} ({oracle.kind}) posted to ...{group_id[-8:]}"
         )
+        return True
 
     @staticmethod
     def _llm_prompt_for(oracle: ContextOracle) -> str:
@@ -361,13 +369,13 @@ class DailyOracleWorker:
 
     async def _post_command_result(
         self, result, oracle: ContextOracle, group_id: str, policy=None
-    ) -> None:
+    ) -> bool:
         if not result or not result.success:
             logger.warning(
                 f"Oracle #{oracle.id}: command returned unsuccessful: "
                 f"{getattr(result, 'text', '(none)')!r}"
             )
-            return
+            return False
         body = _replace_header(result.text or "", oracle.label, self.bot_name)
         sender_handler = self._sender_for(policy)
         if sender_handler is None:
@@ -375,7 +383,7 @@ class DailyOracleWorker:
                 f"Oracle #{oracle.id}: no signal handler available; "
                 f"skipping post"
             )
-            return
+            return False
         await sender_handler.send_message(
             recipient="",
             message=body,
@@ -386,3 +394,4 @@ class DailyOracleWorker:
         logger.info(
             f"Oracle #{oracle.id} ({oracle.kind}) posted to ...{group_id[-8:]}"
         )
+        return True

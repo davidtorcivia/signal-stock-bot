@@ -7,7 +7,10 @@ which has to play well with the existing tarot/iching command output
 and slot the active bot's display_name into the framing.
 """
 
-from src.daily_oracle import _replace_header
+import pytest
+
+from src.contexts.oracles import ContextOracle
+from src.daily_oracle import DailyOracleWorker, _replace_header
 
 
 def test_replace_header_strips_default_tarot_single_header():
@@ -72,3 +75,117 @@ def test_replace_header_default_bot_name_is_neutral():
     assert "Sigil" not in out
     assert "Artaud" not in out
     assert out.startswith("🌅 Today's oracle from Bot:")
+
+
+# --- Stamp gating: mark_fired must only fire on a successful post ----------
+
+class _StubPolicy:
+    id = 1
+    key = "group-key"
+    kind = "group"
+    default_bot_id = None
+
+
+class _StubContexts:
+    async def get(self, _ctx_id):
+        return _StubPolicy()
+
+
+class _StubStore:
+    def __init__(self):
+        self.marked: list[tuple[int, float]] = []
+
+    async def mark_fired(self, oracle_id, fired_at):
+        self.marked.append((oracle_id, fired_at))
+
+
+class _StubResult:
+    def __init__(self, success: bool, text: str = "", styled: bool = False):
+        self.success = success
+        self.text = text
+        self.attachments = None
+        self.styled = styled
+
+
+class _StubAsk:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    async def execute(self, _ctx):
+        self.calls += 1
+        return self.result
+
+
+class _StubSender:
+    def __init__(self):
+        self.sends: list[dict] = []
+
+    async def send_message(self, **kwargs):
+        self.sends.append(kwargs)
+
+
+def _make_worker(*, ask_result, sender=None):
+    ask = _StubAsk(ask_result)
+    sender = sender if sender is not None else _StubSender()
+    worker = DailyOracleWorker(
+        oracle_store=_StubStore(),
+        context_registry=_StubContexts(),
+        tarot_command=None,
+        iching_command=None,
+        ask_command=ask,
+        signal_handler=sender,
+        bot_phone="+15550001111",
+    )
+    return worker, ask, sender
+
+
+def _make_oracle():
+    return ContextOracle(
+        id=42,
+        context_id=1,
+        enabled=True,
+        kind="market_close",
+        schedule_kind="clock",
+        clock_time="16:05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fire_oracle_skips_mark_fired_on_llm_failure():
+    """The exact bug the DeepSeek 520 outage hit on 2026-05-27: a transient
+    provider error returns a failed result from ask_command, but the old
+    code still stamped last_fired_at — burning the slot for the day. The
+    fix must leave the stamp untouched so the next worker tick retries."""
+    worker, ask, sender = _make_worker(
+        ask_result=_StubResult(success=False, text="◇ LLM HTTP 520: ...")
+    )
+    await worker._fire_oracle(_make_oracle())
+    assert ask.calls == 1
+    assert sender.sends == []
+    assert worker.store.marked == []  # slot left open for retry
+
+
+@pytest.mark.asyncio
+async def test_fire_oracle_marks_fired_on_successful_post():
+    worker, ask, sender = _make_worker(
+        ask_result=_StubResult(success=True, text="Markets closed mixed today.")
+    )
+    await worker._fire_oracle(_make_oracle())
+    assert ask.calls == 1
+    assert len(sender.sends) == 1
+    assert len(worker.store.marked) == 1
+    assert worker.store.marked[0][0] == 42
+
+
+@pytest.mark.asyncio
+async def test_fire_oracle_skips_mark_fired_when_no_signal_handler():
+    """No handler available is also a no-post — same retry semantics."""
+    worker, _, _ = _make_worker(
+        ask_result=_StubResult(success=True, text="body"),
+        sender=None,
+    )
+    worker.signal = None  # simulate handler-not-wired
+    worker.signal_pool = None
+    await worker._fire_oracle(_make_oracle())
+    assert worker.store.marked == []
