@@ -107,6 +107,81 @@ SHOULD_RESPOND_TOOL = {
 }
 
 
+def _should_respond_tool_with_bots(slugs: list[str]) -> dict:
+    """Variant of SHOULD_RESPOND_TOOL with a `bot_slug` enum for
+    multi-bot chats. The roster in the system prompt tells the LLM
+    which bot fits which kind of question; the tool argument is how
+    the LLM names its pick.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "should_respond",
+            "description": (
+                "Trigger a full text reply to this message — used when the user "
+                "is asking an open-ended question one of the bots can usefully "
+                "answer, or is clearly continuing a conversation without "
+                "explicitly addressing a bot. Do NOT call for banter, "
+                "logistics, or messages aimed at a specific human. Pick "
+                "ONE bot (`bot_slug`) whose remit fits the question best; "
+                "see the 'Available responders' section of the system "
+                "prompt. Mutually exclusive with emoji_react."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "One short sentence explaining why a real reply "
+                            "is warranted (passed to the writer model as a hint)."
+                        ),
+                    },
+                    "bot_slug": {
+                        "type": "string",
+                        "enum": list(slugs),
+                        "description": (
+                            "Slug of the bot best suited to answer. Match "
+                            "the topic to the bot's remit from the roster."
+                        ),
+                    },
+                },
+                "required": ["reason", "bot_slug"],
+            },
+        },
+    }
+
+
+def _bot_roster_lines(bots: list) -> str:
+    """Render a compact 'who's in the room' section for the reactor's
+    system prompt. Uses `routing_blurb` when set; falls back to the
+    first sentence of `persona`; final fallback is the display name.
+    Keeps each line under ~160 chars so the roster stays cheap.
+    """
+    if not bots:
+        return ""
+    out = []
+    for bot in bots:
+        slug = getattr(bot, "slug", None) or "?"
+        display = getattr(bot, "display_name", None) or slug
+        blurb = (getattr(bot, "routing_blurb", None) or "").strip()
+        if not blurb:
+            persona = (getattr(bot, "persona", None) or "").strip()
+            if persona:
+                # First sentence (or first 140 chars) is usually enough
+                # to convey the bot's lane to the routing decision.
+                for sep in (". ", "\n"):
+                    idx = persona.find(sep)
+                    if 0 < idx < 140:
+                        persona = persona[:idx]
+                        break
+                blurb = persona[:140].strip()
+        if not blurb:
+            blurb = display
+        out.append(f"- {slug} ({display}): {blurb}")
+    return "Available responders (pick one via `bot_slug`):\n" + "\n".join(out)
+
+
 # Appended to the reactor system prompt only when the should_respond tool is
 # actually exposed (per-context flag on, global flag on, cooldown clear).
 NATURAL_RESPONSE_GUIDANCE = """\
@@ -605,6 +680,7 @@ class EmojiReactor:
         policy=None,
         bot_will_reply: bool = False,
         bot=None,
+        candidate_bots: Optional[list] = None,
     ) -> None:
         """Background task. Logs and swallows every error.
 
@@ -613,6 +689,12 @@ class EmojiReactor:
         reactor still emoji-evaluates, but suppresses the should_respond tool
         so we don't fire a duplicate spontaneous reply on top of the explicit
         one.
+
+        `candidate_bots` enumerates the enabled bots that COULD answer in
+        this chat. When length > 1 and we're offering should_respond, the
+        tool exposes a `bot_slug` enum and the system prompt prepends a
+        roster so the LLM picks the right one. When None or length <= 1,
+        behavior collapses to the legacy single-bot path (uses `bot`).
         """
         metrics = get_metrics()
         try:
@@ -670,8 +752,30 @@ class EmojiReactor:
                     group_id, cfg, policy, bot_id=bot_id_for_scope,
                 )
             )
+            # Multi-bot routing: when more than one bot can answer in this
+            # chat and we're offering should_respond, swap in the tool
+            # variant that takes a bot_slug and prepend a roster to the
+            # system prompt so the LLM has the data to pick.
+            multi_bot_candidates: list = []
+            multi_bot_index: dict = {}
+            if offer_should_respond and candidate_bots:
+                multi_bot_candidates = [
+                    b for b in candidate_bots
+                    if getattr(b, "enabled", True)
+                    and getattr(b, "slug", None)
+                ]
+                multi_bot_index = {
+                    b.slug: b for b in multi_bot_candidates
+                }
             if offer_should_respond:
-                tools.append(SHOULD_RESPOND_TOOL)
+                if len(multi_bot_candidates) > 1:
+                    slugs = [b.slug for b in multi_bot_candidates]
+                    tools.append(_should_respond_tool_with_bots(slugs))
+                    roster = _bot_roster_lines(multi_bot_candidates)
+                    if roster:
+                        system_prompt = f"{system_prompt}\n\n{roster}"
+                else:
+                    tools.append(SHOULD_RESPOND_TOOL)
                 extra = cfg["natural_response_extra_prompt"].strip()
                 system_prompt = (
                     f"{system_prompt}\n{extra or NATURAL_RESPONSE_GUIDANCE}"
@@ -791,6 +895,7 @@ class EmojiReactor:
             # exclusive with either: the reactor can react and note in the
             # same call, or just note silently.
             respond_reason: Optional[str] = None
+            respond_bot_slug: Optional[str] = None
             emoji_pick: Optional[str] = None
             memory_notes: list[dict] = []
             for call in tool_calls:
@@ -809,10 +914,37 @@ class EmojiReactor:
                     continue
                 if fname == "should_respond" and respond_reason is None:
                     respond_reason = (args.get("reason") or "").strip() or "(no reason given)"
+                    slug = (args.get("bot_slug") or "").strip()
+                    if slug:
+                        respond_bot_slug = slug
                 elif fname == "emoji_react" and emoji_pick is None:
                     emoji_pick = (args.get("emoji") or "").strip()
                 elif fname == "note_memory":
                     memory_notes.append(args)
+
+            # Multi-bot pick: resolve the LLM's bot_slug to a Bot and
+            # use it as the responder downstream. Unknown / blank
+            # slug → fall back to the originally-resolved `bot` so
+            # the cooldown + writer path still has something to work
+            # with. Logged at warning if the LLM picked a slug not in
+            # the offered list — that's a model-side schema violation
+            # worth knowing about.
+            responder_bot = bot
+            if respond_bot_slug and multi_bot_index:
+                picked = multi_bot_index.get(respond_bot_slug)
+                if picked is not None:
+                    responder_bot = picked
+                else:
+                    logger.warning(
+                        f"Reactor: LLM picked bot_slug={respond_bot_slug!r} "
+                        f"which isn't in the offered roster "
+                        f"{sorted(multi_bot_index.keys())}; "
+                        f"falling back to {getattr(bot, 'slug', None)!r}"
+                    )
+            responder_bot_id = (
+                getattr(responder_bot, "id", None)
+                if responder_bot is not None else None
+            )
 
             # Persist any memory notes regardless of which reactor outcome
             # wins below — passive learning is independent of the public
@@ -829,15 +961,22 @@ class EmojiReactor:
                     )
 
             if respond_reason and offer_should_respond:
-                # Mark cooldown first so concurrent reactor calls for
-                # THIS bot in the same group see it advanced and don't
-                # pile on. Cooldown stands even if the writer model
-                # bails — one decision per window per bot.
-                self.mark_implicit_response(group_id, bot_id=bot_id_for_scope)
+                # Mark cooldown on the RESPONDER bot (which may differ
+                # from the originally-resolved `bot` when the LLM picked
+                # a different one via bot_slug). This prevents the same
+                # bot from re-firing inside the cooldown window, while
+                # leaving the OTHER bot free to be picked next time.
+                self.mark_implicit_response(group_id, bot_id=responder_bot_id)
                 metrics.record_reactor_response()
+                picked_label = (
+                    f" → {getattr(responder_bot, 'slug', None)!r}"
+                    if responder_bot is not None
+                    and getattr(responder_bot, "slug", None) != getattr(bot, "slug", None)
+                    else ""
+                )
                 logger.info(
-                    f"Reactor: triggered should_respond on ...{sender_tail} "
-                    f"— {respond_reason!r}"
+                    f"Reactor: triggered should_respond on ...{sender_tail}"
+                    f"{picked_label} — {respond_reason!r}"
                 )
                 get_bus().publish(
                     "reactor",
@@ -855,6 +994,7 @@ class EmojiReactor:
                             group_id=group_id,
                             policy=policy,
                             reason=respond_reason,
+                            bot_override=responder_bot,
                         )
                     except Exception as e:
                         logger.exception(

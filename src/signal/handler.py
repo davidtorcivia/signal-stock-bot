@@ -37,6 +37,16 @@ VISION_ALLOWED_MIMES = frozenset({
 _DEFAULT_ATTACHMENTS_DIR = "/app/data/signal-cli/attachments"
 
 
+# Grace period before a non-owning handler claims an envelope addressed
+# to a bot on another phone. Long enough that the owner's poller
+# almost always claims first under normal conditions; short enough
+# that recovery latency on the (rare) takeover path doesn't feel like
+# a hang. The common path (both pollers receive — owner claims at
+# t=0, non-owner finds the claim at t=2.5s and drops) just adds a
+# silent coroutine sleep; user-visible latency is unaffected.
+POOL_TAKEOVER_DELAY_SEC = 2.5
+
+
 def _attachments_dir() -> Path:
     return Path(os.environ.get("SIGNAL_ATTACHMENTS_DIR", _DEFAULT_ATTACHMENTS_DIR))
 
@@ -499,6 +509,35 @@ class SignalHandler:
                 return bot
         return None
 
+    @staticmethod
+    def _build_claim_key(envelope: dict, data_message: dict, group_id):
+        """Pool-shared key for cross-handler envelope deduplication.
+
+        Both handlers must compute the SAME key when they receive a
+        copy of the same envelope; otherwise dedup fails and we double-
+        respond. We prefer `sourceUuid` because it's stable across
+        accounts — signal-cli's `source` field can be a phone number on
+        one account's view of a contact and a UUID on another's, which
+        would split the key. Falls back to `source` only when the UUID
+        is missing.
+
+        `dataMessage.timestamp` is the canonical Signal "message id" and
+        is identical across both receiving accounts. Returns None when
+        we can't build a stable key — caller should fall through to the
+        legacy drop-silently path so we don't accidentally double-
+        dispatch.
+        """
+        ts = data_message.get("timestamp") or envelope.get("timestamp")
+        if not ts:
+            return None
+        source_uuid = (envelope.get("sourceUuid") or "").strip()
+        if not source_uuid:
+            # Fallback: `source` is less stable but better than nothing.
+            source_uuid = (envelope.get("source") or "").strip()
+        if not source_uuid:
+            return None
+        return (group_id or "dm", source_uuid, int(ts))
+
     def _owns_bot(self, bot) -> bool:
         """True if this handler should send-as the given bot.
 
@@ -792,13 +831,25 @@ class SignalHandler:
             data_message, group_id, policy_for_routing
         )
 
-        # Multi-phone routing filter. Each registered phone runs its own
-        # SignalHandler/poller; signal-cli delivers a copy of every
-        # envelope to every linked account that's in the group. Only one
-        # handler should respond — the one whose phone matches the bot
-        # that would answer. Other handlers drop silently; without this
-        # filter we'd double-respond (or worse, the wrong persona would
-        # speak using the wrong number).
+        # Multi-phone routing with takeover. Each registered phone runs
+        # its own SignalHandler/poller; signal-cli usually delivers a
+        # copy of every envelope to every linked account in the group,
+        # but we've observed it occasionally miss delivery to one phone
+        # (Signal session/key gap on the sender side). The old behavior
+        # was to silently drop here when the addressed bot lives on
+        # another phone and trust the OTHER handler to pick it up — if
+        # that handler's poller missed delivery, the message was lost.
+        #
+        # New behavior: claim the envelope through the pool. Owner-of-
+        # record handler claims at t=0. Non-owner sleeps
+        # POOL_TAKEOVER_DELAY_SEC and then tries to claim — if the owner
+        # actually received its copy it has already claimed and the
+        # non-owner drops; otherwise the non-owner takes over and
+        # dispatches as the addressed bot (response goes out via
+        # `pool.for_bot(effective_bot)` below so it still comes from
+        # the right phone).
+        effective_bot = None
+        took_over = False
         if (
             self.dispatcher is not None
             and self.dispatcher.bot_registry is not None
@@ -806,11 +857,53 @@ class SignalHandler:
             effective_bot = self.dispatcher._resolve_bot(
                 group_id, policy=policy_for_routing, addressed_bot=addressed_bot,
             )
-            if not self._owns_bot(effective_bot):
+            pool = getattr(self.dispatcher, "signal_pool", None)
+            claim_key = self._build_claim_key(
+                envelope, data_message, group_id,
+            )
+            if claim_key is not None and pool is not None and hasattr(pool, "claim"):
+                if self._owns_bot(effective_bot):
+                    if not pool.claim(claim_key):
+                        logger.debug(
+                            f"Handler ...{self.config.phone_number[-4:]}: "
+                            f"sibling already claimed {claim_key!r}"
+                        )
+                        return
+                else:
+                    # Wait for the owner to claim. If they don't within
+                    # the grace period, the owner's poller likely missed
+                    # delivery — take over.
+                    try:
+                        await asyncio.sleep(POOL_TAKEOVER_DELAY_SEC)
+                    except asyncio.CancelledError:
+                        raise
+                    if not pool.claim(claim_key):
+                        logger.debug(
+                            f"Handler ...{self.config.phone_number[-4:]}: "
+                            f"owner claimed during takeover wait "
+                            f"{claim_key!r}"
+                        )
+                        return
+                    bot_slug = (
+                        effective_bot.slug if effective_bot is not None else None
+                    )
+                    logger.warning(
+                        f"Handler ...{self.config.phone_number[-4:]}: taking "
+                        f"over for bot={bot_slug!r} after "
+                        f"{POOL_TAKEOVER_DELAY_SEC}s — owner's poller "
+                        f"never claimed (signal-cli delivery gap)"
+                    )
+                    took_over = True
+            elif not self._owns_bot(effective_bot):
+                # No pool or no claim key (degenerate envelope): fall back
+                # to the legacy drop-silently behavior so we don't double-
+                # respond on the common case where both handlers have a
+                # copy.
                 logger.debug(
-                    f"Handler ...{self.config.phone_number[-4:]}: dropping "
-                    f"envelope routed to bot="
-                    f"{effective_bot.slug if effective_bot else None!r}"
+                    f"Handler ...{self.config.phone_number[-4:]}: "
+                    f"dropping envelope routed to bot="
+                    f"{effective_bot.slug if effective_bot else None!r} "
+                    f"(no pool/claim key available)"
                 )
                 return
 
@@ -848,8 +941,9 @@ class SignalHandler:
 
         bot_label = f" [→{addressed_bot.slug}]" if addressed_bot else ""
         img_label = f" [+{len(inbound_images)} img]" if inbound_images else ""
+        takeover_label = " [takeover]" if took_over else ""
         logger.info(
-            f"Received message from {sender[-4:]}: "
+            f"Received message from {sender[-4:]}:{takeover_label} "
             f"{'[group] ' if group_id else ''}"
             f"{'[@mentioned]' + bot_label + ' ' if is_mentioned else ''}"
             f"{img_label} "
@@ -871,13 +965,27 @@ class SignalHandler:
             policy=policy_for_routing,
             inbound_images=inbound_images,
         )
-        
-        # Send response if command was processed
+
+        # Send response if command was processed. Route through the
+        # answering bot's own handler so multi-phone installs always
+        # send from the bot's number — required when we took over an
+        # envelope for a bot on another phone, but harmless in the
+        # common (owner-self) case where `for_bot` returns `self`.
         if result:
+            response_handler = self
+            if effective_bot is not None:
+                pool = getattr(self.dispatcher, "signal_pool", None)
+                if pool is not None and hasattr(pool, "for_bot"):
+                    try:
+                        candidate = pool.for_bot(effective_bot)
+                        if candidate is not None:
+                            response_handler = candidate
+                    except Exception as e:
+                        logger.debug(f"pool.for_bot fallback to self: {e}")
             try:
                 # If dm_only, send directly to user regardless of group context
                 target_group = None if result.dm_only else group_id
-                await self.send_message(
+                await response_handler.send_message(
                     recipient=sender,
                     message=result.text,
                     group_id=target_group,

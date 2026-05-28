@@ -333,6 +333,20 @@ class CommandDispatcher:
                     and bool(self.extract_inline_symbols(message))
                 )
             )
+            # Multi-bot routing: hand the reactor the full enabled-bot
+            # roster so the should_respond tool can pick which bot
+            # answers in a chat with more than one resident bot. The
+            # reactor falls back to the resolved `bot` when the list
+            # is None/<=1, preserving single-bot behavior.
+            candidate_bots: list = []
+            if self.bot_registry is not None:
+                try:
+                    candidate_bots = [
+                        b for b in self.bot_registry.list_sync()
+                        if getattr(b, "enabled", True)
+                    ]
+                except Exception as e:
+                    logger.debug(f"reactor candidate_bots lookup failed: {e}")
             asyncio.create_task(
                 self.reactor.maybe_react(
                     sender=sender,
@@ -344,6 +358,7 @@ class CommandDispatcher:
                     bot=self._resolve_bot(
                         group_id, policy=policy, addressed_bot=addressed_bot,
                     ),
+                    candidate_bots=candidate_bots,
                 )
             )
 
@@ -757,6 +772,7 @@ class CommandDispatcher:
         group_id: Optional[str],
         policy=None,
         reason: str = "",
+        bot_override=None,
     ) -> None:
         """Run !ask spontaneously on behalf of the reactor's should_respond tool.
 
@@ -764,6 +780,12 @@ class CommandDispatcher:
         decided this message warrants a reply, so we run the writer model
         with `implicit_reason` set (which adds a system suffix telling it to
         bail freely) and send the result via signal_handler ourselves.
+
+        `bot_override` lets the reactor's multi-bot routing pin the
+        responder when the LLM picked a specific bot via `bot_slug`. An
+        enabled override wins over the per-context default; otherwise we
+        fall back to `_resolve_bot` so legacy single-bot behavior is
+        preserved.
 
         Errors are logged and swallowed; the reactor must never affect the
         rest of the bot.
@@ -777,12 +799,17 @@ class CommandDispatcher:
             logger.info("dispatch_implicit_ask: !ask not allowed by policy; skipping")
             return
 
+        def _resolve_responder():
+            if bot_override is not None and getattr(bot_override, "enabled", True):
+                return bot_override
+            return self._resolve_bot(group_id, policy=policy)
+
         # Same ContextVar dance as dispatch(): the reactor's create_task
         # spawned this in a child task, but the reactor itself doesn't
         # set the transcript context (its own LLM call is not logged).
         # Set it here so the writer round downstream picks it up.
         if policy is not None and policy.id is not None:
-            bot = self._resolve_bot(group_id, policy=policy)
+            bot = _resolve_responder()
             transcript_on = (
                 bool(getattr(policy, "transcript_logging_enabled", False))
                 and policy.kind != "default"
@@ -811,7 +838,7 @@ class CommandDispatcher:
             command="ask",
             args=[message] if message else [""],
             policy=policy,
-            bot=self._resolve_bot(group_id, policy=policy),
+            bot=_resolve_responder(),
             implicit_reason=reason or "(reactor flagged this as worth a reply)",
         )
 

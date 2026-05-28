@@ -15,7 +15,8 @@ bots.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterable, Optional
+import time
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from .handler import SignalConfig, SignalHandler
 
@@ -25,6 +26,14 @@ if TYPE_CHECKING:
     from ..commands.dispatcher import CommandDispatcher
 
 logger = logging.getLogger(__name__)
+
+
+# How long a pool-level claim stays "fresh". Long enough to cover any
+# realistic websocket/dedup window across both handlers, short enough
+# that the dict never grows unbounded under steady traffic.
+_CLAIM_TTL_SEC = 120.0
+# Soft cap before GC. Each entry is ~120 bytes; 4096 is well under 1 MB.
+_CLAIM_MAX = 4096
 
 
 class SignalHandlerPool:
@@ -54,6 +63,11 @@ class SignalHandlerPool:
         # tests sometimes inject a registry that isn't loaded yet).
         self._handlers: dict[str, SignalHandler] = {}
         self._built = False
+        # Cross-handler claim cache used by `claim()` below. Keyed by
+        # (group_id_or_"dm", source_uuid, dataMessage.timestamp). First
+        # handler to claim an inbound envelope wins; the other handler
+        # (if it also received a copy) sees the claim and drops.
+        self._claims: dict[Any, float] = {}
 
     # ------------------------------------------------------------------
     # Build
@@ -205,3 +219,38 @@ class SignalHandlerPool:
     @property
     def default_phone(self) -> str:
         return self._default_phone
+
+    # ------------------------------------------------------------------
+    # Cross-handler envelope claim
+    # ------------------------------------------------------------------
+
+    def claim(self, key: Any) -> bool:
+        """Atomically claim an inbound envelope by `key`.
+
+        Returns True if this caller is the first to claim, False if a
+        sibling handler already did. Used by the handler's takeover
+        path: the owner-of-record handler claims immediately on receipt;
+        the non-owner sleeps briefly and then tries to claim — if the
+        owner's poller actually delivered the envelope it will already
+        be claimed and the non-owner drops; if it didn't (signal-cli
+        delivery gap), the non-owner takes over and dispatches as the
+        addressed bot, sending the reply through the right phone via
+        `for_bot(...)`.
+
+        Idempotent within the TTL window: a second claim for the same
+        key returns False. GC'd lazily — every call drops entries older
+        than `_CLAIM_TTL_SEC`, with a hard cap that triggers a full
+        sweep when the dict grows past `_CLAIM_MAX`.
+        """
+        now = time.time()
+        cutoff = now - _CLAIM_TTL_SEC
+        if len(self._claims) > _CLAIM_MAX:
+            # Hard sweep: rebuild keeping only fresh entries. Cheap
+            # relative to the in-handler 2.5s sleep so we don't care
+            # about doing it on the hot path.
+            self._claims = {k: v for k, v in self._claims.items() if v >= cutoff}
+        existing = self._claims.get(key)
+        if existing is not None and existing >= cutoff:
+            return False
+        self._claims[key] = now
+        return True

@@ -761,6 +761,7 @@ def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
         # marker; if it's present we trust the checkbox state, otherwise
         # we preserve the existing value (or default True on new bots).
         deep_think_enabled=_parse_deep_think_enabled(form, existing),
+        routing_blurb=(form.get("routing_blurb", "") or "").strip() or None,
     )
 
 
@@ -929,6 +930,7 @@ def _register_bots_routes(
             "deep_think_handoff_prompt": "",
             "vision_enabled": False,
             "deep_think_enabled": True,
+            "routing_blurb": "",
         }
         bot_settings = _bot_llm_values(settings_store, bot_id=None)
         if request.method == "POST":
@@ -992,6 +994,7 @@ def _register_bots_routes(
             "deep_think_handoff_prompt": bot.deep_think_handoff_prompt or "",
             "vision_enabled": bot.vision_enabled,
             "deep_think_enabled": bot.deep_think_enabled,
+            "routing_blurb": bot.routing_blurb or "",
         }
         return render_template(
             "bots_form.html",

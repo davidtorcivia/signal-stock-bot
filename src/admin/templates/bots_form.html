@@ -50,6 +50,17 @@
           </span>
         </label>
 
+        <label>Routing blurb (multi-bot chats)
+          <textarea name="routing_blurb" rows="2"
+                    placeholder="One short line. e.g. 'Artaud — poetry, art, philosophy.'">{{ values.routing_blurb }}</textarea>
+          <span class="muted" style="font-size: 11px;">
+            Read by the reactor in multi-bot chats to pick which bot
+            should answer an unaddressed message. Keep it short
+            (under ~140 chars). Empty falls back to the persona's
+            first sentence.
+          </span>
+        </label>
+
         <label>Signal phone (override)
           <input type="text" name="signal_phone" value="{{ values.signal_phone }}"
                  placeholder="+1...  (blank = share the system default)">

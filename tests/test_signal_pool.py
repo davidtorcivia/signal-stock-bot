@@ -205,44 +205,58 @@ class TestLookupBotByPhone:
         assert h._lookup_bot_by_phone("+15550000002") is None
 
 
+def _wire_dispatch_test(pool, bots):
+    """Set up the shared MagicMock dispatcher with a working
+    _resolve_bot, the registry/policy stubs each handler reaches for,
+    and a pool reference so the cross-handler claim cache engages.
+    Returns (dispatch_mock, sigil_h, artaud_h).
+    """
+    sigil_h = pool.for_phone("+15550000001")
+    artaud_h = pool.for_phone("+15550000002")
+    dispatch_mock = AsyncMock(return_value=None)
+    sigil, _ = bots
+
+    def _resolve(group_id, policy=None, addressed_bot=None):
+        return addressed_bot or sigil
+
+    # Both handlers share the same MagicMock dispatcher (the pool
+    # wired them up that way); set the real fakes on it once.
+    dispatcher = sigil_h.dispatcher
+    dispatcher.dispatch = dispatch_mock
+    dispatcher._resolve_bot = _resolve
+    dispatcher.context_registry = None
+    dispatcher.bot_registry = _FakeBotRegistry(bots)
+    # Critical for the new takeover logic: hand the dispatcher the
+    # real pool so `pool.claim(...)` is the actual cross-handler
+    # dedup. Without this, both handlers would see a MagicMock for
+    # `signal_pool.claim` (truthy in all cases) and double-dispatch.
+    dispatcher.signal_pool = pool
+    return dispatch_mock, sigil_h, artaud_h
+
+
 @pytest.mark.asyncio
-async def test_handle_webhook_drops_message_routed_to_other_handler():
-    """End-to-end of the routing filter: a message addressed to Artaud
-    arrives at Sigil's handler (signal-cli broadcasts to both linked
-    accounts); Sigil drops, Artaud dispatches."""
-    from src.signal.handler import SignalHandler, SignalConfig
+async def test_handle_webhook_dedups_when_both_handlers_receive(monkeypatch):
+    """Common multi-phone path: signal-cli delivers a copy of the
+    envelope to both linked accounts. The first handler to claim wins;
+    the second finds the claim and drops. Exactly one dispatch."""
+    # Speed the takeover sleep so the test doesn't wait the real
+    # POOL_TAKEOVER_DELAY_SEC — the dedup logic doesn't depend on the
+    # actual duration.
+    monkeypatch.setattr(
+        "src.signal.handler.POOL_TAKEOVER_DELAY_SEC", 0.01, raising=True,
+    )
 
     bots = [
         _bot(1, "sigil", default_group=True, default_dm=True),
         _bot(2, "artaud", signal_phone="+15550000002"),
     ]
     pool = _make_pool(bots)
-
-    # Hand-build a Sigil-side handler so we can interrogate its dispatch.
-    sigil_h = pool.for_phone("+15550000001")
-    artaud_h = pool.for_phone("+15550000002")
-
-    # Both handlers share the same MagicMock dispatcher (the pool wired
-    # them up that way) — install one AsyncMock for dispatch and inspect
-    # the call list after both handlers have run.
-    dispatch_mock = AsyncMock(return_value=None)
-    sigil_h.dispatcher.dispatch = dispatch_mock
-    # _resolve_bot returns the addressed bot if set, else default.
-    sigil, artaud = bots
-
-    def _resolve(group_id, policy=None, addressed_bot=None):
-        return addressed_bot or sigil
-
-    sigil_h.dispatcher._resolve_bot = _resolve
-    artaud_h.dispatcher._resolve_bot = _resolve
-    sigil_h.dispatcher.context_registry = None
-    artaud_h.dispatcher.context_registry = None
-    sigil_h.dispatcher.bot_registry = _FakeBotRegistry(bots)
-    artaud_h.dispatcher.bot_registry = _FakeBotRegistry(bots)
+    dispatch_mock, sigil_h, artaud_h = _wire_dispatch_test(pool, bots)
 
     envelope = {
         "envelope": {
             "source": "+15551112222",
+            "sourceUuid": "uuid-1111-2222",
             "timestamp": 1234567890,
             "dataMessage": {
                 "message": "Hey artaud",
@@ -252,10 +266,49 @@ async def test_handle_webhook_drops_message_routed_to_other_handler():
         }
     }
 
-    await sigil_h.handle_webhook(envelope)
+    # Both pollers receive — owner-of-record (Artaud's handler) claims
+    # immediately; the non-owner sleeps briefly and finds the claim.
+    # Run sequentially: artaud first (claims), then sigil (drops).
     await artaud_h.handle_webhook(envelope)
+    await sigil_h.handle_webhook(envelope)
 
-    # Exactly one dispatch — from Artaud. Sigil saw the envelope,
-    # recognized Artaud as the addressee, and dropped before dispatching.
+    assert dispatch_mock.call_count == 1
+    assert dispatch_mock.call_args.kwargs["addressed_bot"].slug == "artaud"
+
+
+@pytest.mark.asyncio
+async def test_handle_webhook_takes_over_when_owner_misses_delivery(monkeypatch):
+    """Recovery path: signal-cli delivers the envelope only to Sigil's
+    account (the owner's poller missed it). After the grace period the
+    non-owner takes over and dispatches as Artaud anyway — the message
+    is no longer silently lost."""
+    monkeypatch.setattr(
+        "src.signal.handler.POOL_TAKEOVER_DELAY_SEC", 0.01, raising=True,
+    )
+
+    bots = [
+        _bot(1, "sigil", default_group=True, default_dm=True),
+        _bot(2, "artaud", signal_phone="+15550000002"),
+    ]
+    pool = _make_pool(bots)
+    dispatch_mock, sigil_h, _artaud_h = _wire_dispatch_test(pool, bots)
+
+    envelope = {
+        "envelope": {
+            "source": "+15551112222",
+            "sourceUuid": "uuid-1111-2222",
+            "timestamp": 1234567891,
+            "dataMessage": {
+                "message": "Hey artaud",
+                "timestamp": 1234567891,
+                "mentions": [{"number": "+15550000002"}],
+            },
+        }
+    }
+
+    # Only Sigil's handler receives — Artaud's poller never claims.
+    await sigil_h.handle_webhook(envelope)
+
+    # Takeover dispatched on Sigil's side, still as Artaud.
     assert dispatch_mock.call_count == 1
     assert dispatch_mock.call_args.kwargs["addressed_bot"].slug == "artaud"

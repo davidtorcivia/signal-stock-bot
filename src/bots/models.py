@@ -56,6 +56,15 @@ class Bot:
     # bots whose writer model already handles long reasoning natively or
     # for cost containment on a single bot without changing globals.
     deep_think_enabled: bool = True
+    # Short "when to pick this bot" hint surfaced to the reactor LLM in
+    # multi-bot chats so it can route an unaddressed message to the
+    # bot whose remit best fits ("Artaud — poetry, art, philosophy;
+    # Sigil — markets, technical questions"). Kept separate from
+    # `persona` because persona is a system-prompt fragment the bot
+    # speaks WITH, while this is a one-liner the reactor reads ABOUT
+    # the bot to decide who should answer. Empty/None means the
+    # reactor falls back to the persona's first sentence.
+    routing_blurb: Optional[str] = None
     created_at: float = 0.0
     updated_at: float = 0.0
 

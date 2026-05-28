@@ -135,6 +135,12 @@ class BotRegistry:
                         "ALTER TABLE bots ADD COLUMN "
                         "deep_think_enabled INTEGER NOT NULL DEFAULT 1"
                     )
+                if "routing_blurb" not in existing_cols:
+                    # Nullable: reactor multi-bot routing falls back to
+                    # the persona's first sentence when blurb is unset.
+                    await db.execute(
+                        "ALTER TABLE bots ADD COLUMN routing_blurb TEXT"
+                    )
                 # Seed Sigil if the table is empty. Aliases default to a
                 # single-element list with the display name; admin can
                 # add more from /admin/bots in PR3.
@@ -260,6 +266,10 @@ class BotRegistry:
                         "ALTER TABLE bots ADD COLUMN "
                         "deep_think_enabled INTEGER NOT NULL DEFAULT 1"
                     )
+                if "routing_blurb" not in existing_cols:
+                    conn.execute(
+                        "ALTER TABLE bots ADD COLUMN routing_blurb TEXT"
+                    )
                 cur = conn.execute("SELECT COUNT(*) FROM bots")
                 row = cur.fetchone()
                 if row and row[0] == 0:
@@ -311,7 +321,8 @@ class BotRegistry:
         "signal_phone, signal_api_url, enabled, "
         "default_for_dm, default_for_group, "
         "deep_think_mode, deep_think_handoff_prompt, "
-        "created_at, updated_at, vision_enabled, deep_think_enabled"
+        "created_at, updated_at, vision_enabled, deep_think_enabled, "
+        "routing_blurb"
     )
 
     @staticmethod
@@ -341,6 +352,7 @@ class BotRegistry:
             deep_think_enabled=(
                 bool(row[15]) if len(row) > 15 and row[15] is not None else True
             ),
+            routing_blurb=(row[16] if len(row) > 16 else None),
         )
 
     # ------------------------------------------------------------------
@@ -449,8 +461,9 @@ class BotRegistry:
                         default_for_dm, default_for_group,
                         deep_think_mode, deep_think_handoff_prompt,
                         vision_enabled, deep_think_enabled,
+                        routing_blurb,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         bot.slug,
                         bot.display_name,
@@ -465,6 +478,7 @@ class BotRegistry:
                         bot.deep_think_handoff_prompt or None,
                         1 if bot.vision_enabled else 0,
                         1 if bot.deep_think_enabled else 0,
+                        bot.routing_blurb or None,
                         now,
                         now,
                     ),
@@ -482,6 +496,7 @@ class BotRegistry:
                            enabled = ?, default_for_dm = ?, default_for_group = ?,
                            deep_think_mode = ?, deep_think_handoff_prompt = ?,
                            vision_enabled = ?, deep_think_enabled = ?,
+                           routing_blurb = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -498,6 +513,7 @@ class BotRegistry:
                         bot.deep_think_handoff_prompt or None,
                         1 if bot.vision_enabled else 0,
                         1 if bot.deep_think_enabled else 0,
+                        bot.routing_blurb or None,
                         now,
                         bot.id,
                     ),
