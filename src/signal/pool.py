@@ -68,6 +68,16 @@ class SignalHandlerPool:
         # handler to claim an inbound envelope wins; the other handler
         # (if it also received a copy) sees the claim and drops.
         self._claims: dict[Any, float] = {}
+        # Pool-shared set of every bot UUID we've discovered. Aliased
+        # into each handler's `_known_uuids` at build() so a UUID
+        # learned on one handler's first send is immediately visible to
+        # every other handler's inbound self-check. Bootstrapped eagerly
+        # via `bootstrap_uuids()` so the first inbound has UUIDs to
+        # compare against — without that, a bot's own outbound echoes
+        # back through the OTHER bot's poller with envelope.source set
+        # to a UUID (not a phone), slipping past the phone-only filter
+        # and letting the reactor evaluate it as user input.
+        self._known_uuids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Build
@@ -128,6 +138,9 @@ class SignalHandlerPool:
             # pinned to a phone no handler can serve, and steps in
             # (when it's the default) so the chat doesn't go silent.
             handler._known_phones = set(all_phones)
+            # Share the SAME set object across handlers so a UUID learned
+            # on one handler's send is instantly visible everywhere.
+            handler._known_uuids = self._known_uuids
             self._handlers[phone] = handler
             tail = phone[-4:] if len(phone) >= 4 else phone
             logger.info(
@@ -205,6 +218,40 @@ class SignalHandlerPool:
         for handler in self._handlers.values():
             handler._known_phones = phones
         return len(phones)
+
+    async def bootstrap_uuids(self) -> int:
+        """Eagerly resolve every handler's bot UUID so the inbound
+        self-check has a populated `_known_uuids` set on the first
+        envelope.
+
+        Without this, a bot's outbound message can echo back through a
+        sibling handler's poller with envelope.source set to a UUID
+        rather than a phone number — the phone-only filter at
+        `handle_webhook` lets it through and the reactor evaluates the
+        bot's own message as user input (in multi-bot chats this lets
+        the LLM pick a bot to "reply" to its own post).
+
+        Failures are non-fatal — the handler's lazy fetch_bot_uuid will
+        still try later. Returns the count of UUIDs resolved.
+        """
+        if not self._built:
+            self.build()
+        resolved = 0
+        for handler in self._handlers.values():
+            try:
+                uuid = await handler.fetch_bot_uuid()
+                if uuid:
+                    resolved += 1
+            except Exception as e:
+                logger.warning(
+                    f"SignalHandlerPool.bootstrap_uuids: "
+                    f"{handler.config.phone_number!r} failed: {e}"
+                )
+        logger.info(
+            f"SignalHandlerPool: bootstrapped {resolved}/{len(self._handlers)} "
+            f"bot UUIDs ({len(self._known_uuids)} known)"
+        )
+        return resolved
 
     def handlers(self) -> Iterable[SignalHandler]:
         if not self._built:

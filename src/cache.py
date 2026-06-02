@@ -257,6 +257,8 @@ class LLMMetrics:
     errors: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     total_latency_ms: float = 0.0
     last_call_at: Optional[float] = None
     last_error_at: Optional[float] = None
@@ -267,6 +269,11 @@ class LLMMetrics:
     @property
     def avg_latency_ms(self) -> float:
         return (self.total_latency_ms / self.successes) if self.successes else 0.0
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        total = self.cache_hit_tokens + self.cache_miss_tokens
+        return (self.cache_hit_tokens / total) if total else 0.0
 
 
 @dataclass
@@ -279,6 +286,8 @@ class DeepThinkMetrics:
     errors: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     total_latency_ms: float = 0.0
     last_call_at: Optional[float] = None
     last_error_at: Optional[float] = None
@@ -288,6 +297,11 @@ class DeepThinkMetrics:
     @property
     def avg_latency_ms(self) -> float:
         return (self.total_latency_ms / self.successes) if self.successes else 0.0
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        total = self.cache_hit_tokens + self.cache_miss_tokens
+        return (self.cache_hit_tokens / total) if total else 0.0
 
 
 @dataclass
@@ -385,6 +399,8 @@ class MetricsCollector:
         latency_ms: float,
         tokens_in: int = 0,
         tokens_out: int = 0,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
     ) -> None:
         with self._lock:
             m = self._llm
@@ -392,6 +408,8 @@ class MetricsCollector:
             m.successes += 1
             m.tokens_in += int(tokens_in or 0)
             m.tokens_out += int(tokens_out or 0)
+            m.cache_hit_tokens += int(cache_hit_tokens or 0)
+            m.cache_miss_tokens += int(cache_miss_tokens or 0)
             m.total_latency_ms += latency_ms
             m.last_call_at = time.time()
             m.by_purpose[purpose] = m.by_purpose.get(purpose, 0) + 1
@@ -401,6 +419,8 @@ class MetricsCollector:
             "llm_success",
             purpose=purpose, model=model, latency_ms=latency_ms,
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_hit_tokens=cache_hit_tokens,
+            cache_miss_tokens=cache_miss_tokens,
         )
 
     def record_llm_error(self, *, purpose: str, model: str, error_msg: str) -> None:
@@ -427,6 +447,8 @@ class MetricsCollector:
         latency_ms: float,
         tokens_in: int = 0,
         tokens_out: int = 0,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
     ) -> None:
         with self._lock:
             m = self._deep_think
@@ -434,6 +456,8 @@ class MetricsCollector:
             m.successes += 1
             m.tokens_in += int(tokens_in or 0)
             m.tokens_out += int(tokens_out or 0)
+            m.cache_hit_tokens += int(cache_hit_tokens or 0)
+            m.cache_miss_tokens += int(cache_miss_tokens or 0)
             m.total_latency_ms += latency_ms
             m.last_call_at = time.time()
             if model:
@@ -442,6 +466,8 @@ class MetricsCollector:
             "dt_success",
             model=model, latency_ms=latency_ms,
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_hit_tokens=cache_hit_tokens,
+            cache_miss_tokens=cache_miss_tokens,
         )
 
     def record_deep_think_error(self, *, model: str, error_msg: str) -> None:

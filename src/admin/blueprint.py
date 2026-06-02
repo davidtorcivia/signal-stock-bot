@@ -60,6 +60,7 @@ def create_admin_blueprint(
     group_log=None,
     reactor=None,
     signal_pool=None,
+    daily_oracle=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -127,6 +128,7 @@ def create_admin_blueprint(
             history=history,
             group_log=group_log,
             reactor=reactor,
+            daily_oracle=daily_oracle,
         )
 
     if name_registry is not None:
@@ -1325,7 +1327,7 @@ def _apply_settings_form(store: SettingsStore, form) -> None:
                 store.set(key, [])
             continue
 
-        if key == "MASSIVE_PRO":
+        if key in ("MASSIVE_PRO", "wsb_indexable"):
             store.set(key, raw.lower() in ("1", "true", "yes", "on"))
             continue
 
@@ -1362,6 +1364,7 @@ def _register_context_routes(
     history=None,
     group_log=None,
     reactor=None,
+    daily_oracle=None,
 ) -> None:
     """Context CRUD + (when memory_store is wired) memory CRUD nested under
     each context. Memory routes are mounted unconditionally so the template
@@ -1692,6 +1695,7 @@ def _register_context_routes(
             registry=registry,
             oracle_store=oracle_store,
             loop=loop,
+            daily_oracle=daily_oracle,
         )
 
     _register_memory_routes(
@@ -1703,7 +1707,7 @@ def _register_context_routes(
     )
 
 
-_ORACLE_KIND_OPTIONS = ("tarot", "iching", "market_open", "market_close", "freeform")
+_ORACLE_KIND_OPTIONS = ("tarot", "iching", "market_open", "market_close", "freeform", "wsb_digest")
 _ORACLE_SCHEDULE_OPTIONS = ("sunrise", "sunset", "clock")
 
 
@@ -1737,6 +1741,11 @@ def _oracle_to_view(o) -> dict:
         "clock_time": o.clock_time or "",
         "timezone": o.timezone,
         "weekdays_only": o.weekdays_only,
+        # Which day boxes to pre-check (Mon=0..Sun=6). "every day" shows all 7
+        # checked so the picker is never blank.
+        "days_checked": sorted(o.effective_days()) if o.effective_days() is not None
+                        else [0, 1, 2, 3, 4, 5, 6],
+        "days_label": o.days_label(),
         "prompt": o.prompt or "",
         "label": o.label or "",
         "description": o.describe(),
@@ -1755,6 +1764,20 @@ def _form_to_oracle(form, *, context_id: int, oracle_id: Optional[int] = None):
     def _bool(name: str) -> bool:
         return (form.get(name) or "").lower() in ("1", "true", "yes", "on")
 
+    def _days():
+        """Parse the day-of-week checkboxes (name='days', values 0-6, Mon=0).
+        All 7 or none selected -> None (every day), so clearing the picker can't
+        leave an oracle that never fires."""
+        try:
+            raw = form.getlist("days")
+        except AttributeError:  # plain dict (tests): value may be scalar or list
+            v = form.get("days")
+            raw = v if isinstance(v, (list, tuple)) else ([v] if v else [])
+        out = {int(v) for v in raw if (v or "").strip().isdigit() and 0 <= int(v) <= 6}
+        if not out or len(out) == 7:
+            return None
+        return frozenset(out)
+
     return ContextOracle(
         id=oracle_id,
         context_id=context_id,
@@ -1764,7 +1787,10 @@ def _form_to_oracle(form, *, context_id: int, oracle_id: Optional[int] = None):
         offset_minutes=_int("offset_minutes", 0),
         clock_time=(form.get("clock_time") or "").strip() or None,
         timezone=(form.get("timezone") or "America/New_York").strip(),
-        weekdays_only=_bool("weekdays_only"),
+        # days_of_week supersedes the legacy weekdays_only flag; the form drives
+        # the picker, so weekdays_only is left off for new saves.
+        weekdays_only=False,
+        days_of_week=_days(),
         prompt=(form.get("prompt") or "").strip() or None,
         label=(form.get("label") or "").strip(),
     )
@@ -1776,6 +1802,7 @@ def _register_oracle_routes(
     registry: ContextRegistry,
     oracle_store,
     loop: asyncio.AbstractEventLoop,
+    daily_oracle=None,
 ) -> None:
     """Per-context oracle CRUD nested under /admin/contexts/<id>/oracles.
 
@@ -1791,6 +1818,43 @@ def _register_oracle_routes(
         if policy.kind != "group":
             abort(400)
         return policy
+
+    @bp.route("/contexts/<int:context_id>/oracles/run-wsb", methods=["POST"])
+    @admin_required
+    def oracle_run_wsb(context_id: int):
+        """Manually run the WSB digest pipeline for this group now. Crawls,
+        analyzes, and publishes the static page/index/og; posts the teaser +
+        link to the chat unless post_to_chat is off (preview). Fire-and-forget
+        on the background loop — the run takes ~1 min (crawl + deep-think)."""
+        if not verify_csrf():
+            abort(400)
+        _ctx_or_404(context_id)
+        if daily_oracle is None or getattr(daily_oracle, "wsb_service", None) is None:
+            flash("WSB digest isn't available (oracle worker not running).", "error")
+            return redirect(url_for("admin.context_edit", context_id=context_id))
+        post = request.form.get("post_to_chat") == "1"
+        future = asyncio.run_coroutine_threadsafe(
+            daily_oracle.run_wsb_now(context_id, post_to_chat=post), loop
+        )
+
+        def _log_done(fut):
+            try:
+                logger.info("Admin WSB run (context #%s): %s", context_id, fut.result())
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("Admin WSB run (context #%s) errored: %s", context_id, e)
+
+        future.add_done_callback(_log_done)
+        if post:
+            flash(
+                "WSB digest started — it'll publish the page and post a teaser + "
+                "link to the chat in ~1 minute.", "ok",
+            )
+        else:
+            flash(
+                "WSB digest preview started (no chat post) — the page will "
+                "publish in ~1 minute.", "ok",
+            )
+        return redirect(url_for("admin.context_edit", context_id=context_id))
 
     @bp.route("/contexts/<int:context_id>/oracles/new", methods=["POST"])
     @admin_required

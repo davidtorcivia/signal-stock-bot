@@ -6,6 +6,11 @@ yfinance>=0.2.40
 pyyaml>=6.0
 websockets>=12.0
 
+# HTML parsing for the WSB digest scraper (Redlib frontend). Pure-Python bs4
+# with the lxml backend; both ship as wheels (no system build deps needed).
+beautifulsoup4>=4.12
+lxml>=5.0
+
 # Charts (professional financial charting)
 matplotlib>=3.8
 mplfinance>=0.12.9b7

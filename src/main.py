@@ -1085,6 +1085,21 @@ def build_app(config: Config):
     except Exception as e:
         logger.error(f"Oracle prepopulation failed: {e}")
 
+    # WSB daily-digest pipeline (the wsb_digest oracle kind). Crawls a Redlib
+    # instance, has deep-think analyze the day's r/wallstreetbets, and publishes
+    # a static read; the worker posts a teaser + link to the chat.
+    from .wsb.store import WSBDigestStore
+    from .wsb.service import WSBDigestService
+
+    wsb_service = WSBDigestService(
+        settings_store=settings_store,
+        store=WSBDigestStore(config.watchlist_db_path),
+        static_dir=config.wsb_static_dir,
+        provider_manager=provider_manager,
+    )
+
+    daily_oracle = None  # set below when tarot/iching are available; passed to
+    # the admin UI so the "Run WSB digest now" button can drive the pipeline.
     tarot_cmd_for_oracle = dispatcher.commands.get("tarot")
     iching_cmd_for_oracle = dispatcher.commands.get("iching")
     if tarot_cmd_for_oracle is not None and iching_cmd_for_oracle is not None:
@@ -1097,12 +1112,29 @@ def build_app(config: Config):
             signal_pool=signal_pool,
             bot_name=settings_store.get("bot_name") or config.bot_name or "Bot",
             bot_registry=bot_registry,
+            llm_factory=llm_factory,
+            wsb_service=wsb_service,
         )
         asyncio.run_coroutine_threadsafe(daily_oracle.run_forever(), loop)
         logger.info("Daily oracle worker scheduled (multi-oracle)")
     else:
         logger.warning(
             "Daily oracle: tarot/iching commands not registered; worker not started"
+        )
+
+    # Pre-warm every handler's bot UUID so the inbound self-check has
+    # a populated `_known_uuids` set on the first envelope. Without
+    # this, signal-cli's UUID-form `envelope.source` slips past the
+    # phone-only filter and lets the reactor evaluate a bot's own
+    # outbound as user input — which in multi-bot chats surfaces as
+    # the responder LLM picking a bot to "reply" to its own post.
+    try:
+        asyncio.run_coroutine_threadsafe(
+            signal_pool.bootstrap_uuids(), loop,
+        ).result(timeout=15)
+    except Exception as e:
+        logger.warning(
+            f"signal_pool.bootstrap_uuids failed (will populate lazily): {e}"
         )
 
     # WebSocket message pollers — one per registered phone. Each poller
@@ -1154,6 +1186,7 @@ def build_app(config: Config):
         group_log=group_log,
         reactor=reactor,
         signal_pool=signal_pool,
+        daily_oracle=daily_oracle,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

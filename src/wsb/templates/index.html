@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}{{ bot_name }} · WSB Daily reads{% endblock %}
+{% block meta %}
+<meta property="og:type" content="website">
+<meta property="og:title" content="{{ bot_name }} · WSB Daily">
+<meta property="og:description" content="Daily read of r/{{ subreddit }} — top tickers, posts, and {{ bot_name }}'s take.">
+<meta property="og:url" content="{{ public_base_url }}/">
+{% endblock %}
+{% block content %}
+<p class="date">Daily reads</p>
+<h1>{{ bot_name }} reads r/{{ subreddit }}</h1>
+<p class="lead">Every evening: the day's most-mentioned tickers, the standout posts,
+and {{ bot_name }}'s skeptical take — cross-checked against live prices.</p>
+
+{% if records %}
+<ul class="cards">
+  {% for r in records %}
+  <li>
+    <p class="date">{{ r.date }}</p>
+    <div class="hl"><a href="{{ page_url_for(r.date) }}">{{ r.headline or "WSB Daily — " ~ r.date }}</a></div>
+    {% if r.teaser %}<div style="color:var(--dim);margin-top:4px">{{ r.teaser }}</div>{% endif %}
+    {% if r.tickers %}<div class="tk">{% for t in r.tickers[:5] %}{{ t.symbol }} ({{ t.mentions }}){% if not loop.last %} · {% endif %}{% endfor %}</div>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p style="color:var(--dim)">No reads published yet — check back after the close.</p>
+{% endif %}
+{% endblock %}

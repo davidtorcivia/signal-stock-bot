@@ -42,6 +42,7 @@ from ..bots.settings import (
     resolve_setting,
 )
 from ..cache import get_metrics
+from .client import _extract_cache_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +371,7 @@ class DeepThinkClient:
             usage = data.get("usage") or {}
             tokens_in = int(usage.get("prompt_tokens") or 0)
             tokens_out = int(usage.get("completion_tokens") or 0)
+            cache_hit, cache_miss = _extract_cache_tokens(usage)
         except (KeyError, IndexError, AttributeError, TypeError):
             metrics.record_deep_think_error(
                 model=cfg["model"], error_msg="unexpected response shape",
@@ -380,6 +382,7 @@ class DeepThinkClient:
         metrics.record_deep_think_success(
             model=cfg["model"], latency_ms=latency_ms,
             tokens_in=tokens_in, tokens_out=tokens_out,
+            cache_hit_tokens=cache_hit, cache_miss_tokens=cache_miss,
         )
         logger.debug(
             f"DeepThink round: {tokens_in}+{tokens_out} tok, "

@@ -92,6 +92,58 @@ def test_validate_rejects_unknown_timezone():
     assert any("timezone" in e for e in o.validate())
 
 
+def test_validate_rejects_out_of_range_days():
+    o = ContextOracle(
+        id=None, context_id=1, enabled=True, kind="tarot",
+        schedule_kind="sunrise", days_of_week=frozenset({0, 7}),
+    )
+    assert any("days_of_week" in e for e in o.validate())
+
+
+# ---------- effective_days / days_label -------------------------------------
+
+def test_effective_days_falls_back_to_weekdays_only():
+    o = ContextOracle(id=None, context_id=1, enabled=True, kind="tarot",
+                      schedule_kind="sunrise", weekdays_only=True)
+    assert o.effective_days() == frozenset({0, 1, 2, 3, 4})
+
+
+def test_effective_days_none_means_every_day():
+    o = ContextOracle(id=None, context_id=1, enabled=True, kind="tarot",
+                      schedule_kind="sunrise")
+    assert o.effective_days() is None
+
+
+def test_empty_days_of_week_normalizes_to_none():
+    """An explicit empty set must collapse to None (every day), not fall through
+    to the weekdays_only branch."""
+    o = ContextOracle(id=None, context_id=1, enabled=True, kind="tarot",
+                      schedule_kind="sunrise", weekdays_only=True,
+                      days_of_week=frozenset())
+    assert o.days_of_week is None
+    assert o.effective_days() == frozenset({0, 1, 2, 3, 4})  # back to the flag
+
+
+def test_days_of_week_wins_over_weekdays_only():
+    o = ContextOracle(id=None, context_id=1, enabled=True, kind="tarot",
+                      schedule_kind="sunrise", weekdays_only=True,
+                      days_of_week=frozenset({6, 0, 1, 2, 3}))
+    assert o.effective_days() == frozenset({6, 0, 1, 2, 3})
+
+
+def test_days_label_presets_and_list():
+    def lbl(days=None, wd=False):
+        return ContextOracle(id=None, context_id=1, enabled=True, kind="tarot",
+                             schedule_kind="sunrise", weekdays_only=wd,
+                             days_of_week=days).days_label()
+    assert lbl() == "every day"
+    assert lbl(frozenset(range(7))) == "every day"
+    assert lbl(wd=True) == "Mon-Fri"
+    assert lbl(frozenset({6, 0, 1, 2, 3})) == "Sun-Thu"
+    assert lbl(frozenset({5, 6})) == "weekends"
+    assert lbl(frozenset({0, 2, 4})) == "Mon, Wed, Fri"
+
+
 # ---------- fire_time_for + next_fire_time ----------------------------------
 
 def _sunrise_oracle(offset_minutes=0, weekdays_only=False) -> ContextOracle:
@@ -154,6 +206,33 @@ def test_next_fire_time_skips_weekends_when_weekdays_only():
     assert target.date() >= dt.date(2026, 5, 4)
 
 
+def test_next_fire_time_days_of_week_sun_thu_skips_friday_evening():
+    """Sun-Thu schedule on Friday 18:00 → Sunday's window (skips Fri leftover
+    and Saturday)."""
+    o = ContextOracle(
+        id=1, context_id=1, enabled=True, kind="wsb_digest",
+        schedule_kind="clock", clock_time="20:00", timezone="America/New_York",
+        days_of_week=frozenset({6, 0, 1, 2, 3}),
+    )
+    fri_evening = dt.datetime(2026, 5, 1, 21, 0, tzinfo=_NY).astimezone(_UTC)
+    target = next_fire_time(o, fri_evening).astimezone(_NY)
+    assert target.date() == dt.date(2026, 5, 3)  # Sunday
+    assert target.weekday() == 6
+
+
+def test_next_fire_time_single_day_jumps_a_week():
+    """A Sunday-only oracle on Monday → the coming Sunday, within the window."""
+    o = ContextOracle(
+        id=1, context_id=1, enabled=True, kind="tarot",
+        schedule_kind="clock", clock_time="09:25", timezone="America/New_York",
+        days_of_week=frozenset({6}),
+    )
+    monday = dt.datetime(2026, 5, 4, 10, 0, tzinfo=_NY).astimezone(_UTC)
+    target = next_fire_time(o, monday).astimezone(_NY)
+    assert target.date() == dt.date(2026, 5, 10)  # next Sunday
+    assert target.weekday() == 6
+
+
 def test_next_fire_time_returns_utc():
     """Always tz-aware UTC for clean delta math at the worker."""
     o = _clock_oracle()
@@ -163,11 +242,14 @@ def test_next_fire_time_returns_utc():
 
 # ---------- default_oracles_for_label ---------------------------------------
 
-def test_default_oracles_finance_label_yields_two_market_recaps():
+def test_default_oracles_finance_label_yields_market_recaps_and_wsb():
     out = default_oracles_for_label("Money Chat", context_id=42)
-    kinds = sorted(o.kind for o in out)
-    assert kinds == ["market_close", "market_open"]
-    assert all(o.weekdays_only for o in out)
+    by_kind = {o.kind: o for o in out}
+    assert sorted(by_kind) == ["market_close", "market_open", "wsb_digest"]
+    # market recaps run weekdays; wsb defaults to Sun-Thu (no Fri/Sat read)
+    assert by_kind["market_open"].weekdays_only
+    assert by_kind["market_close"].weekdays_only
+    assert by_kind["wsb_digest"].effective_days() == frozenset({6, 0, 1, 2, 3})
     assert all(not o.enabled for o in out)  # admin opts in
 
 
@@ -223,6 +305,66 @@ async def test_store_round_trip_preserves_every_field(store):
     assert fetched.weekdays_only is True
     assert fetched.prompt == "What's the daily theme?"
     assert fetched.label == "berlin morning"
+
+
+@pytest.mark.asyncio
+async def test_store_migrates_legacy_schema_without_days_column(tmp_path):
+    """A DB created before the picker (no days_of_week column) must gain the
+    column on first use, read legacy rows via the weekdays_only fallback, and
+    accept new days_of_week writes."""
+    import aiosqlite
+
+    db_path = str(tmp_path / "legacy.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """CREATE TABLE context_oracles (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   context_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+                   kind TEXT NOT NULL, schedule_kind TEXT NOT NULL,
+                   offset_minutes INTEGER NOT NULL DEFAULT 0, clock_time TEXT,
+                   timezone TEXT NOT NULL DEFAULT 'America/New_York',
+                   weekdays_only INTEGER NOT NULL DEFAULT 0, prompt TEXT,
+                   label TEXT NOT NULL DEFAULT '', last_fired_at REAL,
+                   created_at REAL NOT NULL, updated_at REAL NOT NULL )"""
+        )
+        await db.execute(
+            "INSERT INTO context_oracles (context_id, enabled, kind, schedule_kind,"
+            " clock_time, weekdays_only, created_at, updated_at) "
+            "VALUES (5, 1, 'market_open', 'clock', '09:25', 1, 0, 0)"
+        )
+        await db.commit()
+
+    store = OracleStore(db_path=db_path)
+    rows = await store.list_for_context(5)  # triggers the ALTER migration
+    assert len(rows) == 1 and rows[0].days_of_week is None
+    assert rows[0].effective_days() == frozenset({0, 1, 2, 3, 4})  # legacy fallback
+    # the migrated table now accepts a days_of_week write
+    rows[0].days_of_week = frozenset({6, 0, 1, 2, 3})
+    await store.upsert(rows[0])
+    assert (await store.get(rows[0].id)).days_of_week == frozenset({6, 0, 1, 2, 3})
+
+
+@pytest.mark.asyncio
+async def test_store_round_trips_days_of_week(store):
+    o = ContextOracle(
+        id=None, context_id=3, enabled=True, kind="wsb_digest",
+        schedule_kind="clock", clock_time="20:00",
+        days_of_week=frozenset({6, 0, 1, 2, 3}),
+    )
+    oid = await store.upsert(o)
+    fetched = await store.get(oid)
+    assert fetched.days_of_week == frozenset({6, 0, 1, 2, 3})
+    assert fetched.effective_days() == frozenset({6, 0, 1, 2, 3})
+    # updating to a different set persists
+    fetched.days_of_week = frozenset({0, 2, 4})
+    await store.upsert(fetched)
+    again = await store.get(oid)
+    assert again.days_of_week == frozenset({0, 2, 4})
+    # clearing to None (every day) round-trips as NULL
+    again.days_of_week = None
+    await store.upsert(again)
+    cleared = await store.get(oid)
+    assert cleared.days_of_week is None
 
 
 @pytest.mark.asyncio
@@ -328,11 +470,11 @@ async def test_prepopulate_seeds_only_group_contexts(store):
         _FakePolicy(4, "group", "woo-group-id", "Woo Chat"),
     ])
     n = await prepopulate_for_existing_contexts(store, registry)
-    # Money chat → 2 oracles, woo chat → 1, others → 0
-    assert n == 3
+    # Money chat → 3 oracles (market open/close + wsb digest), woo chat → 1
+    assert n == 4
     assert len(await store.list_for_context(1)) == 0
     assert len(await store.list_for_context(2)) == 0
-    assert len(await store.list_for_context(3)) == 2
+    assert len(await store.list_for_context(3)) == 3
     assert len(await store.list_for_context(4)) == 1
 
 

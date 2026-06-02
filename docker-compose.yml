@@ -52,6 +52,10 @@ services:
       - ./logs:/app/logs
       - /nvme-mirror/apps/signal-stock-bot/data:/app/data
       - ./admin_password.hash:/app/admin_password.hash:ro
+      # WSB daily read: the bot writes static HTML + og:image PNGs here; the
+      # host Caddy serves this dir (via the Cloudflare tunnel) at
+      # sigil.disinfo.zone. In-container path must match WSB_STATIC_DIR.
+      - /nvme-mirror/static/sigil:/static/sigil
     networks:
       - bot-network
     healthcheck:

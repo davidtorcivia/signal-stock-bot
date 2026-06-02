@@ -46,8 +46,13 @@ KINDS = (
     "market_open",
     "market_close",
     "freeform",
+    "wsb_digest",
 )
 SCHEDULE_KINDS = ("sunrise", "sunset", "clock")
+
+# Python weekday convention: Monday=0 .. Sunday=6 (matches datetime.weekday()).
+_DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_WEEKDAYS = frozenset({0, 1, 2, 3, 4})
 
 # NYC anchors all sunrise/sunset calculations. The chat-side timezone
 # is configurable per oracle (used only for `clock` schedules) — the
@@ -87,6 +92,13 @@ KIND_DESCRIPTIONS = {
         "Use for theme-specific morning notes (e.g. \"Today's "
         "moon phase + a one-line ritual suggestion\")."
     ),
+    "wsb_digest": (
+        "Daily r/wallstreetbets read. Crawls the day's top posts and the "
+        "megathread comments, tallies the most-mentioned tickers, and has "
+        "deep-think analyze the crowd against live prices. Publishes a static "
+        "page and posts a teaser + link to the chat. Best run after the close "
+        "(e.g. 20:00 ET) on weekdays."
+    ),
 }
 
 SCHEDULE_DESCRIPTIONS = {
@@ -115,10 +127,20 @@ class ContextOracle:
     offset_minutes: int = 0              # for sunrise/sunset
     clock_time: Optional[str] = None     # "HH:MM" for clock
     timezone: str = "America/New_York"   # tz for clock + display
-    weekdays_only: bool = False
+    weekdays_only: bool = False          # legacy; superseded by days_of_week
+    # Allowed weekdays (Mon=0..Sun=6). None or empty == every day. When set, it
+    # wins over weekdays_only; the column is the new source of truth and the
+    # flag is kept only so pre-existing rows keep firing on Mon-Fri.
+    days_of_week: Optional[frozenset[int]] = None
     prompt: Optional[str] = None         # for freeform
     label: str = ""
     last_fired_at: Optional[float] = None
+
+    def __post_init__(self):
+        # Normalize an explicit empty set to None so "no restriction" has one
+        # representation (and effective_days's truthiness check is unambiguous).
+        if self.days_of_week is not None and not self.days_of_week:
+            self.days_of_week = None
 
     def validate(self) -> list[str]:
         errs: list[str] = []
@@ -131,6 +153,10 @@ class ContextOracle:
                 errs.append("clock_time must be HH:MM (24h) when schedule is clock")
         if self.kind == "freeform" and not (self.prompt or "").strip():
             errs.append("prompt is required when kind is freeform")
+        if self.days_of_week is not None and any(
+            not isinstance(d, int) or d < 0 or d > 6 for d in self.days_of_week
+        ):
+            errs.append("days_of_week must be integers 0-6 (Mon=0..Sun=6)")
         try:
             ZoneInfo(self.timezone)
         except Exception:
@@ -147,12 +173,39 @@ class ContextOracle:
         except (ValueError, AttributeError):
             return False
 
+    def effective_days(self) -> Optional[frozenset[int]]:
+        """The weekdays this oracle may fire on (Mon=0..Sun=6), or None for
+        every day. `days_of_week` wins; falls back to the legacy `weekdays_only`
+        flag so rows created before the picker keep their Mon-Fri behavior."""
+        if self.days_of_week:
+            return self.days_of_week
+        if self.weekdays_only:
+            return _WEEKDAYS
+        return None
+
+    def days_label(self) -> str:
+        """Short human-readable day scope for the admin UI / logs."""
+        days = self.effective_days()
+        if days is None or len(days) == 7:
+            return "every day"
+        s = set(days)
+        if s == set(_WEEKDAYS):
+            return "Mon-Fri"
+        if s == {6, 0, 1, 2, 3}:
+            return "Sun-Thu"
+        if s == {5, 6}:
+            return "weekends"
+        return ", ".join(_DAY_ABBR[d] for d in sorted(s))
+
     def describe(self) -> str:
         """Human-readable schedule string for admin UI / logs."""
         if self.schedule_kind == "clock":
-            return f"{self.clock_time} {self.timezone}"
-        sign = "+" if self.offset_minutes >= 0 else ""
-        return f"{self.schedule_kind}{sign}{self.offset_minutes}m (NYC)"
+            base = f"{self.clock_time} {self.timezone}"
+        else:
+            sign = "+" if self.offset_minutes >= 0 else ""
+            base = f"{self.schedule_kind}{sign}{self.offset_minutes}m (NYC)"
+        days = self.days_label()
+        return base if days == "every day" else f"{base} · {days}"
 
 
 # ---------- schedule math ----------------------------------------------------
@@ -163,13 +216,6 @@ def _astro_event_for(date: dt.date, kind: str) -> dt.datetime:
     s = sun(_LOCATION.observer, date=date)
     event = s["sunrise"] if kind == "sunrise" else s["sunset"]
     return event.astimezone(_LOCATION.tzinfo)
-
-
-def _is_weekday(dt_local: dt.datetime) -> bool:
-    """Mon=0..Sun=6 — exclude Sat/Sun for weekdays_only oracles. US
-    holidays aren't filtered (would need a calendar dependency); the
-    market_recap oracles will just post a quiet day on holidays."""
-    return dt_local.weekday() < 5
 
 
 def fire_time_for(oracle: ContextOracle, date: dt.date) -> dt.datetime:
@@ -190,9 +236,9 @@ def fire_time_for(oracle: ContextOracle, date: dt.date) -> dt.datetime:
 def next_fire_time(
     oracle: ContextOracle, now: Optional[dt.datetime] = None
 ) -> dt.datetime:
-    """Soonest firing instant strictly after `now`, respecting
-    weekdays_only. Always returns a tz-aware UTC datetime so the
-    caller can take naive `(target - now)` deltas without surprise."""
+    """Soonest firing instant strictly after `now`, respecting the oracle's
+    allowed weekdays (`effective_days`). Always returns a tz-aware UTC datetime
+    so the caller can take naive `(target - now)` deltas without surprise."""
     # Anchor "today" in the oracle's local frame so a clock=00:30 oracle
     # in Tokyo doesn't compute against UTC midnight and miss the day.
     local_tz = (
@@ -204,14 +250,16 @@ def next_fire_time(
         now = dt.datetime.now(dt.timezone.utc)
     now_local = now.astimezone(local_tz)
 
-    # Look at today and the next 8 days (covers weekdays_only with two
-    # weekend skips). Stop at the first valid future fire time.
+    # Look at today and the next 8 days. With at least one allowed weekday the
+    # next occurrence is always within 7 days, so this window never misses a
+    # valid schedule. Stop at the first valid future fire time.
+    allowed = oracle.effective_days()
     for delta in range(0, 9):
         candidate_date = (now_local + dt.timedelta(days=delta)).date()
         fire = fire_time_for(oracle, candidate_date)
         if fire <= now_local:
             continue
-        if oracle.weekdays_only and not _is_weekday(fire):
+        if allowed is not None and fire.weekday() not in allowed:
             continue
         return fire.astimezone(dt.timezone.utc)
 
@@ -222,6 +270,22 @@ def next_fire_time(
 
 
 # ---------- store ------------------------------------------------------------
+
+def _days_to_str(days: Optional[frozenset[int]]) -> Optional[str]:
+    """Serialize an allowed-days set to a sorted CSV ('0,1,2,3,6'). None, empty,
+    or all-seven all store NULL — every canonical "every day" maps to one value."""
+    if not days or len(days) >= 7:
+        return None
+    return ",".join(str(d) for d in sorted(days))
+
+
+def _str_to_days(s: Optional[str]) -> Optional[frozenset[int]]:
+    """Parse the CSV back; NULL/empty/garbage -> None (every day)."""
+    if not s:
+        return None
+    out = {int(p) for p in s.split(",") if p.strip().isdigit() and 0 <= int(p) <= 6}
+    return frozenset(out) or None
+
 
 class OracleStore:
     """SQLite-backed CRUD for per-context oracles."""
@@ -253,6 +317,7 @@ class OracleStore:
                         clock_time TEXT,
                         timezone TEXT NOT NULL DEFAULT 'America/New_York',
                         weekdays_only INTEGER NOT NULL DEFAULT 0,
+                        days_of_week TEXT,
                         prompt TEXT,
                         label TEXT NOT NULL DEFAULT '',
                         last_fired_at REAL,
@@ -261,6 +326,14 @@ class OracleStore:
                     )
                     """
                 )
+                # Upgrade path for installs created before the day-of-week
+                # picker — add the column if it's missing (cf. registry.py).
+                cursor = await db.execute("PRAGMA table_info(context_oracles)")
+                cols = {r[1] for r in await cursor.fetchall()}
+                if "days_of_week" not in cols:
+                    await db.execute(
+                        "ALTER TABLE context_oracles ADD COLUMN days_of_week TEXT"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_oracle_context "
                     "ON context_oracles(context_id)"
@@ -274,7 +347,8 @@ class OracleStore:
 
     _COLS = (
         "id, context_id, enabled, kind, schedule_kind, offset_minutes, "
-        "clock_time, timezone, weekdays_only, prompt, label, last_fired_at"
+        "clock_time, timezone, weekdays_only, prompt, label, last_fired_at, "
+        "days_of_week"
     )
 
     @staticmethod
@@ -292,6 +366,7 @@ class OracleStore:
             prompt=row[9],
             label=row[10] or "",
             last_fired_at=row[11],
+            days_of_week=_str_to_days(row[12]),
         )
 
     async def list_for_context(self, context_id: int) -> list[ContextOracle]:
@@ -334,9 +409,9 @@ class OracleStore:
                     """INSERT INTO context_oracles
                        (context_id, enabled, kind, schedule_kind,
                         offset_minutes, clock_time, timezone,
-                        weekdays_only, prompt, label, last_fired_at,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        weekdays_only, days_of_week, prompt, label,
+                        last_fired_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         oracle.context_id,
                         1 if oracle.enabled else 0,
@@ -346,6 +421,7 @@ class OracleStore:
                         oracle.clock_time,
                         oracle.timezone,
                         1 if oracle.weekdays_only else 0,
+                        _days_to_str(oracle.days_of_week),
                         oracle.prompt,
                         oracle.label,
                         oracle.last_fired_at,
@@ -359,8 +435,8 @@ class OracleStore:
                 """UPDATE context_oracles SET
                        enabled = ?, kind = ?, schedule_kind = ?,
                        offset_minutes = ?, clock_time = ?, timezone = ?,
-                       weekdays_only = ?, prompt = ?, label = ?,
-                       updated_at = ?
+                       weekdays_only = ?, days_of_week = ?, prompt = ?,
+                       label = ?, updated_at = ?
                    WHERE id = ?""",
                 (
                     1 if oracle.enabled else 0,
@@ -370,6 +446,7 @@ class OracleStore:
                     oracle.clock_time,
                     oracle.timezone,
                     1 if oracle.weekdays_only else 0,
+                    _days_to_str(oracle.days_of_week),
                     oracle.prompt,
                     oracle.label,
                     now,
@@ -513,6 +590,15 @@ def default_oracles_for_label(label: str, context_id: int) -> list[ContextOracle
             clock_time="16:05", timezone="America/New_York",
             weekdays_only=True,
             label="close-of-day recap",
+        ))
+        out.append(ContextOracle(
+            id=None, context_id=context_id, enabled=False,
+            kind="wsb_digest", schedule_kind="clock",
+            clock_time="20:00", timezone="America/New_York",
+            # Sun-Thu: the 8pm read sets up the next trading day, so a Fri/Sat
+            # run is wasted (markets are closed Sat/Sun).
+            days_of_week=frozenset({6, 0, 1, 2, 3}),
+            label="wsb daily read",
         ))
 
     if any(k in low for k in _WOO_KEYWORDS):

@@ -115,6 +115,8 @@ class DailyOracleWorker:
         bot_phone: str = "",
         bot_name: str = "Bot",
         bot_registry=None,
+        llm_factory=None,
+        wsb_service=None,
     ):
         self.store = oracle_store
         self.contexts = context_registry
@@ -134,6 +136,12 @@ class DailyOracleWorker:
         # Without it, ask_command falls back to the legacy single-bot
         # client (still correct for single-bot installs).
         self.bot_registry = bot_registry
+        # Optional — wired for the wsb_digest oracle kind. llm_factory yields the
+        # per-bot, tool-equipped deep-think client; wsb_service owns the crawl →
+        # analyze → publish pipeline. Both None on single-bot/test installs that
+        # don't use the WSB digest.
+        self.llm_factory = llm_factory
+        self.wsb_service = wsb_service
 
     async def run_forever(self) -> None:
         logger.info("Daily oracle worker started")
@@ -226,6 +234,8 @@ class DailyOracleWorker:
                 posted = await self._fire_iching(oracle, ctx_policy, group_id)
             elif oracle.kind in ("market_open", "market_close", "freeform"):
                 posted = await self._fire_llm_oracle(oracle, ctx_policy, group_id)
+            elif oracle.kind == "wsb_digest":
+                posted = await self._fire_wsb(oracle, ctx_policy, group_id)
             else:
                 logger.warning(
                     f"Oracle #{oracle.id}: unknown kind {oracle.kind!r}"
@@ -302,6 +312,103 @@ class DailyOracleWorker:
         )
         return True
 
+    async def _produce_wsb(self, ctx_policy, group_id):
+        """Run the WSB pipeline (crawl → deep-think analysis → publish the
+        static read). Does NOT post to chat. Returns (payload, error_str);
+        payload is None on any failure with a human-readable reason."""
+        if self.wsb_service is None:
+            return None, "wsb_service not wired"
+        bot = self._resolve_bot(ctx_policy)
+        dt_client = self._deep_think_for(bot)
+        if dt_client is None:
+            return None, "no deep-think client (llm_factory unwired)"
+        # caller_ctx carries the group's policy so deep-think's bot tools
+        # (price/news) can actually execute for the live cross-check.
+        caller_ctx = self._synth_ctx(group_id, ctx_policy, "wsb digest", "wsb")
+        bot_name = (getattr(bot, "display_name", None) if bot else None) or self.bot_name or "Sigil"
+        payload = await self.wsb_service.run(
+            deep_think_client=dt_client, caller_ctx=caller_ctx, bot_name=bot_name
+        )
+        if payload is None:
+            return None, "digest produced nothing (empty crawl or deep-think unavailable)"
+        return payload, None
+
+    async def _post_wsb(self, ctx_policy, group_id, payload, header: str) -> bool:
+        """Post the teaser + link card to the chat. Returns True only when a
+        message actually went out."""
+        if self.wsb_service is None:
+            return False
+        # Lead the chat message with the model's TLDR (a brief day-summary in the
+        # same voice); the link's own preview card carries the teaser/headline.
+        blurb = payload.tldr or payload.teaser or payload.headline
+        body = f"{header}\n\n{blurb}"
+        if payload.page_url:
+            body = f"{body}\n\n{payload.page_url}"
+        sender_handler = self._sender_for(ctx_policy)
+        if sender_handler is None:
+            logger.warning("WSB digest: no signal handler available; not posting")
+            return False
+        await sender_handler.send_message(
+            recipient="", message=body, group_id=group_id, styled=False
+        )
+        await self.wsb_service.mark_posted(payload.date, True)
+        return True
+
+    async def _fire_wsb(self, oracle, ctx_policy, group_id) -> bool:
+        """wsb_digest oracle: produce the digest + publish, then post a teaser
+        + link. Returns True ONLY when a message went out (mark_fired contract)."""
+        payload, err = await self._produce_wsb(ctx_policy, group_id)
+        if payload is None:
+            logger.warning(f"Oracle #{oracle.id}: wsb digest skipped — {err}")
+            return False
+        posted = await self._post_wsb(
+            ctx_policy, group_id, payload, self._oracle_header(oracle)
+        )
+        if posted:
+            logger.info(
+                f"Oracle #{oracle.id} (wsb_digest) posted to ...{group_id[-8:]}"
+            )
+        return posted
+
+    async def run_wsb_now(self, context_id: int, *, post_to_chat: bool = True) -> dict:
+        """Admin-triggered manual run for a context. Crawls, analyzes, and
+        publishes the static page/index/og; optionally posts the teaser + link
+        to the chat. Never raises — returns a status dict for logging/flashing."""
+        try:
+            ctx_policy = await self.contexts.get(context_id) if self.contexts else None
+            if ctx_policy is None or getattr(ctx_policy, "kind", None) != "group":
+                return {"ok": False, "error": "context not found or not a group"}
+            group_id = ctx_policy.key
+            payload, err = await self._produce_wsb(ctx_policy, group_id)
+            if payload is None:
+                return {"ok": False, "error": err}
+            posted = False
+            if post_to_chat:
+                posted = await self._post_wsb(
+                    ctx_policy, group_id, payload, "📊 WSB daily:"
+                )
+            logger.info(
+                f"Admin WSB run for context #{context_id}: page={payload.page_url} "
+                f"posted={posted}"
+            )
+            return {
+                "ok": True, "page_url": payload.page_url,
+                "headline": payload.headline, "posted": posted,
+                "charts": payload.chart_count,
+            }
+        except Exception as e:
+            logger.exception(f"run_wsb_now failed for context #{context_id}: {e}")
+            return {"ok": False, "error": str(e)}
+
+    def _deep_think_for(self, bot):
+        """Per-bot deep-think client from the shared factory (cached, with
+        bot_tools + mcp_manager already attached). Falls back to the legacy
+        global client when no bot is resolved; None if the factory is unwired."""
+        if self.llm_factory is None:
+            return None
+        bot_id = getattr(bot, "id", None) if bot is not None else None
+        return self.llm_factory.get_deep_think(bot_id)
+
     @staticmethod
     def _llm_prompt_for(oracle: ContextOracle) -> str:
         if oracle.kind == "market_open":
@@ -316,6 +423,7 @@ class DailyOracleWorker:
             "market_open": "🔔 Pre-market check",
             "market_close": "🔔 Closing recap",
             "freeform": "🌅 Today's oracle",
+            "wsb_digest": "📊 WSB daily",
         }
         head = prefix_by_kind.get(oracle.kind, "🌅 Today's oracle")
         if oracle.label:

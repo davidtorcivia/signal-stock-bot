@@ -276,8 +276,10 @@ class LLMClient:
         """Send a full messages array and return the assistant message dict.
 
         The returned dict keeps OpenAI's shape: {role, content, tool_calls?}.
-        The current UTC time is always injected into the system prompt so the
-        LLM knows "now" without relying on its training cutoff.
+        The current UTC + ET time is always prepended to the last user
+        message so the LLM knows "now" without relying on its training
+        cutoff. Kept out of the system block to preserve DeepSeek's
+        prefix-match cache — see `_inject_current_time`.
 
         `overrides` keys (any subset, all optional):
           model, temperature, max_tokens, extra_body
@@ -443,12 +445,15 @@ class LLMClient:
             if msg.get("content") is None:
                 msg["content"] = ""
             usage = data.get("usage") or {}
+            cache_hit, cache_miss = _extract_cache_tokens(usage)
             metrics.record_llm_success(
                 purpose=purpose,
                 model=effective_model,
                 latency_ms=latency_ms,
                 tokens_in=usage.get("prompt_tokens", 0),
                 tokens_out=usage.get("completion_tokens", 0),
+                cache_hit_tokens=cache_hit,
+                cache_miss_tokens=cache_miss,
             )
             # Per-context transcript capture. Only writer rounds (ask /
             # augment) — reactor/summary/healthcheck are intentionally
@@ -639,6 +644,34 @@ def _log_payload_shape(payload: dict, *, purpose: str, url: str) -> None:
         logger.debug(f"_log_payload_shape failed: {e}")
 
 
+def _extract_cache_tokens(usage: dict) -> tuple[int, int]:
+    """Pull (cache_hit_tokens, cache_miss_tokens) from a usage block.
+
+    DeepSeek returns `prompt_cache_hit_tokens` + `prompt_cache_miss_tokens`
+    at the top level of `usage`. OpenAI nests cached tokens under
+    `prompt_tokens_details.cached_tokens` with no miss field, so we infer
+    miss from `prompt_tokens - cached`. Returns (0, 0) when neither shape
+    is present (provider doesn't report cache, or hasn't cached yet).
+    """
+    if not isinstance(usage, dict) or not usage:
+        return 0, 0
+    if (
+        usage.get("prompt_cache_hit_tokens") is not None
+        or usage.get("prompt_cache_miss_tokens") is not None
+    ):
+        return (
+            int(usage.get("prompt_cache_hit_tokens") or 0),
+            int(usage.get("prompt_cache_miss_tokens") or 0),
+        )
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if cached is not None:
+        hit = int(cached or 0)
+        miss = max(0, int(usage.get("prompt_tokens") or 0) - hit)
+        return hit, miss
+    return 0, 0
+
+
 def _ensure_reasoning_content(messages: list[dict]) -> list[dict]:
     """Mirror OpenRouter's `reasoning` / `reasoning_details` onto each
     assistant turn's `reasoning_content`.
@@ -680,20 +713,56 @@ def _ensure_reasoning_content(messages: list[dict]) -> list[dict]:
 
 
 def _inject_current_time(messages: list[dict]) -> list[dict]:
-    """Append the current time (UTC + ET, with weekday) to the system message.
+    """Prepend the current time (UTC + ET, with weekday) to the last user
+    message — explicitly NOT to the system block.
 
     The bot lives on ET — most of the chats are US-time-zone-anchored. The
     weekday name is included because models reason about market-day vs.
     weekend logic better with a literal "Friday" than with an ISO date.
+
+    Why the last user message and not the system prompt: DeepSeek (the
+    primary backend) does prefix-match caching with hours-to-days TTL.
+    Putting a string that changes every minute inside the system block
+    forces a cache miss on every call — system text, tool schemas, and
+    prior turns all become un-cacheable. Stashing the timestamp at the
+    tail of the last user message keeps the entire prefix stable so the
+    cache hits on the bulk of the payload.
+
+    Walks backward so a mid-tool-loop messages array (ending in tool
+    responses) still attaches the time to the user's question rather than
+    to an intermediate tool message.
     """
     now_utc = datetime.now(timezone.utc)
     now_et = now_utc.astimezone(_NY)
     weekday = now_et.strftime("%A")
     et_str = now_et.strftime("%Y-%m-%d %H:%M %Z")
     utc_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
-    return _append_to_system(
-        messages, f"Current time: {weekday}, {et_str} ({utc_str})"
-    )
+    time_line = f"[Current time: {weekday}, {et_str} ({utc_str})]"
+
+    out = list(messages)
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") != "user":
+            continue
+        head = dict(out[i])
+        content = head.get("content")
+        if isinstance(content, list):
+            # Vision multimodal: prepend a text part so the time lands
+            # before any image parts the model has to process.
+            head["content"] = [
+                {"type": "text", "text": time_line}, *content,
+            ]
+        else:
+            existing = (content or "")
+            head["content"] = (
+                f"{time_line}\n\n{existing}" if existing else time_line
+            )
+        out[i] = head
+        return out
+    # No user message in the array — fall back to appending one so the
+    # model still sees the time. Defensive; our call sites all include a
+    # user turn.
+    out.append({"role": "user", "content": time_line})
+    return out
 
 
 def _append_to_system(messages: list[dict], extra: str) -> list[dict]:

@@ -64,7 +64,13 @@ class Config:
     
     # Database settings
     watchlist_db_path: str = "data/watchlist.db"
-    
+
+    # WSB daily-digest static output dir (in-container path; bind-mount the host
+    # static dir here so the host Caddy serves it). Other WSB knobs (Redlib URL,
+    # subreddit, public base URL, indexable, user-agent) are admin-editable in
+    # the settings store, not env.
+    wsb_static_dir: str = "/static/sigil"
+
     # Admin settings
     admin_numbers: list[str] = field(default_factory=list)  # Phone numbers for admin access
     user_rate_limit: int = 30  # Max requests per minute per user
@@ -158,6 +164,7 @@ class Config:
             port=int(os.getenv("PORT", "5000")),
             providers=providers,
             watchlist_db_path=os.getenv("WATCHLIST_DB_PATH", "data/watchlist.db"),
+            wsb_static_dir=os.getenv("WSB_STATIC_DIR", "/static/sigil"),
             admin_numbers=[n.strip() for n in os.getenv("ADMIN_NUMBERS", "").split(",") if n.strip()],
             user_rate_limit=int(os.getenv("USER_RATE_LIMIT", "30")),
             webhook_secret=os.getenv("WEBHOOK_SECRET", "").strip(),

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ bot_name }} · WSB Daily{% endblock %}</title>
+{% if not indexable %}<meta name="robots" content="noindex, nofollow">{% endif %}
+{% block meta %}{% endblock %}
+<style>
+  :root {
+    --bg:#0B0B0F; --panel:#15161B; --panel2:#1C1D24; --line:#262833;
+    --ink:#E8E8EC; --dim:#8A8A95; --faint:#5A5B66;
+    --green:#3FB950; --red:#F85149; --amber:#D29922; --accent:#8B7FD6;
+  }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px; }
+  header.site {
+    border-bottom:1px solid var(--line); position:sticky; top:0;
+    background:rgba(11,11,15,.85); backdrop-filter:blur(8px); z-index:5;
+  }
+  header.site .wrap { display:flex; align-items:baseline; gap:14px; padding:14px 20px; }
+  .brand { font-weight:700; letter-spacing:.3px; color:var(--ink); font-size:18px; }
+  .brand .glyph { color:var(--accent); }
+  header .tag { color:var(--dim); font-size:13px; }
+  main { padding:34px 0 10px; }
+  h1 { font-size:30px; line-height:1.2; margin:.2em 0 .3em; letter-spacing:-.01em; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.12em; color:var(--accent);
+       margin:38px 0 12px; font-weight:700; }
+  h3 { font-size:19px; margin:26px 0 8px; }
+  .date { color:var(--dim); font-size:14px; letter-spacing:.04em; text-transform:uppercase; }
+  .lead { font-size:18px; color:#CFCFD6; border-left:3px solid var(--accent);
+          padding:2px 0 2px 16px; margin:18px 0 6px; }
+  .prose p { margin:0 0 14px; }
+  .prose ul { margin:0 0 14px; padding-left:20px; }
+  .prose code { background:var(--panel2); padding:1px 5px; border-radius:4px; font-size:.9em; }
+  .meta-row { color:var(--faint); font-size:13px; margin:6px 0 0; }
+  table.tickers { width:100%; border-collapse:collapse; margin:8px 0 4px; font-size:14px; }
+  table.tickers td, table.tickers th { padding:8px 8px; border-bottom:1px solid var(--line); text-align:left; }
+  table.tickers th { color:var(--dim); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+  .sym { font-weight:700; font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; }
+  .rank { color:var(--faint); width:24px; }
+  .barcell { width:38%; }
+  .bar { height:8px; border-radius:4px; background:var(--accent); min-width:3px; opacity:.85; }
+  .barwrap { display:flex; align-items:center; gap:8px; }
+  .barwrap .n { color:var(--dim); font-variant-numeric:tabular-nums; width:30px; }
+  .lean { font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .lean.bullish { color:var(--green); background:rgba(63,185,80,.12); }
+  .lean.bearish { color:var(--red); background:rgba(248,81,73,.12); }
+  .lean.mixed { color:var(--amber); background:rgba(210,153,34,.12); }
+  ul.posts { list-style:none; margin:0; padding:0; }
+  ul.posts li { padding:12px 0; border-bottom:1px solid var(--line); }
+  .flair { display:inline-block; font-size:11px; font-weight:700; color:var(--accent);
+           background:var(--panel2); padding:1px 7px; border-radius:4px; margin-right:8px;
+           vertical-align:middle; }
+  .pmeta { color:var(--faint); font-size:13px; margin-top:3px; }
+  .charts { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+            gap:12px; margin:8px 0 6px; }
+  .charts .chart { display:block; border:1px solid var(--line); border-radius:10px;
+                   overflow:hidden; line-height:0; background:var(--panel); }
+  .charts .chart img { width:100%; height:auto; display:block; }
+  .charts .chart:hover { border-color:var(--accent); }
+  .cards { list-style:none; margin:0; padding:0; }
+  .cards li { padding:18px 0; border-bottom:1px solid var(--line); }
+  .cards .hl { font-size:18px; font-weight:600; }
+  .cards .tk { color:var(--dim); font-size:13px; margin-top:4px; font-family:ui-monospace,monospace; }
+  footer.site { border-top:1px solid var(--line); margin-top:40px; padding:24px 0 50px; }
+  footer.site .wrap { color:var(--faint); font-size:12.5px; line-height:1.7; }
+  footer.site a { color:var(--dim); }
+</style>
+</head>
+<body>
+<header class="site"><div class="wrap">
+  <a class="brand" href="/"><span class="glyph">◈</span> {{ bot_name }}</a>
+  <span class="tag">r/{{ subreddit }} daily read</span>
+</div></header>
+<main><div class="wrap">
+{% block content %}{% endblock %}
+</div></main>
+<footer class="site"><div class="wrap">
+  Aggregated from public r/{{ subreddit }} posts via a self-hosted Redlib mirror.
+  Analysis by {{ bot_name }} (an automated model). <strong>Not financial advice.</strong>
+  Sentiment is crowd noise, not signal. · <a href="/">all reads</a>
+</div></footer>
+</body>
+</html>

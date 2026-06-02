@@ -89,6 +89,8 @@ class MetricsLog:
                         latency_ms REAL,
                         tokens_in INTEGER,
                         tokens_out INTEGER,
+                        cache_hit_tokens INTEGER,
+                        cache_miss_tokens INTEGER,
                         emoji TEXT,
                         skip_reason TEXT,
                         error_msg TEXT,
@@ -96,12 +98,22 @@ class MetricsLog:
                     )
                     """
                 )
-                # Pre-existing installs may not yet have bot_id; add it.
+                # Pre-existing installs may not yet have newer columns; add
+                # them in-place. Each ALTER is guarded so re-running on a
+                # fresh install is a no-op.
                 cursor = await db.execute("PRAGMA table_info(metric_events)")
                 cols = {r[1] for r in await cursor.fetchall()}
                 if "bot_id" not in cols:
                     await db.execute(
                         "ALTER TABLE metric_events ADD COLUMN bot_id INTEGER"
+                    )
+                if "cache_hit_tokens" not in cols:
+                    await db.execute(
+                        "ALTER TABLE metric_events ADD COLUMN cache_hit_tokens INTEGER"
+                    )
+                if "cache_miss_tokens" not in cols:
+                    await db.execute(
+                        "ALTER TABLE metric_events ADD COLUMN cache_miss_tokens INTEGER"
                     )
                 # Two indexes: one for kind-scoped windowed queries (the
                 # common dashboard shape), one for time-only prunes.
@@ -128,6 +140,8 @@ class MetricsLog:
             fields.get("latency_ms"),
             fields.get("tokens_in"),
             fields.get("tokens_out"),
+            fields.get("cache_hit_tokens"),
+            fields.get("cache_miss_tokens"),
             fields.get("emoji"),
             fields.get("skip_reason"),
             fields.get("error_msg"),
@@ -156,8 +170,9 @@ class MetricsLog:
                 await db.executemany(
                     """INSERT INTO metric_events
                        (occurred_at, kind, purpose, model, latency_ms,
-                        tokens_in, tokens_out, emoji, skip_reason, error_msg)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tokens_in, tokens_out, cache_hit_tokens,
+                        cache_miss_tokens, emoji, skip_reason, error_msg)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     batch,
                 )
                 await db.commit()
@@ -200,7 +215,9 @@ class MetricsLog:
                    SUM(COALESCE(tokens_in,  0)) AS tokens_in,
                    SUM(COALESCE(tokens_out, 0)) AS tokens_out,
                    AVG(CASE WHEN kind = ? THEN latency_ms END) AS avg_latency_ms,
-                   MAX(occurred_at) AS last_at
+                   MAX(occurred_at) AS last_at,
+                   SUM(COALESCE(cache_hit_tokens,  0)) AS cache_hit_tokens,
+                   SUM(COALESCE(cache_miss_tokens, 0)) AS cache_miss_tokens
                FROM metric_events
                WHERE kind IN (?, ?) AND occurred_at >= ?""",
             (ok_kind, err_kind, ok_kind, ok_kind, err_kind, cutoff),
@@ -241,6 +258,9 @@ class MetricsLog:
         )
         err_row = await cursor.fetchone()
 
+        cache_hit = (row[6] or 0) if row else 0
+        cache_miss = (row[7] or 0) if row else 0
+        cache_total = cache_hit + cache_miss
         return {
             "calls": calls,
             "successes": successes,
@@ -256,6 +276,9 @@ class MetricsLog:
             "last_error_msg": err_row[0] if err_row else None,
             "by_purpose": by_purpose,
             "by_model": by_model,
+            "cache_hit_tokens": cache_hit,
+            "cache_miss_tokens": cache_miss,
+            "cache_hit_ratio": (cache_hit / cache_total) if cache_total else 0.0,
         }
 
     async def _aggregate_reactor(self, db, cutoff: float) -> dict:

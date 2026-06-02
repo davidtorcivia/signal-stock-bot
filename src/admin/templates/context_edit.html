@@ -363,6 +363,32 @@
       {% endif %}
     {% endwith %}
 
+    <div style="margin: 8px 0 18px; padding: 12px; border: 1px solid var(--line, #333); border-radius: 6px;">
+        <strong style="font-size: 13px;">📊 WSB daily digest</strong>
+        <p class="muted" style="font-size: 12px; margin: 4px 0 10px;">
+            Run the WSB pipeline for this group now — crawl r/wallstreetbets, have
+            deep-think analyze it, publish the static read (page + index + og:image),
+            and optionally post the teaser + link here. Useful for testing before the
+            scheduled fire. Takes ~1 minute; watch for the result in the logs / on the
+            page. (deep-think must be configured, or it skips.)
+        </p>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <form method="post"
+                  action="{{ url_for('admin.oracle_run_wsb', context_id=policy.id) }}"
+                  onsubmit="return confirm('Run the WSB digest now and POST it to this chat?');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="post_to_chat" value="1">
+                <button class="secondary" type="submit">Run now + post to chat</button>
+            </form>
+            <form method="post"
+                  action="{{ url_for('admin.oracle_run_wsb', context_id=policy.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="post_to_chat" value="0">
+                <button class="secondary" type="submit">Preview (publish page, no post)</button>
+            </form>
+        </div>
+    </div>
+
     {% if oracles %}
     <table style="margin-bottom: 16px;">
         <thead>
@@ -380,7 +406,7 @@
             <tr>
                 <td>{{ o.id }}</td>
                 <td>{{ o.kind }}</td>
-                <td>{{ o.description }}{% if o.weekdays_only %} <span class="muted">(weekdays only)</span>{% endif %}</td>
+                <td>{{ o.description }}</td>
                 <td>{{ o.label or '—' }}</td>
                 <td>{{ '✓' if o.enabled else '—' }}</td>
                 <td>
@@ -416,10 +442,18 @@
                                 <input type="checkbox" name="enabled" {% if o.enabled %}checked{% endif %}>
                                 <span>Enabled</span>
                             </label>
-                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-                                <input type="checkbox" name="weekdays_only" {% if o.weekdays_only %}checked{% endif %}>
-                                <span>Weekdays only (skip Sat/Sun)</span>
-                            </label>
+                            <label>Days of week</label>
+                            <div class="daypicker">
+                                {% for dn, dv in [('Mon',0),('Tue',1),('Wed',2),('Thu',3),('Fri',4),('Sat',5),('Sun',6)] %}
+                                <label class="day"><input type="checkbox" name="days" value="{{ dv }}" {% if dv in o.days_checked %}checked{% endif %}> {{ dn }}</label>
+                                {% endfor %}
+                            </div>
+                            <div class="daypresets">
+                                <button type="button" onclick="setDays(this,[0,1,2,3,4])">Weekdays</button>
+                                <button type="button" onclick="setDays(this,[6,0,1,2,3])">Sun-Thu</button>
+                                <button type="button" onclick="setDays(this,[0,1,2,3,4,5,6])">Every day</button>
+                            </div>
+                            <p class="muted" style="font-size:11px;margin:2px 0 0;">Days this oracle runs. All or none checked = every day.</p>
                             <div style="margin-top: 12px; display:flex; gap:12px;">
                                 <button type="submit">Save</button>
                             </div>
@@ -489,10 +523,18 @@
                 <input type="checkbox" name="enabled">
                 <span>Enabled</span>
             </label>
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-                <input type="checkbox" name="weekdays_only">
-                <span>Weekdays only</span>
-            </label>
+            <label>Days of week</label>
+            <div class="daypicker">
+                {% for dn, dv in [('Mon',0),('Tue',1),('Wed',2),('Thu',3),('Fri',4),('Sat',5),('Sun',6)] %}
+                <label class="day"><input type="checkbox" name="days" value="{{ dv }}" checked> {{ dn }}</label>
+                {% endfor %}
+            </div>
+            <div class="daypresets">
+                <button type="button" onclick="setDays(this,[0,1,2,3,4])">Weekdays</button>
+                <button type="button" onclick="setDays(this,[6,0,1,2,3])">Sun-Thu</button>
+                <button type="button" onclick="setDays(this,[0,1,2,3,4,5,6])">Every day</button>
+            </div>
+            <p class="muted" style="font-size:11px;margin:2px 0 0;">Days this oracle runs. All or none checked = every day.</p>
 
             <div style="margin-top: 12px;">
                 <button type="submit">Add oracle</button>
@@ -501,5 +543,26 @@
     </details>
 </div>
 {% endif %}
+
+<style>
+  .daypicker { display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 6px; }
+  .daypicker .day { display:inline-flex; align-items:center; gap:5px; cursor:pointer;
+    font-size:13px; color:var(--text); text-transform:none; letter-spacing:normal; margin:0; }
+  .daypresets { display:flex; flex-wrap:wrap; gap:8px; margin:2px 0; }
+  .daypresets button { font-size:12px; padding:3px 10px; background:var(--panel2,#1C1D24);
+    color:var(--text); border:1px solid var(--line,#262833); border-radius:6px; cursor:pointer; }
+  .daypresets button:hover { border-color:var(--accent,#8B7FD6); }
+</style>
+<script>
+  // Day-of-week preset buttons: tick exactly `days` (Mon=0..Sun=6) within the
+  // button's own oracle form, leaving other forms on the page untouched.
+  function setDays(btn, days) {
+    var form = btn.closest('form');
+    if (!form) return;
+    form.querySelectorAll('input[name="days"]').forEach(function (box) {
+      box.checked = days.indexOf(parseInt(box.value, 10)) !== -1;
+    });
+  }
+</script>
 
 {% endblock %}

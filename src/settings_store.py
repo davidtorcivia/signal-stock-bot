@@ -79,6 +79,13 @@ LIVE_KEYS = {
     "deep_think_caps_enabled",
     "deep_think_user_daily_cap",
     "deep_think_group_daily_cap",
+    # WSB daily digest (the wsb_digest oracle kind) — all live. The static
+    # output dir is env-only (config.wsb_static_dir / WSB_STATIC_DIR).
+    "wsb_redlib_base_url",
+    "wsb_subreddit",
+    "wsb_public_base_url",
+    "wsb_indexable",
+    "wsb_user_agent",
 }
 
 # Legacy keys kept readable so the migration in

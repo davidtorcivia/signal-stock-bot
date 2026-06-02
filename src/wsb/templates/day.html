@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}{{ rec.headline or "WSB Daily" }} · {{ bot_name }}{% endblock %}
+{% block meta %}
+<link rel="canonical" href="{{ page_url }}">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="{{ bot_name }} · WSB Daily">
+<meta property="og:title" content="{{ rec.headline or 'WSB Daily — ' ~ rec.date }}">
+<meta property="og:description" content="{{ rec.teaser }}">
+<meta property="og:url" content="{{ page_url }}">
+<meta property="og:image" content="{{ og_image }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ rec.headline or 'WSB Daily — ' ~ rec.date }}">
+<meta name="twitter:description" content="{{ rec.teaser }}">
+<meta name="twitter:image" content="{{ og_image }}">
+{% endblock %}
+{% block content %}
+<p class="date">{{ rec.date }} · WSB Daily</p>
+<h1>{{ rec.headline or "What WallStreetBets did today" }}</h1>
+{% if rec.teaser %}<p class="lead">{{ rec.teaser }}</p>{% endif %}
+<p class="meta-row">{{ rec.posts_scanned }} top posts · {{ rec.comments_scanned }} comments scanned</p>
+
+<div class="prose">
+{{ rec.body_md | md | safe }}
+</div>
+
+{% if rec.charts %}
+<h2>Price action · top names</h2>
+<div class="charts">
+  {% for c in rec.charts %}
+  <a class="chart" href="https://finviz.com/quote.ashx?t={{ c.symbol }}" rel="nofollow noopener" target="_blank">
+    <img src="{{ chart_url_for(rec.date, c.symbol) }}" alt="{{ c.symbol }} {{ '%+.1f'|format(c.change_percent) }}% over the last month" loading="lazy" width="760" height="240">
+  </a>
+  {% endfor %}
+</div>
+<p class="meta-row">1-month daily closes via the bot's price providers. Line colour tracks the move; the WSB tag is the crowd's lean.</p>
+{% endif %}
+
+{% if rec.tickers %}
+<h2>Most-mentioned tickers</h2>
+<table class="tickers">
+  <tr><th class="rank">#</th><th>Ticker</th><th class="barcell">Mentions</th><th>Lean</th><th>Bull / Bear</th></tr>
+  {% for t in rec.tickers %}
+  <tr>
+    <td class="rank">{{ loop.index }}</td>
+    <td class="sym"><a href="https://finviz.com/quote.ashx?t={{ t.symbol }}" rel="nofollow noopener" target="_blank">{{ t.symbol }}</a></td>
+    <td class="barcell"><div class="barwrap">
+      <div class="bar" style="width:{{ (t.mentions / max_mentions * 100) | round(0, 'floor') | int }}%"></div>
+      <span class="n">{{ t.mentions }}</span>
+    </div></td>
+    <td><span class="lean {{ t.lean }}">{{ t.lean }}</span></td>
+    <td style="color:var(--dim)">{{ t.bull }} / {{ t.bear }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if rec.posts %}
+<h2>Top posts of the day</h2>
+<ul class="posts">
+  {% for p in rec.posts %}
+  <li>
+    {% if p.flair %}<span class="flair">{{ p.flair }}</span>{% endif %}
+    {% if p.permalink %}<a href="{{ p.permalink }}" rel="nofollow noopener" target="_blank">{{ p.title }}</a>{% else %}{{ p.title }}{% endif %}
+    <div class="pmeta">▲ {{ "{:,}".format(p.score) }} · {{ "{:,}".format(p.comments) }} comments</div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

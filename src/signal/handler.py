@@ -186,6 +186,14 @@ class SignalHandler:
         self.served_bot_ids: set[int] = set()
         self.is_default_phone: bool = True
         self._known_phones: set[str] = set()
+        # Pool-shared set of every bot UUID known to the deployment.
+        # SignalHandlerPool aliases its own `_known_uuids` here at
+        # build() so a UUID resolved on any handler is instantly visible
+        # to every handler's inbound self-check — without this, signal-
+        # cli's UUID-form `envelope.source` slips past the phone-only
+        # filter and lets the reactor evaluate a bot's own outbound as
+        # user input.
+        self._known_uuids: set[str] = set()
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -567,26 +575,51 @@ class SignalHandler:
         return False
 
     async def fetch_bot_uuid(self) -> Optional[str]:
-        """Fetch and cache the bot's UUID from signal-cli API."""
+        """Fetch and cache the bot's UUID from signal-cli API.
+
+        Uses the per-account identities listing — signal-cli always
+        records a self-trust entry for the account itself, so the row
+        where `number == self.config.phone_number` carries our own
+        UUID. (`/v1/about` only returns version info, which is why the
+        old implementation always failed silently.)
+
+        On success, also registers the UUID into the pool-shared
+        `_known_uuids` set so every sibling handler can recognize this
+        bot's outbound echoes on the next inbound — see the self-check
+        in `handle_webhook`.
+        """
         if self._bot_uuid:
             return self._bot_uuid
-        
+
         try:
             session = await self._get_session()
-            url = f"{self.config.api_url}/v1/about"
+            # signal-cli-rest-api quirk: the path segment is the phone
+            # number with the leading `+` URL-encoded as `%2B`.
+            encoded = self.config.phone_number.replace("+", "%2B")
+            url = f"{self.config.api_url}/v1/identities/{encoded}"
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # Check if our phone's info is available
-                    for account in data if isinstance(data, list) else [data]:
-                        if account.get("number") == self.config.phone_number:
-                            self._bot_uuid = account.get("uuid")
+                    rows = data if isinstance(data, list) else [data]
+                    for row in rows:
+                        if row.get("number") == self.config.phone_number:
+                            self._bot_uuid = row.get("uuid")
                             if self._bot_uuid:
-                                logger.info(f"Fetched bot UUID: {self._bot_uuid[:8]}...")
+                                self._known_uuids.add(self._bot_uuid)
+                                logger.info(
+                                    f"Fetched bot UUID for "
+                                    f"...{self.config.phone_number[-4:]}: "
+                                    f"...{self._bot_uuid[-8:]}"
+                                )
                             return self._bot_uuid
+                else:
+                    logger.debug(
+                        f"fetch_bot_uuid HTTP {resp.status} for "
+                        f"{self.config.phone_number}"
+                    )
         except Exception as e:
             logger.debug(f"Could not fetch bot UUID: {e}")
-        
+
         return None
     
     async def _resolve_addressed_bot(
@@ -762,7 +795,7 @@ class SignalHandler:
             return
 
         # Self-message guard: drop envelopes whose sender is any phone
-        # this pool serves. Two flavors:
+        # OR UUID this pool serves. Three flavors:
         #   * Our own outbound echo (signal-cli has been observed to
         #     replay outbound on reconnect; without the guard the
         #     dispatcher would treat it as user input and could loop).
@@ -771,8 +804,27 @@ class SignalHandler:
         #     "user" input from `+16467699190`. Treating bot-on-bot
         #     traffic as user input would let two bots have a
         #     conversation with each other (token burn, chat noise).
-        if sender == self.config.phone_number or sender in self._known_phones:
-            logger.debug(f"Skipping bot-side echo from ...{sender[-4:]}")
+        #   * UUID-form sender. signal-cli sometimes populates
+        #     `envelope.source` with a UUID rather than a phone (the
+        #     post-PNI Signal account state, or contacts that haven't
+        #     been resolved to a number on this account yet). The
+        #     phone-only checks above silently fail in that case, so we
+        #     also match against the pool-shared `_known_uuids` set —
+        #     populated eagerly at startup by
+        #     `SignalHandlerPool.bootstrap_uuids()` and lazily on every
+        #     `fetch_bot_uuid()` success.
+        source_uuid = (envelope.get("sourceUuid") or "").strip()
+        is_bot_echo = (
+            sender == self.config.phone_number
+            or sender in self._known_phones
+            or (source_uuid and (
+                source_uuid == self._bot_uuid
+                or source_uuid in self._known_uuids
+            ))
+        )
+        if is_bot_echo:
+            tail = (sender or source_uuid or "????")[-4:]
+            logger.debug(f"Skipping bot-side echo from ...{tail}")
             return
 
         # Idempotency: signal-cli replays buffered messages on websocket

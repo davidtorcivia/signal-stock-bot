@@ -66,6 +66,20 @@
             <td>{{ '{:,}'.format(llm.tokens_in or 0) }} in &nbsp;·&nbsp; {{ '{:,}'.format(llm.tokens_out or 0) }} out</td>
         </tr>
         <tr>
+            <th>Prompt cache</th>
+            <td>
+                {% set hit = llm.cache_hit_tokens or 0 %}
+                {% set miss = llm.cache_miss_tokens or 0 %}
+                {% if hit or miss %}
+                    {{ '{:,}'.format(hit) }} hit &nbsp;·&nbsp;
+                    {{ '{:,}'.format(miss) }} miss &nbsp;·&nbsp;
+                    {{ '%.1f%%'|format((llm.cache_hit_ratio or 0) * 100) }}
+                {% else %}
+                    <span class="muted">— (provider not reporting cache, or no calls yet)</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
             <th>Avg latency</th>
             <td>{% if llm.avg_latency_ms %}{{ '%.0f'|format(llm.avg_latency_ms) }}ms{% else %}—{% endif %}</td>
         </tr>
@@ -129,6 +143,20 @@
         <tr>
             <th>Tokens</th>
             <td>{{ '{:,}'.format(dt.tokens_in or 0) }} in &nbsp;·&nbsp; {{ '{:,}'.format(dt.tokens_out or 0) }} out</td>
+        </tr>
+        <tr>
+            <th>Prompt cache</th>
+            <td>
+                {% set dt_hit = dt.cache_hit_tokens or 0 %}
+                {% set dt_miss = dt.cache_miss_tokens or 0 %}
+                {% if dt_hit or dt_miss %}
+                    {{ '{:,}'.format(dt_hit) }} hit &nbsp;·&nbsp;
+                    {{ '{:,}'.format(dt_miss) }} miss &nbsp;·&nbsp;
+                    {{ '%.1f%%'|format((dt.cache_hit_ratio or 0) * 100) }}
+                {% else %}
+                    <span class="muted">— (provider not reporting cache, or no calls yet)</span>
+                {% endif %}
+            </td>
         </tr>
         <tr>
             <th>Avg latency</th>
