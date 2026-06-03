@@ -57,6 +57,10 @@ class WSBPostPayload:
     body_md: str
     tldr: str = ""          # brief humorous day-summary for the chat message
     chart_count: int = 0
+    # Rendered OG card PNG bytes (same image the page uses for og:image). The
+    # worker attaches it to the chat post — signal-cli-rest-api does not
+    # auto-unfurl links, so without attaching it no image ever reaches the chat.
+    og_png: Optional[bytes] = None
 
 
 def _build_question(bot_name: str, subreddit: str, digest: WSBDigest) -> str:
@@ -384,9 +388,11 @@ class WSBDigestService:
             rec.charts = chart_meta
             logger.info("WSB charts: rendered %d price spark image(s)", len(charts))
             site.write_day(rec, og_png=og_png or None, charts=charts)
+            return og_png or None
 
+        og_png: Optional[bytes] = None
         try:
-            await run_blocking(_render_and_write_day, timeout=RENDER_TIMEOUT)
+            og_png = await run_blocking(_render_and_write_day, timeout=RENDER_TIMEOUT)
         except Exception as e:
             logger.warning("WSB digest: page render failed (continuing): %s", e)
 
@@ -402,7 +408,7 @@ class WSBDigestService:
         return WSBPostPayload(
             date=rec.date, headline=headline, teaser=teaser,
             page_url=rec.page_url, body_md=body_md, tldr=tldr,
-            chart_count=len(rec.charts),
+            chart_count=len(rec.charts), og_png=og_png,
         )
 
     @staticmethod

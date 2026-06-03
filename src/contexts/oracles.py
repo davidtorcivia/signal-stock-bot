@@ -269,6 +269,37 @@ def next_fire_time(
     )
 
 
+def recent_fire_time(
+    oracle: ContextOracle, now: Optional[dt.datetime] = None
+) -> dt.datetime:
+    """The scheduled fire instant CLOSEST to `now` (tz-aware UTC), searching the
+    oracle's local yesterday/today/tomorrow.
+
+    This is what "today's firing" means for idempotency. Keying off `now`'s UTC
+    calendar date instead breaks when the local fire time lands near the UTC date
+    boundary (e.g. 20:00 America/New_York == 00:00 UTC): right after such an
+    oracle fires, `now` has already rolled into the next UTC day, so a date-keyed
+    lookup points at tomorrow's instant (~24h away) and concludes the oracle has
+    NOT fired today — re-firing it on the next tick. The occurrence that actually
+    fired is always the nearest candidate regardless of the UTC date. Day-of-week
+    gating is intentionally ignored here (callers compare against last_fired_at;
+    next_fire_time enforces the allowed-days schedule)."""
+    local_tz = (
+        ZoneInfo(oracle.timezone)
+        if oracle.schedule_kind == "clock"
+        else _LOCATION.tzinfo
+    )
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+    now_local = now.astimezone(local_tz)
+    candidates = [
+        fire_time_for(oracle, (now_local + dt.timedelta(days=d)).date())
+        for d in (-1, 0, 1)
+    ]
+    nearest = min(candidates, key=lambda f: abs((f - now_local).total_seconds()))
+    return nearest.astimezone(dt.timezone.utc)
+
+
 # ---------- store ------------------------------------------------------------
 
 def _days_to_str(days: Optional[frozenset[int]]) -> Optional[str]:

@@ -7,6 +7,8 @@ which has to play well with the existing tarot/iching command output
 and slot the active bot's display_name into the framing.
 """
 
+import datetime as dt
+
 import pytest
 
 from src.contexts.oracles import ContextOracle
@@ -189,3 +191,57 @@ async def test_fire_oracle_skips_mark_fired_when_no_signal_handler():
     worker.signal_pool = None
     await worker._fire_oracle(_make_oracle())
     assert worker.store.marked == []
+
+
+def _evening_et_oracle():
+    """A 20:00 America/New_York clock oracle — its fire instant lands at
+    00:00 UTC (EDT) / 01:00 UTC (EST), right on the UTC date boundary."""
+    return ContextOracle(
+        id=4,
+        context_id=1,
+        enabled=True,
+        kind="wsb_digest",
+        schedule_kind="clock",
+        clock_time="20:00",
+        timezone="America/New_York",
+    )
+
+
+def test_already_fired_today_handles_utc_date_boundary():
+    """Regression: the WSB digest (20:00 ET == 00:00 UTC) double-fired on
+    2026-06-02 because _already_fired_today keyed off `now`'s UTC date. Once
+    the oracle fired the clock rolled into the next UTC day, so the date-keyed
+    lookup pointed at *tomorrow's* 20:00 ET instant (~24h away) and reported
+    'not fired today' — re-firing every tick inside the 600s grace window."""
+    oracle = _evening_et_oracle()
+    # Fired at 20:00:04 ET on 2026-06-02 == 00:00:04 UTC 2026-06-03, marked a
+    # few minutes later once the ~4-minute deep-think run finished.
+    fired = dt.datetime(2026, 6, 3, 0, 4, 35, tzinfo=dt.timezone.utc)
+    oracle.last_fired_at = fired.timestamp()
+
+    # A tick a few minutes later (the second crawl actually started 00:09:42).
+    now = dt.datetime(2026, 6, 3, 0, 9, 40, tzinfo=dt.timezone.utc)
+    assert DailyOracleWorker._already_fired_today(oracle, now) is True
+
+    # ...and right after the (bug-era) second post, still fired-for-today.
+    now2 = dt.datetime(2026, 6, 3, 0, 14, 15, tzinfo=dt.timezone.utc)
+    assert DailyOracleWorker._already_fired_today(oracle, now2) is True
+
+
+def test_already_fired_today_allows_next_days_fire():
+    """The fix must not over-suppress: the morning after a fire, the oracle is
+    fireable again for tonight's occurrence."""
+    oracle = _evening_et_oracle()
+    fired = dt.datetime(2026, 6, 3, 0, 4, 35, tzinfo=dt.timezone.utc)
+    oracle.last_fired_at = fired.timestamp()
+
+    # ~13:00 UTC 2026-06-03 == 09:00 ET, well before tonight's 20:00 ET fire.
+    morning = dt.datetime(2026, 6, 3, 13, 0, tzinfo=dt.timezone.utc)
+    assert DailyOracleWorker._already_fired_today(oracle, morning) is False
+
+
+def test_already_fired_today_never_fired():
+    oracle = _evening_et_oracle()
+    oracle.last_fired_at = None
+    now = dt.datetime(2026, 6, 3, 0, 9, 40, tzinfo=dt.timezone.utc)
+    assert DailyOracleWorker._already_fired_today(oracle, now) is False

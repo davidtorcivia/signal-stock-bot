@@ -26,6 +26,7 @@ the rest of the worker or the bot.
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import logging
 from typing import Optional
@@ -34,8 +35,8 @@ from .commands.base import CommandContext
 from .contexts.oracles import (
     ContextOracle,
     OracleStore,
-    fire_time_for,
     next_fire_time,
+    recent_fire_time,
 )
 
 logger = logging.getLogger(__name__)
@@ -196,19 +197,26 @@ class DailyOracleWorker:
     def _already_fired_today(
         oracle: ContextOracle, now: dt.datetime
     ) -> bool:
-        """True if the oracle's last_fired_at is within today's window
-        in its local schedule frame. Prevents double-fire across bot
-        restarts that land in the same minute."""
+        """True if the oracle's last_fired_at lines up with the firing instant
+        nearest to `now` in its local schedule frame. Prevents double-fire
+        across bot restarts (or grace-window re-ticks) that land in the same
+        window."""
         if not oracle.last_fired_at:
             return False
         try:
-            fire = fire_time_for(oracle, now.astimezone(dt.timezone.utc).date())
+            # The occurrence nearest to `now`, NOT the one sharing now's UTC
+            # calendar date: a 20:00 ET oracle fires at 00:00 UTC, so a
+            # date-keyed lookup would point a day off and re-fire it. See
+            # recent_fire_time.
+            fire = recent_fire_time(oracle, now)
         except Exception:
             return False
         last = dt.datetime.fromtimestamp(oracle.last_fired_at, tz=dt.timezone.utc)
-        # If last_fired is within ±12h of today's fire window, we already
-        # posted. Wide window because clock-mode oracles in distant tz
-        # can land on a different UTC date than the bot.
+        # If last_fired is within ±12h of that instant we already posted it.
+        # With the nearest occurrence chosen, the matching fire is within
+        # minutes and any other occurrence is ~24h away, so 12h separates them
+        # cleanly while tolerating the gap between the scheduled instant, the
+        # late-fire grace window, and the post-run mark_fired stamp.
         return abs((last - fire).total_seconds()) <= 12 * 3600
 
     async def _fire_oracle(self, oracle: ContextOracle) -> None:
@@ -348,8 +356,16 @@ class DailyOracleWorker:
         if sender_handler is None:
             logger.warning("WSB digest: no signal handler available; not posting")
             return False
+        # Attach the OG card so an image rides with the post — signal-cli does
+        # not fetch og:image for bot-sent links, so the page's meta tags alone
+        # never produce an in-chat preview. The page still carries og:image for
+        # link unfurls elsewhere.
+        attachments = None
+        if payload.og_png:
+            attachments = [base64.b64encode(payload.og_png).decode("ascii")]
         await sender_handler.send_message(
-            recipient="", message=body, group_id=group_id, styled=False
+            recipient="", message=body, group_id=group_id,
+            attachments=attachments, styled=False,
         )
         await self.wsb_service.mark_posted(payload.date, True)
         return True
