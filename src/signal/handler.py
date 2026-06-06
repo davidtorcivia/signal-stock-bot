@@ -628,6 +628,13 @@ class SignalHandler:
         "hey", "hi", "hello", "yo", "ok", "okay", "so", "um", "uh", "well",
         "hmm", "guys", "everyone", "folks", "both", "also", "please",
     })
+    # When one of these sits immediately before a TRAILING name, the name is
+    # an object/topic ("what do you think of Artaud?"), not a vocative — so
+    # it must NOT be treated as addressing that bot.
+    _TOPIC_MARKERS = frozenset({
+        "of", "about", "regarding", "re", "abt", "like", "than",
+    })
+    _CONNECTORS = frozenset({",", "&", "and"})
 
     @staticmethod
     def _alias_bot_pairs(bots) -> list:
@@ -651,20 +658,23 @@ class SignalHandler:
                 return True
         return False
 
-    def _leading_addressed_bots(self, text: str, bots) -> list:
-        """Bots named in the LEADING vocative phrase, in order, deduped.
+    def _addressed_bots(self, text: str, bots) -> list:
+        """Bots ADDRESSED by name as a vocative — leading OR trailing — in
+        order of appearance, deduped. A name buried mid-sentence as a topic
+        is NOT addressed.
 
-        Scans tokens from the start: skips greeting fillers before the
-        first name, then collects bot names joined by and/&/comma, stopping
-        at the first token that is neither a name nor a connector. So:
-          "Sigil and Artaud, thoughts?" -> [Sigil, Artaud]
-          "Sigil what about Artaud?"     -> [Sigil]   (Artaud is past the
-                                                        first non-name word)
-          "what do you think of Artaud?" -> []        (no leading name)
-        A name buried later as a topic never counts — that's the whole
-        point: you address a bot by leading with its name, not by talking
-        about it. (Trailing vocatives like "thoughts, Sigil?" are not
-        recognized; lead with the name.)
+        Leading: name(s) at the start (after greeting fillers), joined by
+        and/&/comma — "Sigil, …", "hey Sigil and Artaud …".
+        Trailing: name(s) at the very end (ignoring punctuation), joined by
+        connectors — "what about you, sigil?", "thoughts sigil?" — UNLESS
+        the token right before the run is a topic marker like "of"/"about"
+        (which makes it an object, not an addressee).
+
+        Examples:
+          "Sigil and Artaud, thoughts?"   -> [Sigil, Artaud]
+          "what about you sigil?"          -> [Sigil]
+          "Sigil what do you make of Artaud?" -> [Sigil]  (Artaud = topic)
+          "what do you think of Artaud?"   -> []          (topic only)
         """
         alias_map: dict = {}
         for alias, b in self._alias_bot_pairs(bots):
@@ -672,21 +682,54 @@ class SignalHandler:
         if not alias_map:
             return []
         tokens = re.findall(r"[a-z0-9'’]+|,|&", (text or "").lower())
+        if not tokens:
+            return []
+
         found: list = []
+
+        def _add(bot) -> None:
+            bid = getattr(bot, "id", None)
+            if all(getattr(x, "id", None) != bid for x in found):
+                found.append(bot)
+
+        # Leading vocative: greeting fillers, then names + connectors, until
+        # the first token that is neither.
         seen_name = False
         for tok in tokens:
-            if tok in (",", "&", "and"):
-                continue  # connector — allowed before/between names
+            if tok in self._CONNECTORS:
+                continue
             bot = alias_map.get(tok)
             if bot is not None:
-                bid = getattr(bot, "id", None)
-                if all(getattr(x, "id", None) != bid for x in found):
-                    found.append(bot)
+                _add(bot)
                 seen_name = True
                 continue
             if not seen_name and tok in self._VOCATIVE_GREETINGS:
-                continue  # leading filler before the first name
-            break  # first real word that isn't a name → vocative ends
+                continue
+            break
+
+        # Trailing vocative: walk backward over a run of names + connectors
+        # at the very end; reject if a topic marker sits just before it.
+        trailing: list = []
+        run_first = None  # lowest index of the trailing name run
+        i = len(tokens) - 1
+        while i >= 0:
+            tok = tokens[i]
+            if tok in self._CONNECTORS:
+                i -= 1
+                continue
+            bot = alias_map.get(tok)
+            if bot is not None:
+                trailing.append(bot)
+                run_first = i
+                i -= 1
+                continue
+            break
+        if trailing and run_first is not None and run_first - 1 >= 0:
+            if tokens[run_first - 1] in self._TOPIC_MARKERS:
+                trailing = []
+        for bot in reversed(trailing):  # restore appearance order
+            _add(bot)
+
         return found
 
     async def _resolve_addressed_bot(
@@ -768,9 +811,9 @@ class SignalHandler:
                 b for b in bot_registry.list_sync()
                 if getattr(b, "enabled", True)
             ]
-            leading = self._leading_addressed_bots(message_text, all_bots)
-            if leading:
-                return leading[0], True
+            addressed = self._addressed_bots(message_text, all_bots)
+            if addressed:
+                return addressed[0], True
             # Name present only as a topic → engage, but the pinned bot
             # answers; the bot being discussed isn't the addressee.
             if active_bot is not None and self._mentions_any_alias(
@@ -836,7 +879,7 @@ class SignalHandler:
              a bot. If that yields >=1 bot, it IS the set (typed names are
              not consulted — the user tapped specific accounts).
           2. Only when no bot was @-mentioned: LEADING-vocative typed names
-             (see `_leading_addressed_bots`), in order of appearance. A name
+             (see `_addressed_bots` — leading or trailing), in order. A name
              buried later as a topic is ignored, so "Sigil, what about
              Artaud?" addresses only Sigil — it never fans out to the bot
              being talked about.
@@ -888,10 +931,11 @@ class SignalHandler:
                 b for b in bot_registry.list_sync()
                 if getattr(b, "enabled", True)
             ]
-            # Only LEADING-vocative names count, in order of appearance —
-            # so "Sigil and Artaud, …" fans out to both, but "Sigil, what
-            # about Artaud?" addresses only Sigil (Artaud is the topic).
-            for bot in self._leading_addressed_bots(message_text, all_bots):
+            # Only vocative names count (leading or trailing), in order of
+            # appearance — so "Sigil and Artaud, …" fans out to both, but
+            # "Sigil, what about Artaud?" addresses only Sigil (Artaud is
+            # the topic).
+            for bot in self._addressed_bots(message_text, all_bots):
                 _add(bot)
         return found
 

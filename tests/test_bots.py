@@ -332,6 +332,22 @@ async def test_alias_routing_cross_bot(
     assert mentioned is True
     assert bot.slug == "sigil"
 
+    # TRAILING vocative: a name at the end is an addressee, not a topic.
+    # "What about you sigil?" must reach Sigil, not the pinned Artaud
+    # (this is the regression the leading-only rule missed).
+    bot, mentioned = await h._resolve_addressed_bot(
+        {"message": "What about you sigil?"}, "!ARTAUD_GROUP", pol_artaud,
+    )
+    assert mentioned is True
+    assert bot.slug == "sigil"
+
+    # ...but a trailing name preceded by a topic marker is still a topic.
+    bot, mentioned = await h._resolve_addressed_bot(
+        {"message": "what do you think of sigil?"}, "!ARTAUD_GROUP", pol_artaud,
+    )
+    assert mentioned is True
+    assert bot.slug == "artaud"  # pinned fields it; Sigil is the topic
+
 
 @pytest.mark.asyncio
 async def test_quote_reply_routes_to_quoted_bot(registry: BotRegistry):
