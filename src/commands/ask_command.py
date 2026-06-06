@@ -480,13 +480,13 @@ class AskCommand(BaseCommand):
         limit = self._live_group_ctx()
         if limit <= 0 or not ctx.is_group or self.group_log is None:
             return ""
-        bot_floor_at = (
+        floor_at = (
             getattr(ctx.policy, "purge_floor_at", None)
             if ctx.policy is not None else None
         )
         msgs = await self.group_log.recent(
             ctx.group_id, limit=limit, exclude_last=1,
-            bot_floor_at=bot_floor_at,
+            floor_at=floor_at,
         )
         if not msgs:
             return ""

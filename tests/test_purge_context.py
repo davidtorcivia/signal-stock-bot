@@ -5,8 +5,10 @@ Tests for the purge-context flow:
   * `ConversationHistory.load`, `get_summary`, `latest_turn_timestamp`,
     and `turns_to_summarize` honor `floor_at` — pre-floor rows are
     invisible even if they're still in the table.
-  * `GroupMessageLog.recent` filters bot rows by the floor but leaves
-    user rows alone (the room's chatter is preserved).
+  * `GroupMessageLog.recent` filters ALL rows (bot AND user) older than
+    the floor — a purge means the room starts fresh.
+  * `ContextPolicy.storage_key` maps to the prefixed history key the
+    purge action must clear.
   * `GroupMessageLog.clear_bot_rows` only deletes BOT_SENDER rows.
   * `EmojiReactor.clear_recent` drops the in-process deque.
 """
@@ -46,6 +48,32 @@ async def test_set_purge_floor_round_trip(db_path):
     reloaded = await reg.get(new_id)
     assert reloaded is not None
     assert reloaded.purge_floor_at == pytest.approx(floor, abs=0.01)
+
+
+def test_policy_storage_key_matches_history_keying():
+    """The purge action clears history by storage_key(); it must match the
+    `group:`/`dm:` form CommandContext.context_key() writes under — passing
+    the bare row key (group_id / phone) matched nothing, so purges never
+    freed history (every purge logged turns/summary=0)."""
+    from src.database import hash_phone
+
+    grp = ContextPolicy(id=1, kind="group", key="ABC123==", label="G")
+    assert grp.storage_key() == "group:ABC123=="
+
+    dm = ContextPolicy(id=2, kind="dm", key="+15551234567", label="D")
+    assert dm.storage_key() == f"dm:{hash_phone('+15551234567')}"
+
+    # Sanity: it equals what a CommandContext would compute for the same chat.
+    from src.commands.base import CommandContext
+    gctx = CommandContext(
+        sender="+1", group_id="ABC123==", raw_message="", command="", args=[],
+    )
+    assert gctx.context_key() == grp.storage_key()
+    dctx = CommandContext(
+        sender="+15551234567", group_id=None, raw_message="", command="",
+        args=[],
+    )
+    assert dctx.context_key() == dm.storage_key()
 
 
 async def test_upsert_preserves_existing_floor(db_path):
@@ -177,7 +205,7 @@ async def test_turns_to_summarize_respects_floor(db_path):
 # ── group_log: bot-row floor + user-row preservation ──────────────────
 
 
-async def test_group_log_recent_filters_bot_rows_only(db_path):
+async def test_group_log_recent_floor_filters_all_rows(db_path):
     g = GroupMessageLog(db_path=db_path)
     await g.append("grp-1", "+15551234567", "user-old")
     await g.append_bot("grp-1", "bot-old")
@@ -197,9 +225,10 @@ async def test_group_log_recent_filters_bot_rows_only(db_path):
     msgs = await g.recent("grp-1", limit=50)
     assert {m["text"] for m in msgs} == {"user-old", "bot-old", "user-new", "bot-new"}
 
-    # Floor filters ONLY old bot rows. Old user rows stay (room chatter).
-    msgs = await g.recent("grp-1", limit=50, bot_floor_at=floor)
-    assert {m["text"] for m in msgs} == {"user-old", "user-new", "bot-new"}
+    # Floor filters EVERY pre-floor row — bot AND user — so a purged room
+    # starts fresh and the bots can't replay the pre-purge conversation.
+    msgs = await g.recent("grp-1", limit=50, floor_at=floor)
+    assert {m["text"] for m in msgs} == {"user-new", "bot-new"}
 
 
 async def test_clear_bot_rows_leaves_users_alone(db_path):

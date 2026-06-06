@@ -639,7 +639,7 @@ class EmojiReactor:
             try:
                 msgs = await self.group_log.recent(
                     group_id, limit=ctx_count, exclude_last=1,
-                    bot_floor_at=bot_floor_at,
+                    floor_at=bot_floor_at,
                 )
                 for m in msgs:
                     label = self._sender_label(m["sender"])

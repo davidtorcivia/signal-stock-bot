@@ -248,7 +248,7 @@ class GroupMessageLog:
         group_id: str,
         limit: int,
         exclude_last: int = 0,
-        bot_floor_at: Optional[float] = None,
+        floor_at: Optional[float] = None,
     ) -> list[dict]:
         """
         Return up to `limit` recent messages for a group in chronological order.
@@ -256,10 +256,15 @@ class GroupMessageLog:
         `exclude_last` skips the N newest rows — used by !ask so the current
         command itself isn't echoed into its own context.
 
-        `bot_floor_at` is the context's purge floor. Bot-authored rows
-        (sender = BOT_SENDER) older than the floor are filtered out
-        client-side after the fetch. User rows are never filtered — the
-        purge wipes the bot's voice, not the room's chatter.
+        `floor_at` is the context's purge floor: EVERY row older than the
+        floor — bot AND user — is filtered out client-side after the fetch.
+        A purge means "the room starts fresh", so the pre-purge human
+        chatter must vanish from <group_context> too; leaving it in let the
+        bots reconstruct (and keep reacting to) the very conversation the
+        purge was meant to erase. Bot rows are also physically deleted by
+        the purge action; this read-side floor is the belt-and-braces that
+        holds even for surviving rows (and for user rows, which are kept on
+        disk as the room's record but hidden from the model).
         """
         if limit <= 0 or not group_id:
             return []
@@ -279,10 +284,8 @@ class GroupMessageLog:
             {"sender": r[0], "text": r[1], "created_at": r[2], "bot_id": r[3]}
             for r in reversed(rows)
         ]
-        if bot_floor_at is not None:
+        if floor_at is not None:
             result = [
-                m for m in result
-                if m["sender"] != BOT_SENDER
-                or (m["created_at"] or 0) >= bot_floor_at
+                m for m in result if (m["created_at"] or 0) >= floor_at
             ]
         return result

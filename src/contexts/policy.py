@@ -70,16 +70,33 @@ class ContextPolicy:
     # history at all (one-shot mode — useful for oracle-only chats).
     history_turns_override: Optional[int] = None
     # Purge floor: a hard cutoff timestamp. Conversation turns, summaries,
-    # and bot-authored group_log rows older than this are invisible to
-    # all read paths that assemble LLM context — even if the underlying
-    # rows haven't been deleted yet. Set by the admin "Purge context"
-    # button; the purge action also DELETEs pre-floor rows for cleanup,
-    # but the floor is what guarantees the bot can't see its pre-purge
-    # voice forever going forward.
-    # None = no floor (the default). Inbound user messages in group_log
-    # and context_memories are NOT gated by the floor — they're durable
-    # by design.
+    # and ALL group_log rows (bot AND user) older than this are invisible
+    # to every read path that assembles LLM context — even if the
+    # underlying rows haven't been deleted yet. Set by the admin "Purge
+    # context" button; the purge action also DELETEs pre-floor rows for
+    # cleanup, but the floor is what guarantees the bot can't see the
+    # pre-purge conversation forever going forward.
+    # None = no floor (the default). context_memories are NOT gated by the
+    # floor — they're durable by design.
     purge_floor_at: Optional[float] = None
+
+    def storage_key(self) -> str:
+        """Key that conversation_turns / summaries are stored under for
+        this context — `group:<id>` or `dm:<hash>` — mirroring
+        CommandContext.context_key().
+
+        This is NOT `self.key`: the context ROW is indexed by the raw
+        group_id (groups) or phone (DMs), but history is keyed with a
+        `group:` / `dm:` prefix (and DMs hash the phone). The purge action
+        needs this form to clear the right rows — passing `self.key`
+        directly matched nothing, so purges never freed history.
+        """
+        if self.kind == "group":
+            return f"group:{self.key}"
+        if self.kind == "dm":
+            from ..database import hash_phone
+            return f"dm:{hash_phone(self.key)}"
+        return self.key
 
     def allows_command(self, name: str) -> bool:
         name = (name or "").lower()

@@ -1661,7 +1661,16 @@ def _register_context_routes(
         turns_removed = 0
         if history is not None:
             try:
-                turns_removed = _run_on_loop(loop, history.clear(policy.key))
+                # conversation_turns / summaries are keyed by the STORAGE
+                # context_key (`group:<id>` / `dm:<hash>`), not the bare
+                # context row key (`policy.key` = raw group_id or phone).
+                # Passing policy.key directly matched zero rows, so every
+                # purge silently left the bot's history intact (the floor
+                # filter hid it on read, but the rows were never freed and
+                # any read path that forgot the floor would leak them).
+                turns_removed = _run_on_loop(
+                    loop, history.clear(policy.storage_key())
+                )
             except Exception as e:
                 logger.error(f"Purge: history.clear failed: {e}")
 
