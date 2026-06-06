@@ -621,7 +621,74 @@ class SignalHandler:
             logger.debug(f"Could not fetch bot UUID: {e}")
 
         return None
-    
+
+    # Filler words allowed before a leading vocative name without breaking
+    # it ("hey Sigil …", "ok Artaud …"). Lowercased.
+    _VOCATIVE_GREETINGS = frozenset({
+        "hey", "hi", "hello", "yo", "ok", "okay", "so", "um", "uh", "well",
+        "hmm", "guys", "everyone", "folks", "both", "also", "please",
+    })
+
+    @staticmethod
+    def _alias_bot_pairs(bots) -> list:
+        """(lowercased alias, bot) for every enabled bot's alias_set."""
+        pairs: list = []
+        for b in bots:
+            try:
+                for a in b.alias_set():
+                    a = (a or "").strip().lower()
+                    if a:
+                        pairs.append((a, b))
+            except Exception:
+                continue
+        return pairs
+
+    def _mentions_any_alias(self, text: str, bots) -> bool:
+        """True if any bot alias appears anywhere as a whole word."""
+        low = (text or "").lower()
+        for alias, _ in self._alias_bot_pairs(bots):
+            if re.search(rf"\b{re.escape(alias)}\b", low):
+                return True
+        return False
+
+    def _leading_addressed_bots(self, text: str, bots) -> list:
+        """Bots named in the LEADING vocative phrase, in order, deduped.
+
+        Scans tokens from the start: skips greeting fillers before the
+        first name, then collects bot names joined by and/&/comma, stopping
+        at the first token that is neither a name nor a connector. So:
+          "Sigil and Artaud, thoughts?" -> [Sigil, Artaud]
+          "Sigil what about Artaud?"     -> [Sigil]   (Artaud is past the
+                                                        first non-name word)
+          "what do you think of Artaud?" -> []        (no leading name)
+        A name buried later as a topic never counts — that's the whole
+        point: you address a bot by leading with its name, not by talking
+        about it. (Trailing vocatives like "thoughts, Sigil?" are not
+        recognized; lead with the name.)
+        """
+        alias_map: dict = {}
+        for alias, b in self._alias_bot_pairs(bots):
+            alias_map.setdefault(alias, b)
+        if not alias_map:
+            return []
+        tokens = re.findall(r"[a-z0-9'’]+|,|&", (text or "").lower())
+        found: list = []
+        seen_name = False
+        for tok in tokens:
+            if tok in (",", "&", "and"):
+                continue  # connector — allowed before/between names
+            bot = alias_map.get(tok)
+            if bot is not None:
+                bid = getattr(bot, "id", None)
+                if all(getattr(x, "id", None) != bid for x in found):
+                    found.append(bot)
+                seen_name = True
+                continue
+            if not seen_name and tok in self._VOCATIVE_GREETINGS:
+                continue  # leading filler before the first name
+            break  # first real word that isn't a name → vocative ends
+        return found
+
     async def _resolve_addressed_bot(
         self, data_message: dict, group_id: Optional[str], policy
     ):
@@ -685,41 +752,37 @@ class SignalHandler:
                 ):
                     return active_bot, True
 
-        # 2) Alias match — search across ALL enabled bots, not just the
-        # active one. In a multi-bot group, saying "Artaud, …" should
-        # summon Artaud even if Sigil is the pinned default. Active-bot
-        # match keeps priority via list ordering when both names appear.
+        # 2) Typed-name addressing. A bot is ADDRESSED when its name LEADS
+        # the message (a vocative): "Sigil, …", "hey Artaud …", or a
+        # compound "Sigil and Artaud, …". A name buried later as a TOPIC
+        # ("what do you think of Artaud?") must NOT summon it — that was
+        # the old bug: matching a name anywhere + biasing to the pinned
+        # bot meant the bot being talked ABOUT answered instead of the
+        # one being talked TO. Primary = the first-addressed (left-most)
+        # bot. When a name appears only as a topic, the pinned/active bot
+        # fields the reply (the topic mention doesn't redirect it).
         message_text = data_message.get("message") or ""
         bot_registry = getattr(self.dispatcher, "bot_registry", None)
         if message_text and bot_registry is not None:
-            # Build the candidate list with the active bot FIRST so its
-            # alias wins if a message says e.g. "Sigil and Artaud" — the
-            # message is primarily addressed to the active bot in that
-            # ambiguous case.
             all_bots = [
                 b for b in bot_registry.list_sync()
                 if getattr(b, "enabled", True)
             ]
-            ordered: list = []
-            if active_bot is not None and active_bot in all_bots:
-                ordered.append(active_bot)
-                ordered.extend(b for b in all_bots if b is not active_bot)
-            else:
-                ordered = all_bots
-            for bot in ordered:
-                for alias in bot.alias_set():
-                    if re.search(
-                        rf"\b{re.escape(alias)}\b",
-                        message_text, re.IGNORECASE,
-                    ):
-                        return bot, True
+            leading = self._leading_addressed_bots(message_text, all_bots)
+            if leading:
+                return leading[0], True
+            # Name present only as a topic → engage, but the pinned bot
+            # answers; the bot being discussed isn't the addressee.
+            if active_bot is not None and self._mentions_any_alias(
+                message_text, all_bots
+            ):
+                return active_bot, True
         elif active_bot is not None and message_text:
-            # Registry not wired (early-boot / tests) — fall back to the
-            # active bot's own alias set so the legacy single-bot path
-            # still works.
-            for alias in active_bot.alias_set():
-                if re.search(rf"\b{re.escape(alias)}\b", message_text, re.IGNORECASE):
-                    return active_bot, True
+            # Registry not wired (early-boot / tests) — single-bot path.
+            # Leading vs. topic doesn't matter when there's one bot: any
+            # mention of its name engages it.
+            if self._mentions_any_alias(message_text, [active_bot]):
+                return active_bot, True
         elif active_bot is None and message_text:
             # Pre-PR4 single-bot fallback when neither registry nor
             # active bot is available.
@@ -768,13 +831,15 @@ class SignalHandler:
         Artaud, thoughts?" — and have each named bot reply in its own voice
         instead of only the pinned/first one.
 
-        Resolution rule ("mentions, names as fallback"):
+        Resolution rule ("mentions, leading names as fallback"):
           1. Structured @-mentions → every mention whose phone/UUID maps to
              a bot. If that yields >=1 bot, it IS the set (typed names are
              not consulted — the user tapped specific accounts).
-          2. Only when no bot was @-mentioned: typed aliases in the message
-             text → every enabled bot whose alias appears, active-bot first
-             so ordering matches the single-bot resolver.
+          2. Only when no bot was @-mentioned: LEADING-vocative typed names
+             (see `_leading_addressed_bots`), in order of appearance. A name
+             buried later as a topic is ignored, so "Sigil, what about
+             Artaud?" addresses only Sigil — it never fans out to the bot
+             being talked about.
 
         Quote-reply targeting is intentionally excluded — a quote addresses
         one prior message and is handled by the single-bot path. Returns a
@@ -823,19 +888,11 @@ class SignalHandler:
                 b for b in bot_registry.list_sync()
                 if getattr(b, "enabled", True)
             ]
-            ordered: list = []
-            if active_bot is not None and active_bot in all_bots:
-                ordered.append(active_bot)
-                ordered.extend(b for b in all_bots if b is not active_bot)
-            else:
-                ordered = all_bots
-            for bot in ordered:
-                for alias in bot.alias_set():
-                    if re.search(
-                        rf"\b{re.escape(alias)}\b", message_text, re.IGNORECASE,
-                    ):
-                        _add(bot)
-                        break
+            # Only LEADING-vocative names count, in order of appearance —
+            # so "Sigil and Artaud, …" fans out to both, but "Sigil, what
+            # about Artaud?" addresses only Sigil (Artaud is the topic).
+            for bot in self._leading_addressed_bots(message_text, all_bots):
+                _add(bot)
         return found
 
     async def handle_webhook(self, data: dict):

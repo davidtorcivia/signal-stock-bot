@@ -261,12 +261,12 @@ def test_resolve_with_bot_id_none_skips_bot_lookup(store: SettingsStore):
 async def test_alias_routing_cross_bot(
     registry: BotRegistry,
 ):
-    """Multi-bot groups: any enabled bot can be summoned by name.
-    "Sigil, …" in an Artaud-pinned context routes to Sigil; "Artaud,
-    …" in a Sigil-pinned context routes to Artaud. This is the
-    multi-bot battle semantic the user wants. The pinned default
-    still gets priority when AMBIGUOUS (multiple names matched in
-    one message) via candidate ordering."""
+    """Multi-bot groups: any enabled bot can be summoned by LEADING with
+    its name. "Sigil, …" in an Artaud-pinned context routes to Sigil;
+    "Artaud, …" in a Sigil-pinned context routes to Artaud. When several
+    names lead the message ("Sigil and Artaud, …"), the FIRST-addressed
+    wins as primary — not the pinned default (that was the old bug: the
+    pinned bot answered even when another was addressed first)."""
     artaud_id = await registry.upsert(Bot(
         id=None, slug="artaud", display_name="Artaud", aliases=["Artaud"],
     ))
@@ -306,13 +306,31 @@ async def test_alias_routing_cross_bot(
     assert mentioned is True
     assert bot.slug == "sigil"
 
-    # Both names present: active/default bot wins (candidate ordering).
+    # Both names LEAD the message: the first-addressed (Sigil) is primary,
+    # even though Artaud is the pinned default.
     bot, mentioned = await h._resolve_addressed_bot(
-        {"message": "Sigil and Artaud are both here"},
+        {"message": "Sigil and Artaud, both of you weigh in"},
         "!ARTAUD_GROUP", pol_artaud,
     )
     assert mentioned is True
-    assert bot.slug == "artaud"
+    assert bot.slug == "sigil"
+
+    # A name only as a TOPIC (not leading): the pinned bot fields it; the
+    # bot being talked ABOUT is not summoned.
+    bot, mentioned = await h._resolve_addressed_bot(
+        {"message": "what do you think of Sigil?"},
+        "!ARTAUD_GROUP", pol_artaud,
+    )
+    assert mentioned is True
+    assert bot.slug == "artaud"  # pinned, not Sigil (the topic)
+
+    # Leading name + trailing topic: addresses the leading bot only.
+    bot, mentioned = await h._resolve_addressed_bot(
+        {"message": "Sigil what do you make of Artaud?"},
+        "!ARTAUD_GROUP", pol_artaud,
+    )
+    assert mentioned is True
+    assert bot.slug == "sigil"
 
 
 @pytest.mark.asyncio

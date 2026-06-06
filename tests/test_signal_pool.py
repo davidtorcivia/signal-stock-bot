@@ -367,8 +367,8 @@ async def test_resolve_addressed_bot_set_single_mention():
 
 @pytest.mark.asyncio
 async def test_resolve_addressed_bot_set_typed_names_fallback():
-    """No structured @-mentions → fall back to typed aliases; both names
-    present → both bots, active (sigil) first."""
+    """No structured @-mentions → fall back to LEADING typed names, in
+    order of appearance (not pinned-first)."""
     bots = _phoned_bots()
     pool = _make_pool(bots)
     _, sigil_h, _ = _wire_dispatch_test(pool, bots)
@@ -376,7 +376,21 @@ async def test_resolve_addressed_bot_set_typed_names_fallback():
     found = await sigil_h._resolve_addressed_bot_set(
         data_message, "g1", _FakePolicy(),
     )
-    assert [b.slug for b in found] == ["sigil", "artaud"]
+    assert [b.slug for b in found] == ["artaud", "sigil"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_addressed_bot_set_ignores_topic_mention():
+    """A name buried mid-sentence as a topic is NOT an address — no
+    fan-out to the bot being talked about."""
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, _ = _wire_dispatch_test(pool, bots)
+    data_message = {"message": "sigil what do you think of artaud?"}
+    found = await sigil_h._resolve_addressed_bot_set(
+        data_message, "g1", _FakePolicy(),
+    )
+    assert [b.slug for b in found] == ["sigil"]  # artaud is the topic
 
 
 @pytest.mark.asyncio
