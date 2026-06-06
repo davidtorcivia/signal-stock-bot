@@ -2938,13 +2938,19 @@ class AskCommand(BaseCommand):
             bot_id_for_turn = (
                 ctx.bot_id
             )
-            await self.history.append(
-                context_key, "user", question,
-                user_hash=user_hash, sender_tail=sender_tail,
-                turns_per_user=live_turns,
-                image_refs=persisted_images,
-                bot_id=bot_id_for_turn,
-            )
+            # Skip the shared user-turn write for a secondary bot in a
+            # multi-bot fan-out — the primary already stored it, and a
+            # second copy (role='user' matches every bot's load regardless
+            # of bot_id) would replay the human's message twice. The
+            # assistant turn below is always persisted: it's this bot's own.
+            if getattr(ctx, "persist_user_turn", True):
+                await self.history.append(
+                    context_key, "user", question,
+                    user_hash=user_hash, sender_tail=sender_tail,
+                    turns_per_user=live_turns,
+                    image_refs=persisted_images,
+                    bot_id=bot_id_for_turn,
+                )
             # Persist the addressee on the assistant row too: the load path
             # uses it to render `[to Name, time ago]` in group playback so
             # the model can pair its prior answers with the right asker.

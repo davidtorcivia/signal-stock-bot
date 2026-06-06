@@ -32,6 +32,14 @@ class CommandContext:
     # responded to. None when the message isn't a reply.
     quote_text: Optional[str] = None
     quote_author: Optional[str] = None  # phone number, when known
+    # Whether this turn should persist the *inbound user message* into
+    # conversation history. False for a secondary bot in a multi-bot
+    # fan-out (when one message addresses both Sigil and Artaud): the
+    # primary bot already stored the shared user turn, so the secondary
+    # must skip it or the human's message would appear twice in every
+    # bot's replayed history. The secondary still persists its OWN
+    # assistant turn (its reply is unique to it).
+    persist_user_turn: bool = True
     # Set when this !ask was triggered spontaneously by the reactor's
     # should_respond tool — not by an explicit mention/quote/command. Carries
     # the reactor's one-sentence justification so the writer model can decide

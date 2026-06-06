@@ -312,3 +312,153 @@ async def test_handle_webhook_takes_over_when_owner_misses_delivery(monkeypatch)
     # Takeover dispatched on Sigil's side, still as Artaud.
     assert dispatch_mock.call_count == 1
     assert dispatch_mock.call_args.kwargs["addressed_bot"].slug == "artaud"
+
+
+# --------------------------------------------------------------------------
+# Multi-bot fan-out: one message addressing >=2 bots → each replies.
+# --------------------------------------------------------------------------
+
+class _FakePolicy:
+    """Minimal policy stub for fan-out gating."""
+    def __init__(self, llm_intent: bool = True):
+        self.llm_intent = llm_intent
+
+
+def _phoned_bots() -> list[Bot]:
+    """Both bots with explicit signal_phone overrides — mirrors the real
+    deployment (Sigil and Artaud each on their own number), so @-mention
+    phones resolve to a bot from EITHER handler."""
+    return [
+        _bot(1, "sigil", signal_phone="+15550000001",
+             default_group=True, default_dm=True),
+        _bot(2, "artaud", signal_phone="+15550000002"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_addressed_bot_set_both_mentioned():
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, _ = _wire_dispatch_test(pool, bots)
+    data_message = {
+        "message": "what do you two think?",
+        "mentions": [{"number": "+15550000001"}, {"number": "+15550000002"}],
+    }
+    found = await sigil_h._resolve_addressed_bot_set(
+        data_message, "g1", _FakePolicy(),
+    )
+    assert [b.slug for b in found] == ["sigil", "artaud"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_addressed_bot_set_single_mention():
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, _ = _wire_dispatch_test(pool, bots)
+    data_message = {
+        "message": "hi",
+        "mentions": [{"number": "+15550000002"}],
+    }
+    found = await sigil_h._resolve_addressed_bot_set(
+        data_message, "g1", _FakePolicy(),
+    )
+    assert [b.slug for b in found] == ["artaud"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_addressed_bot_set_typed_names_fallback():
+    """No structured @-mentions → fall back to typed aliases; both names
+    present → both bots, active (sigil) first."""
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, _ = _wire_dispatch_test(pool, bots)
+    data_message = {"message": "artaud and sigil, weigh in"}
+    found = await sigil_h._resolve_addressed_bot_set(
+        data_message, "g1", _FakePolicy(),
+    )
+    assert [b.slug for b in found] == ["sigil", "artaud"]
+
+
+@pytest.mark.asyncio
+async def test_fanout_schedules_secondary_for_non_primary(monkeypatch):
+    """With both bots addressed and Sigil the primary, the fan-out
+    schedules exactly one secondary answer — for Artaud."""
+    import asyncio
+    from unittest.mock import AsyncMock as _AM
+
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, _ = _wire_dispatch_test(pool, bots)
+    sigil_h.dispatcher.ask_command = _AM()
+    sigil_h.dispatcher.prefix = "!"
+    sigil_h._answer_secondary = _AM()
+
+    data_message = {
+        "message": "thoughts?",
+        "mentions": [{"number": "+15550000001"}, {"number": "+15550000002"}],
+    }
+    await sigil_h._fanout_secondary_bots(
+        data_message=data_message, group_id="g1", policy=_FakePolicy(),
+        sender="+15551112222", message_text="thoughts?",
+        quote_text=None, quote_author=None, primary_bot=bots[0],
+    )
+    await asyncio.sleep(0)  # let the scheduled task run
+    sigil_h._answer_secondary.assert_called_once()
+    assert sigil_h._answer_secondary.call_args.kwargs["bot"].slug == "artaud"
+
+
+@pytest.mark.asyncio
+async def test_fanout_skips_explicit_commands(monkeypatch):
+    """A `!`-prefixed command is single-bot — no fan-out even if two
+    bots are named."""
+    from unittest.mock import AsyncMock as _AM
+
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, _ = _wire_dispatch_test(pool, bots)
+    sigil_h.dispatcher.ask_command = _AM()
+    sigil_h.dispatcher.prefix = "!"
+    sigil_h._answer_secondary = _AM()
+
+    data_message = {
+        "message": "!price AAPL",
+        "mentions": [{"number": "+15550000001"}, {"number": "+15550000002"}],
+    }
+    await sigil_h._fanout_secondary_bots(
+        data_message=data_message, group_id="g1", policy=_FakePolicy(),
+        sender="+15551112222", message_text="!price AAPL",
+        quote_text=None, quote_author=None, primary_bot=bots[0],
+    )
+    sigil_h._answer_secondary.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_answer_secondary_skips_user_turn_and_sends_from_own_phone():
+    """The secondary answer goes through AskCommand with
+    persist_user_turn=False (the primary already stored the shared user
+    turn) and is sent from the secondary bot's own phone."""
+    from unittest.mock import AsyncMock as _AM, MagicMock as _MM
+    from src.commands.base import CommandResult
+
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, artaud_h = _wire_dispatch_test(pool, bots)
+    sigil_h.dispatcher.prefix = "!"
+    ask_obj = _MM()
+    ask_obj.execute = _AM(return_value=CommandResult(text="the artist speaks"))
+    artaud_h.send_message = _AM()
+
+    await sigil_h._answer_secondary(
+        bot=bots[1], ask_command=ask_obj, pool=pool,
+        sender="+15551112222", group_id="g1", policy=_FakePolicy(),
+        cleaned="thoughts?", quote_text=None, quote_author=None,
+    )
+
+    ask_obj.execute.assert_awaited_once()
+    ctx = ask_obj.execute.call_args.args[0]
+    assert ctx.persist_user_turn is False
+    assert ctx.bot.slug == "artaud"
+    assert ctx.command == "ask"
+    # Sent from Artaud's own handler (its phone), not Sigil's.
+    artaud_h.send_message.assert_awaited_once()
+    assert artaud_h.send_message.call_args.kwargs["message"] == "the artist speaks"

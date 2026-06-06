@@ -756,7 +756,88 @@ class SignalHandler:
                 return active_bot, True
 
         return None, False
-    
+
+    async def _resolve_addressed_bot_set(
+        self, data_message: dict, group_id: Optional[str], policy
+    ) -> list:
+        """Every bot a message EXPLICITLY addresses, in priority order.
+
+        Companion to `_resolve_addressed_bot` (which returns just the
+        primary). This collects the full set so handle_webhook can fan out
+        when a single message names more than one bot — e.g. "Sigil and
+        Artaud, thoughts?" — and have each named bot reply in its own voice
+        instead of only the pinned/first one.
+
+        Resolution rule ("mentions, names as fallback"):
+          1. Structured @-mentions → every mention whose phone/UUID maps to
+             a bot. If that yields >=1 bot, it IS the set (typed names are
+             not consulted — the user tapped specific accounts).
+          2. Only when no bot was @-mentioned: typed aliases in the message
+             text → every enabled bot whose alias appears, active-bot first
+             so ordering matches the single-bot resolver.
+
+        Quote-reply targeting is intentionally excluded — a quote addresses
+        one prior message and is handled by the single-bot path. Returns a
+        list deduped by bot id (empty when nothing is explicitly addressed).
+        """
+        active_bot = None
+        if self.dispatcher is not None and hasattr(self.dispatcher, "_resolve_bot"):
+            try:
+                active_bot = self.dispatcher._resolve_bot(group_id, policy=policy)
+            except Exception:
+                active_bot = None
+
+        found: list = []
+
+        def _add(bot) -> None:
+            if bot is None:
+                return
+            bid = getattr(bot, "id", None)
+            if all(getattr(b, "id", None) != bid for b in found):
+                found.append(bot)
+
+        # 1) Structured @-mentions.
+        mentions = data_message.get("mentions") or []
+        if mentions:
+            if not self._bot_uuid:
+                await self.fetch_bot_uuid()
+            for mention in mentions:
+                target_phone = mention.get("number", "")
+                target_uuid = mention.get("uuid", "")
+                mb = self._lookup_bot_by_phone(target_phone)
+                if mb is not None:
+                    _add(mb)
+                elif active_bot is not None and (
+                    target_phone == self.config.phone_number
+                    or (self._bot_uuid and target_uuid == self._bot_uuid)
+                ):
+                    _add(active_bot)
+        if found:
+            return found
+
+        # 2) Fallback: typed aliases (only when no bot was @-mentioned).
+        message_text = data_message.get("message") or ""
+        bot_registry = getattr(self.dispatcher, "bot_registry", None)
+        if message_text and bot_registry is not None:
+            all_bots = [
+                b for b in bot_registry.list_sync()
+                if getattr(b, "enabled", True)
+            ]
+            ordered: list = []
+            if active_bot is not None and active_bot in all_bots:
+                ordered.append(active_bot)
+                ordered.extend(b for b in all_bots if b is not active_bot)
+            else:
+                ordered = all_bots
+            for bot in ordered:
+                for alias in bot.alias_set():
+                    if re.search(
+                        rf"\b{re.escape(alias)}\b", message_text, re.IGNORECASE,
+                    ):
+                        _add(bot)
+                        break
+        return found
+
     async def handle_webhook(self, data: dict):
         """
         Handle incoming webhook from signal-cli-rest-api.
@@ -1059,7 +1140,138 @@ class SignalHandler:
                         )
                     except Exception as fallback_e:
                         logger.error(f"Fallback DM failed: {fallback_e}")
-    
+
+        # Multi-bot fan-out: when ONE message explicitly addresses more
+        # than one bot ("@Sigil @Artaud thoughts?"), the block above
+        # answered as the PRIMARY bot only. Trigger the other addressed
+        # bots here so each replies in its own voice. This runs only on
+        # the handler that won the per-message claim (the others returned
+        # early), so one handler orchestrates every reply and routes each
+        # through its own bot's phone via the pool — no cross-handler
+        # coordination, and the shared writes (inbound group-log line,
+        # user history turn) stay single-copy because the secondaries
+        # skip them.
+        await self._fanout_secondary_bots(
+            data_message=data_message,
+            group_id=group_id,
+            policy=policy_for_routing,
+            sender=sender,
+            message_text=message_text,
+            quote_text=quote_text,
+            quote_author=quote_author,
+            primary_bot=effective_bot,
+        )
+
+    async def _fanout_secondary_bots(
+        self, *, data_message, group_id, policy, sender, message_text,
+        quote_text, quote_author, primary_bot,
+    ) -> None:
+        """Fire replies from every addressed bot OTHER than the primary.
+
+        No-op unless this is a group chat in conversational (llm_intent)
+        mode and the message explicitly addresses >=2 bots. Plain commands
+        (`!price ...`) are skipped — multi-bot addressing is a chat
+        affordance, not a command one. Each secondary answer is dispatched
+        as a background task so the bots reply in parallel.
+        """
+        if not group_id or self.dispatcher is None:
+            return
+        ask_command = getattr(self.dispatcher, "ask_command", None)
+        if ask_command is None:
+            return
+        if policy is None or not getattr(policy, "llm_intent", False):
+            return
+        prefix = getattr(self.dispatcher, "prefix", "!")
+        if message_text.strip().startswith(prefix):
+            return  # explicit command — single bot handles it
+        try:
+            addressed = await self._resolve_addressed_bot_set(
+                data_message, group_id, policy,
+            )
+        except Exception as e:
+            logger.debug(f"multi-bot set resolve failed: {e}")
+            return
+        primary_id = getattr(primary_bot, "id", None)
+        secondaries = [
+            b for b in addressed if getattr(b, "id", None) != primary_id
+        ]
+        if not secondaries:
+            return
+        # Drop @-mention tokens; each bot reads the remaining text.
+        cleaned = re.sub(r"@\S+\s*", "", message_text).strip() or message_text.strip()
+        if not cleaned:
+            return
+        pool = getattr(self.dispatcher, "signal_pool", None)
+        for bot in secondaries:
+            logger.info(
+                f"Multi-bot fan-out: also answering as {bot.slug} "
+                f"(primary={getattr(primary_bot, 'slug', None)})"
+            )
+            asyncio.create_task(
+                self._answer_secondary(
+                    bot=bot, ask_command=ask_command, pool=pool,
+                    sender=sender, group_id=group_id, policy=policy,
+                    cleaned=cleaned, quote_text=quote_text,
+                    quote_author=quote_author,
+                )
+            )
+
+    async def _answer_secondary(
+        self, *, bot, ask_command, pool, sender, group_id, policy, cleaned,
+        quote_text, quote_author,
+    ) -> None:
+        """Produce + send one secondary bot's reply in a multi-bot fan-out.
+
+        Bypasses dispatcher.dispatch on purpose: the primary already logged
+        the inbound message to the group log and stored the shared user
+        turn. Calls AskCommand directly with `persist_user_turn=False` so
+        the secondary stores only its OWN assistant turn, then sends from
+        the secondary bot's phone via `pool.for_bot`.
+        """
+        from ..commands.base import CommandContext
+        try:
+            ctx = CommandContext(
+                sender=sender,
+                group_id=group_id,
+                raw_message=f"{getattr(self.dispatcher, 'prefix', '!')}ask {cleaned}",
+                command="ask",
+                args=cleaned.split(),
+                policy=policy,
+                bot=bot,
+                quote_text=quote_text,
+                quote_author=quote_author,
+                persist_user_turn=False,
+            )
+            result = await ask_command.execute(ctx)
+        except Exception as e:
+            logger.error(
+                f"Multi-bot fan-out: ask failed for {getattr(bot, 'slug', None)}: {e}"
+            )
+            return
+        if not result or not getattr(result, "text", None):
+            return
+        response_handler = self
+        if pool is not None and hasattr(pool, "for_bot"):
+            try:
+                candidate = pool.for_bot(bot)
+                if candidate is not None:
+                    response_handler = candidate
+            except Exception as e:
+                logger.debug(f"fan-out for_bot fallback to self: {e}")
+        try:
+            target_group = None if result.dm_only else group_id
+            await response_handler.send_message(
+                recipient=sender,
+                message=result.text,
+                group_id=target_group,
+                attachments=result.attachments,
+                styled=result.styled,
+            )
+        except Exception as e:
+            logger.error(
+                f"Multi-bot fan-out send failed for {getattr(bot, 'slug', None)}: {e}"
+            )
+
     async def close(self):
         """Close the HTTP session"""
         if self._session and not self._session.closed:
