@@ -1,13 +1,15 @@
 """Tests for the prompt-formatting helpers introduced in the v2 prompt build.
 
 Covers:
-  - format_relative_age bucket boundaries
+  - format_history_timestamp absolute UTC rendering (cache-stable)
   - _wrap_xml empty/non-empty behaviour
   - ConversationHistory.load() timestamp + attribution prefixes
   - ConversationHistory.latest_turn_timestamp() empty + populated
 """
 
+import re
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -17,43 +19,43 @@ from src.commands.ask_command import (
     _wrap_xml,
     STALENESS_THRESHOLD_SECONDS,
 )
-from src.llm.history import ConversationHistory, format_relative_age
+from src.llm.history import ConversationHistory, format_history_timestamp
 
 
-# ---------- format_relative_age ----------------------------------------------
-
-def test_format_relative_age_just_now():
-    assert format_relative_age(0) == "just now"
-    assert format_relative_age(59) == "just now"
+# Matches the `YYYY-MM-DD HH:MM UTC` stamp the history renderer now emits.
+_UTC_STAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC"
 
 
-def test_format_relative_age_minutes():
-    assert format_relative_age(60) == "1m ago"
-    assert format_relative_age(599) == "9m ago"
-    assert format_relative_age(3599) == "59m ago"
+# ---------- format_history_timestamp -----------------------------------------
+
+def test_format_history_timestamp_shape():
+    # A known epoch second renders to its exact UTC wall-clock minute.
+    # 1749234600 == 2025-06-06 18:30:00 UTC.
+    assert format_history_timestamp(1749234600) == "2025-06-06 18:30 UTC"
 
 
-def test_format_relative_age_hours():
-    assert format_relative_age(3600) == "1h ago"
-    assert format_relative_age(7200) == "2h ago"
-    assert format_relative_age(86399) == "23h ago"
+def test_format_history_timestamp_truncates_to_minute():
+    # Sub-minute seconds are dropped so the string is stable for a full
+    # minute — adding 59s within the same minute must not change it.
+    base = 1749234600  # ...18:30:00 UTC
+    assert format_history_timestamp(base) == format_history_timestamp(base + 59)
 
 
-def test_format_relative_age_days():
-    assert format_relative_age(86400) == "1d ago"
-    assert format_relative_age(3 * 86400) == "3d ago"
-    assert format_relative_age(7 * 86400 - 1) == "6d ago"
+def test_format_history_timestamp_is_absolute_not_relative():
+    # The whole point of the change: the rendered stamp depends ONLY on the
+    # turn's own created_at, never on "now". Rendering the same timestamp
+    # twice (as if from two different requests) yields identical text, so the
+    # prompt prefix stays cacheable.
+    ts = time.time() - 3600
+    assert format_history_timestamp(ts) == format_history_timestamp(ts)
 
 
-def test_format_relative_age_weeks():
-    assert format_relative_age(7 * 86400) == "1w ago"
-    assert format_relative_age(30 * 86400) == "4w ago"
-
-
-def test_format_relative_age_negative_clamps_to_just_now():
-    # Clock skew between writer and reader shouldn't crash or produce
-    # nonsense — treat any negative age as "fresh".
-    assert format_relative_age(-5) == "just now"
+def test_format_history_timestamp_matches_utc_clock():
+    ts = time.time()
+    expected = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+    assert format_history_timestamp(ts) == expected
 
 
 # ---------- _wrap_xml --------------------------------------------------------
@@ -205,6 +207,26 @@ def test_strip_meta_leak_user_turn_with_tail_form():
     )
 
 
+def test_strip_meta_leak_user_turn_with_utc_stamp():
+    """Current bracket form: the model echoes the absolute-UTC speaker label
+    from history playback. Both the named and tail variants must strip."""
+    assert (
+        _strip_meta_leak("[David, 2026-06-06 18:30 UTC] hey there")
+        == "hey there"
+    )
+    assert (
+        _strip_meta_leak("[...4137, 2026-06-06 18:30 UTC] sure")
+        == "sure"
+    )
+
+
+def test_strip_meta_leak_assistant_turn_with_utc_stamp():
+    assert (
+        _strip_meta_leak("[to David, 2026-06-06 18:30 UTC] price check")
+        == "price check"
+    )
+
+
 def test_strip_meta_leak_user_turn_paraphrased_time():
     """The model sometimes paraphrases the time ('a moment ago',
     '5 minutes ago') instead of the canonical short form. Strip those too."""
@@ -244,17 +266,21 @@ def history(tmp_path):
 
 
 async def _seed_turn(h, ctx, role, content, sender_tail=None, user_hash=None, age_seconds=0):
-    """Insert a turn and backdate created_at by `age_seconds`."""
+    """Insert a turn, backdate created_at by `age_seconds`, return that
+    created_at so callers can assert the exact UTC stamp the renderer emits."""
     await h.append(ctx, role, content, sender_tail=sender_tail, user_hash=user_hash)
-    if age_seconds:
-        import aiosqlite
-        async with aiosqlite.connect(h.db_path) as db:
-            await db.execute(
-                "UPDATE conversation_turns SET created_at = ? "
-                "WHERE id = (SELECT MAX(id) FROM conversation_turns WHERE context_key = ?)",
-                (time.time() - age_seconds, ctx),
-            )
-            await db.commit()
+    if not age_seconds:
+        return None
+    created = time.time() - age_seconds
+    import aiosqlite
+    async with aiosqlite.connect(h.db_path) as db:
+        await db.execute(
+            "UPDATE conversation_turns SET created_at = ? "
+            "WHERE id = (SELECT MAX(id) FROM conversation_turns WHERE context_key = ?)",
+            (created, ctx),
+        )
+        await db.commit()
+    return created
 
 
 async def test_load_dm_no_attribution_no_timestamps_by_default(history):
@@ -270,11 +296,16 @@ async def test_load_dm_no_attribution_no_timestamps_by_default(history):
 
 async def test_load_dm_timestamps_when_now_passed(history):
     h = history
-    await _seed_turn(h, "dm:bob", "user", "old question", age_seconds=3600 * 2)
+    created = await _seed_turn(
+        h, "dm:bob", "user", "old question", age_seconds=3600 * 2
+    )
     await _seed_turn(h, "dm:bob", "assistant", "old answer", age_seconds=3600 * 2)
     now = time.time()
     turns = await h.load("dm:bob", now=now)
-    assert turns[0] == {"role": "user", "content": "[2h ago] old question"}
+    stamp = format_history_timestamp(created)
+    assert turns[0] == {"role": "user", "content": f"[{stamp}] old question"}
+    # The stamp is absolute UTC, not "2h ago".
+    assert re.fullmatch(rf"\[{_UTC_STAMP}\] old question", turns[0]["content"])
     # Assistant turns are not timestamp-prefixed — they implicitly follow
     # the user turn they answered.
     assert turns[1] == {"role": "assistant", "content": "old answer"}
@@ -282,12 +313,15 @@ async def test_load_dm_timestamps_when_now_passed(history):
 
 async def test_load_group_attribution_and_timestamps(history):
     h = history
-    await _seed_turn(h, "group:42", "user", "q1", sender_tail="4137", age_seconds=120)
+    created = await _seed_turn(
+        h, "group:42", "user", "q1", sender_tail="4137", age_seconds=120
+    )
     await _seed_turn(h, "group:42", "assistant", "a1", age_seconds=120)
     now = time.time()
     turns = await h.load("group:42", attribute_senders=True, now=now)
+    stamp = format_history_timestamp(created)
     assert turns[0]["role"] == "user"
-    assert turns[0]["content"] == "[...4137, 2m ago] q1"
+    assert turns[0]["content"] == f"[...4137, {stamp}] q1"
     assert turns[1] == {"role": "assistant", "content": "a1"}
 
 
@@ -303,16 +337,16 @@ async def test_load_group_assistant_tagged_with_addressee(history):
     """Assistant turns in groups get `[to <addressee>, <ago>]` so the model
     can pair its prior replies with the right asker across speakers."""
     h = history
-    await _seed_turn(
+    q_created = await _seed_turn(
         h, "group:42", "user", "q1", sender_tail="4137", age_seconds=180,
     )
-    await _seed_turn(
+    a_created = await _seed_turn(
         h, "group:42", "assistant", "a1", sender_tail="4137", age_seconds=180,
     )
     now = time.time()
     turns = await h.load("group:42", attribute_senders=True, now=now)
-    assert turns[0]["content"] == "[...4137, 3m ago] q1"
-    assert turns[1]["content"] == "[to ...4137, 3m ago] a1"
+    assert turns[0]["content"] == f"[...4137, {format_history_timestamp(q_created)}] q1"
+    assert turns[1]["content"] == f"[to ...4137, {format_history_timestamp(a_created)}] a1"
 
 
 async def test_load_group_assistant_no_addressee_falls_back_to_bare(history):
@@ -320,13 +354,13 @@ async def test_load_group_assistant_no_addressee_falls_back_to_bare(history):
     row (legacy data), the load path falls back to bare content rather than
     inventing an addressee."""
     h = history
-    await _seed_turn(
+    q_created = await _seed_turn(
         h, "group:42", "user", "q1", sender_tail="4137", age_seconds=120,
     )
     await _seed_turn(h, "group:42", "assistant", "a1", age_seconds=120)
     now = time.time()
     turns = await h.load("group:42", attribute_senders=True, now=now)
-    assert turns[0]["content"] == "[...4137, 2m ago] q1"
+    assert turns[0]["content"] == f"[...4137, {format_history_timestamp(q_created)}] q1"
     assert turns[1] == {"role": "assistant", "content": "a1"}
 
 
@@ -335,17 +369,21 @@ async def test_load_dm_assistant_unaffected_by_addressee_change(history):
     attribute_senders) must keep assistant content bare — the addressee
     label is purely a multi-speaker affordance."""
     h = history
-    await _seed_turn(h, "dm:bob", "user", "q1", sender_tail="4137", age_seconds=120)
+    q_created = await _seed_turn(
+        h, "dm:bob", "user", "q1", sender_tail="4137", age_seconds=120
+    )
     await _seed_turn(h, "dm:bob", "assistant", "a1", sender_tail="4137", age_seconds=120)
     now = time.time()
     turns = await h.load("dm:bob", now=now)
-    assert turns[0] == {"role": "user", "content": "[2m ago] q1"}
+    assert turns[0] == {
+        "role": "user", "content": f"[{format_history_timestamp(q_created)}] q1",
+    }
     assert turns[1] == {"role": "assistant", "content": "a1"}
 
 
 async def test_load_group_assistant_resolves_name_via_registry(history, tmp_path):
     """When a name is registered for the addressee user_hash, assistant
-    turns render as `[to <Name>, <ago>]` instead of falling back to the
+    turns render as `[to <Name>, <UTC stamp>]` instead of falling back to the
     `...tail` form."""
     from src.users import NameRegistry
     from src.database import hash_phone
@@ -357,18 +395,18 @@ async def test_load_group_assistant_resolves_name_via_registry(history, tmp_path
     await registry.set_name("David", user_hash=user_hash)
     history.name_registry = registry
 
-    await _seed_turn(
+    q_created = await _seed_turn(
         history, "group:99", "user", "q1",
         sender_tail="4137", user_hash=user_hash, age_seconds=60,
     )
-    await _seed_turn(
+    a_created = await _seed_turn(
         history, "group:99", "assistant", "a1",
         sender_tail="4137", user_hash=user_hash, age_seconds=60,
     )
     now = time.time()
     turns = await history.load("group:99", attribute_senders=True, now=now)
-    assert turns[0]["content"] == "[David, 1m ago] q1"
-    assert turns[1]["content"] == "[to David, 1m ago] a1"
+    assert turns[0]["content"] == f"[David, {format_history_timestamp(q_created)}] q1"
+    assert turns[1]["content"] == f"[to David, {format_history_timestamp(a_created)}] a1"
 
 
 # ---------- history.latest_turn_timestamp ------------------------------------

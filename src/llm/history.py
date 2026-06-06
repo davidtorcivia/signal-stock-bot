@@ -16,6 +16,7 @@ Pruning is triggered on every write:
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -28,32 +29,32 @@ logger = logging.getLogger(__name__)
 DEFAULT_RETENTION_DAYS = 7
 
 
-def format_relative_age(seconds: float) -> str:
-    """Render a non-negative age as a short relative-time string.
+def format_history_timestamp(created_at: float) -> str:
+    """Render a turn's creation time as an absolute UTC wall-clock stamp.
 
-    Granularity buckets: "just now" (<60s), "Nm ago" (<60m), "Nh ago" (<24h),
-    "Nd ago" (<7d), "Nw ago" otherwise. Coarse on purpose — the model only
-    needs to distinguish "fresh" from "day-old" from "ancient", not
-    minute-precision recall.
+    Format: ``2026-06-06 18:30 UTC``. Absolute on purpose — and that is the
+    whole point. A turn's timestamp must be identical on every request, or
+    the backend's prefix cache (DeepSeek does hours-to-days prefix-match
+    caching) misses on the entire payload: system text, tool schemas, and
+    every prior turn become un-cacheable. The old relative form ("2m ago")
+    changed every minute, so the history block — which sits in the cached
+    prefix — was rewritten on each call and the cache never hit.
+
+    Recency is still recoverable by the model: `_inject_current_time`
+    stamps the current UTC+ET time onto the tail of the last user message,
+    so the model subtracts that anchor from these absolute stamps itself.
+    Minute precision (no seconds) keeps the string stable for a full minute
+    even if two reads of the *same* turn ever disagreed on sub-minute time.
     """
-    if seconds < 0:
-        seconds = 0
-    if seconds < 60:
-        return "just now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m ago"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}h ago"
-    if seconds < 7 * 86400:
-        return f"{int(seconds // 86400)}d ago"
-    return f"{int(seconds // (7 * 86400))}w ago"
+    dt = datetime.fromtimestamp(created_at, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _join_bracket(name: Optional[str], ago: Optional[str]) -> Optional[str]:
+def _join_bracket(name: Optional[str], stamp: Optional[str]) -> Optional[str]:
     """Compose the inside of a `[...]` label from the parts that exist."""
-    if name and ago:
-        return f"{name}, {ago}"
-    return name or ago
+    if name and stamp:
+        return f"{name}, {stamp}"
+    return name or stamp
 
 
 class ConversationHistory:
@@ -357,9 +358,13 @@ class ConversationHistory:
         When `attribute_senders` is True, user messages are prefixed with
         `[...tail]` so the LLM can tell speakers apart in a group thread.
 
-        When `now` is provided, user messages also carry a relative-time
-        suffix in the same bracket (`[David, 2h ago]`, `[3d ago]` in DMs)
-        so the model can tell which turns are fresh vs. days old.
+        When `now` is provided, user messages also carry an absolute UTC
+        timestamp in the same bracket (`[David, 2026-06-06 18:30 UTC]`, or
+        `[2026-06-06 18:30 UTC]` in DMs) so the model can tell which turns
+        are fresh vs. days old. `now` is only a presence gate here — the
+        rendered stamp comes from each row's own `created_at`, not from
+        `now`, so a given turn renders identically across requests and the
+        prompt prefix stays cacheable. See `format_history_timestamp`.
 
         `floor_at` is the context's purge floor — rows with
         `created_at < floor_at` are filtered out so a purge can't be
@@ -412,12 +417,12 @@ class ConversationHistory:
                     self._attribution_label(user_hash, sender_tail)
                     if attribute_senders else None
                 )
-                ago = (
-                    format_relative_age(now - created_at)
+                stamp = (
+                    format_history_timestamp(created_at)
                     if now is not None and created_at is not None
                     else None
                 )
-                bracket = _join_bracket(name, ago)
+                bracket = _join_bracket(name, stamp)
                 if bracket:
                     text = f"[{bracket}] {content}"
             elif role == "assistant" and attribute_senders:
@@ -426,13 +431,13 @@ class ConversationHistory:
                 # across speakers. `user_hash` / `sender_tail` were stored
                 # at append time as the addressee of this reply.
                 name = self._attribution_label(user_hash, sender_tail)
-                ago = (
-                    format_relative_age(now - created_at)
+                stamp = (
+                    format_history_timestamp(created_at)
                     if now is not None and created_at is not None
                     else None
                 )
                 if name:
-                    bracket = _join_bracket(f"to {name}", ago)
+                    bracket = _join_bracket(f"to {name}", stamp)
                     if bracket:
                         text = f"[{bracket}] {content}"
             turn: dict = {"role": role, "content": text}

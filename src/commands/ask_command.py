@@ -63,7 +63,7 @@ from ..llm import (
     LLMError,
     LLMNotConfigured,
     ConversationHistory,
-    format_relative_age,
+    format_history_timestamp,
 )
 from ..memory import (
     FORGET_TOOL,
@@ -126,16 +126,19 @@ def _user_explicitly_asked_to_think(text: str) -> bool:
 _META_LEAK_PATTERNS = (
     # Assistant-turn addressee label: `[to David, 2m ago]`
     re.compile(r"^\s*\[to [^\]\n]{1,80}\]\s*", re.IGNORECASE),
-    # User-turn speaker label: `[J, just now]`, `[David, 2m ago]`,
-    # `[...4137, 5h ago]`. Same shape the history load path produces
-    # for user messages in groups; some models mimic it as a header
-    # for their own reply. Tightly constrained — must contain a
-    # comma + a time-like phrase — so generic bracket-bullets
-    # ("[1] foo", "[note] bar") survive untouched.
+    # User-turn speaker label: `[David, 2026-06-06 18:30 UTC]` (current
+    # form), plus the legacy relative forms `[J, just now]`, `[David, 2m
+    # ago]`, `[...4137, 5h ago]` that older assistant turns may still carry
+    # or that a model mimics. Same shape the history load path produces for
+    # user messages in groups; some models echo it as a header for their
+    # own reply. Tightly constrained — must contain a comma + a time-like
+    # phrase — so generic bracket-bullets ("[1] foo", "[note] bar") survive
+    # untouched.
     re.compile(
         r"^\s*\["
         r"[^\]\n,]{1,40},\s*"
         r"(?:just now|a moment ago|"
+        r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*UTC|"
         r"\d+\s*(?:[smhdw]|min(?:ute)?|sec(?:ond)?|hour|day|week)s?"
         r"(?:\s*ago)?)"
         r"\s*\]\s*",
@@ -463,13 +466,16 @@ class AskCommand(BaseCommand):
             logger.debug(f"Read-time enrichment failed: {e}")
             return text
 
-    async def _build_group_context(self, ctx, now: float) -> str:
+    async def _build_group_context(self, ctx) -> str:
         """Render recent group chat, oldest-first, wrapped for the model.
 
-        Each line gets `[Sender, 5m ago] text` so the model can tell which
-        bits of context are seconds-old vs. hours-old. Returns the full
-        `<group_context>...</group_context>` block, or "" if there's nothing
-        to show.
+        Each line gets `[Sender, 2026-06-06 18:30 UTC] text` so the model can
+        tell which bits of context are seconds-old vs. hours-old. The stamp
+        is absolute (derived from each message's own `created_at`, not from
+        "now") so the block stays byte-stable across requests and lands in
+        the cached prompt prefix — see `format_history_timestamp`. Returns
+        the full `<group_context>...</group_context>` block, or "" if
+        there's nothing to show.
         """
         limit = self._live_group_ctx()
         if limit <= 0 or not ctx.is_group or self.group_log is None:
@@ -520,12 +526,28 @@ class AskCommand(BaseCommand):
             if not text:
                 continue
             if m["sender"] == BOT_SENDER:
-                label = _bot_row_label(m.get("bot_id"))
+                # Skip the ACTIVE bot's own prior replies. They're already
+                # replayed in the user/assistant alternation as this bot's
+                # assistant turns (history.load is bot_id-scoped to include
+                # them), so rendering them here too made the writer see its
+                # last message twice — and the group_context copy sits right
+                # before the new question, priming it to repeat itself. The
+                # absolute UTC stamp on every line + assistant turn lets the
+                # model reconstruct the interleaved timeline without this
+                # copy. Legacy NULL-bot rows are treated as the active bot's
+                # own (matching history.load, which replays NULL assistant
+                # turns as this bot's), so they're skipped too. CO-bots'
+                # rows (a different bot_id) stay — they're filtered out of
+                # THIS bot's history, so group_context is their only home.
+                row_bot_id = m.get("bot_id")
+                if row_bot_id == active_bot_id or row_bot_id is None:
+                    continue
+                label = _bot_row_label(row_bot_id)
             else:
                 label = self._sender_label(m["sender"])
             ts = m.get("created_at")
-            ago = format_relative_age(now - ts) if ts is not None else None
-            bracket = f"{label}, {ago}" if ago else label
+            stamp = format_history_timestamp(ts) if ts is not None else None
+            bracket = f"{label}, {stamp}" if stamp else label
             lines.append(f"[{bracket}] {text.replace(chr(10), ' ')}")
         if not lines:
             return ""
@@ -2210,7 +2232,7 @@ class AskCommand(BaseCommand):
             # re-surface old images regardless of what's persisted.
             self._inflate_image_history(prior, ctx)
 
-            group_ctx_block = await self._build_group_context(ctx, now_ts)
+            group_ctx_block = await self._build_group_context(ctx)
 
             # Long-term rolling summary, if one exists. Lives in the system
             # suffix so it bookends the persona; the XML tag tells the
@@ -2246,9 +2268,14 @@ class AskCommand(BaseCommand):
                 last_ts = None
             if last_ts is not None and prior:
                 age = now_ts - last_ts
+                # Gate on `age` (presence flips once, when the thread crosses
+                # the threshold) but render the stamp absolutely so the block
+                # text doesn't drift every request — the model reads recency
+                # off the current-time anchor in the last user message.
                 if age >= STALENESS_THRESHOLD_SECONDS:
                     staleness_block = (
-                        f"The most recent prior turn was {format_relative_age(age)}. "
+                        f"The most recent prior turn was at "
+                        f"{format_history_timestamp(last_ts)}. "
                         f"Treat the conversation history as background — the new "
                         f"message may be a fresh topic, unrelated to those older turns."
                     )
@@ -2265,22 +2292,25 @@ class AskCommand(BaseCommand):
                 attribution_rules = (
                     "Attribution rules — this is a multi-speaker group chat:\n"
                     "- Every line in <group_context> and every user message "
-                    "in the conversation history begins with `[Name, time ago]` "
-                    "showing WHO spoke and WHEN. Different `[Name]` brackets "
-                    "are different people. Never combine, conflate, or "
-                    "transfer statements between speakers.\n"
+                    "in the conversation history begins with `[Name, "
+                    "YYYY-MM-DD HH:MM UTC]` showing WHO spoke and WHEN (the "
+                    "timestamp is UTC; compare it against the current time "
+                    "given in your latest message to judge how long ago it "
+                    "was). Different `[Name]` brackets are different people. "
+                    "Never combine, conflate, or transfer statements between "
+                    "speakers.\n"
                     "- Your own past replies (assistant turns) are tagged "
-                    "`[to Name, time ago]` showing WHO you were answering. "
-                    "Those are your words, not the addressee's. Untagged "
-                    "assistant turns are still yours — they just predate this "
-                    "labeling.\n"
-                    "- BOTH bracket forms — `[Name, time ago]` on user "
-                    "turns AND `[to Name, time ago]` on your assistant "
+                    "`[to Name, YYYY-MM-DD HH:MM UTC]` showing WHO you were "
+                    "answering. Those are your words, not the addressee's. "
+                    "Untagged assistant turns are still yours — they just "
+                    "predate this labeling.\n"
+                    "- BOTH bracket forms — `[Name, ...UTC]` on user "
+                    "turns AND `[to Name, ...UTC]` on your assistant "
                     "turns — are INTERNAL METADATA the system adds at "
                     "replay time. They exist so YOU can tell speakers "
                     "apart in history; they are NEVER part of a visible "
-                    "reply. Do NOT begin your output with `[J, just now]`, "
-                    "`[David, 2m ago]`, `[to Sarah]`, or any other "
+                    "reply. Do NOT begin your output with `[David, "
+                    "2026-06-06 18:30 UTC]`, `[to Sarah]`, or any other "
                     "bracket-prefix that mimics those formats. If you "
                     "want to address someone by name, use natural prose "
                     "(`David — yes, …`) — never the bracket form.\n"

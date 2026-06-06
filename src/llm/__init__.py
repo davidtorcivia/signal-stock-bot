@@ -2,7 +2,7 @@
 
 from .client import LLMClient, LLMDisabled, LLMError, LLMNotConfigured
 from .deep_think import DeepThinkClient
-from .history import ConversationHistory, format_relative_age
+from .history import ConversationHistory, format_history_timestamp
 from .reactor import EmojiReactor
 
 __all__ = [
@@ -13,5 +13,5 @@ __all__ = [
     "ConversationHistory",
     "DeepThinkClient",
     "EmojiReactor",
-    "format_relative_age",
+    "format_history_timestamp",
 ]

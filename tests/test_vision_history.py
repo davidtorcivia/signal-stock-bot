@@ -64,7 +64,7 @@ async def test_image_refs_survives_load_with_attribution(history):
         "ctx", "user", "look", sender_tail="1234", image_refs=refs,
     )
     turns = await history.load("ctx", attribute_senders=True, now=1_700_000_000.0)
-    # Attribution prepended a [..tail, just now] bracket onto content
+    # Attribution prepended a [..tail, <UTC stamp>] bracket onto content
     assert turns[0]["content"].startswith("[")
     # Image refs still attached
     assert turns[0]["image_refs"] == refs
