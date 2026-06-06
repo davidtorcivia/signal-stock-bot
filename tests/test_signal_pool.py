@@ -336,6 +336,37 @@ def _phoned_bots() -> list[Bot]:
 
 
 @pytest.mark.asyncio
+async def test_uuid_only_mention_resolves_to_named_bot_on_every_handler():
+    """A tap-mention that carries only a UUID (no phone — Signal hides
+    numbers) must resolve to the NAMED bot, not the pinned default, and
+    resolve identically on BOTH handlers so the claim filter routes it to
+    the right phone. Regression: "@Sigil" in an Artaud-pinned group used to
+    return Artaud (or nothing), so the tagged bot stayed silent."""
+    bots = _phoned_bots()  # sigil=1 (default/pinned-ish), artaud=2
+    pool = _make_pool(bots)
+    _, sigil_h, artaud_h = _wire_dispatch_test(pool, bots)
+    # Pin Artaud as the active/default bot, like "Bot Town".
+    artaud = bots[1]
+
+    def _resolve(group_id, policy=None, addressed_bot=None):
+        return addressed_bot or artaud  # pinned = Artaud
+
+    sigil_h.dispatcher._resolve_bot = _resolve
+    # Each handler knows its own account UUID (normally fetched at boot).
+    sigil_h._bot_uuid = "uuid-sigil"
+    artaud_h._bot_uuid = "uuid-artaud"
+
+    env = {"message": "what do you reckon", "mentions": [{"uuid": "uuid-sigil"}]}
+
+    # Both handlers resolve the SAME bot (Sigil) from the UUID mention,
+    # even though Artaud is pinned.
+    bot_s, m_s = await sigil_h._resolve_addressed_bot(env, "g1", _FakePolicy())
+    bot_a, m_a = await artaud_h._resolve_addressed_bot(env, "g1", _FakePolicy())
+    assert (m_s, bot_s.slug) == (True, "sigil")
+    assert (m_a, bot_a.slug) == (True, "sigil")
+
+
+@pytest.mark.asyncio
 async def test_resolve_addressed_bot_set_both_mentioned():
     bots = _phoned_bots()
     pool = _make_pool(bots)

@@ -518,6 +518,69 @@ class SignalHandler:
         return None
 
     @staticmethod
+    def _mention_ids(mention: dict) -> tuple:
+        """Normalize a mention's (number, uuid) across signal-cli shapes.
+
+        signal-cli mentions carry `number` and/or `uuid`; on number-privacy
+        accounts only the UUID is present, sometimes under `name`/`aci`.
+        """
+        number = (mention.get("number") or "").strip()
+        uuid = (
+            mention.get("uuid") or mention.get("aci") or mention.get("author")
+            or ""
+        ).strip()
+        if not uuid:
+            # `name` holds the UUID when the number is hidden.
+            nm = (mention.get("name") or "").strip()
+            if "-" in nm and " " not in nm:  # looks like a UUID, not a label
+                uuid = nm
+        return number, uuid
+
+    def _mention_targets_self(self, mention: dict) -> bool:
+        """True if this mention names THIS handler's own Signal account."""
+        number, uuid = self._mention_ids(mention)
+        return bool(
+            (number and number == self.config.phone_number)
+            or (self._bot_uuid and uuid == self._bot_uuid)
+        )
+
+    def _resolve_mention_bot(self, mention: dict):
+        """Resolve a structured @-mention to the bot it addresses, or None.
+
+        Order: by phone (global) → by UUID (global, via the pool) → by THIS
+        handler's own identity → the single bot this handler serves.
+
+        Crucially this returns the SERVED bot, never the pinned `active_bot`
+        — a tap-mention of Sigil in an Artaud-pinned group must summon
+        Sigil. And it resolves the SAME bot on every handler (phone/UUID
+        lookups are global), so the multi-phone claim filter routes the
+        envelope to the right phone instead of two handlers disagreeing and
+        the wrong one claiming it (which dropped the message — the bot you
+        tagged stayed silent). Returns None only when the mention names no
+        known bot, or names a shared-phone account serving several bots
+        (ambiguous — caller falls back to the pinned bot).
+        """
+        number, uuid = self._mention_ids(mention)
+        bot = self._lookup_bot_by_phone(number)
+        if bot is not None:
+            return bot
+        pool = getattr(self.dispatcher, "signal_pool", None) if self.dispatcher else None
+        if uuid and pool is not None and hasattr(pool, "bot_for_uuid"):
+            bot = pool.bot_for_uuid(uuid)
+            if bot is not None:
+                return bot
+        # Mention names this handler's own account → the bot it serves.
+        if self._mention_targets_self(mention):
+            served = list(self.served_bot_ids)
+            if (
+                len(served) == 1
+                and self.dispatcher is not None
+                and self.dispatcher.bot_registry is not None
+            ):
+                return self.dispatcher.bot_registry.get_sync(served[0])
+        return None
+
+    @staticmethod
     def _build_claim_key(envelope: dict, data_message: dict, group_id):
         """Pool-shared key for cross-handler envelope deduplication.
 
@@ -781,19 +844,25 @@ class SignalHandler:
         if mentions:
             if not self._bot_uuid:
                 await self.fetch_bot_uuid()
+            targets_self = False
             for mention in mentions:
-                target_phone = mention.get("number", "")
-                target_uuid = mention.get("uuid", "")
-                mentioned_bot = self._lookup_bot_by_phone(target_phone)
-                if mentioned_bot is not None:
-                    return mentioned_bot, True
-                # Fall-back for single-bot installs without
-                # signal_phone overrides: phone/UUID match against this
-                # handler's own identity still counts as "addressing me."
-                if target_phone == self.config.phone_number or (
-                    self._bot_uuid and target_uuid == self._bot_uuid
-                ):
-                    return active_bot, True
+                mb = self._resolve_mention_bot(mention)
+                if mb is not None:
+                    return mb, True
+                if self._mention_targets_self(mention):
+                    targets_self = True
+            # The mention named this handler's account but it serves
+            # several bots (shared-phone) — can't disambiguate, so the
+            # pinned bot fields it. (Multi-phone never reaches here: the
+            # served-bot resolution above handles it.)
+            if targets_self and active_bot is not None:
+                return active_bot, True
+            # Mentions present but none mapped to a bot we serve — log the
+            # raw ids so a misrouted tag is debuggable instead of silent.
+            logger.info(
+                "Mention(s) matched no bot: %s",
+                [self._mention_ids(m) for m in mentions],
+            )
 
         # 2) Typed-name addressing. A bot is ADDRESSED when its name LEADS
         # the message (a vocative): "Sigil, …", "hey Artaud …", or a
@@ -904,22 +973,22 @@ class SignalHandler:
             if all(getattr(b, "id", None) != bid for b in found):
                 found.append(bot)
 
-        # 1) Structured @-mentions.
+        # 1) Structured @-mentions — resolve each to the bot it names
+        # (phone or UUID, globally), returning the served bot, never the
+        # pinned default. See `_resolve_mention_bot`.
         mentions = data_message.get("mentions") or []
         if mentions:
             if not self._bot_uuid:
                 await self.fetch_bot_uuid()
+            targets_self = False
             for mention in mentions:
-                target_phone = mention.get("number", "")
-                target_uuid = mention.get("uuid", "")
-                mb = self._lookup_bot_by_phone(target_phone)
+                mb = self._resolve_mention_bot(mention)
                 if mb is not None:
                     _add(mb)
-                elif active_bot is not None and (
-                    target_phone == self.config.phone_number
-                    or (self._bot_uuid and target_uuid == self._bot_uuid)
-                ):
-                    _add(active_bot)
+                elif self._mention_targets_self(mention):
+                    targets_self = True
+            if not found and targets_self and active_bot is not None:
+                _add(active_bot)
         if found:
             return found
 

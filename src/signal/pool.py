@@ -174,6 +174,32 @@ class SignalHandlerPool:
             self.build()
         return self._handlers.get(phone)
 
+    def bot_for_uuid(self, uuid: Optional[str]):
+        """Return the bot whose Signal account UUID matches `uuid`, or None.
+
+        Resolves @-mentions that carry only a UUID (modern Signal hides
+        phone numbers, so a tap-mention often has no `number`). We map
+        UUID -> the handler that owns it -> the single bot it serves. This
+        is GLOBAL (any handler can resolve any bot's mention to the same
+        bot), which the multi-phone claim filter relies on — otherwise the
+        two handlers disagree on who was addressed and the wrong one claims
+        the envelope. Ambiguous (a shared-phone handler serving several
+        bots) returns None so the caller falls back."""
+        if not uuid:
+            return None
+        if not self._built:
+            self.build()
+        for handler in self._handlers.values():
+            if handler._bot_uuid and handler._bot_uuid == uuid:
+                served = list(handler.served_bot_ids)
+                if len(served) == 1 and self._bot_registry is not None:
+                    try:
+                        return self._bot_registry.get_sync(served[0])
+                    except Exception:
+                        return None
+                return None
+        return None
+
     def default(self) -> SignalHandler:
         if not self._built:
             self.build()
