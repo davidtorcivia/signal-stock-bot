@@ -184,6 +184,26 @@ def _strip_meta_leak(text: str) -> str:
 _strip_addressee_leak = _strip_meta_leak
 
 
+# Pseudo-tool-call markup the model emitted as TEXT instead of a real
+# tool_calls payload (seen 2026-06-09: a reply ending in
+# `<function=brave-search__brave_web_search>\n<parameter=query>...`).
+# Everything from the first such marker onward is malformed scaffolding,
+# never user-facing prose — drop it. Covers OpenAI-ish `<function=...>`,
+# `<tool_call>`, `<invoke ...>`, and DeepSeek's `<|tool▁calls▁begin|>`
+# family.
+_TOOL_CALL_LEAK_RE = re.compile(
+    r"<\|?(?:function[=\s>]|tool[_▁\s]?call|invoke[\s=>])[\s\S]*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_tool_call_leak(text: str) -> str:
+    """Cut a leaked, unparsed tool-call block off the end of a reply."""
+    if not text or "<" not in text:
+        return text
+    return _TOOL_CALL_LEAK_RE.sub("", text).rstrip()
+
+
 # Tool exposed to the writer LLM when DeepThinkClient is configured + ready.
 # Single tool, no namespace prefix — distinguishes itself by literal name in
 # the dispatch path inside _execute_tool_call.
@@ -499,10 +519,14 @@ class AskCommand(BaseCommand):
 
         # Multi-bot attribution: each BOT_SENDER row carries the writing
         # bot's id (or NULL on legacy rows). The renderer looks up that
-        # bot's display_name so a multi-bot group reads naturally — bot
-        # A sees bot B's prior turns labeled `[Sigil, 5m ago]` as if
-        # Sigil were a participant. The bot itself doesn't know (and
-        # shouldn't know) the other speaker is a bot.
+        # bot's display_name and prefixes it with `Bot:` — co-bot rows
+        # read `[Bot: Sigil, ...]`. Hiding the bot-ness (the original
+        # design) made the writer treat sibling bots as humans: it
+        # attributed their lines to people, claimed authorship of their
+        # replies, and argued with users about who said what (the
+        # 2026-06-06 Bot Town incident). The marker plus the matching
+        # attribution rule lets the model keep humans, itself, and
+        # sibling bots in three distinct buckets.
         active_bot_name = self._active_bot_display(ctx)
         active_bot_id = getattr(getattr(ctx, "bot", None), "id", None)
 
@@ -542,7 +566,7 @@ class AskCommand(BaseCommand):
                 row_bot_id = m.get("bot_id")
                 if row_bot_id == active_bot_id or row_bot_id is None:
                     continue
-                label = _bot_row_label(row_bot_id)
+                label = f"Bot: {_bot_row_label(row_bot_id)}"
             else:
                 label = self._sender_label(m["sender"])
             ts = m.get("created_at")
@@ -2314,6 +2338,12 @@ class AskCommand(BaseCommand):
                     "bracket-prefix that mimics those formats. If you "
                     "want to address someone by name, use natural prose "
                     "(`David — yes, …`) — never the bracket form.\n"
+                    "- Lines in <group_context> labeled `[Bot: Name, "
+                    "...UTC]` are messages from OTHER automated bots in "
+                    "this chat. They are not humans and they are not you. "
+                    "Never claim their statements as your own, never "
+                    "attribute them to a human, and never answer on their "
+                    "behalf.\n"
                     "- The current message is wrapped in "
                     "`<current_message from=\"Name\">`. Reply to that speaker; "
                     "do not assume the prior turn's asker is still in front "
@@ -2629,10 +2659,19 @@ class AskCommand(BaseCommand):
                 # rules don't trigger that mimicry as easily, and the
                 # closing "do not echo" rule + the response-style no-echo
                 # rule + _strip_meta_leak give us defense in depth.
+                # The reason is reactor-LLM output derived from raw user
+                # text — sanitize before it lands in the system suffix:
+                # cap the length and drop angle brackets so it can't
+                # open/close XML-ish blocks or smuggle directive-shaped
+                # markup into the prompt. It's informational scaffolding;
+                # lossy is fine.
+                reason_safe = re.sub(
+                    r"[<>]", "", str(ctx.implicit_reason)
+                ).strip()[:200] or "(no reason given)"
                 implicit_directive = (
                     "The current message was NOT addressed to you directly "
                     "— no @mention, quote-reply, or name trigger. The "
-                    f"reactor flagged it because: {ctx.implicit_reason!r}.\n\n"
+                    f"reactor flagged it because: {reason_safe!r}.\n\n"
                     "You are the second-stage filter. Look at the full "
                     "group context and decide whether a real reply is "
                     "actually warranted. It is fine — and often correct "
@@ -2912,8 +2951,15 @@ class AskCommand(BaseCommand):
         # "Reflex note:", etc.). The system prompt tells it not to, but
         # this is the safety net so users never see internal scaffolding
         # as literal output — and it prevents leaks from round-tripping
-        # through history.
-        answer = _strip_meta_leak(answer)
+        # through history. Same for pseudo-tool-call markup the model
+        # wrote as text instead of a real tool_calls payload.
+        answer = _strip_tool_call_leak(_strip_meta_leak(answer))
+        # Re-check: if scaffolding was the ENTIRE output, the strip just
+        # emptied the answer. Without this guard an empty assistant turn
+        # would be persisted (breaking the user/assistant alternation on
+        # replay) and the explicit path would send a blank Signal message.
+        if not answer:
+            return CommandResult.error("LLM returned no answer.")
 
         try:
             # Store the raw question (no prefix) + sender_tail separately; the
@@ -2943,23 +2989,29 @@ class AskCommand(BaseCommand):
             # second copy (role='user' matches every bot's load regardless
             # of bot_id) would replay the human's message twice. The
             # assistant turn below is always persisted: it's this bot's own.
-            if getattr(ctx, "persist_user_turn", True):
+            # Hold the per-context lock across the pair so two concurrent
+            # asks in the same context can't interleave their writes
+            # (user-A, user-B, assistant-B, assistant-A) and garble the
+            # replayed alternation.
+            async with self.history.lock_for(context_key):
+                if getattr(ctx, "persist_user_turn", True):
+                    await self.history.append(
+                        context_key, "user", question,
+                        user_hash=user_hash, sender_tail=sender_tail,
+                        turns_per_user=live_turns,
+                        image_refs=persisted_images,
+                        bot_id=bot_id_for_turn,
+                    )
+                # Persist the addressee on the assistant row too: the load
+                # path uses it to render `[to Name, time ago]` in group
+                # playback so the model can pair its prior answers with
+                # the right asker.
                 await self.history.append(
-                    context_key, "user", question,
+                    context_key, "assistant", answer,
                     user_hash=user_hash, sender_tail=sender_tail,
                     turns_per_user=live_turns,
-                    image_refs=persisted_images,
                     bot_id=bot_id_for_turn,
                 )
-            # Persist the addressee on the assistant row too: the load path
-            # uses it to render `[to Name, time ago]` in group playback so
-            # the model can pair its prior answers with the right asker.
-            await self.history.append(
-                context_key, "assistant", answer,
-                user_hash=user_hash, sender_tail=sender_tail,
-                turns_per_user=live_turns,
-                bot_id=bot_id_for_turn,
-            )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")
 
