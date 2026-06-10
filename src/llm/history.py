@@ -13,6 +13,7 @@ Pruning is triggered on every write:
   * global age cap:      rows older than `llm_retention_days` deleted
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -78,6 +79,26 @@ class ConversationHistory:
         # When unset, attribution falls back to `[...tail]`.
         self.name_registry = name_registry
         self._initialized = False
+        # Per-context locks so a user+assistant turn pair is written
+        # without another ask's pair interleaving (which would garble
+        # the replayed alternation). Callers hold lock_for() around
+        # the paired append() calls.
+        self._ctx_locks: dict[str, asyncio.Lock] = {}
+
+    def lock_for(self, context_key: str) -> asyncio.Lock:
+        """Return the (lazily created) lock serializing writes for one
+        context. Bounded: idle locks are evicted once the table grows
+        past 512 contexts."""
+        lock = self._ctx_locks.get(context_key)
+        if lock is None:
+            if len(self._ctx_locks) > 512:
+                for k in [
+                    k for k, v in self._ctx_locks.items()
+                    if not v.locked()
+                ][:256]:
+                    del self._ctx_locks[k]
+            lock = self._ctx_locks[context_key] = asyncio.Lock()
+        return lock
 
     def _retention_seconds(self) -> float:
         if self.settings_store is None:
@@ -167,18 +188,62 @@ class ConversationHistory:
                 """
             )
             # Migration: legacy summaries lived as one row per
-            # context_key with no bot_id column. Add the column and
-            # promote those rows to bot_id=0 (the "shared / legacy"
-            # sentinel — every bot's reader passes 0 as a fallback
-            # when the per-bot row is missing).
+            # context_key with PRIMARY KEY (context_key) and no bot_id.
+            # ALTER TABLE can't change a primary key, so adding the
+            # column isn't enough: upsert_summary's
+            # ON CONFLICT(context_key, bot_id) needs a matching
+            # constraint, and the single-column PK also forbids two
+            # bots' rows coexisting in one context. Rebuild the table
+            # when the composite PK is missing, promoting legacy rows
+            # to bot_id=0 (the "shared / legacy" sentinel every reader
+            # falls back to when the per-bot row is absent).
             cursor = await db.execute(
                 "PRAGMA table_info(conversation_summaries)"
             )
-            summ_cols = {r[1] for r in await cursor.fetchall()}
-            if "bot_id" not in summ_cols:
+            summ_info = await cursor.fetchall()
+            summ_cols = {r[1] for r in summ_info}
+            pk_cols = {r[1] for r in summ_info if r[5]}
+            if pk_cols != {"context_key", "bot_id"}:
                 await db.execute(
                     "ALTER TABLE conversation_summaries "
-                    "ADD COLUMN bot_id INTEGER NOT NULL DEFAULT 0"
+                    "RENAME TO conversation_summaries_legacy"
+                )
+                await db.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        context_key TEXT NOT NULL,
+                        bot_id INTEGER NOT NULL DEFAULT 0,
+                        summary TEXT NOT NULL,
+                        summary_through_id INTEGER NOT NULL DEFAULT 0,
+                        turns_summarized INTEGER NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (context_key, bot_id)
+                    )
+                    """
+                )
+                # Copy whichever of the new columns the legacy table
+                # actually has; missing ones take their defaults.
+                copy_cols = [
+                    c for c in (
+                        "context_key", "bot_id", "summary",
+                        "summary_through_id", "turns_summarized",
+                        "updated_at",
+                    ) if c in summ_cols
+                ]
+                select_exprs = [
+                    "COALESCE(bot_id, 0)" if c == "bot_id" else c
+                    for c in copy_cols
+                ]
+                await db.execute(
+                    f"INSERT OR IGNORE INTO conversation_summaries "
+                    f"({', '.join(copy_cols)}) "
+                    f"SELECT {', '.join(select_exprs)} "
+                    f"FROM conversation_summaries_legacy"
+                )
+                await db.execute("DROP TABLE conversation_summaries_legacy")
+                logger.info(
+                    "Migrated conversation_summaries to composite "
+                    "(context_key, bot_id) primary key"
                 )
             await db.commit()
         self._initialized = True
