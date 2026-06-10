@@ -5,11 +5,15 @@ Mounts auth + dashboard + settings under /admin/*.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
+import os.path
+import socket
 import time
 from datetime import timedelta
 from typing import Optional
+from urllib.parse import urlparse
 
 from flask import Blueprint, Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, url_for
 
@@ -582,6 +586,9 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
 
         raw = form.get(key, "").strip()
 
+        if key in _OUTBOUND_URL_KEYS:
+            _validate_outbound_base_url(key, raw)
+
         if key in bool_keys:
             store.set(key, raw.lower() in ("1", "true", "yes", "on"))
             continue
@@ -825,6 +832,10 @@ def _apply_bot_llm_form(
                     )
                 store.set_bot(bot_id, role, key, raw)
                 continue
+            if key == "base_url":
+                # Same SSRF guard as the global llm_base_url /
+                # deep_think_base_url settings.
+                _validate_outbound_base_url(field, raw)
             store.set_bot(bot_id, role, key, raw)
 
 
@@ -1135,6 +1146,78 @@ def _parse_args(raw: str) -> list[str]:
     return [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
 
 
+# Settings whose value becomes an outbound fetch target. Post-auth
+# defense-in-depth: a hijacked admin session shouldn't be able to point
+# the bot's LLM/scrape traffic at internal infrastructure — the
+# unauthenticated signal-cli container (bare Docker DNS name), cloud
+# metadata (169.254.169.254), or loopback. Dotted RFC1918 hosts stay
+# allowed on purpose: a local LLM endpoint (e.g. ollama on the LAN) is a
+# legitimate base URL.
+_OUTBOUND_URL_KEYS = ("llm_base_url", "deep_think_base_url", "wsb_redlib_base_url")
+
+
+def _validate_outbound_base_url(key: str, url: str) -> None:
+    """Raise ValueError when an admin-supplied base URL points somewhere
+    outbound traffic must never go. Empty values are fine (fallback)."""
+    if not url:
+        return
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"{key} must be an http(s) URL")
+    host = parsed.hostname
+    try:
+        ipaddress.ip_address(host)
+        addrs = [host]
+    except ValueError:
+        # Bare single-label names are the Docker-internal DNS namespace
+        # (signal-api, stock-bot, ...) — never a public API host.
+        if "." not in host:
+            raise ValueError(
+                f"{key}: bare hostname {host!r} looks like an internal "
+                f"Docker service name; use a fully-qualified host"
+            ) from None
+        try:
+            addrs = sorted({i[4][0] for i in socket.getaddrinfo(host, None)})
+        except OSError:
+            raise ValueError(f"{key}: cannot resolve host {host!r}") from None
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr)
+        if (
+            ip.is_loopback or ip.is_link_local or ip.is_multicast
+            or ip.is_reserved or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"{key}: host {host!r} resolves to a blocked address "
+                f"({ip}) — loopback/link-local/metadata targets are not "
+                f"allowed"
+            )
+
+
+# Stdio MCP servers are arbitrary subprocesses launched inside the
+# container. Restrict the binary to known package-runner runtimes plus
+# conventionally-named MCP binaries so a hijacked admin session can't
+# configure command=/bin/bash. Matching is on the basename so absolute
+# paths to the same runtimes still work.
+_MCP_COMMAND_RUNTIMES = {
+    "npx", "uvx", "uv", "node", "deno", "bun", "bunx", "python", "python3",
+}
+
+
+def _validate_mcp_command(command: Optional[str]) -> None:
+    if not command:
+        return
+    base = os.path.basename(command.strip())
+    if base in _MCP_COMMAND_RUNTIMES:
+        return
+    if base.startswith("mcp-") or base.endswith(("-mcp", "-mcp-server")):
+        return
+    raise ValueError(
+        f"command {command!r} is not an allowed MCP launcher — use one of "
+        f"{sorted(_MCP_COMMAND_RUNTIMES)} or a binary named mcp-* / "
+        f"*-mcp-server"
+    )
+
+
 def _form_to_config(form, existing_id: Optional[int] = None) -> MCPServerConfig:
     name = (form.get("name") or "").strip()
     transport = (form.get("transport") or "").strip()
@@ -1144,6 +1227,8 @@ def _form_to_config(form, existing_id: Optional[int] = None) -> MCPServerConfig:
     args = _parse_args(form.get("args") or "")
     env = _parse_kv_textarea(form.get("env") or "")
     headers = _parse_kv_textarea(form.get("headers") or "")
+    if transport == "stdio":
+        _validate_mcp_command(command)
     cfg = MCPServerConfig(
         id=existing_id,
         name=name,
@@ -1339,6 +1424,9 @@ def _apply_settings_form(store: SettingsStore, form) -> None:
             except ValueError:
                 raise ValueError(f"{key} must be an integer") from None
             continue
+
+        if key in _OUTBOUND_URL_KEYS:
+            _validate_outbound_base_url(key, raw)
 
         # Default: string
         store.set(key, raw)

@@ -107,8 +107,16 @@ class CacheCommand(BaseCommand):
         
         action = ctx.args[0].lower() if ctx.args else "stats"
         cache_mgr = get_cache_manager()
-        
+
         if action == "clear":
+            # Destructive: unlike read-only stats (open when no admin list
+            # is configured), wiping the cache requires an EXPLICIT admin
+            # list — otherwise any group member could clear it.
+            if not self.admin_numbers or ctx.sender not in self.admin_numbers:
+                return CommandResult.error(
+                    "Cache clear requires a configured admin "
+                    "(set ADMIN_NUMBERS)."
+                )
             cache_mgr.clear_all()
             return CommandResult.ok("All caches cleared.")
         

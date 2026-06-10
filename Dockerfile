@@ -50,6 +50,14 @@ COPY scripts/download_tarot.py scripts/download_tarot.py
 # Create logs directory
 RUN mkdir -p logs
 
+# Drop root: everything from here on (gunicorn, MCP stdio subprocesses,
+# LLM tool calls) runs as an unprivileged user, so a compromise of any
+# of those paths doesn't get root-in-container. UID 1000 matches the
+# host owner of the bind-mounted data/ and logs/ dirs.
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin botuser \
+    && chown -R botuser:botuser /app
+USER botuser
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1

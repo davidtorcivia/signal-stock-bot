@@ -80,7 +80,17 @@ def create_app(
             logger.warning("Received empty or invalid webhook payload")
             return jsonify({"status": "error", "message": "Empty payload"}), 400
 
-        logger.debug(f"Received webhook: {data}")
+        # Shape-only debug line: never log the full envelope — it carries
+        # message plaintext and phone numbers, which would persist in
+        # bot.log whenever the level is DEBUG.
+        if logger.isEnabledFor(logging.DEBUG):
+            envelope = data.get("envelope") or {}
+            logger.debug(
+                "Received webhook: source=...%s ts=%s keys=%s",
+                str(envelope.get("source") or "")[-4:],
+                envelope.get("timestamp"),
+                sorted(envelope.keys()),
+            )
 
         future = asyncio.run_coroutine_threadsafe(
             signal_handler.handle_webhook(data), loop

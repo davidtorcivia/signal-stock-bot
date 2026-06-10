@@ -5,7 +5,12 @@ services:
     container_name: signal-api
     restart: unless-stopped
     ports:
-      - "8093:8080"
+      # Loopback ONLY: the signal-cli REST API has no authentication —
+      # bound to 0.0.0.0 it let anyone on the LAN send messages as the
+      # bots' numbers and dump group/identity data. The stock-bot
+      # container reaches it via the Docker network (signal-api:8080);
+      # this binding exists purely for on-host debugging.
+      - "127.0.0.1:8093:8080"
     dns:
       - 1.1.1.1
       - 8.8.8.8
