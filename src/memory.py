@@ -246,7 +246,7 @@ class MemoryStore:
         content = content.strip()
         speaker = source_user_hash or ""
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             # BEGIN IMMEDIATE acquires the reserved lock at start of read,
             # so a concurrent writer waits instead of read-then-double-insert.
             await db.execute("BEGIN IMMEDIATE")
@@ -371,7 +371,7 @@ class MemoryStore:
             sql += " AND (bot_id = ? OR bot_id IS NULL)"
             params.append(bot_id)
         sql += " ORDER BY confidence DESC, updated_at DESC"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(sql, params)
             rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -479,7 +479,7 @@ class MemoryStore:
             bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
             params = params + (bot_id,)
         params = params + (limit,)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"""SELECT {self._SELECT_COLS}
                     FROM context_memories
@@ -548,7 +548,7 @@ class MemoryStore:
         sets.append("updated_at = ?")
         params.append(time.time())
         params.append(memory_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with db_session(self) as db:
             cursor = await db.execute(
                 f"UPDATE context_memories SET {', '.join(sets)} WHERE id = ?",
                 params,

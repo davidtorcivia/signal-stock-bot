@@ -391,6 +391,15 @@ class CommandDispatcher:
             policy_ok = policy is None or policy.allows_command("corn")
             now = time.time()
             if policy_ok and now - self._corn_cooldown.get(sender, 0) > 60:
+                # Bounded: entries older than the cooldown are dead weight,
+                # so sweep them whenever the table grows past a sane size
+                # (the dict otherwise accumulates one key per sender
+                # forever).
+                if len(self._corn_cooldown) > 256:
+                    self._corn_cooldown = {
+                        k: v for k, v in self._corn_cooldown.items()
+                        if now - v <= 60
+                    }
                 self._corn_cooldown[sender] = now
                 corn_result = await self._handle_corn_easter_egg()
                 if corn_result:

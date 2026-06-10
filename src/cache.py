@@ -716,8 +716,10 @@ class RequestDeduplicator:
                 logger.debug(f"Dedup hit for {key}")
                 return await self._pending[key]
             
-            # Create a new future for this request
-            future = asyncio.get_event_loop().create_future()
+            # Create a new future for this request. get_running_loop, not
+            # the deprecated get_event_loop — the latter raises on 3.12+
+            # when no loop is set on the thread.
+            future = asyncio.get_running_loop().create_future()
             self._pending[key] = future
         
         try:

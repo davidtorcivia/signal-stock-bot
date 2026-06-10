@@ -390,6 +390,14 @@ class WSBDigestService:
             site.write_day(rec, og_png=og_png or None, charts=charts)
             return og_png or None
 
+        # Persist the row BEFORE writing static files: if the static page
+        # lands on disk but the upsert then fails, the page is orphaned at
+        # a live URL with no DB record (invisible to the index, never
+        # cleaned up). Upserting first guarantees every on-disk page has a
+        # row; the second upsert below refreshes the same row (keyed by
+        # date) with the chart metadata the render fills in.
+        await self.store.upsert(rec)
+
         og_png: Optional[bytes] = None
         try:
             og_png = await run_blocking(_render_and_write_day, timeout=RENDER_TIMEOUT)

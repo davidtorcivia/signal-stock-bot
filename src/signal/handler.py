@@ -299,8 +299,7 @@ class SignalHandler:
         if attachments:
             # Signal API format: "data:<mime>;filename=<name>;base64,<data>"
             payload["base64_attachments"] = [
-                f"data:image/png;filename=chart.png;base64,{att}"
-                for att in attachments
+                self._attachment_data_uri(att) for att in attachments
             ]
         
         url = f"{self.config.api_url}/v2/send"
@@ -333,6 +332,31 @@ class SignalHandler:
             logger.error(f"Failed to send response: {e}")
             raise
     
+    @staticmethod
+    def _attachment_data_uri(att: str) -> str:
+        """Wrap a base64 attachment in Signal's data-URI format, sniffing
+        the real MIME type from the magic bytes. The old hardcoded
+        image/png label misdelivered anything that wasn't a PNG (JPEG /
+        GIF / WebP rendered broken on some clients). Unknown content
+        falls back to PNG — every current caller sends chart PNGs.
+        """
+        mime, ext = "image/png", "png"
+        try:
+            # 24 base64 chars decode cleanly (multiple of 4) to 18 bytes —
+            # plenty for every magic number checked here.
+            head = base64.b64decode(att[:24])
+        except Exception:
+            head = b""
+        if head.startswith(b"\xff\xd8\xff"):
+            mime, ext = "image/jpeg", "jpg"
+        elif head.startswith(b"GIF8"):
+            mime, ext = "image/gif", "gif"
+        elif head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            mime, ext = "image/webp", "webp"
+        elif head.startswith(b"%PDF"):
+            mime, ext = "application/pdf", "pdf"
+        return f"data:{mime};filename=attachment.{ext};base64,{att}"
+
     async def send_reaction(
         self,
         recipient: str,

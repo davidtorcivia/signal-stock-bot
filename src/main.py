@@ -609,8 +609,10 @@ async def _alert_worker(alerts_db, provider_manager, signal_handler):
                         continue
 
                     logger.info(f"Alert triggered: {alert['id']} for {symbol}")
-                    await alerts_db.trigger_alert(alert["id"])
-
+                    # Send FIRST, mark second: marking before a failed send
+                    # consumed the alert permanently — the user never got
+                    # notified and the next poll skipped it. A retry on the
+                    # next poll (≤60s later) beats a silent loss.
                     try:
                         await signal_handler.send_message(
                             recipient=alert["user_phone"],
@@ -619,6 +621,8 @@ async def _alert_worker(alerts_db, provider_manager, signal_handler):
                         )
                     except Exception as e:
                         logger.error(f"Failed to send alert notification: {e}")
+                    else:
+                        await alerts_db.trigger_alert(alert["id"])
 
             await asyncio.sleep(60)
 

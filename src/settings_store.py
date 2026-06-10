@@ -132,6 +132,17 @@ class SettingsStore:
         self._bot_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self._loaded = False
         self._bot_loaded = False
+        # Eager warm-up: the first get() lazy-loaded the whole table with
+        # synchronous sqlite, which blocked the asyncio event loop when
+        # that first read landed on the message hot path. Construction
+        # happens at startup before the loop is busy, so load now; on
+        # failure fall back to the lazy path (get() retries under the
+        # lock).
+        try:
+            self._load_all()
+            self._load_bot_cache()
+        except Exception as e:
+            logger.warning(f"SettingsStore eager load failed, will lazy-load: {e}")
 
     def _ensure_table(self, conn: sqlite3.Connection) -> None:
         conn.execute(

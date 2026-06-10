@@ -132,19 +132,30 @@ class WatchlistDB:
             Tuple of (count added, list of symbols that were skipped due to limit)
         """
         await self._ensure_initialized()
-        
-        current_count = await self.count(user_hash)
-        remaining_capacity = self.MAX_SYMBOLS_PER_USER - current_count
-        
-        if remaining_capacity <= 0:
-            return 0, symbols
-        
-        # Only add up to remaining capacity
-        symbols_to_add = [s.upper() for s in symbols[:remaining_capacity]]
-        skipped = [s.upper() for s in symbols[remaining_capacity:]]
-        
+
         added = 0
         async with aiosqlite.connect(self.db_path) as db:
+            # Count and insert inside ONE write transaction so two
+            # concurrent add calls can't both read the same count and
+            # together blow past MAX_SYMBOLS_PER_USER (the old
+            # count-then-connect pattern was a TOCTOU race).
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM watchlists WHERE user_hash = ?",
+                (user_hash,),
+            )
+            row = await cursor.fetchone()
+            current_count = row[0] if row else 0
+            remaining_capacity = self.MAX_SYMBOLS_PER_USER - current_count
+
+            if remaining_capacity <= 0:
+                await db.commit()
+                return 0, symbols
+
+            # Only add up to remaining capacity
+            symbols_to_add = [s.upper() for s in symbols[:remaining_capacity]]
+            skipped = [s.upper() for s in symbols[remaining_capacity:]]
+
             for symbol in symbols_to_add:
                 try:
                     await db.execute(
@@ -156,7 +167,7 @@ class WatchlistDB:
                     # Symbol already exists for this user
                     pass
             await db.commit()
-        
+
         return added, skipped
     
     async def remove_symbol(self, user_hash: str, symbol: str) -> bool:

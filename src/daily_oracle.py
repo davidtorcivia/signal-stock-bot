@@ -185,10 +185,15 @@ class DailyOracleWorker:
         for oracle in fresh:
             if self._already_fired_today(oracle, now):
                 continue
-            fire_at = next_fire_time(oracle, now - dt.timedelta(hours=1))
-            # If the next fire (computed from "an hour ago") is in the
-            # past or within the grace window, fire it now. Otherwise
-            # leave for the next tick.
+            # Nearest occurrence to `now` — same frame _already_fired_today
+            # uses. The old form, next_fire_time(now - 1h), broke when the
+            # -1h reference crossed a local-date boundary near UTC midnight
+            # (the same bug class recent_fire_time was written to fix).
+            try:
+                fire_at = recent_fire_time(oracle, now)
+            except Exception:
+                continue
+            # Fire when that occurrence just passed and is within grace.
             delta = (now - fire_at).total_seconds()
             if 0 <= delta <= self._LATE_FIRE_GRACE_SECONDS:
                 await self._fire_oracle(oracle)
