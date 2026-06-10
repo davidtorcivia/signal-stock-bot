@@ -42,7 +42,7 @@ from ..bots.settings import (
     resolve_setting,
 )
 from ..cache import get_metrics
-from .client import _extract_cache_tokens
+from .client import _ensure_reasoning_content, _extract_cache_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,23 @@ class DeepThinkClient:
         self._daily_calls: int = 0
         self._daily_per_user: dict[str, int] = {}
         self._daily_per_group: dict[str, int] = {}
+        # Long-lived session reused across rounds and calls (mirrors
+        # LLMClient). A fresh session per round meant a tool loop paid
+        # one TCP+TLS handshake per round — 25 handshakes on the worst
+        # observed loop.
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     @staticmethod
     def _utc_date() -> str:
@@ -303,6 +320,12 @@ class DeepThinkClient:
         """One chat-completion call. Records per-round metrics. Raises
         RuntimeError on failure — the outer loop catches and converts to
         the silent (deep_think unavailable: ...) stub."""
+        # Mirror reasoning -> reasoning_content on prior assistant turns,
+        # exactly as LLMClient.chat_messages does. DeepSeek thinking
+        # models reject (HTTP 400) a round-tripped assistant turn whose
+        # reasoning_content is missing, so without this every tool loop
+        # died on round 2+.
+        messages = _ensure_reasoning_content(messages)
         payload: dict = {
             "model": cfg["model"],
             "messages": messages,
@@ -337,14 +360,17 @@ class DeepThinkClient:
         metrics = get_metrics()
         started = time.time()
 
+        session = await self._get_session()
+
         async def _do_call():
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    body = await resp.text()
-                    if resp.status >= 400:
-                        snippet = body[:200].replace("\n", " ")
-                        raise RuntimeError(f"HTTP {resp.status}: {snippet}")
-                    return await resp.json(content_type=None)
+            async with session.post(
+                url, json=payload, headers=headers, timeout=timeout
+            ) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    snippet = body[:200].replace("\n", " ")
+                    raise RuntimeError(f"HTTP {resp.status}: {snippet}")
+                return await resp.json(content_type=None)
 
         try:
             data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)

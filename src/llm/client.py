@@ -70,6 +70,23 @@ DEFAULT_RESPONSE_STYLE = (
 _PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 
 
+# Upstream statuses worth a second, unpinned attempt: payment/balance
+# errors and transient 5xx from the pinned provider. 401/429 stay
+# terminal — they're about OUR key/quota, not the upstream host.
+_PROVIDER_RETRY_STATUSES = ("402", "502", "503", "520", "522", "524")
+
+
+def _should_retry_without_pin(payload: dict, err_text: str) -> bool:
+    """True when a provider-pinned OpenRouter call failed with an error
+    that another provider of the same model could plausibly serve."""
+    provider = payload.get("provider")
+    if not isinstance(provider, dict) or not provider.get("order"):
+        return False
+    if "Provider returned error" in err_text:
+        return True
+    return any(f"LLM HTTP {s}" in err_text for s in _PROVIDER_RETRY_STATUSES)
+
+
 def build_provider_routing(
     *,
     order: Optional[str],
@@ -416,7 +433,30 @@ class LLMClient:
         # never trips. Generous so thinking models get room to finish.
         hard_timeout = 120
         try:
-            data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
+            try:
+                data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
+            except LLMError as e:
+                # Provider-pinned routing (provider.order +
+                # allow_fallbacks=false) turns any upstream wobble into a
+                # hard failure: when the pinned provider returns 402/5xx
+                # ("Provider returned error" — e.g. DeepSeek first-party
+                # answering "Insufficient Balance" on 2026-06-10),
+                # OpenRouter is forbidden from failing over to another
+                # host of the same model. Retry ONCE with the pin removed
+                # so the chat degrades to a slower provider instead of
+                # erroring out.
+                if not _should_retry_without_pin(payload, str(e)):
+                    raise
+                metrics.record_llm_error(
+                    purpose=purpose, model=effective_model,
+                    error_msg=f"pinned provider failed, retrying unpinned: {e}",
+                )
+                logger.warning(
+                    f"LLM pinned-provider call failed ({e}); "
+                    f"retrying once without provider pin"
+                )
+                payload.pop("provider", None)
+                data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
         except asyncio.TimeoutError as e:
             metrics.record_llm_error(
                 purpose=purpose, model=effective_model,
