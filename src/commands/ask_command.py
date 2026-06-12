@@ -186,13 +186,16 @@ _strip_addressee_leak = _strip_meta_leak
 
 # Pseudo-tool-call markup the model emitted as TEXT instead of a real
 # tool_calls payload (seen 2026-06-09: a reply ending in
-# `<function=brave-search__brave_web_search>\n<parameter=query>...`).
-# Everything from the first such marker onward is malformed scaffolding,
-# never user-facing prose — drop it. Covers OpenAI-ish `<function=...>`,
-# `<tool_call>`, `<invoke ...>`, and DeepSeek's `<|tool▁calls▁begin|>`
-# family.
+# `<function=brave-search__brave_web_search>\n<parameter=query>...`;
+# seen 2026-06-12: Artaud's local writer ending in `</function=remember>`
+# + a bare `<parameter=fact>` block — note the closing-style slash, which
+# the original pattern missed). Everything from the first such marker
+# onward is malformed scaffolding, never user-facing prose — drop it.
+# Covers OpenAI-ish `<function=...>` open OR close variants, bare
+# `<parameter=...>` blocks, `<tool_call>`, `<invoke ...>`, and DeepSeek's
+# `<|tool▁calls▁begin|>` family.
 _TOOL_CALL_LEAK_RE = re.compile(
-    r"<\|?(?:function[=\s>]|tool[_▁\s]?call|invoke[\s=>])[\s\S]*$",
+    r"</?\|?(?:function[=\s>]|parameter=|tool[_▁\s]?call|invoke[\s=>])[\s\S]*$",
     re.IGNORECASE,
 )
 

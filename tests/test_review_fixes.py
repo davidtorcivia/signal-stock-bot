@@ -117,6 +117,27 @@ def test_strip_tool_call_leak_deepseek_markers():
     assert _strip_tool_call_leak(leaked) == "Sure."
 
 
+def test_strip_tool_call_leak_closing_style_function_markup():
+    # The exact shape observed 2026-06-12 from Artaud's local writer:
+    # a closing-style `</function=...>` marker plus a bare parameter
+    # block. The original pattern required `<function`, no slash.
+    leaked = (
+        "What does that say about how seriously I should take it?\n\n"
+        "</function=remember>\n"
+        "<parameter=fact>\n"
+        "Taylor addressed Sigil as Mr. X in a group chat.\n"
+        "</parameter>"
+    )
+    assert _strip_tool_call_leak(leaked) == (
+        "What does that say about how seriously I should take it?"
+    )
+
+
+def test_strip_tool_call_leak_bare_parameter_block():
+    leaked = "Fine.\n<parameter=fact>\nsomething\n</parameter>"
+    assert _strip_tool_call_leak(leaked) == "Fine."
+
+
 def test_strip_tool_call_leak_leaves_normal_text():
     for text in (
         "AAPL is up 2% today.",
