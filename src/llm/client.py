@@ -777,7 +777,19 @@ def _inject_current_time(messages: list[dict]) -> list[dict]:
     weekday = now_et.strftime("%A")
     et_str = now_et.strftime("%Y-%m-%d %H:%M %Z")
     utc_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
-    time_line = f"[Current time: {weekday}, {et_str} ({utc_str})]"
+    # Spell the ET time out in 12-hour form and state the live UTC offset.
+    # Everything else in the prompt (history labels, group-context stamps)
+    # is UTC, and a writer model asked "what time is it" will otherwise
+    # anchor on those and apply its own idea of the ET offset — the local
+    # writer believed ET was UTC-6 and answered two hours early. Giving
+    # the colloquial time verbatim leaves it no arithmetic to get wrong.
+    twelve_hr = now_et.strftime("%I:%M %p").lstrip("0")
+    utc_off = now_et.utcoffset()
+    offset_hours = int(utc_off.total_seconds() // 3600) if utc_off else 0
+    time_line = (
+        f"[Current time: {weekday}, {et_str} — {twelve_hr} Eastern "
+        f"({utc_str}; ET is UTC{offset_hours:+d})]"
+    )
 
     out = list(messages)
     for i in range(len(out) - 1, -1, -1):
