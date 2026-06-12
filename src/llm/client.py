@@ -427,11 +427,14 @@ class LLMClient:
                     raise LLMError(f"LLM HTTP {resp.status}: {snippet}")
                 return await resp.json(content_type=None)
 
-        # Hard ceiling is intentionally well above cfg["timeout"]: aiohttp's
-        # total= should fire first on a normal slow request; this only kicks
-        # in for the pathological slow-trickle case where aiohttp's timer
-        # never trips. Generous so thinking models get room to finish.
-        hard_timeout = 120
+        # Backstop tracks the configured timeout instead of a constant:
+        # aiohttp's total= should fire first on a normal slow request; this
+        # only kicks in for the pathological slow-trickle case where
+        # aiohttp's timer never trips. It was once hardcoded to 120s —
+        # which silently capped every bot the moment admins configured
+        # timeout_seconds above it (Artaud's 600s writer hit it in Woo,
+        # 2026-06-12).
+        hard_timeout = cfg["timeout"] + 15
         try:
             try:
                 data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
