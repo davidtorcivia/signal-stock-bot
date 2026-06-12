@@ -54,6 +54,8 @@ _EVENTS_PER_SERIES = 3
 # search anyway, this just picks which path to try first.
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9._-]*\d[A-Z0-9._-]*$")
 
+_FOOTER = "% = market-implied odds of YES (= the YES price in ¢)"
+
 
 def _price_cents(market: dict) -> Optional[int]:
     """Best-effort YES price in cents (== implied probability %).
@@ -128,10 +130,15 @@ def _fmt_close(market: dict) -> str:
 
 
 def _market_line(market: dict, label: Optional[str] = None) -> str:
-    """One market as `  • label: YES 63¢ (vol 12k, closes Jun 30)`."""
+    """One market as `  • label: 63% (vol 12k, closes Jun 30)`.
+
+    The YES price in cents IS the implied probability in percent, and
+    percent is the number people (and the tool-calling LLM) actually
+    want — so that's what leads. The footer explains the equivalence.
+    """
     name = label or market.get("yes_sub_title") or market.get("ticker", "?")
     cents = _price_cents(market)
-    price = f"YES {cents}¢" if cents is not None else "no quotes"
+    price = f"{cents}%" if cents is not None else "no quotes"
     extras = []
     vol = _volume_24h(market)
     if vol:
@@ -213,6 +220,12 @@ def _match_events(events: list[dict], query: str, limit: int) -> list[dict]:
 
 
 def _format_event(ev: dict, max_markets: int = 3) -> list[str]:
+    """Compact event rendering for search-result lists.
+
+    Truncates to the most-traded outcomes, but the truncation note names
+    the event ticker so a human (or the LLM on its next tool call) can
+    pull the full board with `!kalshi <EVENT_TICKER>`.
+    """
     lines = [f"◆ {ev.get('title') or ev.get('event_ticker', '?')}"]
     markets = sorted(
         ev.get("markets") or [], key=_volume_24h, reverse=True,
@@ -225,7 +238,48 @@ def _format_event(ev: dict, max_markets: int = 3) -> list[str]:
         for m in markets[:max_markets]:
             lines.append(_market_line(m))
         if len(markets) > max_markets:
-            lines.append(f"  … +{len(markets) - max_markets} more outcomes")
+            ticker = ev.get("event_ticker", "?")
+            lines.append(
+                f"  … +{len(markets) - max_markets} more — "
+                f"!kalshi {ticker} for all outcomes"
+            )
+    return lines
+
+
+def _format_event_full(ev: dict, max_markets: int = 40) -> list[str]:
+    """Full event rendering for explicit ticker lookups.
+
+    Shows every outcome that has a live opinion. Price ladders carry
+    dozens of strikes pinned at ≤1% or ≥99% — those are noise for
+    "what are the odds", so they're folded into one summary line each
+    rather than burning the message budget. Markets stay in API order
+    (strike order for ladders), not volume order: a ladder read out of
+    order is unreadable.
+    """
+    lines = [f"◆ {ev.get('title') or ev.get('event_ticker', '?')}"]
+    markets = ev.get("markets") or []
+    if len(markets) == 1:
+        lines.append(_market_line(markets[0], label=markets[0].get("ticker", "?")))
+        return lines
+
+    interesting, floor, ceiling = [], 0, 0
+    for m in markets:
+        cents = _price_cents(m)
+        if cents is not None and cents <= 1:
+            floor += 1
+        elif cents is not None and cents >= 99:
+            ceiling += 1
+        else:
+            interesting.append(m)
+
+    for m in interesting[:max_markets]:
+        lines.append(_market_line(m))
+    if len(interesting) > max_markets:
+        lines.append(f"  … +{len(interesting) - max_markets} more outcomes")
+    if ceiling:
+        lines.append(f"  • ({ceiling} outcome(s) at ≥99% — near-certain YES)")
+    if floor:
+        lines.append(f"  • ({floor} outcome(s) at ≤1% — near-certain NO)")
     return lines
 
 
@@ -236,19 +290,19 @@ class KalshiCommand(BaseCommand):
     description = (
         "Kalshi prediction-market odds. Search live markets by topic "
         "(e.g. \"fed rate cut\", \"bitcoin price\", \"government shutdown\") "
-        "or look up a specific market/event ticker. YES prices are in "
-        "cents and read as implied probability (63¢ = 63%)."
+        "or look up a specific market/event ticker for the full outcome "
+        "board. Numbers shown are market-implied probabilities in percent."
     )
     usage = "!kalshi fed decision  |  !kalshi bitcoin price  |  !kalshi KXBTCD-25JUN13  |  !kalshi shutdown -n 8"
     help_explanation = """Live odds from Kalshi, the regulated prediction market.
 
 **Two ways to ask:**
 • Topic search: !kalshi fed decision — finds open markets matching the words.
-• Ticker lookup: !kalshi KXBTCD-25JUN13 — exact market or event ticker.
+• Ticker lookup: !kalshi KXFEDDECISION-26JUN — full outcome board for an event or market ticker.
 
 **Reading the numbers:**
-• YES 63¢ means the market prices a 63% chance the event happens.
-• Buyers of YES pay 63¢ and collect $1 if it resolves yes.
+• 63% means the market prices a 63% chance the event happens.
+• That's also the YES price: pay 63¢, collect $1 if it resolves yes.
 • vol is 24h contracts traded — low volume means stale/noisy odds.
 
 **Flags:**
@@ -422,6 +476,8 @@ class KalshiCommand(BaseCommand):
             rules = (m.get("rules_primary") or "").strip()
             if rules:
                 lines.append(f"Resolves: {rules[:300]}")
+            lines.append("")
+            lines.append(_FOOTER)
             return "\n".join(lines)
 
         data = await self._get(
@@ -430,7 +486,9 @@ class KalshiCommand(BaseCommand):
         event = (data or {}).get("event")
         if event:
             return "\n".join(
-                [f"◈ Kalshi {ticker}", ""] + _format_event(event, max_markets=8)
+                [f"◈ Kalshi {ticker}", ""]
+                + _format_event_full(event)
+                + ["", _FOOTER]
             )
         return None
 
@@ -485,5 +543,5 @@ class KalshiCommand(BaseCommand):
         for ev in matches:
             lines.extend(_format_event(ev))
             lines.append("")
-        lines.append("YES price ≈ implied probability (63¢ = 63%)")
+        lines.append(_FOOTER)
         return CommandResult.ok("\n".join(lines).strip())

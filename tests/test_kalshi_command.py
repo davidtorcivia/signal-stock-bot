@@ -5,6 +5,8 @@ import pytest
 from src.commands.base import CommandContext
 from src.commands.kalshi_command import (
     KalshiCommand,
+    _format_event,
+    _format_event_full,
     _match_events,
     _match_series,
     _price_cents,
@@ -105,6 +107,43 @@ class TestSeriesMatching:
         assert got[0]["ticker"] == "KXBTCD"
 
 
+class TestFormatting:
+    def test_search_truncation_names_drilldown_ticker(self):
+        ev = _event(
+            "BTC price today?",
+            [_market(last_price=i + 2, volume_24h=i) for i in range(6)],
+            ticker="KXBTCD-26JUN12",
+        )
+        lines = _format_event(ev, max_markets=3)
+        assert lines[-1] == "  … +3 more — !kalshi KXBTCD-26JUN12 for all outcomes"
+
+    def test_full_board_shows_all_live_outcomes(self):
+        ev = _event(
+            "BTC price today?",
+            [
+                _market(yes_sub_title="$60k or above", last_price=99),
+                _market(yes_sub_title="$63k or above", last_price=63),
+                _market(yes_sub_title="$64k or above", last_price=29),
+                _market(yes_sub_title="$70k or above", last_price=1),
+                _market(yes_sub_title="$80k or above", last_price=0),
+            ],
+        )
+        text = "\n".join(_format_event_full(ev))
+        # the live belly of the ladder is fully shown, in API order
+        assert "$63k or above: 63%" in text
+        assert "$64k or above: 29%" in text
+        assert text.index("$63k") < text.index("$64k")
+        # pinned tails are folded into summary lines, not listed
+        assert "$60k" not in text and "$70k" not in text
+        assert "1 outcome(s) at ≥99%" in text
+        assert "2 outcome(s) at ≤1%" in text
+
+    def test_full_board_single_market(self):
+        ev = _event("One-off?", [_market(last_price=40)], ticker="KXONE-26")
+        lines = _format_event_full(ev)
+        assert len(lines) == 2 and ": 40%" in lines[1]
+
+
 class TestSearchMerge:
     @pytest.mark.asyncio
     async def test_series_events_lead_and_dedupe(self, monkeypatch):
@@ -174,7 +213,7 @@ class TestExecute:
         result = await cmd.execute(_ctx(["fed", "rate", "cut"]))
         assert result.success
         assert "Fed rate cut by July?" in result.text
-        assert "YES 27¢" in result.text
+        assert ": 27%" in result.text
 
     @pytest.mark.asyncio
     async def test_ticker_path_then_search_fallback(self, monkeypatch):
