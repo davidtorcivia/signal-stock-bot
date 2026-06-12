@@ -33,6 +33,9 @@ from .earnings_commands import (
 from .news_commands import (
     NewsCommand,
 )
+from .kalshi_command import (
+    KalshiCommand,
+)
 from .admin_commands import (
     MetricsCommand,
     CacheCommand,
@@ -97,6 +100,7 @@ __all__ = [
     "DividendCommand",
     # News
     "NewsCommand",
+    "KalshiCommand",
     # Admin
     "MetricsCommand",
     "CacheCommand",

@@ -55,6 +55,7 @@ from .commands import (
     EarningsCommand,
     DividendCommand,
     NewsCommand,
+    KalshiCommand,
     MetricsCommand,
     CacheCommand,
     AdminCommand,
@@ -247,6 +248,10 @@ def create_dispatcher(
     news_cmd = NewsCommand(provider_manager)
     dispatcher.register(news_cmd)
     help_commands.append(news_cmd)
+
+    kalshi_cmd = KalshiCommand()
+    dispatcher.register(kalshi_cmd)
+    help_commands.append(kalshi_cmd)
 
     if watchlist_db:
         watch_cmd = WatchCommand(provider_manager, watchlist_db)
