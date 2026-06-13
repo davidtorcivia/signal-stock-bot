@@ -35,6 +35,7 @@ from .commands.base import CommandContext
 from .contexts.oracles import (
     ContextOracle,
     OracleStore,
+    fire_allowed_on_day,
     next_fire_time,
     recent_fire_time,
 )
@@ -192,6 +193,11 @@ class DailyOracleWorker:
             try:
                 fire_at = recent_fire_time(oracle, now)
             except Exception:
+                continue
+            # recent_fire_time ignores day-of-week (it's for idempotency); the
+            # fire decision must apply the allowed-days gate itself, else a
+            # weekdays-only market oracle fires on Saturday's 09:25 slot too.
+            if not fire_allowed_on_day(oracle, fire_at):
                 continue
             # Fire when that occurrence just passed and is within grace.
             delta = (now - fire_at).total_seconds()

@@ -77,12 +77,16 @@ class TestYahooIntegration:
     
     @pytest.mark.asyncio
     async def test_invalid_symbol_real(self, integration_dispatcher):
-        """Test invalid symbol handling"""
+        """A well-formed but nonexistent ticker should reach the provider
+        lookup and come back as 'Symbol not found'. (Use a <=10-char
+        alphanumeric symbol so it passes format validation — a longer blob
+        like 'INVALIDXYZ123' is rejected earlier as a bad format, which is a
+        different, also-correct path that this test isn't exercising.)"""
         result = await integration_dispatcher.dispatch(
             sender="+15551234567",
-            message="!price INVALIDXYZ123",
+            message="!price ZZZZZZ",
         )
-        
+
         assert result is not None
         assert not result.success
         assert "not found" in result.text.lower()

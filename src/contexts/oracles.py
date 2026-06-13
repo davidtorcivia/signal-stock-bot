@@ -218,6 +218,28 @@ def _astro_event_for(date: dt.date, kind: str) -> dt.datetime:
     return event.astimezone(_LOCATION.tzinfo)
 
 
+def _local_tz_for(oracle: ContextOracle):
+    """The frame an oracle's calendar day is reckoned in: the configured
+    timezone for clock schedules, NYC for the observer-anchored sun events."""
+    return (
+        ZoneInfo(oracle.timezone)
+        if oracle.schedule_kind == "clock"
+        else _LOCATION.tzinfo
+    )
+
+
+def fire_allowed_on_day(oracle: ContextOracle, fire_utc: dt.datetime) -> bool:
+    """True if the scheduled instant `fire_utc` lands on a weekday this oracle
+    is allowed to fire. Evaluated in the oracle's local frame so a clock oracle
+    whose UTC instant crosses midnight (e.g. 20:00 ET == 00:00 UTC) is judged by
+    its local calendar day, not the UTC one. `recent_fire_time` deliberately
+    ignores day-of-week, so the fire loop must apply this gate itself."""
+    allowed = oracle.effective_days()
+    if allowed is None:
+        return True
+    return fire_utc.astimezone(_local_tz_for(oracle)).weekday() in allowed
+
+
 def fire_time_for(oracle: ContextOracle, date: dt.date) -> dt.datetime:
     """Compute the firing instant for `oracle` on `date`. Returns a
     tz-aware datetime in the oracle's local timezone (or NYC for
@@ -241,11 +263,7 @@ def next_fire_time(
     so the caller can take naive `(target - now)` deltas without surprise."""
     # Anchor "today" in the oracle's local frame so a clock=00:30 oracle
     # in Tokyo doesn't compute against UTC midnight and miss the day.
-    local_tz = (
-        ZoneInfo(oracle.timezone)
-        if oracle.schedule_kind == "clock"
-        else _LOCATION.tzinfo
-    )
+    local_tz = _local_tz_for(oracle)
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
     now_local = now.astimezone(local_tz)
@@ -284,11 +302,7 @@ def recent_fire_time(
     fired is always the nearest candidate regardless of the UTC date. Day-of-week
     gating is intentionally ignored here (callers compare against last_fired_at;
     next_fire_time enforces the allowed-days schedule)."""
-    local_tz = (
-        ZoneInfo(oracle.timezone)
-        if oracle.schedule_kind == "clock"
-        else _LOCATION.tzinfo
-    )
+    local_tz = _local_tz_for(oracle)
     if now is None:
         now = dt.datetime.now(dt.timezone.utc)
     now_local = now.astimezone(local_tz)

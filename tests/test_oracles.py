@@ -22,9 +22,11 @@ from src.contexts.oracles import (
     SCHEDULE_KINDS,
     KINDS,
     default_oracles_for_label,
+    fire_allowed_on_day,
     fire_time_for,
     next_fire_time,
     prepopulate_for_existing_contexts,
+    recent_fire_time,
 )
 
 
@@ -231,6 +233,52 @@ def test_next_fire_time_single_day_jumps_a_week():
     target = next_fire_time(o, monday).astimezone(_NY)
     assert target.date() == dt.date(2026, 5, 10)  # next Sunday
     assert target.weekday() == 6
+
+
+# ---------- fire_allowed_on_day (fire-time day-of-week gate) ----------------
+# recent_fire_time deliberately ignores day-of-week, so the worker's fire loop
+# must apply this gate. Without it a weekdays-only market oracle posts on the
+# weekend's 09:25 slot too (the production bug: Sat 2026-06-13 fires).
+
+def test_fire_allowed_on_day_blocks_weekend_for_weekdays_only():
+    """The regression: a weekdays-only 09:25 ET oracle must NOT be allowed to
+    fire at Saturday's 09:25 occurrence."""
+    o = _clock_oracle(clock_time="09:25", weekdays_only=True)
+    # Sat 2026-06-13 09:26 ET — just inside the grace window after the slot.
+    sat = dt.datetime(2026, 6, 13, 9, 26, tzinfo=_NY).astimezone(_UTC)
+    fire_at = recent_fire_time(o, sat)
+    assert fire_at.astimezone(_NY).weekday() == 5  # the nearest slot IS Saturday
+    assert fire_allowed_on_day(o, fire_at) is False
+
+
+def test_fire_allowed_on_day_permits_weekday_for_weekdays_only():
+    o = _clock_oracle(clock_time="09:25", weekdays_only=True)
+    mon = dt.datetime(2026, 6, 15, 9, 26, tzinfo=_NY).astimezone(_UTC)
+    fire_at = recent_fire_time(o, mon)
+    assert fire_allowed_on_day(o, fire_at) is True
+
+
+def test_fire_allowed_on_day_none_restriction_allows_every_day():
+    o = _clock_oracle(clock_time="09:25", weekdays_only=False)
+    sat = dt.datetime(2026, 6, 13, 9, 26, tzinfo=_NY).astimezone(_UTC)
+    assert fire_allowed_on_day(o, recent_fire_time(o, sat)) is True
+
+
+def test_fire_allowed_on_day_judges_local_day_across_utc_midnight():
+    """A 20:00 ET Sun-Thu oracle fires at 00:00 UTC the next calendar day.
+    The gate must use the LOCAL day (Fri evening = weekday 4, disallowed), not
+    the UTC day (Sat). This is why Oracle #4 wrongly fired Fri 2026-06-12."""
+    o = ContextOracle(
+        id=4, context_id=1, enabled=True, kind="wsb_digest",
+        schedule_kind="clock", clock_time="20:00", timezone="America/New_York",
+        days_of_week=frozenset({6, 0, 1, 2, 3}),  # Sun-Thu
+    )
+    # Fri 2026-06-12 20:01 ET == Sat 2026-06-13 00:01 UTC.
+    fri_eve = dt.datetime(2026, 6, 12, 20, 1, tzinfo=_NY).astimezone(_UTC)
+    fire_at = recent_fire_time(o, fri_eve)
+    assert fire_at.astimezone(dt.timezone.utc).weekday() == 5  # Sat in UTC
+    assert fire_at.astimezone(_NY).weekday() == 4              # Fri locally
+    assert fire_allowed_on_day(o, fire_at) is False
 
 
 def test_next_fire_time_returns_utc():

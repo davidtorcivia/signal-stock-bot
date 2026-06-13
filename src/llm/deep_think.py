@@ -469,15 +469,34 @@ class DeepThinkClient:
             messages.append(assistant_msg)
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
-                # Deep models in thinking mode sometimes return reasoning
-                # in a sibling field with empty content. Surface either.
+                # The final answer is ALWAYS in `content`. Reasoning models put
+                # their chain-of-thought in a sibling `reasoning`/`reasoning_content`
+                # field — that is the thinking, never the deliverable. Empty content
+                # with reasoning present means the model stopped before emitting a
+                # real answer (truncated mid-think, or a thinking-only turn); never
+                # surface that trace as the result or it gets published verbatim
+                # (e.g. the WSB digest printing a thought trace instead of an
+                # article). Return an honest stub and log the trace length so the
+                # failure is visible without leaking it downstream.
                 content = (assistant_msg.get("content") or "").strip()
                 if not content:
-                    content = (
+                    reasoning = (
                         assistant_msg.get("reasoning_content")
                         or assistant_msg.get("reasoning")
                         or ""
                     ).strip()
+                    logger.warning(
+                        f"DeepThink: round {round_idx + 1} produced no content "
+                        f"({len(reasoning)}c of reasoning, {len(tool_call_history)} "
+                        f"tools, {total_in}+{total_out} tok); returning stub"
+                    )
+                    return (
+                        "(deep_think produced no final answer — the model stopped "
+                        "while still reasoning)",
+                        tool_call_history,
+                        total_in,
+                        total_out,
+                    )
                 logger.info(
                     f"DeepThink: final answer in round {round_idx + 1} "
                     f"({len(content)}c, {len(tool_call_history)} tools, "
