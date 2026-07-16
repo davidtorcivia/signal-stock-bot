@@ -153,3 +153,27 @@ async def test_stats_reports_current_and_backups(monkeypatch, tmp_logger):
     assert stats["size_bytes"] > 0
     # At least one backup exists post-rotation.
     assert len(stats["backups"]) >= 1
+
+
+def test_admin_clear_button_does_not_nest_a_form():
+    """The clear action must override the settings form's endpoint.
+
+    Browsers do not support nested forms. The old markup silently submitted
+    the surrounding context-settings form, leaving transcript files intact.
+    """
+    template_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "admin"
+        / "templates"
+        / "context_edit.html"
+    )
+    template = template_path.read_text(encoding="utf-8")
+    settings_start = template.index('<form method="post" autocomplete="off">')
+    settings_end = template.index("</form>", settings_start)
+    settings_form = template[settings_start:settings_end]
+
+    assert settings_form.count("<form") == 1
+    assert "admin.context_transcript_clear" in settings_form
+    assert 'formmethod="post"' in settings_form
+    assert "formnovalidate" in settings_form

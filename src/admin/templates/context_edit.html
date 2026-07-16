@@ -305,15 +305,20 @@
         </div>
 
         {% if transcript_stats.exists %}
-        <form method="post"
-              action="{{ url_for('admin.context_transcript_clear', context_id=policy.id) }}"
-              onsubmit="return confirm('Delete the transcript file and all backups for this chat? Cannot be undone.');"
-              style="margin-top: 10px;">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button type="submit" class="secondary" style="background: var(--bad); color: white;">
-                Clear transcript files
-            </button>
-        </form>
+        {# This button lives inside the context-settings form. A nested form
+           is invalid HTML and browsers submit the outer form instead. Use
+           per-button overrides to target the destructive endpoint while
+           retaining the outer form's CSRF field. formnovalidate prevents
+           unrelated required settings fields from blocking the action. #}
+        <button type="submit"
+                class="secondary"
+                formaction="{{ url_for('admin.context_transcript_clear', context_id=policy.id) }}"
+                formmethod="post"
+                formnovalidate
+                onclick="return confirm('Delete the transcript file and all backups for this chat? Cannot be undone.');"
+                style="margin-top: 10px; background: var(--bad); color: white;">
+            Clear transcript files
+        </button>
         {% endif %}
         {% endif %}
         {% endif %}
