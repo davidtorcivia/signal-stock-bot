@@ -76,6 +76,11 @@ from ..llm.mcp_broker import (
 )
 from ..llm.prompt_cache import PromptCachePlan
 from ..llm.tool_runtime import ToolCallLedger
+from ..llm.output_safety import (
+    strip_meta_leak as _strip_meta_leak,
+    strip_tool_call_leak as _strip_tool_call_leak,
+)
+from ..signal.message_text import normalize_signal_text
 from ..memory import (
     FORGET_TOOL,
     KINDS,
@@ -127,95 +132,10 @@ def _user_explicitly_asked_to_think(text: str) -> bool:
     return bool(_DEEP_THINK_TRIGGER_RE.search(text or ""))
 
 
-# Distinctive openers that ONLY ever appear in the system prompt's directive
-# blocks — never as a legitimate user-facing reply. The model occasionally
-# pattern-matches on these labels and copies them into its visible output
-# (we've seen `[to David]`, `Spontaneous reply:`, `Reflex note:`...). The
-# system prompt tells it not to; these regexes strip the leak as belt-and-
-# braces. Patterns are anchored to the start of the answer because mid-reply
-# uses of these phrases (e.g. quoting them in an explanation) are fine.
-_META_LEAK_PATTERNS = (
-    # Assistant-turn addressee label: `[to David, 2m ago]`
-    re.compile(r"^\s*\[to [^\]\n]{1,80}\]\s*", re.IGNORECASE),
-    # User-turn speaker label: `[David, 2026-06-06 18:30 UTC]` (current
-    # form), plus the legacy relative forms `[J, just now]`, `[David, 2m
-    # ago]`, `[...4137, 5h ago]` that older assistant turns may still carry
-    # or that a model mimics. Same shape the history load path produces for
-    # user messages in groups; some models echo it as a header for their
-    # own reply. Tightly constrained — must contain a comma + a time-like
-    # phrase — so generic bracket-bullets ("[1] foo", "[note] bar") survive
-    # untouched.
-    re.compile(
-        r"^\s*\["
-        r"[^\]\n,]{1,40},\s*"
-        r"(?:just now|a moment ago|"
-        r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*UTC|"
-        r"\d+\s*(?:[smhdw]|min(?:ute)?|sec(?:ond)?|hour|day|week)s?"
-        r"(?:\s*ago)?)"
-        r"\s*\]\s*",
-        re.IGNORECASE,
-    ),
-    # Implicit-ask path system block opener
-    re.compile(r"^\s*Spontaneous[- ]reply[ -]?path?:[^\n]*\n?", re.IGNORECASE),
-    re.compile(r"^\s*Spontaneous reply:[^\n]*\n?", re.IGNORECASE),
-    # Other directive labels that the model has been observed mimicking
-    re.compile(r"^\s*Reflex note:[^\n]*\n?", re.IGNORECASE),
-    re.compile(r"^\s*Identity note:[^\n]*\n?", re.IGNORECASE),
-    re.compile(r"^\s*Attribution rules?[^\n]*\n?", re.IGNORECASE),
-)
-
-
-def _strip_meta_leak(text: str) -> str:
-    """Remove directive/system-prompt text the model copied into output.
-
-    Some models start their reply with the heading of the directive block
-    they were just given (`Spontaneous reply: ...`, `[to David] ...`). The
-    response-style rule tells them not to, but this is the safety net so
-    users never see internal scaffolding as literal output text — and it
-    prevents stacked leaks from round-tripping through history.
-    """
-    if not text:
-        return text
-    # Loop because leaks can stack (e.g. `[to David] Spontaneous reply: ...`)
-    # and a single pass would only catch the outermost. Bounded so a degenerate
-    # model output can't burn cycles here.
-    for _ in range(4):
-        new = text
-        for pat in _META_LEAK_PATTERNS:
-            new = pat.sub("", new, count=1)
-        if new == text:
-            break
-        text = new
-    return text
-
-
 # Backwards-compat shim — older tests and callers may reference the
 # narrower addressee-only stripper. The general stripper is a strict
 # superset, so aliasing is safe.
 _strip_addressee_leak = _strip_meta_leak
-
-
-# Pseudo-tool-call markup the model emitted as TEXT instead of a real
-# tool_calls payload (seen 2026-06-09: a reply ending in
-# `<function=brave-search__brave_web_search>\n<parameter=query>...`;
-# seen 2026-06-12: Artaud's local writer ending in `</function=remember>`
-# + a bare `<parameter=fact>` block — note the closing-style slash, which
-# the original pattern missed). Everything from the first such marker
-# onward is malformed scaffolding, never user-facing prose — drop it.
-# Covers OpenAI-ish `<function=...>` open OR close variants, bare
-# `<parameter=...>` blocks, `<tool_call>`, `<invoke ...>`, and DeepSeek's
-# `<|tool▁calls▁begin|>` family.
-_TOOL_CALL_LEAK_RE = re.compile(
-    r"</?\|?(?:function[=\s>]|parameter=|tool[_▁\s]?call|invoke[\s=>])[\s\S]*$",
-    re.IGNORECASE,
-)
-
-
-def _strip_tool_call_leak(text: str) -> str:
-    """Cut a leaked, unparsed tool-call block off the end of a reply."""
-    if not text or "<" not in text:
-        return text
-    return _TOOL_CALL_LEAK_RE.sub("", text).rstrip()
 
 
 # Tool exposed to the writer LLM when DeepThinkClient is configured + ready.
@@ -500,20 +420,52 @@ class AskCommand(BaseCommand):
             logger.debug(f"Read-time enrichment failed: {e}")
             return text
 
-    async def _build_group_context(self, ctx) -> str:
+    @staticmethod
+    def _canonical_turn_text(text: object) -> str:
+        """Comparison form used only for legacy history/group deduplication."""
+        value = normalize_signal_text(text).strip()
+        # History stores the question without the explicit command token;
+        # group_log stores the original inbound line. Signal timestamps are
+        # authoritative for new rows, but this makes pre-migration rows match.
+        value = re.sub(r"^!\S+\s+", "", value)
+        return " ".join(value.split()).casefold()
+
+    @staticmethod
+    def _history_turn_candidates(prior: list[dict]) -> list[dict]:
+        return [
+            {
+                "turn_id": turn.get("_turn_id"),
+                "role": turn.get("role"),
+                "raw_content": turn.get("_raw_content") or "",
+                "created_at": turn.get("_created_at"),
+                "source_message_ts": turn.get("_source_message_ts"),
+                "sender_tail": turn.get("_sender_tail"),
+                "sender": None,
+                "bot_id": None,
+            }
+            for turn in prior
+            if turn.get("_turn_id")
+        ]
+
+    async def _build_group_context(
+        self,
+        ctx,
+        prior: Optional[list[dict]] = None,
+    ) -> tuple[str, list[dict]]:
         """Render recent group chat, oldest-first, wrapped for the model.
 
-        Each line gets `[Sender, 2026-06-06 18:30 UTC] text` so the model can
-        tell which bits of context are seconds-old vs. hours-old. The stamp
+        Each line gets `[turn g12; Sender, 2026-06-06 18:30 UTC] text` so the
+        model can tell which bits of context are seconds-old vs. hours-old
+        and exact quotes can point back to one row. The stamp
         is absolute (derived from each message's own `created_at`, not from
         "now") so the block stays byte-stable across requests and lands in
         the cached prompt prefix — see `format_history_timestamp`. Returns
-        the full `<group_context>...</group_context>` block, or "" if
+        the block plus its visible turn registry, or two empty values if
         there's nothing to show.
         """
         limit = self._live_group_ctx()
         if limit <= 0 or not ctx.is_group or self.group_log is None:
-            return ""
+            return "", []
         floor_at = (
             getattr(ctx.policy, "purge_floor_at", None)
             if ctx.policy is not None else None
@@ -523,12 +475,59 @@ class AskCommand(BaseCommand):
             floor_at=floor_at,
         )
         if not msgs:
-            return ""
+            return "", []
+
+        # A user post that triggered the bot exists in both stores: history
+        # preserves the role alternation, while group_log preserves the room
+        # timeline. Never send both copies. New rows match on Signal's stable
+        # source timestamp; old rows fall back to sender-tail + normalized
+        # content, consuming matches one-for-one so repeated messages survive.
+        history_signal_ids = {
+            str(t.get("_source_message_ts"))
+            for t in (prior or [])
+            if t.get("role") == "user" and t.get("_source_message_ts") is not None
+        }
+        legacy_history_counts: dict[tuple[str, str], int] = {}
+        for turn in prior or []:
+            if turn.get("role") != "user" or turn.get("_source_message_ts") is not None:
+                continue
+            sig = (
+                str(turn.get("_sender_tail") or ""),
+                self._canonical_turn_text(turn.get("_raw_content")),
+            )
+            legacy_history_counts[sig] = legacy_history_counts.get(sig, 0) + 1
+
+        deduped: list[dict] = []
+        for msg in msgs:
+            if msg.get("sender") == BOT_SENDER:
+                deduped.append(msg)
+                continue
+            message_ts = msg.get("message_ts")
+            if message_ts is not None and str(message_ts) in history_signal_ids:
+                continue
+            # Synthetic/implicit asks may lack a source timestamp even while
+            # their dispatcher-written group row has one. Use the legacy
+            # signature whenever exact-id matching did not resolve the row.
+            sig = (
+                str(msg.get("sender") or "")[-4:],
+                self._canonical_turn_text(msg.get("text")),
+            )
+            remaining = legacy_history_counts.get(sig, 0)
+            if remaining:
+                legacy_history_counts[sig] = remaining - 1
+                continue
+            deduped.append(msg)
+        msgs = deduped
+        if not msgs:
+            return "", []
 
         # Enrich messages concurrently. _enrich short-circuits on empty
         # input so empty cells cost ~nothing; gathering avoids 30 sequential
         # awaits stacking up on the LLM hot path.
-        raw_texts = [(m["text"] or "").strip() for m in msgs]
+        raw_texts = [
+            normalize_signal_text(m.get("text") or "").strip()
+            for m in msgs
+        ]
         enriched = await asyncio.gather(*(self._enrich(t) for t in raw_texts))
 
         # Multi-bot attribution: each BOT_SENDER row carries the writing
@@ -560,6 +559,7 @@ class AskCommand(BaseCommand):
             return active_bot_name
 
         lines: list[str] = []
+        candidates: list[dict] = []
         for m, text in zip(msgs, enriched):
             if not text:
                 continue
@@ -581,15 +581,87 @@ class AskCommand(BaseCommand):
                 if row_bot_id == active_bot_id or row_bot_id is None:
                     continue
                 label = f"Bot: {_bot_row_label(row_bot_id)}"
+                role = "assistant"
             else:
                 label = self._sender_label(m["sender"])
+                role = "user"
             ts = m.get("created_at")
             stamp = format_history_timestamp(ts) if ts is not None else None
             bracket = f"{label}, {stamp}" if stamp else label
-            lines.append(f"[{bracket}] {text.replace(chr(10), ' ')}")
+            turn_id = f"g{m['id']}"
+            lines.append(
+                f"[turn {turn_id}; {bracket}] {text.replace(chr(10), ' ')}"
+            )
+            candidates.append({
+                "turn_id": turn_id,
+                "role": role,
+                "raw_content": m.get("text") or "",
+                "created_at": ts,
+                "source_message_ts": m.get("message_ts"),
+                "sender_tail": (
+                    str(m.get("sender") or "")[-4:]
+                    if m.get("sender") != BOT_SENDER else None
+                ),
+                "sender": m.get("sender"),
+                "bot_id": m.get("bot_id"),
+            })
         if not lines:
-            return ""
-        return _wrap_xml("group_context", "\n".join(lines))
+            return "", []
+        return _wrap_xml("group_context", "\n".join(lines)), candidates
+
+    def _candidate_matches_quote_author(self, ctx, candidate: dict) -> bool:
+        author = getattr(ctx, "quote_author", None)
+        if not author:
+            return True
+        if candidate.get("sender") and candidate.get("sender") != BOT_SENDER:
+            return candidate["sender"] == author
+        if candidate.get("role") == "user":
+            return str(author)[-4:] == str(candidate.get("sender_tail") or "")
+
+        active_bot = getattr(ctx, "bot", None)
+        if candidate.get("turn_id", "").startswith("h"):
+            return (
+                active_bot is not None
+                and (getattr(active_bot, "signal_phone", None) or "") == author
+            )
+        if self.bot_registry is not None and candidate.get("bot_id") is not None:
+            try:
+                bot = self.bot_registry.get_sync(candidate["bot_id"])
+            except Exception:
+                bot = None
+            return bool(bot and (getattr(bot, "signal_phone", None) or "") == author)
+        return True
+
+    def _find_reply_turn(self, ctx, candidates: list[dict]) -> Optional[str]:
+        """Resolve a Signal quote to one visible history/group turn id."""
+        if not getattr(ctx, "quote_text", None):
+            return None
+        quote_ts = getattr(ctx, "quote_timestamp", None)
+        if quote_ts is not None:
+            for candidate in reversed(candidates):
+                source_ts = candidate.get("source_message_ts")
+                if source_ts is not None and str(source_ts) == str(quote_ts):
+                    return candidate.get("turn_id")
+
+        wanted = self._canonical_turn_text(ctx.quote_text)
+        if not wanted:
+            return None
+        for candidate in reversed(candidates):
+            if not self._candidate_matches_quote_author(ctx, candidate):
+                continue
+            actual = self._canonical_turn_text(candidate.get("raw_content"))
+            if actual == wanted:
+                return candidate.get("turn_id")
+        # Some Signal quote payloads truncate long source text.  A bounded
+        # containment fallback remains safer than dropping the reference.
+        if len(wanted) >= 8:
+            for candidate in reversed(candidates):
+                if not self._candidate_matches_quote_author(ctx, candidate):
+                    continue
+                actual = self._canonical_turn_text(candidate.get("raw_content"))
+                if wanted in actual or actual in wanted:
+                    return candidate.get("turn_id")
+        return None
 
     def _active_bot_display(self, ctx) -> str:
         """Display name to attribute the bot's own past turns to.
@@ -2342,6 +2414,7 @@ class AskCommand(BaseCommand):
 
         parts = ctx.raw_message.split(maxsplit=1)
         question = parts[1].strip() if len(parts) > 1 else " ".join(ctx.args)
+        question = normalize_signal_text(question)
         if not question:
             return CommandResult.error("Ask something: !ask <question>")
 
@@ -2370,6 +2443,8 @@ class AskCommand(BaseCommand):
                 now=now_ts,
                 floor_at=floor_at,
                 bot_id=history_bot_id,
+                include_turn_ids=is_group,
+                include_internal=True,
             )
             # Re-enrich each prior turn — bot/user messages stored before
             # the enricher existed (or stored with a failed enrichment)
@@ -2379,11 +2454,17 @@ class AskCommand(BaseCommand):
                 m for m in prior if isinstance(m.get("content"), str)
             ]
             if text_msgs:
+                normalized = [
+                    normalize_signal_text(m["content"]) for m in text_msgs
+                ]
                 enriched = await asyncio.gather(
-                    *(self._enrich(m["content"]) for m in text_msgs)
+                    *(self._enrich(text) for text in normalized)
                 )
                 for m, new_content in zip(text_msgs, enriched):
                     m["content"] = new_content
+                    m["_raw_content"] = normalize_signal_text(
+                        m.get("_raw_content") or ""
+                    )
 
             # Image-history replay: re-attach images on the last
             # `VISION_HISTORY_USER_TURNS` user messages so follow-ups
@@ -2395,7 +2476,20 @@ class AskCommand(BaseCommand):
             # re-surface old images regardless of what's persisted.
             self._inflate_image_history(prior, ctx)
 
-            group_ctx_block = await self._build_group_context(ctx)
+            group_ctx_block, group_turns = await self._build_group_context(
+                ctx, prior,
+            )
+            history_turns = self._history_turn_candidates(prior)
+            visible_turns = history_turns + group_turns
+            reply_turn_id = self._find_reply_turn(ctx, visible_turns)
+            latest_turn_id = None
+            dated_turns = [
+                t for t in visible_turns if t.get("created_at") is not None
+            ]
+            if dated_turns:
+                latest_turn_id = max(
+                    dated_turns, key=lambda t: t["created_at"]
+                ).get("turn_id")
             # Snapshot the active bot's deep-think client once for every
             # prompt/execution gate in this request. The default client on
             # self.deep_think may have different readiness and settings.
@@ -2460,8 +2554,8 @@ class AskCommand(BaseCommand):
             if is_group:
                 attribution_rules = (
                     "Attribution rules — this is a multi-speaker group chat:\n"
-                    "- Every line in <group_context> and every user message "
-                    "in the conversation history begins with `[Name, "
+                    "- Every line in <group_context> and every conversation "
+                    "history turn begins with `[turn ID; Name, "
                     "YYYY-MM-DD HH:MM UTC]` showing WHO spoke and WHEN (the "
                     "timestamp is UTC; compare it against the current time "
                     "given in your latest message to judge how long ago it "
@@ -2469,26 +2563,32 @@ class AskCommand(BaseCommand):
                     "Never combine, conflate, or transfer statements between "
                     "speakers.\n"
                     "- Your own past replies (assistant turns) are tagged "
-                    "`[to Name, YYYY-MM-DD HH:MM UTC]` showing WHO you were "
+                    "`[turn ID; to Name, YYYY-MM-DD HH:MM UTC]` showing WHO you were "
                     "answering. Those are your words, not the addressee's. "
                     "Untagged assistant turns are still yours — they just "
                     "predate this labeling.\n"
-                    "- BOTH bracket forms — `[Name, ...UTC]` on user "
-                    "turns AND `[to Name, ...UTC]` on your assistant "
+                    "- BOTH bracket forms — `[turn ID; Name, ...UTC]` on user "
+                    "turns AND `[turn ID; to Name, ...UTC]` on your assistant "
                     "turns — are INTERNAL METADATA the system adds at "
                     "replay time. They exist so YOU can tell speakers "
                     "apart in history; they are NEVER part of a visible "
-                    "reply. Do NOT begin your output with `[David, "
-                    "2026-06-06 18:30 UTC]`, `[to Sarah]`, or any other "
+                    "reply. Do NOT begin your output with `[turn h12; David, "
+                    "2026-06-06 18:30 UTC]`, `[turn h13; to Sarah]`, or any other "
                     "bracket-prefix that mimics those formats. If you "
                     "want to address someone by name, use natural prose "
                     "(`David — yes, …`) — never the bracket form.\n"
-                    "- Lines in <group_context> labeled `[Bot: Name, "
+                    "- Lines in <group_context> labeled `[turn ID; Bot: Name, "
                     "...UTC]` are messages from OTHER automated bots in "
                     "this chat. They are not humans and they are not you. "
                     "Never claim their statements as your own, never "
                     "attribute them to a human, and never answer on their "
                     "behalf.\n"
+                    "- `<current_message ... follows=\"ID\">` points to the "
+                    "most recent visible turn. For unquoted follow-ups such "
+                    "as 'what does that mean?', resolve 'that' against the "
+                    "follows turn before reaching back to older topics. "
+                    "`<replying_to turn=\"ID\">`, when present, is an explicit "
+                    "Signal quote and is the authoritative target.\n"
                     "- The current message is wrapped in "
                     "`<current_message from=\"Name\">`. Reply to that speaker; "
                     "do not assume the prior turn's asker is still in front "
@@ -3029,7 +3129,20 @@ class AskCommand(BaseCommand):
                 # stay silent. The label resolver below uses the same
                 # naming scheme as group_context.
                 quoted_label = self._reply_target_label(ctx)
-                trigger_parts.append(f'<replying_to from="{quoted_label}"/>')
+                if reply_turn_id:
+                    trigger_parts.append(
+                        f'<replying_to turn="{reply_turn_id}" '
+                        f'from="{quoted_label}"/>'
+                    )
+                else:
+                    # The source may be older than both retention windows.
+                    # In that case preserve Signal's quote payload once,
+                    # rather than leaving the model an author-only pointer.
+                    trigger_parts.append(
+                        f'<replying_to from="{quoted_label}">\n'
+                        f'{normalize_signal_text(ctx.quote_text)}\n'
+                        f'</replying_to>'
+                    )
 
             sender_label = self._sender_label(ctx.sender) if is_group else "user"
             # For implicit / spontaneous asks the closing instruction softens
@@ -3040,8 +3153,12 @@ class AskCommand(BaseCommand):
                 if getattr(ctx, "implicit_reason", None)
                 else "Respond to this message."
             )
+            follows_attr = (
+                f' follows="{latest_turn_id}"' if latest_turn_id else ""
+            )
             trigger_parts.append(
-                f'<current_message from="{sender_label}" sent="just now">\n'
+                f'<current_message from="{sender_label}" sent="just now"'
+                f'{follows_attr}>\n'
                 f"{question}\n"
                 f"</current_message>\n"
                 f"{closing}"
@@ -3082,8 +3199,14 @@ class AskCommand(BaseCommand):
             else:
                 user_message_content = current_user_content
 
+            # Internal ids/timestamps power deduplication and reply pointers,
+            # but provider message objects must contain only API fields.
+            provider_prior = [
+                {k: v for k, v in turn.items() if not k.startswith("_")}
+                for turn in prior
+            ]
             messages: list[dict] = [{"role": "system", "content": system_prompt}]
-            messages.extend(prior)
+            messages.extend(provider_prior)
             messages.append({"role": "user", "content": user_message_content})
 
             tools = self._collect_tools(policy=ctx.policy, bot=ctx.bot)
@@ -3239,6 +3362,7 @@ class AskCommand(BaseCommand):
                             turns_per_user=live_turns,
                             image_refs=persisted_images,
                             bot_id=bot_id_for_turn,
+                            source_message_ts=ctx.message_timestamp,
                         )
                     # Persist the addressee on the assistant row too: the load
                     # path uses it to render `[to Name, time ago]` in group

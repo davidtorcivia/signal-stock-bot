@@ -26,6 +26,7 @@ from ..bots.settings import (
 )
 from ..cache import get_metrics
 from .prompt_cache import PromptCachePlan, automatic_cache_plan
+from .output_safety import sanitize_assistant_message
 from .resilience import LLMHTTPFailure, resilient_chat_post
 from .transcript import (
     LOGGED_PURPOSES,
@@ -594,7 +595,7 @@ class LLMClient:
             model=model,
             messages=messages,
             tools=tools,
-            assistant_msg=assistant_msg,
+            assistant_msg=sanitize_assistant_message(assistant_msg),
             params=params,
             latency_ms=latency_ms,
             bot_id=active.bot_id,

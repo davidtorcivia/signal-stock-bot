@@ -16,6 +16,7 @@ import aiohttp
 
 from ..admin.events import get_bus
 from ..commands.dispatcher import CommandDispatcher
+from .message_text import normalize_signal_text
 
 logger = logging.getLogger(__name__)
 
@@ -1045,7 +1046,9 @@ class SignalHandler:
 
         # Handle data message
         data_message = envelope.get("dataMessage", {})
-        message_text = data_message.get("message", "")
+        message_text = normalize_signal_text(
+            data_message.get("message", ""), data_message,
+        )
         # dataMessage.timestamp is the canonical "message id" — prefer it when
         # present; otherwise fall back to the envelope timestamp.
         message_ts = data_message.get("timestamp") or target_timestamp
@@ -1133,7 +1136,10 @@ class SignalHandler:
         # message. signal-cli puts the original text/author here so the LLM
         # can see what's being replied to without us looking it up.
         quote = data_message.get("quote") or {}
-        quote_text = (quote.get("text") or "").strip() or None
+        quote_text = normalize_signal_text(
+            quote.get("text") or "", quote,
+        ).strip() or None
+        quote_timestamp = quote.get("id") or quote.get("timestamp") or None
         quote_author = (
             quote.get("authorNumber")
             or quote.get("author")
@@ -1288,6 +1294,7 @@ class SignalHandler:
             target_timestamp=message_ts,
             quote_text=quote_text,
             quote_author=quote_author,
+            quote_timestamp=quote_timestamp,
             addressed_bot=addressed_bot,
             policy=policy_for_routing,
             inbound_images=inbound_images,
@@ -1353,12 +1360,15 @@ class SignalHandler:
             message_text=message_text,
             quote_text=quote_text,
             quote_author=quote_author,
+            quote_timestamp=quote_timestamp,
+            message_timestamp=message_ts,
             primary_bot=effective_bot,
         )
 
     async def _fanout_secondary_bots(
         self, *, data_message, group_id, policy, sender, message_text,
-        quote_text, quote_author, primary_bot,
+        quote_text, quote_author, primary_bot, quote_timestamp=None,
+        message_timestamp=None,
     ) -> None:
         """Fire replies from every addressed bot OTHER than the primary.
 
@@ -1407,12 +1417,14 @@ class SignalHandler:
                     sender=sender, group_id=group_id, policy=policy,
                     cleaned=cleaned, quote_text=quote_text,
                     quote_author=quote_author,
+                    quote_timestamp=quote_timestamp,
+                    message_timestamp=message_timestamp,
                 )
             )
 
     async def _answer_secondary(
         self, *, bot, ask_command, pool, sender, group_id, policy, cleaned,
-        quote_text, quote_author,
+        quote_text, quote_author, quote_timestamp=None, message_timestamp=None,
     ) -> None:
         """Produce + send one secondary bot's reply in a multi-bot fan-out.
 
@@ -1434,6 +1446,8 @@ class SignalHandler:
                 bot=bot,
                 quote_text=quote_text,
                 quote_author=quote_author,
+                quote_timestamp=quote_timestamp,
+                message_timestamp=message_timestamp,
                 persist_user_turn=False,
             )
             result = await ask_command.execute(ctx)

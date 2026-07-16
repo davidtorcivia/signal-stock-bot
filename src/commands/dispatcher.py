@@ -252,6 +252,7 @@ class CommandDispatcher:
         target_timestamp: Optional[int] = None,
         quote_text: Optional[str] = None,
         quote_author: Optional[str] = None,
+        quote_timestamp: Optional[int] = None,
         addressed_bot=None,
         policy=None,
         inbound_images: Optional[list[dict]] = None,
@@ -370,7 +371,10 @@ class CommandDispatcher:
             )
             if ctx_limit > 0:
                 try:
-                    await self.group_log.append(group_id, sender, message)
+                    await self.group_log.append(
+                        group_id, sender, message,
+                        message_ts=target_timestamp,
+                    )
                 except Exception as e:
                     logger.error(f"Failed to append to group log: {e}")
 
@@ -418,6 +422,8 @@ class CommandDispatcher:
                         result = await self._execute_command(
                             command, args, sender, message, group_id, policy,
                             quote_text=quote_text, quote_author=quote_author,
+                            quote_timestamp=quote_timestamp,
+                            message_timestamp=target_timestamp,
                             addressed_bot=addressed_bot,
                             inbound_images=inbound_images,
                         )
@@ -435,6 +441,8 @@ class CommandDispatcher:
             return await self._execute_command(
                 command, args, sender, message, group_id, policy,
                 quote_text=quote_text, quote_author=quote_author,
+                quote_timestamp=quote_timestamp,
+                message_timestamp=target_timestamp,
                 addressed_bot=addressed_bot,
                 inbound_images=inbound_images,
             )
@@ -448,6 +456,8 @@ class CommandDispatcher:
                 return await self._execute_command(
                     "price", symbols, sender, message, group_id, policy,
                     quote_text=quote_text, quote_author=quote_author,
+                    quote_timestamp=quote_timestamp,
+                    message_timestamp=target_timestamp,
                     addressed_bot=addressed_bot,
                     inbound_images=inbound_images,
                 )
@@ -483,6 +493,8 @@ class CommandDispatcher:
                     bot=self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot),
                     quote_text=quote_text,
                     quote_author=quote_author,
+                    quote_timestamp=quote_timestamp,
+                    message_timestamp=target_timestamp,
                     inbound_images=inbound_images or [],
                 )
                 try:
@@ -596,6 +608,9 @@ class CommandDispatcher:
                     result = await self._execute_command(
                         intent.command, intent.args, sender, message, group_id,
                         policy, addressed_bot=addressed_bot,
+                        quote_text=quote_text, quote_author=quote_author,
+                        quote_timestamp=quote_timestamp,
+                        message_timestamp=target_timestamp,
                         inbound_images=inbound_images,
                     )
                     if result:
@@ -703,6 +718,8 @@ class CommandDispatcher:
         policy=None,
         quote_text: Optional[str] = None,
         quote_author: Optional[str] = None,
+        quote_timestamp: Optional[int] = None,
+        message_timestamp: Optional[int] = None,
         addressed_bot=None,
         inbound_images: Optional[list[dict]] = None,
     ) -> CommandResult:
@@ -740,6 +757,8 @@ class CommandDispatcher:
             bot=self._resolve_bot(group_id, policy=policy, addressed_bot=addressed_bot),
             quote_text=quote_text,
             quote_author=quote_author,
+            quote_timestamp=quote_timestamp,
+            message_timestamp=message_timestamp,
             inbound_images=inbound_images or [],
         )
 

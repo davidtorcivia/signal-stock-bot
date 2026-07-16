@@ -26,6 +26,7 @@ from src.commands.base import CommandContext
 from src.bots.models import Bot
 from src.llm.client import DEFAULT_SYSTEM_PROMPT
 from src.llm.history import ConversationHistory, format_history_timestamp
+from src.group_log import GroupMessageLog
 
 
 # Matches the `YYYY-MM-DD HH:MM UTC` stamp the history renderer now emits.
@@ -568,6 +569,123 @@ async def test_load_group_attribution_and_timestamps(history):
     assert turns[0]["role"] == "user"
     assert turns[0]["content"] == f"[...4137, {stamp}] q1"
     assert turns[1] == {"role": "assistant", "content": "a1"}
+
+
+async def test_load_group_can_expose_stable_turn_ids_and_source_pointer(history):
+    await history.append(
+        "group:42", "user", "what does that mean?",
+        sender_tail="4137", source_message_ts=1784220300000,
+    )
+    turns = await history.load(
+        "group:42", attribute_senders=True, now=time.time(),
+        include_turn_ids=True, include_internal=True,
+    )
+    assert re.match(
+        rf"\[turn h\d+; \.\.\.4137, {_UTC_STAMP}\] what does that mean\?",
+        turns[0]["content"],
+    )
+    assert re.fullmatch(r"h\d+", turns[0]["_turn_id"])
+    assert turns[0]["_source_message_ts"] == 1784220300000
+    assert turns[0]["_raw_content"] == "what does that mean?"
+
+
+@pytest.mark.asyncio
+async def test_group_context_dedupes_history_and_points_followup(tmp_path):
+    class _GroupPromptStore(_PromptStore):
+        def get_int(self, key, default, *, min_value=None):
+            value = 20 if key == "group_context_messages" else default
+            return max(min_value, value) if min_value is not None else value
+
+    llm = _CapturingLLM()
+    llm.store = _GroupPromptStore()
+    history = ConversationHistory(
+        db_path=str(tmp_path / "history.db"), turns_per_user=10,
+    )
+    group_log = GroupMessageLog(db_path=str(tmp_path / "group.db"))
+    await history.append(
+        "group:group-1", "user", "how do you feel about Asher and Israel?",
+        sender_tail="4123", source_message_ts=1001,
+    )
+    await history.append(
+        "group:group-1", "assistant", "Asher was a gift; Israel remains.",
+        sender_tail="4123",
+    )
+    await group_log.append(
+        "group-1", "+15551234123",
+        "how do you feel about Asher and Israel?", message_ts=1001,
+    )
+    # Dispatcher logs the current inbound row before AskCommand runs; the
+    # group-context reader intentionally excludes this last row.
+    await group_log.append(
+        "group-1", "+15551234123", "what does that mean?", message_ts=1002,
+    )
+
+    ask = AskCommand(llm, history, group_log=group_log)
+    bot = Bot(
+        id=2, slug="artaud", display_name="Artaud",
+        signal_phone="+15550000002",
+    )
+    ctx = CommandContext(
+        sender="+15551234123", group_id="group-1",
+        raw_message="!ask what does that mean?", command="ask",
+        args=["what", "does", "that", "mean?"], bot=bot,
+        message_timestamp=1002,
+    )
+
+    result = await ask.execute(ctx)
+    assert result.success
+    prompt = llm.calls[0]
+    tail = prompt[-1]["content"]
+    assistant_history = prompt[-2]["content"]
+    turn_match = re.match(r"\[turn (h\d+); to ", assistant_history)
+    assert turn_match
+    assert f'follows="{turn_match.group(1)}"' in tail
+    # The user question remains in role history only, not a second time in
+    # group_context, and private assembly keys never reach the provider.
+    assert "<group_context>" not in tail
+    assert all(not any(k.startswith("_") for k in m) for m in prompt)
+
+
+@pytest.mark.asyncio
+async def test_signal_quote_points_to_exact_group_turn(tmp_path):
+    class _GroupPromptStore(_PromptStore):
+        def get_int(self, key, default, *, min_value=None):
+            value = 20 if key == "group_context_messages" else default
+            return max(min_value, value) if min_value is not None else value
+
+    llm = _CapturingLLM()
+    llm.store = _GroupPromptStore()
+    history = ConversationHistory(
+        db_path=str(tmp_path / "history.db"), turns_per_user=10,
+    )
+    group_log = GroupMessageLog(db_path=str(tmp_path / "group.db"))
+    await group_log.append(
+        "group-1", "+15559994137", "That sounds intense.", message_ts=2001,
+    )
+    await group_log.append(
+        "group-1", "+15551234123", "\ufffc", message_ts=2002,
+    )
+    ask = AskCommand(llm, history, group_log=group_log)
+    ctx = CommandContext(
+        sender="+15551234123", group_id="group-1",
+        raw_message="!ask \ufffc", command="ask", args=["\ufffc"],
+        bot=Bot(id=2, slug="artaud", display_name="Artaud"),
+        quote_text="That sounds intense.", quote_author="+15559994137",
+        quote_timestamp=2001, message_timestamp=2002,
+    )
+
+    assert (await ask.execute(ctx)).success
+    tail = llm.calls[0][-1]["content"]
+    group_turn = re.search(r"\[turn (g\d+);", tail)
+    assert group_turn
+    assert f'<replying_to turn="{group_turn.group(1)}"' in tail
+    assert "[unrendered Signal object]" in tail
+
+
+def test_strip_meta_leak_turn_pointer_form():
+    assert _strip_meta_leak(
+        "[turn h17; to David, 2026-07-16 16:45 UTC] actual answer"
+    ) == "actual answer"
 
 
 async def test_load_group_attribution_only_no_now(history):

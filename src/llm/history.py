@@ -124,7 +124,10 @@ class ConversationHistory:
                     sender_tail TEXT,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    bot_id INTEGER,
+                    image_refs TEXT,
+                    source_message_ts INTEGER
                 )
                 """
             )
@@ -158,6 +161,11 @@ class ConversationHistory:
                 await db.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN image_refs TEXT"
                 )
+            if "source_message_ts" not in cols:
+                await db.execute(
+                    "ALTER TABLE conversation_turns "
+                    "ADD COLUMN source_message_ts INTEGER"
+                )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_ctx_time "
                 "ON conversation_turns(context_key, created_at)"
@@ -165,6 +173,10 @@ class ConversationHistory:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_bot_ctx_time "
                 "ON conversation_turns(bot_id, context_key, created_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conv_ctx_signal_id "
+                "ON conversation_turns(context_key, source_message_ts)"
             )
             # Per-(context, bot) rolling summary. `summary_through_id`
             # is the highest conversation_turns.id that's already been
@@ -417,6 +429,8 @@ class ConversationHistory:
         now: Optional[float] = None,
         floor_at: Optional[float] = None,
         bot_id: Optional[int] = None,
+        include_turn_ids: bool = False,
+        include_internal: bool = False,
     ) -> list[dict]:
         """Return the last 2*N rows for this context in chronological order.
 
@@ -443,6 +457,11 @@ class ConversationHistory:
         as the bot's own past for backward compat. Other bots' prior
         replies surface in the `<group_context>` block instead, where
         the renderer labels them with each writer's display name.
+
+        `include_turn_ids` prefixes replay labels with stable `h<ID>` row
+        pointers. `include_internal` adds underscore-prefixed assembly
+        metadata used for exact quote matching and group-log deduplication;
+        callers must remove those private keys before provider submission.
         """
         await self._ensure_initialized()
         # ``0`` is an explicit one-shot/no-history setting. Using ``or``
@@ -472,8 +491,8 @@ class ConversationHistory:
                 params.append(bot_id)
             params.append(n)
             cursor = await db.execute(
-                f"""SELECT role, content, sender_tail, user_hash, created_at,
-                          image_refs
+                f"""SELECT id, role, content, sender_tail, user_hash,
+                          created_at, image_refs, source_message_ts
                    FROM conversation_turns
                    WHERE context_key = ?{floor_clause}{bot_clause}
                    ORDER BY created_at DESC, id DESC
@@ -483,8 +502,12 @@ class ConversationHistory:
             rows = await cursor.fetchall()
 
         turns: list[dict] = []
-        for role, content, sender_tail, user_hash, created_at, image_refs_json in reversed(rows):
+        for (
+            row_id, role, content, sender_tail, user_hash, created_at,
+            image_refs_json, source_message_ts,
+        ) in reversed(rows):
             text = content
+            turn_id = f"h{row_id}"
             if role == "user":
                 name = (
                     self._attribution_label(user_hash, sender_tail)
@@ -496,6 +519,11 @@ class ConversationHistory:
                     else None
                 )
                 bracket = _join_bracket(name, stamp)
+                if include_turn_ids:
+                    bracket = (
+                        f"turn {turn_id}; {bracket}"
+                        if bracket else f"turn {turn_id}"
+                    )
                 if bracket:
                     text = f"[{bracket}] {content}"
             elif role == "assistant" and attribute_senders:
@@ -509,10 +537,22 @@ class ConversationHistory:
                     if now is not None and created_at is not None
                     else None
                 )
-                if name:
-                    bracket = _join_bracket(f"to {name}", stamp)
-                    if bracket:
-                        text = f"[{bracket}] {content}"
+                # Preserve the legacy bare-assistant form when no addressee
+                # exists. Turn-pointer mode still labels every row, because
+                # an exact target must be visible even on migrated records.
+                bracket = (
+                    _join_bracket(f"to {name}", stamp) if name else None
+                )
+                if include_turn_ids:
+                    bracket = _join_bracket(
+                        f"to {name}" if name else None, stamp,
+                    )
+                    bracket = (
+                        f"turn {turn_id}; {bracket}"
+                        if bracket else f"turn {turn_id}"
+                    )
+                if bracket:
+                    text = f"[{bracket}] {content}"
             turn: dict = {"role": role, "content": text}
             # Image attachments stored at append time. ask_command
             # inflates these into multimodal parts for the last N user
@@ -526,6 +566,17 @@ class ConversationHistory:
                         turn["image_refs"] = refs
                 except (TypeError, ValueError):
                     pass
+            if include_internal:
+                # Private prompt-assembly metadata. AskCommand removes these
+                # keys before sending the message list to the provider.
+                turn.update({
+                    "_turn_id": turn_id,
+                    "_raw_content": content,
+                    "_created_at": created_at,
+                    "_source_message_ts": source_message_ts,
+                    "_sender_tail": sender_tail,
+                    "_user_hash": user_hash,
+                })
             turns.append(turn)
         return turns
 
@@ -587,6 +638,7 @@ class ConversationHistory:
         turns_per_user: Optional[int] = None,
         image_refs: Optional[list[dict]] = None,
         bot_id: Optional[int] = None,
+        source_message_ts: Optional[int] = None,
     ) -> None:
         """Insert one turn and prune by row-cap (per context) and age (global).
 
@@ -621,10 +673,10 @@ class ConversationHistory:
             await db.execute(
                 """INSERT INTO conversation_turns
                    (user_hash, context_key, sender_tail, role, content,
-                    created_at, image_refs, bot_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, image_refs, bot_id, source_message_ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_hash, context_key, sender_tail, role, content,
-                 now, image_refs_json, bot_id),
+                 now, image_refs_json, bot_id, source_message_ts),
             )
             # Age-based purge (whole table)
             await db.execute(

@@ -84,7 +84,8 @@ class GroupMessageLog:
                     sender TEXT NOT NULL,
                     text TEXT NOT NULL,
                     created_at REAL NOT NULL,
-                    bot_id INTEGER
+                    bot_id INTEGER,
+                    message_ts INTEGER
                 )
                 """
             )
@@ -98,14 +99,32 @@ class GroupMessageLog:
                 await db.execute(
                     "ALTER TABLE group_messages ADD COLUMN bot_id INTEGER"
                 )
+            if "message_ts" not in cols:
+                # dataMessage.timestamp is Signal's stable source-message id.
+                # It lets conversation history and group context identify the
+                # same human turn exactly instead of comparing mutable text.
+                await db.execute(
+                    "ALTER TABLE group_messages ADD COLUMN message_ts INTEGER"
+                )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_group_msgs_time "
                 "ON group_messages(group_id, created_at)"
             )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_group_msgs_signal_id "
+                "ON group_messages(group_id, message_ts)"
+            )
             await db.commit()
         self._initialized = True
 
-    async def append(self, group_id: str, sender: str, text: str) -> None:
+    async def append(
+        self,
+        group_id: str,
+        sender: str,
+        text: str,
+        *,
+        message_ts: Optional[int] = None,
+    ) -> None:
         """Record a message and prune by both row-cap and age."""
         if not group_id or not text:
             return
@@ -123,9 +142,10 @@ class GroupMessageLog:
         age_cutoff = now - self._retention_seconds()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO group_messages (group_id, sender, text, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (group_id, sender, text, now),
+                "INSERT INTO group_messages "
+                "(group_id, sender, text, created_at, message_ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (group_id, sender, text, now, message_ts),
             )
             # Age-based purge (applies to the whole table)
             await db.execute(
@@ -270,7 +290,8 @@ class GroupMessageLog:
             return []
         async with db_session(self) as db:
             cursor = await db.execute(
-                """SELECT sender, text, created_at, bot_id FROM group_messages
+                """SELECT id, sender, text, created_at, bot_id, message_ts
+                   FROM group_messages
                    WHERE group_id = ?
                    ORDER BY created_at DESC, id DESC
                    LIMIT ? OFFSET ?""",
@@ -281,7 +302,14 @@ class GroupMessageLog:
         # before the column existed — both are valid; the renderer
         # decides display.
         result = [
-            {"sender": r[0], "text": r[1], "created_at": r[2], "bot_id": r[3]}
+            {
+                "id": r[0],
+                "sender": r[1],
+                "text": r[2],
+                "created_at": r[3],
+                "bot_id": r[4],
+                "message_ts": r[5],
+            }
             for r in reversed(rows)
         ]
         if floor_at is not None:

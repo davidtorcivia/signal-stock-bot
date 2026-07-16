@@ -32,6 +32,11 @@ class CommandContext:
     # responded to. None when the message isn't a reply.
     quote_text: Optional[str] = None
     quote_author: Optional[str] = None  # phone number, when known
+    # Signal's dataMessage timestamp is its stable message identifier.  Keep
+    # it with the command so group-log rows, history rows, and quote replies
+    # can refer to the same source turn without fuzzy text matching.
+    message_timestamp: Optional[int] = None
+    quote_timestamp: Optional[int] = None
     # Whether this turn should persist the *inbound user message* into
     # conversation history. False for a secondary bot in a multi-bot
     # fan-out (when one message addresses both Sigil and Artaud): the

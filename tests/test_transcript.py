@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from src.llm import transcript as tx
+from src.llm.output_safety import sanitize_assistant_message
 
 
 @pytest.fixture
@@ -140,6 +141,18 @@ def test_logged_purposes_excludes_reactor():
     assert "reactor" not in tx.LOGGED_PURPOSES
     assert "summary" not in tx.LOGGED_PURPOSES
     assert "healthcheck" not in tx.LOGGED_PURPOSES
+
+
+def test_transcript_assistant_cleanup_keeps_tool_calls():
+    original = {
+        "role": "assistant",
+        "content": "[to David] clean answer",
+        "tool_calls": [{"id": "1", "function": {"name": "x"}}],
+    }
+    cleaned = sanitize_assistant_message(original)
+    assert cleaned["content"] == "clean answer"
+    assert cleaned["tool_calls"] == original["tool_calls"]
+    assert original["content"].startswith("[to David]")
 
 
 @pytest.mark.asyncio

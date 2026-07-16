@@ -168,7 +168,9 @@ async def test_memory_legacy_null_rows_shared(tmp_path):
 async def test_group_log_records_writing_bot(tmp_path):
     """append_bot stores bot_id; recent() surfaces it for the renderer."""
     log = GroupMessageLog(db_path=str(tmp_path / "g.db"))
-    await log.append("g1", "+15551111111", "hello bots")
+    await log.append(
+        "g1", "+15551111111", "hello bots", message_ts=123456789,
+    )
     await log.append_bot("g1", "hi from sigil", bot_id=1)
     await log.append_bot("g1", "hi from artaud", bot_id=2)
     msgs = await log.recent("g1", limit=10)
@@ -178,6 +180,8 @@ async def test_group_log_records_writing_bot(tmp_path):
     artaud_msg = msgs[2]
     assert user_msg["sender"] == "+15551111111"
     assert user_msg["bot_id"] is None  # user turn, no bot_id
+    assert user_msg["message_ts"] == 123456789
+    assert isinstance(user_msg["id"], int)
     assert sigil_msg["sender"] == BOT_SENDER
     assert sigil_msg["bot_id"] == 1
     assert artaud_msg["sender"] == BOT_SENDER

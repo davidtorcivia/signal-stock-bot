@@ -19,6 +19,7 @@ from src.signal.handler import (
     VISION_MAX_PER_IMAGE_BYTES,
     _read_inbound_image_attachments,
 )
+from src.signal.message_text import normalize_signal_text
 
 
 @pytest.fixture
@@ -65,6 +66,21 @@ async def test_vision_persists_through_upsert(registry):
 
 
 # ── _read_inbound_image_attachments ────────────────────────────────────────
+
+def test_signal_object_placeholder_uses_sticker_emoji_metadata():
+    assert normalize_signal_text(
+        "\ufffc", {"sticker": {"emoji": "🚂"}},
+    ) == "[sticker: 🚂]"
+
+
+def test_signal_object_placeholder_has_honest_generic_fallback():
+    assert normalize_signal_text("look \ufffc") == (
+        "look [unrendered Signal object]"
+    )
+
+
+def test_real_train_emoji_is_not_rewritten():
+    assert normalize_signal_text("model train 🚂") == "model train 🚂"
 
 def test_no_attachments_returns_empty(attachments_tmp):
     assert _read_inbound_image_attachments({}) == []
@@ -166,7 +182,7 @@ def test_vision_bypasses_research_mode_message_present():
     fork and is the documented signal for the bypass.
     """
     import src.commands.ask_command as ask_mod
-    src_text = open(ask_mod.__file__).read()
+    src_text = open(ask_mod.__file__, encoding="utf-8").read()
     assert "Vision short-circuit" in src_text, (
         "Vision short-circuit comment missing — bypass logic may have "
         "been removed. Image turns will be incorrectly routed through "
