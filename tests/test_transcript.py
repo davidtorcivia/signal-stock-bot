@@ -134,6 +134,37 @@ def test_build_record_shape():
     assert rec["_meta"]["latency_ms"] == 123.4
 
 
+def test_build_record_freezes_inputs_and_redacts_inline_images():
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "inspect this"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,QUJDREVGRw=="},
+            },
+        ],
+    }]
+    tools = [{"type": "function", "function": {"name": "price"}}]
+    response = {"role": "assistant", "content": "done"}
+    rec = tx.build_record(
+        purpose="ask", model="gpt-test", messages=messages, tools=tools,
+        assistant_msg=response, params={}, latency_ms=1, bot_id=1,
+        context_id=2, context_label=None, sender_tail=None, group_id=None,
+    )
+
+    messages.append({"role": "assistant", "content": "later"})
+    tools[0]["function"]["name"] = "mutated"
+    response["content"] = "mutated"
+
+    assert len(rec["messages"]) == 1
+    assert rec["tools"][0]["function"]["name"] == "price"
+    assert rec["response"]["content"] == "done"
+    image_url = rec["messages"][0]["content"][1]["image_url"]["url"]
+    assert image_url.startswith("data:image/png;base64,[inline binary omitted:")
+    assert "QUJDREVGRw" not in image_url
+
+
 def test_logged_purposes_excludes_reactor():
     """Reactor/summary/healthcheck calls must NOT be logged."""
     assert "ask" in tx.LOGGED_PURPOSES

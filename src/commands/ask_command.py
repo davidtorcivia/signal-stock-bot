@@ -75,7 +75,20 @@ from ..llm.mcp_broker import (
     invoke_mcp_tool,
 )
 from ..llm.prompt_cache import PromptCachePlan
-from ..llm.tool_runtime import ToolCallLedger
+from ..llm.summarizer import render_summary_for_prompt
+from ..llm.prompt_compiler import (
+    PromptCompiler,
+    StablePromptBlock,
+    VolatilePromptBlock,
+)
+from ..llm.tool_runtime import (
+    DurableToolLedger,
+    ToolCallLedger,
+    ToolExecution,
+    ToolLoopRuntime,
+    ensure_tool_result_envelope,
+    tool_result_ok,
+)
 from ..llm.output_safety import (
     strip_meta_leak as _strip_meta_leak,
     strip_tool_call_leak as _strip_tool_call_leak,
@@ -298,6 +311,9 @@ class AskCommand(BaseCommand):
         # display name for all bot turns.
         self.bot_registry = bot_registry
         self.history = history
+        self._durable_tool_ledger = DurableToolLedger(
+            getattr(history, "db_path", "data/watchlist.db")
+        )
         self.group_log = group_log
         self.mcp_manager = mcp_manager
         self.bot_tools = bot_tools
@@ -350,7 +366,7 @@ class AskCommand(BaseCommand):
         self.name_registry = name_registry
         # Optional rolling-summary writer. When set, each successful !ask
         # fires a fire-and-forget call that may (re)compress older turns
-        # into a paragraph injected into future user-tail context.
+        # into a cited structured summary for future user-tail context.
         self.summarizer = summarizer
         # Optional reactor — used here only as a read-only source for the
         # in-memory log of recent reactions, so the writing LLM can answer
@@ -920,9 +936,9 @@ class AskCommand(BaseCommand):
         Attachments produced by bot-tool calls are appended to `attachments`
         so the caller can include them in the final Signal response.
 
-        If the round cap is hit we DO NOT fabricate a summary from partial
-        results — accuracy matters more than appearing helpful. Instead we
-        return an honest error noting the cap and the tools the LLM tried.
+        If a round/call/progress budget is hit, the runtime makes one final
+        no-tools synthesis constrained to completed evidence. If that fails,
+        it returns an honest incomplete-work message.
         """
         # Resolve the writer client per-bot. _llm_for handles the
         # ctx.bot=None fallback so legacy callers (no factory wired)
@@ -932,52 +948,66 @@ class AskCommand(BaseCommand):
         # command.
         llm = self._llm_for(caller_ctx)
         max_rounds = self._live_max_tool_rounds()
-        tool_call_history: list[str] = []
-        ledger = ToolCallLedger()
 
-        for round_idx in range(max_rounds):
+        async def chat_round(
+            working_messages: list[dict], active_tools: Optional[list[dict]],
+        ) -> dict:
             logger.info(
-                f"LLM round {round_idx + 1}/{max_rounds}: "
-                f"requesting completion ({len(messages)} msgs in context)"
+                "LLM tool runtime: requesting completion (%d msgs)",
+                len(working_messages),
             )
-            assistant_msg = await llm.chat_messages(
-                messages, tools=tools, cache_plan=cache_plan,
+            return await llm.chat_messages(
+                working_messages, tools=active_tools, cache_plan=cache_plan,
             )
-            messages.append(assistant_msg)
-            tool_calls = assistant_msg.get("tool_calls") or []
-            if not tool_calls:
-                content = (assistant_msg.get("content") or "").strip()
-                logger.info(
-                    f"LLM round {round_idx + 1}: final answer "
-                    f"({len(content)} chars, no tool calls)"
-                )
-                return content
-            for call in tool_calls:
-                fn_name = (call.get("function") or {}).get("name") or "?"
-                tool_call_history.append(fn_name)
-                await self._execute_tool_call(
-                    call, messages, caller_ctx, attachments, tools=tools,
-                    ledger=ledger,
-                )
 
-        # Cap hit — log the full sequence and return an honest error. We
-        # deliberately do NOT make a final no-tools call: the LLM would
-        # produce a summary based on incomplete work, which can be
-        # confidently wrong on factual queries.
-        logger.warning(
-            f"Tool loop hit cap ({max_rounds} rounds) without resolution. "
-            f"Tool sequence: {' -> '.join(tool_call_history)}"
-        )
+        async def execute_call(
+            call: dict, ledger: ToolCallLedger,
+        ) -> ToolExecution:
+            local_messages: list[dict] = []
+            local_attachments: list = []
+            await self._execute_tool_call(
+                call, local_messages, caller_ctx, local_attachments,
+                tools=tools, ledger=ledger,
+            )
+            name = (call.get("function") or {}).get("name") or ""
+            message = local_messages[-1] if local_messages else {
+                "role": "tool", "tool_call_id": call.get("id") or "",
+                "name": name,
+                "content": ensure_tool_result_envelope(
+                    name, "ERROR: tool returned no result", ok=False,
+                ),
+            }
+            return ToolExecution(
+                message=message,
+                attachments=local_attachments,
+                ok=tool_result_ok(message.get("content", "")),
+            )
 
-        # Last few tools tried, for the user-facing message
-        recent = tool_call_history[-6:]
-        recent_str = " -> ".join(recent)
-        return (
-            f"Task didn't complete after {max_rounds} tool-call rounds. "
-            f"The model was working through: {recent_str}. "
-            f"Either ask a more focused question, or raise "
-            f"`Max tool-call rounds per !ask` in /admin/llm."
+        source_key = None
+        if caller_ctx.message_timestamp is not None:
+            source_key = (
+                f"{caller_ctx.context_key()}:{caller_ctx.bot_id or 0}:"
+                f"{caller_ctx.message_timestamp}"
+            )
+        outcome = await ToolLoopRuntime(max_rounds=max_rounds).run(
+            messages=messages,
+            tools=tools,
+            chat=chat_round,
+            execute=execute_call,
+            attachments=attachments,
+            source_key=source_key,
+            durable_ledger=self._durable_tool_ledger,
+            incomplete_fallback=(
+                f"Task did not complete within the {max_rounds}-round tool "
+                "budget. The completed results were insufficient for a safe answer."
+            ),
         )
+        logger.info(
+            "LLM tool runtime stopped reason=%s rounds=%d calls=%d parallel=%d",
+            outcome.stop_reason, outcome.rounds, outcome.calls,
+            outcome.parallel_batches,
+        )
+        return outcome.content
 
     _DEFAULT_RESEARCH_HANDOFF = (
         "RESEARCH NOTES (from your research model — the slower, smarter "
@@ -2123,7 +2153,7 @@ class AskCommand(BaseCommand):
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": content,
+                    "content": ensure_tool_result_envelope(name, content, ok=False),
                 })
                 return
 
@@ -2137,11 +2167,16 @@ class AskCommand(BaseCommand):
                     name, duplicate_reason,
                 )
                 if duplicate_reason == "duplicate_call_id_conflict":
-                    content = duplicate_content or "ERROR: duplicate tool call suppressed"
+                    content = ensure_tool_result_envelope(
+                        name,
+                        duplicate_content or "ERROR: duplicate tool call suppressed",
+                        ok=False,
+                        reused="duplicate tool call suppressed: call-id conflict",
+                    )
                 else:
-                    content = (
-                        f"(duplicate tool call suppressed: {duplicate_reason}; "
-                        f"reusing prior result)\n{duplicate_content or '(no result)'}"
+                    content = ensure_tool_result_envelope(
+                        name, duplicate_content or "(no result)", ok=True,
+                        reused=f"duplicate tool call suppressed: {duplicate_reason}",
                     )
                 messages.append({
                     "role": "tool",
@@ -2263,6 +2298,8 @@ class AskCommand(BaseCommand):
             elif is_bot_tool:
                 result = await self.bot_tools.call(name, args, caller_ctx)
                 content = result.text if result else "(no result)"
+                if result is not None and not result.success:
+                    content = f"ERROR: {content}"
                 if result and result.attachments:
                     attachments.extend(result.attachments)
             elif name == MCP_DISCOVER_NAME:
@@ -2300,7 +2337,9 @@ class AskCommand(BaseCommand):
         # ..." in the UA leaks the legacy persona into in-context
         # learning and the writer starts answering as Sigil. Hygiene
         # generally: don't pass raw tool errors verbatim.
-        content = _scrub_tool_content(content)
+        content = ensure_tool_result_envelope(
+            name, _scrub_tool_content(content),
+        )
 
         if ledger is not None:
             ledger.record(
@@ -2443,7 +2482,7 @@ class AskCommand(BaseCommand):
                 now=now_ts,
                 floor_at=floor_at,
                 bot_id=history_bot_id,
-                include_turn_ids=is_group,
+                include_turn_ids=True,
                 include_internal=True,
             )
             # Re-enrich each prior turn — bot/user messages stored before
@@ -2490,6 +2529,51 @@ class AskCommand(BaseCommand):
                 latest_turn_id = max(
                     dated_turns, key=lambda t: t["created_at"]
                 ).get("turn_id")
+            current_parent_ref = reply_turn_id or latest_turn_id
+
+            # Hybrid selection: exact recent history remains in role order;
+            # a few older lexical matches are added only to the volatile tail.
+            # This recovers relevant older details without widening the cached
+            # prefix or repeating rows already visible verbatim.
+            retrieved_history_block = ""
+            retrieved_turns: list[dict] = []
+            if live_turns > 0:
+                try:
+                    retrieved_turns = await self.history.retrieve_relevant(
+                        context_key,
+                        question,
+                        exclude_turn_ids={
+                            str(turn.get("_turn_id")) for turn in prior
+                            if turn.get("_turn_id")
+                        },
+                        limit=4,
+                        floor_at=floor_at,
+                        bot_id=history_bot_id,
+                        attribute_senders=is_group,
+                    )
+                    if retrieved_turns:
+                        retrieved_history_block = "\n".join(
+                            f"[turn {turn['turn_id']}; {turn['speaker']}; "
+                            f"{format_history_timestamp(turn['created_at'])}] "
+                            f"{turn['content']}"
+                            for turn in retrieved_turns
+                        )
+                except Exception as e:
+                    logger.debug(f"Relevant-history retrieval failed: {e}")
+
+            # Render stored graph edges separately so legacy history labels
+            # stay stable. New rows carry a parent reference, including g<ID>
+            # quote targets that cannot be represented as a SQLite foreign key.
+            graph_edges = [
+                f"{turn.get('_turn_id')} -> {turn.get('_parent_turn_ref')}"
+                for turn in prior
+                if turn.get("_turn_id") and turn.get("_parent_turn_ref")
+            ]
+            graph_edges.extend(
+                f"{turn['turn_id']} -> {turn['parent_turn_ref']}"
+                for turn in retrieved_turns if turn.get("parent_turn_ref")
+            )
+            turn_graph_block = "\n".join(dict.fromkeys(graph_edges))
             # Snapshot the active bot's deep-think client once for every
             # prompt/execution gate in this request. The default client on
             # self.deep_think may have different readiness and settings.
@@ -2511,7 +2595,8 @@ class AskCommand(BaseCommand):
                         bot_id=summary_bot_id,
                     )
                     if summary and summary.get("summary"):
-                        summary_text = await self._enrich(summary["summary"])
+                        summary_text = render_summary_for_prompt(summary["summary"])
+                        summary_text = await self._enrich(summary_text)
                         summary_block = summary_text
                 except Exception as e:
                     logger.debug(f"Failed to load summary for ask: {e}")
@@ -2588,7 +2673,9 @@ class AskCommand(BaseCommand):
                     "as 'what does that mean?', resolve 'that' against the "
                     "follows turn before reaching back to older topics. "
                     "`<replying_to turn=\"ID\">`, when present, is an explicit "
-                    "Signal quote and is the authoritative target.\n"
+                    "Signal quote and is the authoritative target. The "
+                    "`parent` attribute and <turn_graph> record the durable "
+                    "reply edge; follow that edge when topics interleave.\n"
                     "- The current message is wrapped in "
                     "`<current_message from=\"Name\">`. Reply to that speaker; "
                     "do not assume the prior turn's asker is still in front "
@@ -3055,36 +3142,32 @@ class AskCommand(BaseCommand):
                 ctx, authoritative_prompt=base_system_prompt,
             )
 
-            # Cache contract: only persona/configuration blocks may enter the
-            # system prefix. Anything derived from this message, recalled
-            # state, or another model belongs in the volatile user tail.
+            # Typed blocks are compiled below.  Request-derived content has a
+            # different type from cacheable configuration, so it cannot enter
+            # the system prefix through this assembly path.
             stable_system_blocks = [
-                ("your_identity", _wrap_xml("your_identity", identity_block)),
-                ("attribution_rules", _wrap_xml("attribution_rules", attribution_rules)),
-                ("identity_note", _wrap_xml("identity_note", names_directive)),
-                ("reactor_reflex", _wrap_xml("reactor_reflex", reactor_directive)),
-                ("tarot_tool", _wrap_xml("tarot_tool", tarot_directive)),
-                ("iching_tool", _wrap_xml("iching_tool", iching_directive)),
-                ("portfolio_journal", _wrap_xml("portfolio_journal", journal_directive)),
-                ("deep_think_tool", _wrap_xml("deep_think_tool", deep_think_directive)),
-                ("mcp_broker", _wrap_xml("mcp_broker", mcp_broker_directive)),
-                ("python_tool", _wrap_xml("python_tool", python_tool_directive)),
+                StablePromptBlock("your_identity", _wrap_xml("your_identity", identity_block)),
+                StablePromptBlock(
+                    "turn_pointer_rules",
+                    _wrap_xml(
+                        "turn_pointer_rules",
+                        "Conversation-history rows may begin with a stable "
+                        "`[turn h<ID>; ...]` pointer. The current message's "
+                        "`parent`/`follows` attributes and <turn_graph> refer "
+                        "to those IDs. Use the pointers for reference "
+                        "resolution, but never copy them into your reply.",
+                    ),
+                ),
+                StablePromptBlock("attribution_rules", _wrap_xml("attribution_rules", attribution_rules)),
+                StablePromptBlock("identity_note", _wrap_xml("identity_note", names_directive)),
+                StablePromptBlock("reactor_reflex", _wrap_xml("reactor_reflex", reactor_directive)),
+                StablePromptBlock("tarot_tool", _wrap_xml("tarot_tool", tarot_directive)),
+                StablePromptBlock("iching_tool", _wrap_xml("iching_tool", iching_directive)),
+                StablePromptBlock("portfolio_journal", _wrap_xml("portfolio_journal", journal_directive)),
+                StablePromptBlock("deep_think_tool", _wrap_xml("deep_think_tool", deep_think_directive)),
+                StablePromptBlock("mcp_broker", _wrap_xml("mcp_broker", mcp_broker_directive)),
+                StablePromptBlock("python_tool", _wrap_xml("python_tool", python_tool_directive)),
             ]
-            system_suffix_parts = [
-                content for _, content in stable_system_blocks if content
-            ]
-            system_suffix_parts = [p for p in system_suffix_parts if p]
-            system_suffix = "\n\n".join(system_suffix_parts) or None
-
-            # Per-bot system prompt: route through the bot-scoped writer
-            # so a bot's writer-role override (e.g. Artaud's persona
-            # baked into bot_llm_settings) replaces the global default.
-            # Use the same configuration snapshot that identity validation
-            # saw above. Resolving twice permits an admin/settings refresh to
-            # produce two different base prompts inside one request.
-            system_prompt = base_system_prompt
-            if system_suffix:
-                system_prompt = f"{base_system_prompt}\n\n{system_suffix}"
 
             # Trigger user-message: optional group context, optional reply
             # target, then the live message wrapped in <current_message>
@@ -3105,14 +3188,16 @@ class AskCommand(BaseCommand):
                 )
 
             volatile_prompt_blocks = [
-                ("spontaneous_reply", _wrap_xml("spontaneous_reply", implicit_directive)),
-                ("conversation_memory", _wrap_xml("conversation_memory", summary_block)),
-                ("context_memories", _wrap_xml("context_memories", memory_block)),
-                ("conversation_status", _wrap_xml("conversation_status", staleness_block)),
-                ("deep_think_trigger", _wrap_xml("deep_think_trigger", deep_think_trigger_hint)),
+                VolatilePromptBlock("spontaneous_reply", _wrap_xml("spontaneous_reply", implicit_directive)),
+                VolatilePromptBlock("conversation_memory", _wrap_xml("conversation_memory", summary_block)),
+                VolatilePromptBlock("retrieved_history", _wrap_xml("retrieved_history", retrieved_history_block)),
+                VolatilePromptBlock("turn_graph", _wrap_xml("turn_graph", turn_graph_block)),
+                VolatilePromptBlock("context_memories", _wrap_xml("context_memories", memory_block)),
+                VolatilePromptBlock("conversation_status", _wrap_xml("conversation_status", staleness_block)),
+                VolatilePromptBlock("deep_think_trigger", _wrap_xml("deep_think_trigger", deep_think_trigger_hint)),
             ]
             trigger_parts.extend(
-                content for _, content in volatile_prompt_blocks if content
+                block.content for block in volatile_prompt_blocks if block.content
             )
 
             if ctx.quote_text:
@@ -3156,9 +3241,12 @@ class AskCommand(BaseCommand):
             follows_attr = (
                 f' follows="{latest_turn_id}"' if latest_turn_id else ""
             )
+            parent_attr = (
+                f' parent="{current_parent_ref}"' if current_parent_ref else ""
+            )
             trigger_parts.append(
                 f'<current_message from="{sender_label}" sent="just now"'
-                f'{follows_attr}>\n'
+                f'{follows_attr}{parent_attr}>\n'
                 f"{question}\n"
                 f"</current_message>\n"
                 f"{closing}"
@@ -3205,21 +3293,26 @@ class AskCommand(BaseCommand):
                 {k: v for k, v in turn.items() if not k.startswith("_")}
                 for turn in prior
             ]
-            messages: list[dict] = [{"role": "system", "content": system_prompt}]
-            messages.extend(provider_prior)
-            messages.append({"role": "user", "content": user_message_content})
-
             tools = self._collect_tools(policy=ctx.policy, bot=ctx.bot)
-            cache_plan = PromptCachePlan.from_blocks(
-                stable=[("base_system", base_system_prompt)] + stable_system_blocks,
-                volatile=[
-                    ("group_context", group_ctx_block),
-                    ("recent_reactions", _wrap_xml("recent_reactions", reactor_log_block)),
-                    *volatile_prompt_blocks,
-                    ("reply_target", ctx.quote_text or ""),
-                    ("current_message", question),
-                ],
+            compiler = PromptCompiler.with_base_system(base_system_prompt)
+            compiler.extend_stable(stable_system_blocks)
+            compiler.extend_volatile([
+                VolatilePromptBlock("group_context", group_ctx_block),
+                VolatilePromptBlock(
+                    "recent_reactions",
+                    _wrap_xml("recent_reactions", reactor_log_block),
+                ),
+                *volatile_prompt_blocks,
+                VolatilePromptBlock("reply_target", ctx.quote_text or ""),
+                VolatilePromptBlock("current_message", question),
+            ])
+            compiled_prompt = compiler.compile(
+                history=provider_prior,
+                user_content=user_message_content,
+                tools=tools,
             )
+            messages = compiled_prompt.messages
+            cache_plan = compiled_prompt.cache_plan
             attachments: list = []
 
             # Research mode: when the active bot is configured for it
@@ -3355,14 +3448,22 @@ class AskCommand(BaseCommand):
             # replayed alternation.
             if live_turns > 0:
                 async with self.history.lock_for(context_key):
+                    current_user_turn_ref = None
                     if getattr(ctx, "persist_user_turn", True):
-                        await self.history.append(
+                        inserted_user_id = await self.history.append(
                             context_key, "user", question,
                             user_hash=user_hash, sender_tail=sender_tail,
                             turns_per_user=live_turns,
                             image_refs=persisted_images,
                             bot_id=bot_id_for_turn,
                             source_message_ts=ctx.message_timestamp,
+                            parent_turn_ref=current_parent_ref,
+                        )
+                        if inserted_user_id is not None:
+                            current_user_turn_ref = f"h{inserted_user_id}"
+                    else:
+                        current_user_turn_ref = await self.history.find_turn_ref_by_source(
+                            context_key, ctx.message_timestamp,
                         )
                     # Persist the addressee on the assistant row too: the load
                     # path uses it to render `[to Name, time ago]` in group
@@ -3373,6 +3474,7 @@ class AskCommand(BaseCommand):
                         user_hash=user_hash, sender_tail=sender_tail,
                         turns_per_user=live_turns,
                         bot_id=bot_id_for_turn,
+                        parent_turn_ref=current_user_turn_ref,
                     )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")

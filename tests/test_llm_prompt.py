@@ -640,10 +640,23 @@ async def test_group_context_dedupes_history_and_points_followup(tmp_path):
     turn_match = re.match(r"\[turn (h\d+); to ", assistant_history)
     assert turn_match
     assert f'follows="{turn_match.group(1)}"' in tail
+    assert f'parent="{turn_match.group(1)}"' in tail
     # The user question remains in role history only, not a second time in
     # group_context, and private assembly keys never reach the provider.
     assert "<group_context>" not in tail
     assert all(not any(k.startswith("_") for k in m) for m in prompt)
+
+    stored = await history.load(
+        "group:group-1", turns_per_user=10, include_internal=True,
+        include_turn_ids=True,
+    )
+    current_user = next(
+        turn for turn in stored
+        if turn.get("_raw_content") == "what does that mean?"
+    )
+    current_answer = stored[stored.index(current_user) + 1]
+    assert current_user["_parent_turn_ref"] == turn_match.group(1)
+    assert current_answer["_parent_turn_ref"] == current_user["_turn_id"]
 
 
 @pytest.mark.asyncio

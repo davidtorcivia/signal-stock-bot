@@ -54,7 +54,14 @@ from .mcp_broker import (
 )
 from .prompt_cache import PromptCachePlan
 from .resilience import LLMHTTPFailure, resilient_chat_post
-from .tool_runtime import ToolCallLedger
+from .tool_runtime import (
+    DurableToolLedger,
+    ToolCallLedger,
+    ToolExecution,
+    ToolLoopRuntime,
+    ensure_tool_result_envelope,
+    tool_result_ok,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +125,7 @@ class DeepThinkClient:
         # falls back to a single-shot text call without tools.
         self.bot_tools = bot_tools
         self.mcp_manager = mcp_manager
+        self.durable_tool_ledger = DurableToolLedger()
         # Rolling log for the admin dashboard. (ts, question, latency_ms,
         # model, tokens_in, tokens_out, ok, error_msg, user_tail, group_id,
         # tool_calls — names of tools the deep model called this turn).
@@ -508,14 +516,10 @@ class DeepThinkClient:
         the recent-calls dashboard view; per-round metrics are recorded
         inside `_chat_call` for the LLM/deep_think totals.
 
-        Hitting the round cap returns whatever text the model has produced
-        so far plus an honest warning — accuracy beats appearing helpful.
+        Budget or no-progress stops get one final no-tools synthesis constrained
+        to completed evidence, with an honest fallback if synthesis fails.
         """
         max_rounds = max(1, cfg["max_tool_rounds"])
-        tool_call_history: list[str] = []
-        total_in = 0
-        total_out = 0
-        ledger = ToolCallLedger()
         context_id = None
         bot_id = None
         if caller_ctx is not None:
@@ -523,70 +527,69 @@ class DeepThinkClient:
             context_id = getattr(policy, "id", None)
             bot_id = getattr(caller_ctx, "bot_id", None)
 
-        for round_idx in range(max_rounds):
-            assistant_msg = await self._chat_call(
-                messages, tools=tools, cfg=cfg, sender_tail=sender_tail,
-                group_id=group_id, context_id=context_id, bot_id=bot_id,
-                cache_plan=cache_plan,
+        async def chat_round(
+            working_messages: list[dict], active_tools: Optional[list[dict]],
+        ) -> dict:
+            return await self._chat_call(
+                working_messages, tools=active_tools, cfg=cfg,
+                sender_tail=sender_tail, group_id=group_id,
+                context_id=context_id, bot_id=bot_id, cache_plan=cache_plan,
             )
-            total_in += assistant_msg.pop("_dt_tokens_in", 0)
-            total_out += assistant_msg.pop("_dt_tokens_out", 0)
-            messages.append(assistant_msg)
-            tool_calls = assistant_msg.get("tool_calls") or []
-            if not tool_calls:
-                # The final answer is ALWAYS in `content`. Reasoning models put
-                # their chain-of-thought in a sibling `reasoning`/`reasoning_content`
-                # field — that is the thinking, never the deliverable. Empty content
-                # with reasoning present means the model stopped before emitting a
-                # real answer (truncated mid-think, or a thinking-only turn); never
-                # surface that trace as the result or it gets published verbatim
-                # (e.g. the WSB digest printing a thought trace instead of an
-                # article). Return an honest stub and log the trace length so the
-                # failure is visible without leaking it downstream.
-                content = (assistant_msg.get("content") or "").strip()
-                if not content:
-                    reasoning = (
-                        assistant_msg.get("reasoning_content")
-                        or assistant_msg.get("reasoning")
-                        or ""
-                    ).strip()
-                    logger.warning(
-                        f"DeepThink: round {round_idx + 1} produced no content "
-                        f"({len(reasoning)}c of reasoning, {len(tool_call_history)} "
-                        f"tools, {total_in}+{total_out} tok); returning stub"
-                    )
-                    return (
-                        "(deep_think produced no final answer — the model stopped "
-                        "while still reasoning)",
-                        tool_call_history,
-                        total_in,
-                        total_out,
-                    )
-                logger.info(
-                    f"DeepThink: final answer in round {round_idx + 1} "
-                    f"({len(content)}c, {len(tool_call_history)} tools, "
-                    f"{total_in}+{total_out} tok)"
-                )
-                return content, tool_call_history, total_in, total_out
 
-            for call in tool_calls:
-                fn_name = (call.get("function") or {}).get("name") or "?"
-                tool_call_history.append(fn_name)
-                await self._dispatch_tool_call(
-                    call, messages, caller_ctx, attachments,
-                    tools=tools, ledger=ledger,
-                )
+        async def execute_call(
+            call: dict, ledger: ToolCallLedger,
+        ) -> ToolExecution:
+            local_messages: list[dict] = []
+            local_attachments: list = []
+            await self._dispatch_tool_call(
+                call, local_messages, caller_ctx, local_attachments,
+                tools=tools, ledger=ledger,
+            )
+            name = (call.get("function") or {}).get("name") or ""
+            message = local_messages[-1] if local_messages else {
+                "role": "tool", "tool_call_id": call.get("id") or "",
+                "name": name,
+                "content": ensure_tool_result_envelope(
+                    name, "ERROR: tool returned no result", ok=False,
+                ),
+            }
+            return ToolExecution(
+                message, local_attachments,
+                tool_result_ok(message.get("content", "")),
+            )
 
-        logger.warning(
-            f"DeepThink: tool loop hit cap ({max_rounds} rounds). "
-            f"Tools tried: {' -> '.join(tool_call_history)}"
+        source_key = None
+        if (
+            caller_ctx is not None
+            and getattr(caller_ctx, "message_timestamp", None) is not None
+        ):
+            source_key = (
+                f"{caller_ctx.context_key()}:"
+                f"{getattr(caller_ctx, 'bot_id', None) or 0}:"
+                f"{caller_ctx.message_timestamp}"
+            )
+        outcome = await ToolLoopRuntime(max_rounds=max_rounds).run(
+            messages=messages, tools=tools, chat=chat_round,
+            execute=execute_call, attachments=attachments,
+            source_key=source_key,
+            durable_ledger=getattr(self, "durable_tool_ledger", None),
+            empty_response=(
+                "(deep_think produced no final answer — the model stopped "
+                "while still reasoning)"
+            ),
+            incomplete_fallback=(
+                f"(deep_think exhausted its {max_rounds}-round tool budget "
+                "without enough completed evidence for a safe answer)"
+            ),
+        )
+        logger.info(
+            "DeepThink runtime stopped reason=%s rounds=%d calls=%d parallel=%d",
+            outcome.stop_reason, outcome.rounds, outcome.calls,
+            outcome.parallel_batches,
         )
         return (
-            f"(deep_think hit tool-loop cap of {max_rounds} rounds; "
-            f"last tools: {' -> '.join(tool_call_history[-6:])})",
-            tool_call_history,
-            total_in,
-            total_out,
+            outcome.content, outcome.tool_history,
+            outcome.tokens_in, outcome.tokens_out,
         )
 
     async def _dispatch_tool_call(
@@ -629,9 +632,11 @@ class DeepThinkClient:
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": (
+                    "content": ensure_tool_result_envelope(
+                        name,
                         f"ERROR: no tool named {name!r} is available. "
-                        f"Use {MCP_DISCOVER_NAME} for MCP capabilities."
+                        f"Use {MCP_DISCOVER_NAME} for MCP capabilities.",
+                        ok=False,
                     ),
                 })
                 return
@@ -645,14 +650,18 @@ class DeepThinkClient:
                     "Suppressing duplicate DeepThink tool call name=%s reason=%s",
                     name, duplicate_reason,
                 )
-                content = (
-                    duplicate_content
-                    if duplicate_reason == "duplicate_call_id_conflict"
-                    else (
-                        f"(duplicate tool call suppressed: {duplicate_reason}; "
-                        f"reusing prior result)\n{duplicate_content or '(no result)'}"
+                if duplicate_reason == "duplicate_call_id_conflict":
+                    content = ensure_tool_result_envelope(
+                        name,
+                        duplicate_content or "ERROR: duplicate tool call suppressed",
+                        ok=False,
+                        reused="duplicate tool call suppressed: call-id conflict",
                     )
-                )
+                else:
+                    content = ensure_tool_result_envelope(
+                        name, duplicate_content or "(no result)", ok=True,
+                        reused=f"duplicate tool call suppressed: {duplicate_reason}",
+                    )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -677,6 +686,8 @@ class DeepThinkClient:
                 else:
                     result = await self.bot_tools.call(name, args, caller_ctx)
                     content = result.text if result else "(no result)"
+                    if result is not None and not result.success:
+                        content = f"ERROR: {content}"
                     if result and result.attachments:
                         attachments.extend(result.attachments)
             elif name == MCP_DISCOVER_NAME:
@@ -706,6 +717,8 @@ class DeepThinkClient:
         except Exception as e:
             logger.warning(f"DeepThink tool {name} failed: {e}")
             content = f"ERROR: {e}"
+
+        content = ensure_tool_result_envelope(name, content)
 
         if ledger is not None:
             ledger.record(

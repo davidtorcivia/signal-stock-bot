@@ -21,7 +21,9 @@ skip silently.
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -31,6 +33,38 @@ from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _redacted_binary(value: str) -> str:
+    """Return a stable, non-secret marker for an inline binary payload."""
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"[inline binary omitted: sha256={digest}, chars={len(value)}]"
+
+
+def snapshot_payload(value: Any, *, key: Optional[str] = None) -> Any:
+    """Freeze an API payload and omit inline attachment bytes.
+
+    Transcript writes run in a background task while the tool loop continues
+    mutating its message list.  Capturing by value here keeps each record tied
+    to the exact provider request that produced its response.
+    """
+    if isinstance(value, dict):
+        return {
+            str(k): snapshot_payload(v, key=str(k))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [snapshot_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [snapshot_payload(item) for item in value]
+    if isinstance(value, str):
+        if key in {"data_b64", "base64", "bytes_b64"}:
+            return _redacted_binary(value)
+        if value.startswith("data:") and ";base64," in value[:128]:
+            header = value.split(",", 1)[0]
+            return f"{header},{_redacted_binary(value)}"
+        return value
+    return copy.deepcopy(value)
 
 # Rotate when the active file crosses 100 MB. Keep 3 backups so the admin
 # can grab a fresh batch and still recover the prior one. Aligned with
@@ -267,19 +301,27 @@ def build_record(
     fields (`_meta`) are namespaced under an underscore so naive readers
     can drop them.
     """
+    # Snapshot synchronously, before append() is scheduled on the event loop.
+    frozen_messages = snapshot_payload(messages)
+    frozen_tools = snapshot_payload(tools or [])
+    frozen_assistant = snapshot_payload(assistant_msg)
+    frozen_params = snapshot_payload(params)
+    frozen_usage = snapshot_payload(usage or {})
+    frozen_manifest = snapshot_payload(cache_manifest or {})
+    frozen_event = snapshot_payload(cache_event or {})
     return {
         "ts": time.time(),
         "purpose": purpose,
         "model": model,
-        "messages": messages,
-        "tools": tools or [],
+        "messages": frozen_messages,
+        "tools": frozen_tools,
         "response": {
-            "role": assistant_msg.get("role", "assistant"),
-            "content": assistant_msg.get("content") or "",
-            "tool_calls": assistant_msg.get("tool_calls") or [],
+            "role": frozen_assistant.get("role", "assistant"),
+            "content": frozen_assistant.get("content") or "",
+            "tool_calls": frozen_assistant.get("tool_calls") or [],
         },
-        "params": params,
-        "usage": usage or {},
+        "params": frozen_params,
+        "usage": frozen_usage,
         "_meta": {
             "bot_id": bot_id,
             "context_id": context_id,
@@ -288,7 +330,7 @@ def build_record(
             "group_id": group_id,
             "latency_ms": latency_ms,
             # Fingerprints and sizes only — no duplicate prompt plaintext.
-            "cache_manifest": cache_manifest or {},
-            "cache_event": cache_event or {},
+            "cache_manifest": frozen_manifest,
+            "cache_event": frozen_event,
         },
     }

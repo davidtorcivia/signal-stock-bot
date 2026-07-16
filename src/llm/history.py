@@ -16,18 +16,29 @@ Pruning is triggered on every write:
 import asyncio
 import json
 import logging
+import math
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
 
 from ..database import db_session
+from ..utils.stopwords import STOPWORDS
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RETENTION_DAYS = 7
+DEFAULT_RETRIEVAL_ROWS = 200
+
+
+def _retrieval_tokens(text: str) -> set[str]:
+    return {
+        token for token in re.findall(r"[\w$]{2,}", (text or "").lower())
+        if token not in STOPWORDS
+    }
 
 
 def format_history_timestamp(created_at: float) -> str:
@@ -107,6 +118,13 @@ class ConversationHistory:
             "llm_retention_days", DEFAULT_RETENTION_DAYS, min_value=1,
         ) * 86400.0
 
+    def _retrieval_rows(self) -> int:
+        if self.settings_store is None:
+            return DEFAULT_RETRIEVAL_ROWS
+        return self.settings_store.get_int(
+            "llm_retrieval_rows", DEFAULT_RETRIEVAL_ROWS, min_value=0,
+        )
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -127,7 +145,8 @@ class ConversationHistory:
                     created_at REAL NOT NULL,
                     bot_id INTEGER,
                     image_refs TEXT,
-                    source_message_ts INTEGER
+                    source_message_ts INTEGER,
+                    parent_turn_ref TEXT
                 )
                 """
             )
@@ -165,6 +184,11 @@ class ConversationHistory:
                 await db.execute(
                     "ALTER TABLE conversation_turns "
                     "ADD COLUMN source_message_ts INTEGER"
+                )
+            if "parent_turn_ref" not in cols:
+                await db.execute(
+                    "ALTER TABLE conversation_turns "
+                    "ADD COLUMN parent_turn_ref TEXT"
                 )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_ctx_time "
@@ -406,7 +430,8 @@ class ConversationHistory:
                 )
                 params.append(bot_id)
             cursor = await db.execute(
-                f"""SELECT id, role, content, sender_tail, user_hash
+                f"""SELECT id, role, content, sender_tail, user_hash,
+                           created_at, parent_turn_ref
                    FROM conversation_turns
                    WHERE context_key = ?
                      AND id > ?
@@ -417,7 +442,8 @@ class ConversationHistory:
             rows = await cursor.fetchall()
         return [
             {"id": r[0], "role": r[1], "content": r[2],
-             "sender_tail": r[3], "user_hash": r[4]}
+             "sender_tail": r[3], "user_hash": r[4],
+             "created_at": r[5], "parent_turn_ref": r[6]}
             for r in rows
         ]
 
@@ -489,10 +515,17 @@ class ConversationHistory:
                     " AND (role = 'user' OR bot_id = ? OR bot_id IS NULL)"
                 )
                 params.append(bot_id)
-            params.append(n)
+            # Per-bot selection below needs enough rows to preserve this
+            # bot's older assistant replies even when another bot generated
+            # many newer shared user rows.
+            query_limit = (
+                max(n, self._retrieval_rows() * 4) if bot_id is not None else n
+            )
+            params.append(query_limit)
             cursor = await db.execute(
                 f"""SELECT id, role, content, sender_tail, user_hash,
-                          created_at, image_refs, source_message_ts
+                          created_at, image_refs, source_message_ts,
+                          parent_turn_ref
                    FROM conversation_turns
                    WHERE context_key = ?{floor_clause}{bot_clause}
                    ORDER BY created_at DESC, id DESC
@@ -504,7 +537,7 @@ class ConversationHistory:
         turns: list[dict] = []
         for (
             row_id, role, content, sender_tail, user_hash, created_at,
-            image_refs_json, source_message_ts,
+            image_refs_json, source_message_ts, parent_turn_ref,
         ) in reversed(rows):
             text = content
             turn_id = f"h{row_id}"
@@ -553,6 +586,16 @@ class ConversationHistory:
                     )
                 if bracket:
                     text = f"[{bracket}] {content}"
+            elif role == "assistant" and include_turn_ids:
+                stamp = (
+                    format_history_timestamp(created_at)
+                    if now is not None and created_at is not None
+                    else None
+                )
+                bracket = f"turn {turn_id}"
+                if stamp:
+                    bracket += f"; {stamp}"
+                text = f"[{bracket}] {content}"
             turn: dict = {"role": role, "content": text}
             # Image attachments stored at append time. ask_command
             # inflates these into multimodal parts for the last N user
@@ -574,11 +617,125 @@ class ConversationHistory:
                     "_raw_content": content,
                     "_created_at": created_at,
                     "_source_message_ts": source_message_ts,
+                    "_parent_turn_ref": parent_turn_ref,
                     "_sender_tail": sender_tail,
                     "_user_hash": user_hash,
                 })
             turns.append(turn)
         return turns
+
+    async def retrieve_relevant(
+        self,
+        context_key: str,
+        query: str,
+        *,
+        exclude_turn_ids: Optional[set[str]] = None,
+        limit: int = 4,
+        floor_at: Optional[float] = None,
+        bot_id: Optional[int] = None,
+        attribute_senders: bool = False,
+    ) -> list[dict]:
+        """Return older turns ranked by lexical relevance plus recency.
+
+        The provider still receives a strict recent window.  This method
+        searches the retained reservoir and supplies only a few non-duplicate
+        snippets in the volatile prompt tail, so retrieval cannot destabilize
+        the cacheable system/history prefix.
+        """
+        await self._ensure_initialized()
+        query_tokens = _retrieval_tokens(query)
+        if not query_tokens or limit <= 0:
+            return []
+        excluded = exclude_turn_ids or set()
+        params: list[Any] = [context_key]
+        floor_clause = ""
+        if floor_at is not None:
+            floor_clause = " AND created_at >= ?"
+            params.append(floor_at)
+        bot_clause = ""
+        if bot_id is not None:
+            bot_clause = " AND (role = 'user' OR bot_id = ? OR bot_id IS NULL)"
+            params.append(bot_id)
+        params.append(max(limit * 20, self._retrieval_rows() * 4))
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""SELECT id, role, content, sender_tail, user_hash,
+                           created_at, parent_turn_ref
+                    FROM conversation_turns
+                    WHERE context_key = ?{floor_clause}{bot_clause}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?""",
+                tuple(params),
+            )
+            rows = await cursor.fetchall()
+
+        if bot_id is not None and effective_turns > 0:
+            per_role = max(0, int(effective_turns))
+            # Take the first N from the DESC query for each role, then replay
+            # their union chronologically.
+            selected_user = [row[0] for row in rows if row[1] == "user"][:per_role]
+            selected_assistant = [
+                row[0] for row in rows if row[1] == "assistant"
+            ][:per_role]
+            selected = set(selected_user + selected_assistant)
+            rows = [row for row in rows if row[0] in selected]
+
+        now = time.time()
+        ranked: list[tuple[float, tuple]] = []
+        lowered_query = (query or "").strip().lower()
+        for row in rows:
+            turn_id = f"h{row[0]}"
+            if turn_id in excluded:
+                continue
+            content_tokens = _retrieval_tokens(row[2])
+            overlap = query_tokens & content_tokens
+            if not overlap:
+                continue
+            lexical = len(overlap) / math.sqrt(
+                max(1, len(query_tokens) * len(content_tokens))
+            )
+            phrase = 0.35 if lowered_query and lowered_query in row[2].lower() else 0.0
+            age_days = max(0.0, now - float(row[5] or now)) / 86400.0
+            recency = 0.15 / (1.0 + age_days)
+            ranked.append((lexical + phrase + recency, row))
+        ranked.sort(key=lambda item: (item[0], item[1][5], item[1][0]), reverse=True)
+
+        results = []
+        for score, row in ranked[:limit]:
+            row_id, role, content, sender_tail, user_hash, created_at, parent_ref = row
+            label = role
+            if attribute_senders:
+                person = self._attribution_label(user_hash, sender_tail)
+                if role == "user" and person:
+                    label = person
+                elif role == "assistant" and person:
+                    label = f"assistant to {person}"
+            results.append({
+                "turn_id": f"h{row_id}",
+                "parent_turn_ref": parent_ref,
+                "role": role,
+                "speaker": label,
+                "content": str(content)[:800],
+                "created_at": created_at,
+                "score": round(score, 4),
+            })
+        return results
+
+    async def find_turn_ref_by_source(
+        self, context_key: str, source_message_ts: Optional[int],
+    ) -> Optional[str]:
+        if source_message_ts is None:
+            return None
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT id FROM conversation_turns WHERE context_key=? "
+                "AND role='user' AND source_message_ts=? "
+                "ORDER BY id DESC LIMIT 1",
+                (context_key, source_message_ts),
+            )
+            row = await cursor.fetchone()
+        return f"h{row[0]}" if row else None
 
     async def latest_turn_timestamp(
         self, context_key: str, floor_at: Optional[float] = None
@@ -639,7 +796,8 @@ class ConversationHistory:
         image_refs: Optional[list[dict]] = None,
         bot_id: Optional[int] = None,
         source_message_ts: Optional[int] = None,
-    ) -> None:
+        parent_turn_ref: Optional[str] = None,
+    ) -> int:
         """Insert one turn and prune by row-cap (per context) and age (global).
 
         `turns_per_user` overrides the constructor default so a per-context
@@ -659,7 +817,10 @@ class ConversationHistory:
         effective_turns = (
             turns_per_user if turns_per_user is not None else self.turns_per_user
         )
-        max_rows = max(0, effective_turns) * 2
+        max_rows = (
+            0 if effective_turns <= 0 else
+            max(int(effective_turns) * 2, self._retrieval_rows())
+        )
         image_refs_json: Optional[str] = None
         if image_refs:
             try:
@@ -670,14 +831,17 @@ class ConversationHistory:
                 logger.warning(f"history.append: image_refs serialize failed: {e}")
 
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """INSERT INTO conversation_turns
                    (user_hash, context_key, sender_tail, role, content,
-                    created_at, image_refs, bot_id, source_message_ts)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, image_refs, bot_id, source_message_ts,
+                    parent_turn_ref)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_hash, context_key, sender_tail, role, content,
-                 now, image_refs_json, bot_id, source_message_ts),
+                 now, image_refs_json, bot_id, source_message_ts,
+                 parent_turn_ref),
             )
+            inserted_id = int(cursor.lastrowid)
             # Age-based purge (whole table)
             await db.execute(
                 "DELETE FROM conversation_turns WHERE created_at < ?",
@@ -720,6 +884,7 @@ class ConversationHistory:
                     (context_key, context_key, max_rows),
                 )
             await db.commit()
+        return inserted_id
 
     async def clear(self, context_key: str) -> int:
         async with db_session(self) as db:

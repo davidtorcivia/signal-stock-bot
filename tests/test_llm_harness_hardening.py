@@ -17,6 +17,11 @@ from src.llm.mcp_broker import (
     invoke_mcp_tool,
 )
 from src.llm.prompt_cache import PromptCachePlan
+from src.llm.prompt_compiler import (
+    PromptCompiler,
+    StablePromptBlock,
+    VolatilePromptBlock,
+)
 from src.llm.resilience import LLMHTTPFailure, resilient_chat_post
 from src.llm.tool_runtime import ToolCallLedger
 from src.mcp_integration import MCPTool
@@ -84,6 +89,23 @@ def test_prompt_plan_separates_stable_prefix_from_volatile_tail():
     assert first["stable_blocks_hash"] == second["stable_blocks_hash"]
     assert first["volatile_blocks_hash"] != second["volatile_blocks_hash"]
     assert "Artaud" not in json.dumps(first)
+
+
+def test_typed_prompt_compiler_enforces_cache_boundary():
+    first_builder = PromptCompiler.with_base_system("You are Artaud.")
+    first_builder.add_stable(StablePromptBlock("identity", "Name: Artaud"))
+    first_builder.add_volatile(VolatilePromptBlock("reaction", "👍"))
+    first = first_builder.compile(user_content="reaction: 👍", tools=list(MCP_BROKER_TOOLS))
+
+    second_builder = PromptCompiler.with_base_system("You are Artaud.")
+    second_builder.add_stable(StablePromptBlock("identity", "Name: Artaud"))
+    second_builder.add_volatile(VolatilePromptBlock("reaction", "🚂"))
+    second = second_builder.compile(user_content="reaction: 🚂", tools=list(MCP_BROKER_TOOLS))
+
+    first.assert_same_cache_prefix(second)
+    assert first.messages[-1] != second.messages[-1]
+    with pytest.raises(TypeError):
+        first_builder.add_stable(VolatilePromptBlock("bad", "dynamic"))
 
 
 def test_prompt_metrics_flag_stable_changes_and_unchanged_prefix_misses():
@@ -191,6 +213,29 @@ async def test_writer_broker_invocation_is_idempotent_within_tool_loop():
     )
     assert len(manager.calls) == 1
     assert "duplicate tool call suppressed" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_writer_unknown_tool_returns_bounded_error_envelope():
+    ask = AskCommand(llm=object(), history=object())
+    ctx = CommandContext(
+        sender="+1", group_id=None, raw_message="", command="ask", args=[],
+    )
+    messages = []
+    await ask._execute_tool_call(
+        {
+            "id": "bad",
+            "function": {"name": "invented__tool", "arguments": "{}"},
+        },
+        messages,
+        ctx,
+        [],
+        tools=[{"type": "function", "function": {"name": "real_tool"}}],
+    )
+    envelope = json.loads(messages[-1]["content"])
+    assert envelope["_tool_result"] == 1
+    assert envelope["ok"] is False
+    assert envelope["tool"] == "invented__tool"
 
 
 @pytest.mark.asyncio

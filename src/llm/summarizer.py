@@ -3,9 +3,9 @@ Rolling per-context conversation summary.
 
 When a chat accumulates more turns than the rolling history window holds,
 verbatim turns get pruned and the LLM loses long-term continuity. The
-Summarizer compresses the older portion of each conversation into a
-paragraph that lives separately from the turn-by-turn history and is
-injected into the system prompt on subsequent calls.
+Summarizer compresses the older portion of each conversation into cited,
+structured JSON that lives separately from turn-by-turn history and is
+rendered into the volatile user tail on subsequent calls.
 
 Design:
   * Triggered by `maybe_summarize(context_key)` — fire-and-forget from
@@ -25,37 +25,149 @@ Design:
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
+
+from .history import format_history_timestamp
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_KEEP_RECENT = 12          # turns kept verbatim — same as history window
 DEFAULT_MIN_NEW_TURNS = 10        # don't bother summarizing < this many new turns
-DEFAULT_MAX_SUMMARY_CHARS = 1500  # hard ceiling on the stored summary
-DEFAULT_MAX_TOKENS = 600          # output budget for the summarizer LLM call
+DEFAULT_MAX_SUMMARY_CHARS = 2500  # hard ceiling on the stored JSON summary
+DEFAULT_MAX_TOKENS = 800          # output budget for the summarizer LLM call
+
+SUMMARY_SECTIONS = ("facts", "decisions", "open_questions", "topics")
+
+
+def _empty_summary() -> dict:
+    return {"version": 1, **{section: [] for section in SUMMARY_SECTIONS}}
+
+
+def parse_structured_summary(raw: str, *, allow_legacy: bool = True) -> Optional[dict]:
+    """Validate summary JSON; optionally promote old prose without losing it."""
+    text = (raw or "").strip()
+    if not text:
+        return _empty_summary()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        if not allow_legacy:
+            return None
+        value = _empty_summary()
+        value["facts"] = [{
+            "text": text,
+            "source_turn_ids": [],
+            "last_confirmed": None,
+        }]
+        return value
+    if not isinstance(value, dict):
+        return None
+    clean = _empty_summary()
+    for section in SUMMARY_SECTIONS:
+        rows = value.get(section) or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, str):
+                row = {"text": row}
+            if not isinstance(row, dict):
+                continue
+            item_text = str(row.get("text") or "").strip()
+            if not item_text:
+                continue
+            sources = row.get("source_turn_ids") or []
+            if not isinstance(sources, list):
+                sources = []
+            clean[section].append({
+                "text": item_text[:600],
+                "source_turn_ids": [
+                    str(source) for source in sources
+                    if re.fullmatch(r"h\d+", str(source))
+                ][:8],
+                "last_confirmed": (
+                    str(row.get("last_confirmed"))[:40]
+                    if row.get("last_confirmed") else None
+                ),
+            })
+    return clean
+
+
+def serialize_structured_summary(value: dict, max_chars: int) -> str:
+    """Serialize valid JSON under the hard limit without slicing syntax."""
+    clean = parse_structured_summary(json.dumps(value), allow_legacy=False)
+    if clean is None:
+        raise ValueError("invalid structured summary")
+    max_chars = max(256, int(max_chars))
+    encoded = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
+    # Remove lowest-value tail items until the complete JSON fits.  Open
+    # questions and decisions survive longest because losing them breaks
+    # continuity more visibly than dropping a background topic.
+    removal_order = ("topics", "facts", "decisions", "open_questions")
+    while len(encoded) > max_chars:
+        removed = False
+        for section in removal_order:
+            if clean[section]:
+                clean[section].pop()
+                removed = True
+                break
+        if not removed:
+            break
+        encoded = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
+    return encoded
+
+
+def render_summary_for_prompt(raw: str) -> str:
+    """Turn stored JSON into concise, evidence-linked model context."""
+    value = parse_structured_summary(raw, allow_legacy=True)
+    if not value:
+        return ""
+    labels = {
+        "facts": "Durable facts",
+        "decisions": "Decisions",
+        "open_questions": "Open questions",
+        "topics": "Ongoing topics",
+    }
+    parts = []
+    for section in SUMMARY_SECTIONS:
+        rows = value.get(section) or []
+        if not rows:
+            continue
+        lines = []
+        for row in rows:
+            sources = row.get("source_turn_ids") or []
+            source_note = f" [sources: {', '.join(sources)}]" if sources else ""
+            lines.append(f"- {row['text']}{source_note}")
+        parts.append(f"{labels[section]}:\n" + "\n".join(lines))
+    return "\n\n".join(parts)
 
 SUMMARIZER_PROMPT = """\
 You maintain a long-term memory of a Signal chat conversation.
 
 You will receive (a) the current rolling summary, if any, and (b) a batch
 of new conversation turns since the last summary update. Produce an
-UPDATED rolling summary that folds the new material into the existing one.
+UPDATED structured summary that folds the new material into the existing one.
 
 Rules:
-- Keep it under {max_chars} characters. Aggressively trim less-relevant
+- Return one JSON object with exactly these array keys: facts, decisions,
+  open_questions, topics. Each item must have: text, source_turn_ids (an
+  array of h-number turn IDs), and last_confirmed (the supplied UTC timestamp
+  or null). Do not emit markdown fences.
+- Keep the serialized JSON under {max_chars} characters. Aggressively trim less-relevant
   context as the conversation evolves.
 - Capture: who is in the conversation, what they care about, key facts
   they've shared (birth charts, watchlists, opinions, preferences),
   ongoing topics, unresolved threads, decisions or commitments.
 - Drop: small talk, transient acknowledgements, command output details
   that aren't asked about again.
-- Write in plain prose paragraphs. No headers, no bullet lists.
 - Refer to people by their bracket label as it appears in the input
   (e.g. "David said…" not "user 4137 said…").
 - If the new turns contradict an earlier fact, prefer the newer one and
   drop the older entry.
-- Output ONLY the updated summary text. No preamble, no meta commentary,
-  no "Updated summary:" prefix."""
+- Never invent source IDs. Preserve the source IDs of retained prior entries.
+- Output ONLY the JSON object. No preamble or commentary."""
 
 
 class Summarizer:
@@ -98,9 +210,11 @@ class Summarizer:
         if role == "user":
             tail = turn.get("sender_tail")
             label = f"...{tail}" if tail else "user"
-            return f"[{label}] {content}"
+            stamp = format_history_timestamp(turn.get("created_at"))
+            return f"[turn h{turn.get('id')}; {label}; {stamp}] {content}"
         if role == "assistant":
-            return f"[bot] {content}"
+            stamp = format_history_timestamp(turn.get("created_at"))
+            return f"[turn h{turn.get('id')}; bot; {stamp}] {content}"
         if role == "tool":
             # Tool results are too noisy and too long for the summary
             # context. Skip them — the LLM's own assistant turn that
@@ -163,6 +277,11 @@ class Summarizer:
         )
         through_id = existing["summary_through_id"] if existing else 0
         prior_summary = existing["summary"] if existing else ""
+        if prior_summary:
+            prior_value = parse_structured_summary(prior_summary, allow_legacy=True)
+            prior_summary = serialize_structured_summary(
+                prior_value or _empty_summary(), cfg["max_chars"],
+            )
 
         pending = await self.history.turns_to_summarize(
             context_key,
@@ -219,12 +338,20 @@ class Summarizer:
             logger.warning(f"Summarizer LLM call failed for {context_key[:24]}: {e}")
             return False
 
-        new_summary = (assistant_msg.get("content") or "").strip()
-        if not new_summary:
+        raw_summary = (assistant_msg.get("content") or "").strip()
+        if not raw_summary:
             logger.info(f"Summarizer returned empty content for {context_key[:24]}")
             return False
-        if len(new_summary) > cfg["max_chars"]:
-            new_summary = new_summary[: cfg["max_chars"]].rstrip() + "…"
+        parsed_summary = parse_structured_summary(raw_summary, allow_legacy=False)
+        if parsed_summary is None:
+            logger.warning(
+                "Summarizer returned invalid structured JSON for %s",
+                context_key[:24],
+            )
+            return False
+        new_summary = serialize_structured_summary(
+            parsed_summary, cfg["max_chars"],
+        )
 
         prior_count = existing["turns_summarized"] if existing else 0
         await self.history.upsert_summary(
