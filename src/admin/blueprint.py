@@ -122,6 +122,7 @@ def create_admin_blueprint(
             bp,
             registry=context_registry,
             mcp_registry=mcp_registry,
+            mcp_manager=mcp_manager,
             dispatcher=dispatcher,
             loop=loop,
             memory_store=memory_store,
@@ -1442,6 +1443,7 @@ def _register_context_routes(
     *,
     registry: ContextRegistry,
     mcp_registry: Optional[MCPRegistry],
+    mcp_manager: Optional[MCPManager],
     dispatcher,
     loop: asyncio.AbstractEventLoop,
     memory_store=None,
@@ -1486,7 +1488,7 @@ def _register_context_routes(
             "label": "",
             "command_mode": MODE_ALLOW_ALL,
             "commands": [],
-            "mcp_mode": MODE_ALLOW_ALL,
+            "mcp_mode": MODE_ALLOW_LIST,
             "mcp_servers": [],
             "system_prompt": "",
             "llm_intent": False,
@@ -1513,6 +1515,7 @@ def _register_context_routes(
             values = _form_to_values(request.form)
 
         all_commands, all_servers = _available_commands_and_servers(dispatcher, mcp_registry, loop)
+        mcp_tool_stats = _mcp_tool_stats(mcp_manager)
         return render_template(
             "context_edit.html",
             is_new=True,
@@ -1521,6 +1524,7 @@ def _register_context_routes(
             modes=MODES,
             all_commands=all_commands,
             all_servers=all_servers,
+            mcp_tool_stats=mcp_tool_stats,
             all_bots=_bots_for_template(),
             error=error,
         )
@@ -1576,6 +1580,7 @@ def _register_context_routes(
             values["key"] = policy.key
 
         all_commands, all_servers = _available_commands_and_servers(dispatcher, mcp_registry, loop)
+        mcp_tool_stats = _mcp_tool_stats(mcp_manager)
 
         # Per-context oracles. Only group contexts can have them; for
         # default/dm rows we still pass an empty list so the template
@@ -1612,6 +1617,7 @@ def _register_context_routes(
             modes=MODES,
             all_commands=all_commands,
             all_servers=all_servers,
+            mcp_tool_stats=mcp_tool_stats,
             all_bots=_bots_for_template(),
             oracles=oracles_view,
             oracle_kinds=_ORACLE_KIND_OPTIONS,
@@ -2379,6 +2385,41 @@ def _available_commands_and_servers(dispatcher, mcp_registry, loop):
     return commands, servers
 
 
+def _mcp_tool_stats(mcp_manager: Optional[MCPManager]) -> dict[str, dict[str, int]]:
+    """Return the live schema footprint grouped by MCP server.
+
+    Context policy filters whole servers, while the provider bills the JSON
+    schema for every tool on an allowed server. Showing only a server name hid
+    the important distinction between a one-tool server and, for example, an
+    astrology server with twenty large schemas. This helper uses the exact
+    OpenAI payload representation emitted by the harness.
+    """
+    stats: dict[str, dict[str, int]] = {}
+    if mcp_manager is None:
+        return stats
+    try:
+        tools = mcp_manager.all_tools()
+    except Exception as e:
+        logger.debug(f"MCP tool stats unavailable: {e}")
+        return stats
+    for tool in tools:
+        server = str(tool.server_name)
+        row = stats.setdefault(server, {"tools": 0, "chars": 0})
+        row["tools"] += 1
+        try:
+            encoded = json.dumps(
+                tool.to_openai_tool(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            row["chars"] += len(encoded)
+        except (TypeError, ValueError):
+            # The runtime call path will surface a malformed schema. The admin
+            # page should still render and show its tool count.
+            pass
+    return stats
+
+
 def _form_to_values(form) -> dict:
     return {
         "kind": form.get("kind", "group"),
@@ -2386,7 +2427,7 @@ def _form_to_values(form) -> dict:
         "label": form.get("label", "").strip(),
         "command_mode": form.get("command_mode", MODE_ALLOW_ALL),
         "commands": form.getlist("commands"),
-        "mcp_mode": form.get("mcp_mode", MODE_ALLOW_ALL),
+        "mcp_mode": form.get("mcp_mode", MODE_ALLOW_LIST),
         "mcp_servers": form.getlist("mcp_servers"),
         "system_prompt": form.get("system_prompt", ""),
         "llm_intent": form.get("llm_intent", "") == "on",
@@ -2413,7 +2454,7 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         key = base.key  # immutable
     label = (form.get("label") or "").strip()
     command_mode = (form.get("command_mode") or MODE_ALLOW_ALL).strip()
-    mcp_mode = (form.get("mcp_mode") or MODE_ALLOW_ALL).strip()
+    mcp_mode = (form.get("mcp_mode") or MODE_ALLOW_LIST).strip()
     commands = form.getlist("commands")
     mcp_servers = form.getlist("mcp_servers")
     system_prompt = (form.get("system_prompt") or "").strip() or None

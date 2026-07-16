@@ -65,13 +65,40 @@
             <option value="deny_list" {% if values.mcp_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
         </select>
 
+        <div id="mcp-schema-summary"
+             style="margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:4px;background:#0b0d10;font-size:12px;color:var(--text);">
+            Effective payload: <strong id="mcp-effective-tools">0 tool schemas</strong>,
+            <strong id="mcp-effective-size">0 JSON characters</strong>
+            <span class="muted" id="mcp-effective-tokens"></span>
+        </div>
+        <p id="mcp-allow-all-warning" class="muted"
+           style="font-size:11px;margin-top:5px;color:var(--warn,#d9a441);display:none;">
+            “Allow all servers” sends every tool from every running MCP server.
+            The selections below have no effect in this mode.
+        </p>
+        <p class="muted" style="font-size:11px;margin-top:5px;">
+            Keep this list stable for the chat. Changing schemas between turns can
+            invalidate the provider's prompt cache.
+        </p>
+
         {% if all_servers %}
         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;">
             {% for s in all_servers %}
+                {% set tool_stat = mcp_tool_stats.get(s, {}) %}
                 <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
                     <input type="checkbox" name="mcp_servers" value="{{ s }}"
+                           data-tool-count="{{ tool_stat.get('tools', 0) }}"
+                           data-schema-chars="{{ tool_stat.get('chars', 0) }}"
                            {% if s in values.mcp_servers %}checked{% endif %}>
-                    <span>{{ s }}</span>
+                    <span>
+                        {{ s }}
+                        {% if tool_stat.get('tools', 0) %}
+                            <span class="muted" style="font-size:10px;">
+                                ({{ tool_stat.get('tools', 0) }} tools,
+                                {{ '{:,}'.format(tool_stat.get('chars', 0)) }} chars)
+                            </span>
+                        {% endif %}
+                    </span>
                 </label>
             {% endfor %}
         </div>
@@ -563,6 +590,41 @@
       box.checked = days.indexOf(parseInt(box.value, 10)) !== -1;
     });
   }
+
+  // Show the exact live MCP schema footprint for the access rule being edited.
+  // The token figure is deliberately labeled approximate: providers tokenize
+  // function schemas differently, while character count is exact.
+  (function () {
+    var mode = document.getElementById('mcp_mode');
+    var toolOut = document.getElementById('mcp-effective-tools');
+    var sizeOut = document.getElementById('mcp-effective-size');
+    var tokenOut = document.getElementById('mcp-effective-tokens');
+    var warning = document.getElementById('mcp-allow-all-warning');
+    if (!mode || !toolOut || !sizeOut || !tokenOut || !warning) return;
+
+    var boxes = Array.from(document.querySelectorAll('input[name="mcp_servers"]'));
+    function refreshMcpFootprint() {
+      var toolCount = 0;
+      var schemaChars = 0;
+      boxes.forEach(function (box) {
+        var included = mode.value === 'allow_all' ||
+          (mode.value === 'allow_list' && box.checked) ||
+          (mode.value === 'deny_list' && !box.checked);
+        if (!included) return;
+        toolCount += parseInt(box.dataset.toolCount || '0', 10);
+        schemaChars += parseInt(box.dataset.schemaChars || '0', 10);
+      });
+      toolOut.textContent = toolCount.toLocaleString() +
+        (toolCount === 1 ? ' tool schema' : ' tool schemas');
+      sizeOut.textContent = schemaChars.toLocaleString() + ' JSON characters';
+      tokenOut.textContent = '(roughly ' + Math.ceil(schemaChars / 3).toLocaleString() +
+        ' prompt tokens)';
+      warning.style.display = mode.value === 'allow_all' ? 'block' : 'none';
+    }
+    mode.addEventListener('change', refreshMcpFootprint);
+    boxes.forEach(function (box) { box.addEventListener('change', refreshMcpFootprint); });
+    refreshMcpFootprint();
+  }());
 </script>
 
 {% endblock %}

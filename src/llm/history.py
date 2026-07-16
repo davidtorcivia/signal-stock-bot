@@ -445,7 +445,15 @@ class ConversationHistory:
         the renderer labels them with each writer's display name.
         """
         await self._ensure_initialized()
-        n = (turns_per_user or self.turns_per_user) * 2
+        # ``0`` is an explicit one-shot/no-history setting. Using ``or``
+        # here silently replaced it with the global default and leaked old
+        # turns into contexts whose policy promised stateless behavior.
+        effective_turns = (
+            self.turns_per_user
+            if turns_per_user is None
+            else turns_per_user
+        )
+        n = max(0, int(effective_turns)) * 2
         async with aiosqlite.connect(self.db_path) as db:
             params: list = [context_key]
             floor_clause = ""

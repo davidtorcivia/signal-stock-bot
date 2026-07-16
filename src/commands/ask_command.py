@@ -65,6 +65,7 @@ from ..llm import (
     ConversationHistory,
     format_history_timestamp,
 )
+from ..llm.client import DEFAULT_SYSTEM_PROMPT
 from ..memory import (
     FORGET_TOOL,
     KINDS,
@@ -594,18 +595,26 @@ class AskCommand(BaseCommand):
             return self.name_registry.bot_name
         return "Bot"
 
-    def _build_identity_block(self, ctx) -> str:
-        """One-line identity reminder so the writer doesn't answer to
-        another participant's name. Lists the active bot's display name
-        and any alias slugs it responds to.
+    def _build_identity_block(
+        self,
+        ctx,
+        authoritative_prompt: Optional[str] = None,
+    ) -> str:
+        """Build a routing/identity reminder without fighting the persona.
 
-        Persona precedence: if the bot's persona/system_prompt already
-        names the character (case-insensitive substring match), we
-        DROP the "Your name is X" lead and keep only the "you also
-        answer to" + cross-bot guard. This avoids a contradiction when
-        the admin sets a persona like "You are Marvin, …" but the
-        display_name is "Sigil". The cross-bot guidance still applies
-        either way.
+        The resolved writer system prompt is authoritative for identity.
+        Bot ``display_name`` and aliases are also routing handles used by
+        Signal, but they are not necessarily the character's name (a legacy
+        ``sigil`` bot row may, for example, host an Artaud-trained writer).
+        Treating a routing handle as a name produced the contradictory pair
+        ``You are Artaud`` / ``Your name is Sigil`` in the same system
+        message.
+
+        With a generic prompt there is no persona identity, so a direct name
+        reminder remains useful. When the resolved prompt actually declares a
+        character, the block describes display names as chat routing handles
+        instead and leaves identity to that prompt. If the prompt already
+        contains the display name, the shorter legacy wording is safe.
 
         Other bots in the room are deliberately NOT mentioned — they
         appear in <group_context> as labeled participant utterances,
@@ -625,23 +634,48 @@ class AskCommand(BaseCommand):
             f" (you also answer to: {', '.join(names[1:])})"
             if len(names) > 1 else ""
         )
-        # Persona-named check: skip the "Your name is X" lead-in if the
-        # display_name already appears in the persona text (case-
-        # insensitive, whole word). The cross-bot anti-impersonation
-        # guidance still applies — that's purely about NOT responding
-        # to other names, doesn't conflict with persona content.
+        # Check the ACTUAL resolved base prompt, not only bots.persona.
+        # Per-bot bot_llm_settings.system_prompt and per-context overrides
+        # take precedence over that field and were the source of the
+        # production Artaud/Sigil contradiction.
+        resolved = (authoritative_prompt or "").strip()
         persona = (getattr(bot, "persona", None) or "").strip()
-        persona_names_bot = bool(persona) and re.search(
+        identity_text = resolved or persona
+        prompt_names_bot = bool(identity_text) and re.search(
             rf"\b{re.escape(bot.display_name)}\b",
-            persona,
+            identity_text,
             re.IGNORECASE,
         )
-        if persona_names_bot:
+        if prompt_names_bot:
             return (
                 f"You also answer to: {', '.join(names)}. "
                 f"When someone in chat addresses a different name, "
                 f"that's a different participant — do not respond as "
                 f"them or assume their identity. Speak only as yourself."
+            )
+
+        # A prompt/persona may intentionally name a character that differs
+        # from the registry display name. Detect explicit identity framing,
+        # rather than assuming every custom instruction is a persona: a
+        # harmless override such as "Keep answers concise" should still get
+        # the configured display name.
+        declares_identity = bool(persona)
+        if resolved and resolved != DEFAULT_SYSTEM_PROMPT:
+            declares_identity = declares_identity or bool(re.search(
+                r"(?im)^\s*(?:you are|your name is|you answer as|"
+                r"you(?:'re| are) called|i am)\s+"
+                r"(?!an?\b|the\s+(?:assistant|bot)\b)[A-Z][\w'.-]*\b",
+                resolved,
+            ))
+        if declares_identity:
+            return (
+                f"Chat routing handles for this bot: {', '.join(names)}. "
+                f"Messages addressed to those handles are routed to you, "
+                f"but your identity and voice come from the primary system "
+                f"prompt; do not adopt a different identity from a routing "
+                f"handle. When someone addresses any other name, that's a "
+                f"different participant — do not respond as them or assume "
+                f"their identity. Speak only as yourself."
             )
         return (
             f"Your name is {bot.display_name}{also}. "
@@ -709,8 +743,20 @@ class AskCommand(BaseCommand):
         # guaranteed-stub when we already know it's off. The per-bot flag
         # is a master kill — admins flip it off when they want deep_think
         # completely out of one bot's repertoire.
-        if self.deep_think is not None:
-            dt_status = self.deep_think.status()
+        # Resolve readiness from the ACTIVE bot's deep-think client. The
+        # constructor field belongs to the default bot; using it here made
+        # non-default bots advertise or hide tools according to another
+        # bot's configuration even though dispatch later used the factory.
+        deep_think = self.deep_think
+        factory = getattr(self, "llm_factory", None)
+        if (
+            factory is not None
+            and bot is not None
+            and getattr(bot, "id", None) is not None
+        ):
+            deep_think = factory.get_deep_think(bot.id)
+        if deep_think is not None:
+            dt_status = deep_think.status()
             policy_ok = policy is None or policy.allows_deep_think()
             bot_ok = bot is None or getattr(bot, "deep_think_enabled", True)
             if dt_status.get("ready") and policy_ok and bot_ok:
@@ -770,6 +816,13 @@ class AskCommand(BaseCommand):
             if self.portfolio_journal is not None:
                 schemas.append(PORTFOLIO_JOURNAL_APPEND_TOOL)
                 schemas.append(PORTFOLIO_JOURNAL_READ_TOOL)
+        # MCP sessions can be restarted in any order. Canonical ordering keeps
+        # an unchanged effective tool set byte-identical for prefix caching.
+        schemas.sort(
+            key=lambda schema: str(
+                (schema.get("function") or {}).get("name") or ""
+            )
+        )
         return schemas or None
 
     async def _run_tool_loop(
@@ -1978,7 +2031,8 @@ class AskCommand(BaseCommand):
             self.bot_tools is not None
             and name.startswith(self.bot_tools.NAMESPACE + "__")
         )
-        is_deep_think = name == "deep_think" and self.deep_think is not None
+        deep_think_client = self._deep_think_for(caller_ctx)
+        is_deep_think = name == "deep_think" and deep_think_client is not None
         is_memory = name in ("remember", "recall", "forget") and (
             self.memory_store is not None
         )
@@ -2074,7 +2128,7 @@ class AskCommand(BaseCommand):
                     # to the writer's attachment list. Per-bot deep_think
                     # routing here too — Artaud's deep_think config is
                     # different from Sigil's even when called as a tool.
-                    content = await self._deep_think_for(caller_ctx).think(
+                    content = await deep_think_client.think(
                         question=str(args.get("question") or ""),
                         context=str(args.get("context") or ""),
                         user_hash=user_hash,
@@ -2227,9 +2281,10 @@ class AskCommand(BaseCommand):
             history_bot_id = (
                 ctx.bot_id
             )
+            live_turns = self._live_turns(ctx)
             prior = await self.history.load(
                 context_key,
-                turns_per_user=self._live_turns(ctx),
+                turns_per_user=live_turns,
                 attribute_senders=is_group,
                 now=now_ts,
                 floor_at=floor_at,
@@ -2260,39 +2315,45 @@ class AskCommand(BaseCommand):
             self._inflate_image_history(prior, ctx)
 
             group_ctx_block = await self._build_group_context(ctx)
+            # Snapshot the active bot's deep-think client once for every
+            # prompt/execution gate in this request. The default client on
+            # self.deep_think may have different readiness and settings.
+            deep_think_client = self._deep_think_for(ctx)
 
             # Long-term rolling summary, if one exists. Lives in the system
             # suffix so it bookends the persona; the XML tag tells the
             # model what it is (the inner text no longer needs a prose label).
             summary_block = ""
-            try:
-                summary_bot_id = (
-                    ctx.bot.id if getattr(ctx, "bot", None) is not None
-                    else None
-                )
-                summary = await self.history.get_summary(
-                    context_key,
-                    floor_at=floor_at,
-                    bot_id=summary_bot_id,
-                )
-                if summary and summary.get("summary"):
-                    summary_text = await self._enrich(summary["summary"])
-                    summary_block = summary_text
-            except Exception as e:
-                logger.debug(f"Failed to load summary for ask: {e}")
+            if live_turns > 0:
+                try:
+                    summary_bot_id = (
+                        ctx.bot.id if getattr(ctx, "bot", None) is not None
+                        else None
+                    )
+                    summary = await self.history.get_summary(
+                        context_key,
+                        floor_at=floor_at,
+                        bot_id=summary_bot_id,
+                    )
+                    if summary and summary.get("summary"):
+                        summary_text = await self._enrich(summary["summary"])
+                        summary_block = summary_text
+                except Exception as e:
+                    logger.debug(f"Failed to load summary for ask: {e}")
 
             # Staleness advisory: if the most recent stored turn is hours old,
             # warn the model so it doesn't assume the new message is a
             # continuation of an old thread. Skipped when the history is
             # empty — there's nothing to be stale about.
             staleness_block = ""
-            try:
-                last_ts = await self.history.latest_turn_timestamp(
-                    context_key, floor_at=floor_at
-                )
-            except Exception as e:
-                logger.debug(f"Failed to read latest turn timestamp: {e}")
-                last_ts = None
+            last_ts = None
+            if live_turns > 0:
+                try:
+                    last_ts = await self.history.latest_turn_timestamp(
+                        context_key, floor_at=floor_at
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to read latest turn timestamp: {e}")
             if last_ts is not None and prior:
                 age = now_ts - last_ts
                 # Gate on `age` (presence flips once, when the thread crosses
@@ -2382,25 +2443,39 @@ class AskCommand(BaseCommand):
 
             # Tell the writing-LLM that emoji reactions in the chat are its
             # own reflex — they're produced by a separate fire-and-forget
-            # process the model has no episodic memory of. Without this,
+            # process with only a short explicit event log. Without this,
             # users tease "why did you react?" and the model indignantly
             # denies having thumbs, then that denial gets persisted into
             # history and poisons every future turn.
             reactor_directive = ""
             try:
-                global_reactor_on = bool(self.llm.store.get("reactor_enabled", False))
+                if self.reactor is not None and hasattr(
+                    self.reactor, "is_enabled"
+                ):
+                    reactor_on = self.reactor.is_enabled(
+                        ctx.bot, ctx.policy,
+                    )
+                else:
+                    # Backward-compatible path for older test doubles and
+                    # deployments constructed without EmojiReactor.
+                    reactor_on = bool(
+                        self.llm.store.get("reactor_enabled", False)
+                    ) and (
+                        ctx.policy is None
+                        or getattr(ctx.policy, "reactor_enabled", True)
+                    )
             except Exception:
-                global_reactor_on = False
-            ctx_reactor_on = ctx.policy is None or getattr(
-                ctx.policy, "reactor_enabled", True
-            )
-            if is_group and global_reactor_on and ctx_reactor_on:
+                reactor_on = False
+            if is_group and reactor_on:
                 reactor_directive = (
                     "Reflex note: in group chats you also emoji-react to "
                     "messages. It runs as a separate fast reflex out of "
-                    "band from this conversation, so you do not have an "
-                    "explicit memory of which emoji you picked or when — "
-                    "but the reactions are yours. The reflex is rate-"
+                    "band from this conversation, but the reactions are "
+                    "yours. When a <recent_reactions> block is present in "
+                    "the current user turn, it is your short explicit log "
+                    "of which emoji you placed and on what; use it when "
+                    "answering questions about a specific reaction. The "
+                    "reflex is rate-"
                     "limited and only fires on messages with clear "
                     "sentiment, so it does not hit every message. When "
                     "users tease you about reacting ('why did you "
@@ -2507,8 +2582,8 @@ class AskCommand(BaseCommand):
             # (deep_think disabled / unconfigured).
             deep_think_user_trigger = False
             if (
-                self.deep_think is not None
-                and self.deep_think.status().get("ready")
+                deep_think_client is not None
+                and deep_think_client.status().get("ready")
                 and (ctx.policy is None or ctx.policy.allows_deep_think())
             ):
                 # Strong hint — appended after the directive — when the
@@ -2574,16 +2649,16 @@ class AskCommand(BaseCommand):
                     "directly using what you know."
                 )
 
-            # Recent reactions: small in-memory log from the reactor. Lets
-            # Sigil answer "why did you react with X?" by reading off the
-            # target message instead of denying or confabulating. Newest
-            # first, capped at 5.
+            # Recent reactions: volatile in-memory state from the reactor.
+            # It MUST live in the tail user turn, not the system suffix:
+            # every reaction changes this text, and putting it in the static
+            # prefix invalidates the provider's ~40K-token prompt cache.
+            # Newest first, capped at 5.
             reactor_log_block = ""
             if (
                 is_group
                 and self.reactor is not None
-                and global_reactor_on
-                and ctx_reactor_on
+                and reactor_on
             ):
                 try:
                     recent_rxns = self.reactor.recent_reactions(
@@ -2599,11 +2674,30 @@ class AskCommand(BaseCommand):
                     recent_rxns = []
                 if recent_rxns:
                     lines = ["Recent emoji reactions you placed in this chat (newest first):"]
-                    for r in recent_rxns:
+                    for r in recent_rxns[:5]:
+                        if not isinstance(r, dict):
+                            continue
+                        # The target is user-controlled historical text.
+                        # Flatten/cap it so a malformed reactor row cannot
+                        # balloon or break the XML-shaped prompt block.
+                        emoji = re.sub(
+                            r"[\r\n<>\[\]\"]", "",
+                            str(r.get("emoji") or ""),
+                        )[:16]
+                        sender = re.sub(
+                            r"[\r\n<>\[\]\"]", "",
+                            str(r.get("sender") or "unknown"),
+                        )[:80]
+                        target = re.sub(
+                            r"\s+", " ", str(r.get("target") or "")
+                        ).replace("<", "‹").replace(">", "›").replace(
+                            '"', "”"
+                        )[:500]
                         lines.append(
-                            f"  {r['emoji']} on [{r['sender']}] \"{r['target']}\""
+                            f"  {emoji} on [{sender}] \"{target}\""
                         )
-                    reactor_log_block = "\n".join(lines)
+                    if len(lines) > 1:
+                        reactor_log_block = "\n".join(lines)
 
             # Python sandbox: when the Pyodide MCP server is running, the
             # writer LLM gets `pyodide__pyodide_execute(code, timeout)` and
@@ -2706,8 +2800,8 @@ class AskCommand(BaseCommand):
             # quickly" framing in summary or staleness blocks.
             deep_think_trigger_hint = ""
             if (
-                self.deep_think is not None
-                and self.deep_think.status().get("ready")
+                deep_think_client is not None
+                and deep_think_client.status().get("ready")
                 and (ctx.policy is None or ctx.policy.allows_deep_think())
                 and deep_think_user_trigger
             ):
@@ -2749,19 +2843,31 @@ class AskCommand(BaseCommand):
                 except Exception as e:
                     logger.debug(f"Memory preamble build failed: {e}")
 
-            # Identity block: clarifies which name belongs to THIS bot so
+            prompt_override = None
+            if ctx.policy is not None and ctx.policy.system_prompt:
+                prompt_override = ctx.policy.system_prompt
+            writer = self._llm_for(ctx)
+            base_system_prompt = writer._resolve_system_prompt(
+                prompt_override, None
+            )
+
+            # Identity block: clarifies which chat handles route to THIS bot so
             # a multi-bot group doesn't confuse the model into answering
             # to another bot's name. Other bots in the room appear as
             # regular participants in <group_context> — the writer
             # should NOT treat them differently from human speakers.
-            identity_block = self._build_identity_block(ctx)
+            # The resolved base prompt is passed in so a per-bot/context
+            # persona remains authoritative and cannot be contradicted by
+            # a stale registry display name.
+            identity_block = self._build_identity_block(
+                ctx, authoritative_prompt=base_system_prompt,
+            )
 
             system_suffix_parts = [
                 _wrap_xml("your_identity", identity_block),
                 _wrap_xml("attribution_rules", attribution_rules),
                 _wrap_xml("identity_note", names_directive),
                 _wrap_xml("reactor_reflex", reactor_directive),
-                _wrap_xml("recent_reactions", reactor_log_block),
                 _wrap_xml("tarot_tool", tarot_directive),
                 _wrap_xml("iching_tool", iching_directive),
                 _wrap_xml("portfolio_journal", journal_directive),
@@ -2776,15 +2882,15 @@ class AskCommand(BaseCommand):
             system_suffix_parts = [p for p in system_suffix_parts if p]
             system_suffix = "\n\n".join(system_suffix_parts) or None
 
-            prompt_override = None
-            if ctx.policy is not None and ctx.policy.system_prompt:
-                prompt_override = ctx.policy.system_prompt
             # Per-bot system prompt: route through the bot-scoped writer
             # so a bot's writer-role override (e.g. Artaud's persona
             # baked into bot_llm_settings) replaces the global default.
-            system_prompt = self._llm_for(ctx)._resolve_system_prompt(
-                prompt_override, system_suffix
-            )
+            # Use the same configuration snapshot that identity validation
+            # saw above. Resolving twice permits an admin/settings refresh to
+            # produce two different base prompts inside one request.
+            system_prompt = base_system_prompt
+            if system_suffix:
+                system_prompt = f"{base_system_prompt}\n\n{system_suffix}"
 
             # Trigger user-message: optional group context, optional reply
             # target, then the live message wrapped in <current_message>
@@ -2795,6 +2901,14 @@ class AskCommand(BaseCommand):
 
             if group_ctx_block:
                 trigger_parts.append(group_ctx_block)
+
+            # Volatile reflex state belongs beside the other situational
+            # context at the tail of the prompt. This preserves the static
+            # system/history cache prefix when a new emoji reaction lands.
+            if reactor_log_block:
+                trigger_parts.append(
+                    _wrap_xml("recent_reactions", reactor_log_block)
+                )
 
             if ctx.quote_text:
                 # Flag this turn as a quote-reply but DON'T embed the
@@ -2883,8 +2997,8 @@ class AskCommand(BaseCommand):
                 ctx.bot is not None
                 and getattr(ctx.bot, "deep_think_mode", "replace") == "research"
                 and getattr(ctx.bot, "deep_think_enabled", True)
-                and self.deep_think is not None
-                and self.deep_think.status().get("ready")
+                and deep_think_client is not None
+                and deep_think_client.status().get("ready")
                 and (ctx.policy is None or ctx.policy.allows_deep_think())
             )
             # Vision short-circuit: when the writer has images on this
@@ -2970,7 +3084,6 @@ class AskCommand(BaseCommand):
             # Pass the same turns-per-user value the load path uses so a
             # context-override of 30 doesn't get clipped back to the global
             # 6 on every write.
-            live_turns = self._live_turns(ctx)
             # Persist inbound images on the user turn so follow-ups can
             # re-see them (see _inflate_image_history). Only when vision
             # was actually active this round — if the bot doesn't have
@@ -2996,25 +3109,26 @@ class AskCommand(BaseCommand):
             # asks in the same context can't interleave their writes
             # (user-A, user-B, assistant-B, assistant-A) and garble the
             # replayed alternation.
-            async with self.history.lock_for(context_key):
-                if getattr(ctx, "persist_user_turn", True):
+            if live_turns > 0:
+                async with self.history.lock_for(context_key):
+                    if getattr(ctx, "persist_user_turn", True):
+                        await self.history.append(
+                            context_key, "user", question,
+                            user_hash=user_hash, sender_tail=sender_tail,
+                            turns_per_user=live_turns,
+                            image_refs=persisted_images,
+                            bot_id=bot_id_for_turn,
+                        )
+                    # Persist the addressee on the assistant row too: the load
+                    # path uses it to render `[to Name, time ago]` in group
+                    # playback so the model can pair its prior answers with
+                    # the right asker.
                     await self.history.append(
-                        context_key, "user", question,
+                        context_key, "assistant", answer,
                         user_hash=user_hash, sender_tail=sender_tail,
                         turns_per_user=live_turns,
-                        image_refs=persisted_images,
                         bot_id=bot_id_for_turn,
                     )
-                # Persist the addressee on the assistant row too: the load
-                # path uses it to render `[to Name, time ago]` in group
-                # playback so the model can pair its prior answers with
-                # the right asker.
-                await self.history.append(
-                    context_key, "assistant", answer,
-                    user_hash=user_hash, sender_tail=sender_tail,
-                    turns_per_user=live_turns,
-                    bot_id=bot_id_for_turn,
-                )
         except Exception as e:
             logger.error(f"Failed to persist ask history: {e}")
 
@@ -3049,7 +3163,7 @@ class AskCommand(BaseCommand):
         # decides whether enough new turns have arrived to warrant an LLM
         # call, and dedupes via per-context lock. Errors stay inside the
         # task so they never affect the ask response.
-        if self.summarizer is not None:
+        if self.summarizer is not None and live_turns > 0:
             try:
                 import asyncio as _aio
                 _aio.create_task(

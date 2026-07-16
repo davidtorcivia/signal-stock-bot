@@ -21,7 +21,7 @@ import aiosqlite
 
 from ..database import db_session
 
-from .policy import ContextPolicy, MODE_ALLOW_ALL
+from .policy import ContextPolicy, MODE_ALLOW_ALL, MODE_ALLOW_LIST
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class ContextRegistry:
                         label TEXT NOT NULL DEFAULT '',
                         command_mode TEXT NOT NULL DEFAULT 'allow_all',
                         commands TEXT NOT NULL DEFAULT '[]',
-                        mcp_mode TEXT NOT NULL DEFAULT 'allow_all',
+                        mcp_mode TEXT NOT NULL DEFAULT 'allow_list',
                         mcp_servers TEXT NOT NULL DEFAULT '[]',
                         system_prompt TEXT,
                         llm_intent INTEGER NOT NULL DEFAULT 0,
@@ -135,7 +135,7 @@ class ContextRegistry:
                         """INSERT OR IGNORE INTO contexts
                            (kind, key, label, command_mode, commands, mcp_mode,
                             mcp_servers, system_prompt, first_seen, updated_at)
-                           VALUES ('default', ?, ?, 'allow_all', '[]', 'allow_all',
+                           VALUES ('default', ?, ?, 'allow_all', '[]', 'allow_list',
                                    '[]', NULL, ?, ?)""",
                         (default_key, label, now, now),
                     )
@@ -165,7 +165,7 @@ class ContextRegistry:
             label=row[3] or "",
             command_mode=row[4] or MODE_ALLOW_ALL,
             commands=json.loads(row[5] or "[]"),
-            mcp_mode=row[6] or MODE_ALLOW_ALL,
+            mcp_mode=row[6] or MODE_ALLOW_LIST,
             mcp_servers=json.loads(row[7] or "[]"),
             system_prompt=row[8],
             llm_intent=bool(row[9]) if len(row) > 9 else False,
@@ -257,7 +257,7 @@ class ContextRegistry:
                     """INSERT OR IGNORE INTO contexts
                        (kind, key, label, command_mode, commands, mcp_mode,
                         mcp_servers, system_prompt, first_seen, updated_at)
-                       VALUES ('group', ?, '', 'allow_all', '[]', 'allow_all',
+                       VALUES ('group', ?, '', 'allow_all', '[]', 'allow_list',
                                '[]', NULL, ?, ?)""",
                     (group_id, now, now),
                 )

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from src.contexts import ContextPolicy, ContextRegistry
+from src.contexts.policy import MODE_ALLOW_ALL, MODE_ALLOW_LIST, PERMISSIVE
 
 
 @pytest.fixture
@@ -21,10 +22,29 @@ async def registry():
 
 @pytest.mark.asyncio
 async def test_defaults_for_new_policy(registry):
-    """Newly created policies default to logging-off + override-none."""
+    """New policies carry no MCP schemas until an admin opts servers in."""
     p = ContextPolicy(id=None, kind="group", key="grp-test", label="Test")
     assert p.transcript_logging_enabled is False
     assert p.history_turns_override is None
+    assert p.mcp_mode == MODE_ALLOW_LIST
+    assert p.mcp_servers == []
+    assert p.allows_mcp("large-server") is False
+
+
+def test_registry_failure_fallback_remains_permissive():
+    """The emergency fallback keeps legacy availability semantics even
+    though ordinary contexts now default to an empty MCP allow-list."""
+    assert PERMISSIVE.mcp_mode == MODE_ALLOW_ALL
+    assert PERMISSIVE.allows_mcp("any-running-server") is True
+
+
+@pytest.mark.asyncio
+async def test_seeded_defaults_use_empty_mcp_allow_list(registry):
+    await registry._ensure_initialized()
+    policies = {p.key: p for p in await registry.list()}
+    for key in ("default:group", "default:dm"):
+        assert policies[key].mcp_mode == MODE_ALLOW_LIST
+        assert policies[key].mcp_servers == []
 
 
 @pytest.mark.asyncio

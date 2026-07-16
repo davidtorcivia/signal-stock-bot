@@ -7,18 +7,24 @@ Covers:
   - ConversationHistory.latest_turn_timestamp() empty + populated
 """
 
+import asyncio
 import re
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from src.commands.ask_command import (
+    AskCommand,
     _strip_addressee_leak,
     _strip_meta_leak,
     _wrap_xml,
     STALENESS_THRESHOLD_SECONDS,
 )
+from src.commands.base import CommandContext
+from src.bots.models import Bot
+from src.llm.client import DEFAULT_SYSTEM_PROMPT
 from src.llm.history import ConversationHistory, format_history_timestamp
 
 
@@ -72,6 +78,221 @@ def test_wrap_xml_non_empty_wraps():
 
 def test_wrap_xml_strips_inner_whitespace():
     assert _wrap_xml("x", "\n  body  \n") == "<x>\nbody\n</x>"
+
+
+# ---------- identity authority ----------------------------------------------
+
+def _identity_ctx(*, name="Sigil", persona=""):
+    return SimpleNamespace(
+        bot=SimpleNamespace(
+            display_name=name,
+            aliases=[],
+            persona=persona,
+        )
+    )
+
+
+def test_identity_block_does_not_contradict_custom_writer_prompt():
+    """The resolved writer prompt, not a stale registry display name, owns
+    persona identity. Regression for `You are Artaud` followed by
+    `<your_identity>Your name is Sigil` in the same system message."""
+    ask = AskCommand.__new__(AskCommand)
+    block = ask._build_identity_block(
+        _identity_ctx(name="Sigil"),
+        authoritative_prompt="You are Artaud and you engage with brevity.",
+    )
+    assert "Your name is Sigil" not in block
+    assert "Chat routing handles for this bot: Sigil" in block
+    assert "identity and voice come from the primary system prompt" in block
+
+
+def test_identity_block_names_bot_with_generic_builtin_prompt():
+    """The built-in prompt has no persona name, so the registry display
+    name remains the useful and authoritative fallback."""
+    ask = AskCommand.__new__(AskCommand)
+    block = ask._build_identity_block(
+        _identity_ctx(name="Sigil"),
+        authoritative_prompt=DEFAULT_SYSTEM_PROMPT,
+    )
+    assert block.startswith("Your name is Sigil")
+
+
+def test_identity_block_names_bot_with_non_persona_custom_prompt():
+    """Custom behavioral instructions do not automatically erase the
+    registry identity when they declare no competing character."""
+    ask = AskCommand.__new__(AskCommand)
+    block = ask._build_identity_block(
+        _identity_ctx(name="Sigil"),
+        authoritative_prompt="Keep answers concise and cite your sources.",
+    )
+    assert block.startswith("Your name is Sigil")
+
+
+# ---------- volatile reaction state / prompt-cache locality -----------------
+
+class _PromptStore:
+    def get(self, key, default=None):
+        if key == "reactor_enabled":
+            return True
+        return default
+
+    def get_int(self, key, default, *, min_value=None):
+        value = default
+        if min_value is not None:
+            value = max(min_value, value)
+        return value
+
+
+class _CapturingLLM:
+    def __init__(self):
+        self.store = _PromptStore()
+        self.calls = []
+
+    def _resolve_system_prompt(self, override, suffix):
+        base = override or "You are Artaud and you engage with brevity."
+        return f"{base}\n\n{suffix}" if suffix else base
+
+    async def chat_messages(self, messages, tools=None):
+        # The harness mutates its local list after this call, so snapshot the
+        # strings needed for cache-locality assertions now.
+        self.calls.append([dict(m) for m in messages])
+        return {"role": "assistant", "content": "done"}
+
+
+class _NoopHistory:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.append_count = 0
+        self.summary_read_count = 0
+
+    async def load(self, *args, **kwargs):
+        return []
+
+    async def get_summary(self, *args, **kwargs):
+        self.summary_read_count += 1
+        return None
+
+    async def latest_turn_timestamp(self, *args, **kwargs):
+        return None
+
+    def lock_for(self, context_key):
+        return self.lock
+
+    async def append(self, *args, **kwargs):
+        self.append_count += 1
+        return None
+
+
+class _StaleSummaryHistory(_NoopHistory):
+    async def get_summary(self, *args, **kwargs):
+        self.summary_read_count += 1
+        return {"summary": "SECRET OLD SUMMARY"}
+
+
+class _OneShotPolicy:
+    history_turns_override = 0
+    purge_floor_at = None
+    system_prompt = None
+    reactor_enabled = True
+    id = 1
+    kind = "dm"
+
+    def allows_deep_think(self):
+        return False
+
+    def allows_command(self, command):
+        return False
+
+    def allows_mcp(self, server):
+        return False
+
+
+class _MutableReactor:
+    def __init__(self):
+        self.target = "first message"
+
+    def recent_reactions(self, group_id, limit=5, bot_id=None):
+        return [{"emoji": "🔥", "sender": "David", "target": self.target}]
+
+    def is_enabled(self, bot=None, policy=None):
+        return True
+
+
+@pytest.mark.asyncio
+async def test_recent_reactions_change_only_tail_user_message():
+    """Changing reflex state must not change the static system prefix.
+
+    This is the cache regression: the provider can keep its large prompt
+    prefix cached while the recent-reaction log changes in the final user
+    turn next to group context.
+    """
+    llm = _CapturingLLM()
+    reactor = _MutableReactor()
+    ask = AskCommand(llm, _NoopHistory(), reactor=reactor)
+    bot = Bot(id=1, slug="sigil", display_name="Sigil")
+    ctx = CommandContext(
+        sender="+15551234123",
+        group_id="group-1",
+        raw_message="!ask why the reaction?",
+        command="ask",
+        args=["why", "the", "reaction?"],
+        bot=bot,
+    )
+
+    first = await ask.execute(ctx)
+    reactor.target = "second message"
+    second = await ask.execute(ctx)
+
+    assert first.success and second.success
+    first_system = llm.calls[0][0]["content"]
+    second_system = llm.calls[1][0]["content"]
+    first_user = llm.calls[0][-1]["content"]
+    second_user = llm.calls[1][-1]["content"]
+
+    assert first_system == second_system
+    # The static reflex instructions may name the tag, but no volatile log
+    # body may be embedded in the system message.
+    assert "<recent_reactions>\nRecent emoji reactions" not in first_system
+    assert "do not have an explicit memory" not in first_system
+    assert "short explicit log" in first_system
+    assert "Your name is Sigil" not in first_system
+    assert first_system.startswith("You are Artaud")
+    assert "<recent_reactions>" in first_user
+    assert "first message" in first_user
+    assert "second message" in second_user
+
+
+@pytest.mark.asyncio
+async def test_zero_history_mode_skips_summary_and_persistence():
+    """A one-shot context cannot inherit an old rolling summary or write
+    turns that are immediately pruned."""
+    llm = _CapturingLLM()
+    history = _StaleSummaryHistory()
+    ask = AskCommand(llm, history)
+    bot = Bot(id=1, slug="sigil", display_name="Sigil")
+    ctx = CommandContext(
+        sender="+15551234123",
+        group_id=None,
+        raw_message="!ask clean slate",
+        command="ask",
+        args=["clean", "slate"],
+        policy=_OneShotPolicy(),
+        bot=bot,
+    )
+
+    result = await ask.execute(ctx)
+
+    assert result.success
+    assert history.summary_read_count == 0
+    assert history.append_count == 0
+    assert "SECRET OLD SUMMARY" not in llm.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_zero_turn_history_override_loads_no_prior_turns(history):
+    await history.append("ctx-zero", "user", "old question")
+    await history.append("ctx-zero", "assistant", "old answer")
+    assert await history.load("ctx-zero", turns_per_user=0) == []
 
 
 # ---------- _strip_addressee_leak --------------------------------------------

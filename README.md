@@ -562,10 +562,10 @@ A separate fire-and-forget LLM that decides whether to react to inbound group me
 
 **How it fires.** Every inbound group message kicks off a background `maybe_react()` task in parallel with normal command dispatch. The reactor runs through cheap rules first (per-sender cooldown, per-group cooldown, min message length), then passes the message + recent group context through the configured "reactor" model (typically a cheap/fast variant — e.g. Sonnet over Opus, or DeepSeek with thinking disabled) and gives the LLM exactly one tool: `emoji_react(emoji)`. If the LLM calls the tool, we POST a Signal reaction; if it doesn't, the user never sees anything. All errors are logged and swallowed — the reactor must never affect command handling or surface diagnostics.
 
-**Coordination with the writing LLM.** The reactor and the writing LLM (`!ask` and `llm_intent` routing) are different processes with no shared memory, which used to cause comedy: users would tease "why did you react with 💩?" and the writing LLM would indignantly deny having thumbs while the reactor kept slapping emoji on every message. The current design fixes this with two pieces injected into the writing LLM's system suffix at `!ask` time:
+**Coordination with the writing LLM.** The reactor and the writing LLM (`!ask` and `llm_intent` routing) are separate processes. A small bridge gives the writer enough state to own and explain its reactions:
 
-1. A **reflex directive** explaining that emoji reactions are the bot's own out-of-band reflex, that it has no episodic memory of the specific reaction, and that it should own them rather than deny them — with explicit instruction to disregard older turns where it claimed to be text-only.
-2. A **rolling log** — last 5 reactions in the current group with target message and emoji (e.g. `💀 on [Tyler] "housing crash tweet…"`) — so the model can answer "why did you react with X?" by reading the target text instead of confabulating. The log is in-memory per-process, capped at 20 per group, and wipes on restart.
+1. A **reflex directive** in the stable system suffix explains that emoji reactions belong to the bot and tells the writer how to use the event log when one is present.
+2. A **rolling log** carries the last 5 reactions in the current group with target message and emoji (for example, `💀 on [Tyler] "housing crash tweet…"`). This volatile block sits in the current user turn beside `<group_context>`, preserving the provider's cached system/history prefix when a new reaction arrives. The backing log is in-memory per process, capped at 20 per group, and clears on restart.
 
 Both pieces are gated on `reactor_enabled` being true globally **and** for the current context — they don't appear in the prompt for chats where the reactor is off.
 
@@ -719,11 +719,17 @@ Two protected default rows always exist:
 
 | Mode | Behavior |
 |------|----------|
-| Allow all | No restriction (default) |
+| Allow all | No restriction. For MCP, every schema from every running server is sent. |
 | Allow only selected | Whitelist |
 | Block selected | Blacklist (use this to hide just `corn` etc. without re-enabling everything else) |
 
 Gating is by canonical command name, so allowing `price` automatically allows `!p`, `!pr`, `$`. Bot tools and MCP tools exposed to the LLM are filtered through the same policy — disallowed tools simply don't appear in the LLM's tool list.
+
+New and auto-registered contexts start with an empty MCP allow-list. This keeps
+large server schemas out of the writer prompt until an admin selects them.
+Existing contexts retain their stored access mode. The context editor shows the
+effective live tool count and serialized schema size; selections are ignored
+when the mode is **Allow all servers**.
 
 ---
 

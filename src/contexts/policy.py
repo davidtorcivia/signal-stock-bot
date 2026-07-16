@@ -2,7 +2,7 @@
 ContextPolicy — the resolved access rules for a given chat (group or DM).
 
 Three "modes" per gate:
-  * allow_all  — no restriction (default)
+  * allow_all  — no restriction
   * allow_list — only the listed items pass
   * deny_list  — everything except the listed items passes
 """
@@ -25,7 +25,11 @@ class ContextPolicy:
     label: str = ""
     command_mode: str = MODE_ALLOW_ALL
     commands: list[str] = field(default_factory=list)
-    mcp_mode: str = MODE_ALLOW_ALL
+    # MCP schemas are unusually expensive: a handful of enabled servers can
+    # add tens of thousands of tokens to every writer request. New contexts
+    # therefore start with an empty, stable allow-list and must opt servers in
+    # deliberately. Existing database rows keep their stored mode.
+    mcp_mode: str = MODE_ALLOW_LIST
     mcp_servers: list[str] = field(default_factory=list)
     system_prompt: Optional[str] = None   # None / empty => use global LLM prompt
     llm_intent: bool = False              # Route non-command messages through the LLM with bot+MCP tools
@@ -120,4 +124,11 @@ class ContextPolicy:
 
 
 # Fully-open fallback used when the registry can't be consulted for any reason.
-PERMISSIVE = ContextPolicy(id=None, kind="default", key="__fallback__")
+# Keep this explicit now that normal ContextPolicy instances default MCP access
+# to an empty allow-list.
+PERMISSIVE = ContextPolicy(
+    id=None,
+    kind="default",
+    key="__fallback__",
+    mcp_mode=MODE_ALLOW_ALL,
+)

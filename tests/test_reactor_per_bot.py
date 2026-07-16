@@ -153,6 +153,23 @@ async def test_string_zero_is_treated_as_false(store):
         assert cfg["enabled"] is True, f"{val!r} should coerce to True"
 
 
+@pytest.mark.asyncio
+async def test_is_enabled_uses_bot_override_and_context_gate(store):
+    """Writer prompt gating and reactor execution share the active bot's
+    override, then apply the chat policy gate."""
+    store.set("reactor_enabled", False)
+    store.set_bot(7, "reactor", "enabled", True)
+    reactor = EmojiReactor(
+        settings_store=store, llm_client=None, signal_handler=None,
+    )
+    bot = _ctx_bot(bot_id=7)
+    assert reactor.is_enabled(bot, policy=None) is True
+
+    policy = MagicMock(reactor_enabled=False)
+    assert reactor.is_enabled(bot, policy=policy) is False
+    assert reactor.is_enabled(_ctx_bot(bot_id=99), policy=None) is False
+
+
 # ── Reactor._llm_for ───────────────────────────────────────────────────────
 
 

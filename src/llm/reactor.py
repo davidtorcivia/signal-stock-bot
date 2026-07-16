@@ -380,6 +380,20 @@ class EmojiReactor:
             ),
         }
 
+    def is_enabled(self, bot=None, policy=None) -> bool:
+        """Return the effective reactor gate for one bot and chat.
+
+        Prompt builders and dispatchers must use the same resolution chain
+        as ``maybe_react``. Reading only the global flag makes a writer claim
+        it has a reflex that its bot-scoped config disabled, or hides the
+        reflex state from a bot whose per-bot override enabled it.
+        """
+        if not self._config(bot)["enabled"]:
+            return False
+        return policy is None or bool(
+            getattr(policy, "reactor_enabled", True)
+        )
+
     def _llm_for(self, bot):
         """Pick the LLM client that will run the reactor decision call.
 

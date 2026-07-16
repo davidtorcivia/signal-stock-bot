@@ -432,6 +432,13 @@ class DeepThinkClient:
             if policy is not None:
                 mcp_tools = [t for t in mcp_tools if policy.allows_mcp(t.server_name)]
             schemas.extend(t.to_openai_tool() for t in mcp_tools)
+        # Match the writer's canonical ordering. Session restart order should
+        # not rewrite an otherwise identical request prefix.
+        schemas.sort(
+            key=lambda schema: str(
+                (schema.get("function") or {}).get("name") or ""
+            )
+        )
         return schemas or None
 
     async def _run_tool_loop(
