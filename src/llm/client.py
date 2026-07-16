@@ -211,6 +211,16 @@ class LLMClient:
                 sys_prompt_raw = persona
         if sys_prompt_raw is None:
             sys_prompt_raw = store.get("llm_system_prompt")
+        max_tokens = resolve_int(
+            store, bot_id, role, "max_tokens",
+            global_keys=["llm_max_tokens"], default=1000,
+            min_value=1,
+        )
+        extended_max_tokens = resolve_int(
+            store, bot_id, role, "extended_max_tokens",
+            global_keys=["llm_extended_max_tokens"], default=1000,
+            min_value=1,
+        )
         return {
             "enabled": resolve_bool(
                 store, bot_id, role, "enabled",
@@ -232,9 +242,11 @@ class LLMClient:
                 store, bot_id, role, "temperature",
                 global_keys=["llm_temperature"], default=0.7,
             ),
-            "max_tokens": resolve_int(
-                store, bot_id, role, "max_tokens",
-                global_keys=["llm_max_tokens"], default=1000,
+            "max_tokens": max_tokens,
+            # Never make a request smaller because an inherited extended
+            # ceiling lagged behind a bot-specific conversational budget.
+            "extended_max_tokens": max(
+                max_tokens, extended_max_tokens,
             ),
             "system_prompt": sys_prompt_raw or DEFAULT_SYSTEM_PROMPT,
             "timeout": resolve_int(

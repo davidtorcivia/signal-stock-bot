@@ -82,6 +82,19 @@ def test_signal_object_placeholder_has_honest_generic_fallback():
 def test_real_train_emoji_is_not_rewritten():
     assert normalize_signal_text("model train 🚂") == "model train 🚂"
 
+
+def test_structured_mention_phone_token_is_removed():
+    text = "[+16467699190] last thing, what car do you drive?"
+    data_message = {"mentions": [{"number": "+16467699190"}]}
+    assert normalize_signal_text(text, data_message) == (
+        "last thing, what car do you drive?"
+    )
+
+
+def test_unstructured_bracketed_phone_is_preserved():
+    text = "Call [+16467699190] tomorrow"
+    assert normalize_signal_text(text, {"mentions": []}) == text
+
 def test_no_attachments_returns_empty(attachments_tmp):
     assert _read_inbound_image_attachments({}) == []
     assert _read_inbound_image_attachments({"attachments": []}) == []

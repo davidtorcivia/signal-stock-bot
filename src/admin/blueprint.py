@@ -416,6 +416,7 @@ LLM_KEYS = [
     "llm_api_key",
     "llm_temperature",
     "llm_max_tokens",
+    "llm_extended_max_tokens",
     "llm_timeout_seconds",
     "llm_history_turns",
     "llm_retention_days",
@@ -477,6 +478,7 @@ LLM_DEFAULTS = {
     "llm_model": "gpt-4o-mini",
     "llm_temperature": 0.7,
     "llm_max_tokens": 1000,
+    "llm_extended_max_tokens": 1000,
     "llm_timeout_seconds": 30,
     "llm_history_turns": 6,
     "llm_retention_days": 7,
@@ -574,6 +576,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
     }
     int_keys = {
         "llm_max_tokens",
+        "llm_extended_max_tokens",
         "llm_timeout_seconds",
         "llm_history_turns",
         "llm_retention_days",
@@ -672,6 +675,7 @@ _BOT_LLM_FIELDS = {
         ("model", "str"),
         ("temperature", "float"),
         ("max_tokens", "int"),
+        ("extended_max_tokens", "int"),
         ("timeout_seconds", "int"),
         ("system_prompt", "str"),
         ("extra_body", "json"),

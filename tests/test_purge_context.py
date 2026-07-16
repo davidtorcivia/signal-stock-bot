@@ -267,9 +267,10 @@ def test_reactor_clear_recent_drops_deque():
     )
     r._record_recent(
         group_id="grp-rx", sender_label="...4137",
-        target_text="world", emoji="🙂",
+        target_text="world", emoji="🙂", target_timestamp=12345,
     )
 
+    assert r.recent_reactions("grp-rx")[0]["target_timestamp"] == 12345
     assert r.clear_recent("grp-rx") == 2
     assert r.recent_reactions("grp-rx") == []
     # Idempotent: a second clear is a no-op.

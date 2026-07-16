@@ -141,8 +141,60 @@ _DEEP_THINK_TRIGGER_RE = re.compile(
 )
 
 
+# Requests that normally need more room than the writer's terse conversational
+# budget. Tool results also select the extended budget at runtime, even when
+# the original wording was short ("price?", "fetch this").
+_EXTENDED_RESPONSE_RE = re.compile(
+    r"\b("
+    r"summary|summaries|summari[sz](?:e|ed|ing|ation)?"
+    r"|analy[sz](?:e|ed|ing|is)"
+    r"|compar(?:e|ed|ing|ison)"
+    r"|explain|explanation"
+    r"|break\s+down|step[\s-]+by[\s-]+step"
+    r"|detail(?:ed|s)?|thorough(?:ly)?|comprehensive"
+    r"|long(?:er|form)?|essay|report|pros\s+and\s+cons"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _user_explicitly_asked_to_think(text: str) -> bool:
     return bool(_DEEP_THINK_TRIGGER_RE.search(text or ""))
+
+
+def _wants_extended_response(text: str) -> bool:
+    return bool(_EXTENDED_RESPONSE_RE.search(text or ""))
+
+
+def _adaptive_response_overrides(
+    writer, question: str, messages: list[dict],
+) -> Optional[dict]:
+    """Select the extended writer budget for long-form or evidence rounds.
+
+    ``max_tokens`` remains the cheap conversational default. The separately
+    configurable extended ceiling is used when the user asks for depth or a
+    tool has returned evidence that needs synthesis. Test doubles and legacy
+    clients without ``_config`` simply retain their normal behavior.
+    """
+    has_tool_results = any(
+        message.get("role") == "tool" for message in messages
+    )
+    if not has_tool_results and not _wants_extended_response(question):
+        return None
+    try:
+        cfg = writer._config()
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    try:
+        normal = max(1, int(cfg.get("max_tokens", 1000)))
+        extended = max(
+            normal, int(cfg.get("extended_max_tokens", normal)),
+        )
+    except (TypeError, ValueError):
+        return None
+    return {"max_tokens": extended} if extended > normal else None
 
 
 # Backwards-compat shim — older tests and callers may reference the
@@ -463,6 +515,54 @@ class AskCommand(BaseCommand):
             if turn.get("_turn_id")
         ]
 
+    @staticmethod
+    def _render_turn_graph(
+        prior: list[dict],
+        retrieved_turns: list[dict],
+        visible_turns: list[dict],
+    ) -> str:
+        """Render only useful, resolvable non-linear reply edges.
+
+        A normal alternating history already says h2 follows h1, so emitting
+        every h2->h1 edge duplicates ordering and makes the graph look more
+        important than it is. Keep only branches whose parent differs from
+        the preceding history row, and only when both endpoints are visible.
+        Retrieved rows have no reliable adjacent ordering, so their visible
+        parent edges are retained.
+        """
+        visible_ids = {
+            str(turn.get("turn_id"))
+            for turn in visible_turns
+            if turn.get("turn_id")
+        }
+        visible_ids.update(
+            str(turn.get("turn_id"))
+            for turn in retrieved_turns
+            if turn.get("turn_id")
+        )
+
+        edges: list[str] = []
+        previous_id: Optional[str] = None
+        for turn in prior:
+            turn_id = turn.get("_turn_id")
+            parent = turn.get("_parent_turn_ref")
+            if (
+                turn_id
+                and parent
+                and str(parent) in visible_ids
+                and str(parent) != previous_id
+            ):
+                edges.append(f"{turn_id} parent={parent}")
+            if turn_id:
+                previous_id = str(turn_id)
+
+        for turn in retrieved_turns:
+            turn_id = turn.get("turn_id")
+            parent = turn.get("parent_turn_ref")
+            if turn_id and parent and str(parent) in visible_ids:
+                edges.append(f"{turn_id} parent={parent}")
+        return "\n".join(dict.fromkeys(edges))
+
     async def _build_group_context(
         self,
         ctx,
@@ -490,6 +590,27 @@ class AskCommand(BaseCommand):
             ctx.group_id, limit=limit, exclude_last=1,
             floor_at=floor_at,
         )
+        if not msgs:
+            return "", []
+
+        # Ambient context is a delta, not a rolling replay. Once this bot has
+        # persisted a newer conversation turn, older room chatter has already
+        # served its purpose and repeating it on every request both wastes
+        # tokens and re-anchors the model on a stale aside. This timestamp
+        # cursor is per-bot because `prior` is already bot-scoped.
+        history_cutoff = max(
+            (
+                float(turn.get("_created_at"))
+                for turn in (prior or [])
+                if turn.get("_created_at") is not None
+            ),
+            default=None,
+        )
+        if history_cutoff is not None:
+            msgs = [
+                msg for msg in msgs
+                if float(msg.get("created_at") or 0) > history_cutoff
+            ]
         if not msgs:
             return "", []
 
@@ -930,6 +1051,7 @@ class AskCommand(BaseCommand):
         caller_ctx: CommandContext,
         attachments: list,
         cache_plan: Optional[PromptCachePlan] = None,
+        question: str = "",
     ) -> str:
         """Drive the assistant/tool back-and-forth until we have final text.
 
@@ -958,6 +1080,9 @@ class AskCommand(BaseCommand):
             )
             return await llm.chat_messages(
                 working_messages, tools=active_tools, cache_plan=cache_plan,
+                overrides=_adaptive_response_overrides(
+                    llm, question, working_messages,
+                ),
             )
 
         async def execute_call(
@@ -1111,6 +1236,9 @@ class AskCommand(BaseCommand):
         # Single-shot: no tools. The writer's only job is to compose.
         assistant_msg = await writer.chat_messages(
             messages, tools=None, cache_plan=cache_plan,
+            overrides=_adaptive_response_overrides(
+                writer, question, messages,
+            ),
         )
         return (assistant_msg.get("content") or "").strip()
 
@@ -2561,19 +2689,11 @@ class AskCommand(BaseCommand):
                 except Exception as e:
                     logger.debug(f"Relevant-history retrieval failed: {e}")
 
-            # Render stored graph edges separately so legacy history labels
-            # stay stable. New rows carry a parent reference, including g<ID>
-            # quote targets that cannot be represented as a SQLite foreign key.
-            graph_edges = [
-                f"{turn.get('_turn_id')} -> {turn.get('_parent_turn_ref')}"
-                for turn in prior
-                if turn.get("_turn_id") and turn.get("_parent_turn_ref")
-            ]
-            graph_edges.extend(
-                f"{turn['turn_id']} -> {turn['parent_turn_ref']}"
-                for turn in retrieved_turns if turn.get("parent_turn_ref")
+            # History order already carries the ordinary chain. Surface only
+            # visible branch edges, with an unambiguous parent= representation.
+            turn_graph_block = self._render_turn_graph(
+                prior, retrieved_turns, visible_turns,
             )
-            turn_graph_block = "\n".join(dict.fromkeys(graph_edges))
             # Snapshot the active bot's deep-think client once for every
             # prompt/execution gate in this request. The default client on
             # self.deep_think may have different readiness and settings.
@@ -2674,8 +2794,9 @@ class AskCommand(BaseCommand):
                     "follows turn before reaching back to older topics. "
                     "`<replying_to turn=\"ID\">`, when present, is an explicit "
                     "Signal quote and is the authoritative target. The "
-                    "`parent` attribute and <turn_graph> record the durable "
-                    "reply edge; follow that edge when topics interleave.\n"
+                    "`parent` attribute and <turn_graph> record durable reply "
+                    "edges. A graph row `child parent=target` means child "
+                    "replied to target; follow it when topics interleave.\n"
                     "- The current message is wrapped in "
                     "`<current_message from=\"Name\">`. Reply to that speaker; "
                     "do not assume the prior turn's asker is still in front "
@@ -2941,7 +3062,13 @@ class AskCommand(BaseCommand):
                     logger.debug(f"Failed to fetch recent reactions: {e}")
                     recent_rxns = []
                 if recent_rxns:
-                    lines = ["Recent emoji reactions you placed in this chat (newest first):"]
+                    reaction_turns = {
+                        str(turn.get("source_message_ts")): turn.get("turn_id")
+                        for turn in [*visible_turns, *retrieved_turns]
+                        if turn.get("source_message_ts") is not None
+                        and turn.get("turn_id")
+                    }
+                    lines = ["Recent reactions you placed (newest first):"]
                     for r in recent_rxns[:5]:
                         if not isinstance(r, dict):
                             continue
@@ -2952,18 +3079,29 @@ class AskCommand(BaseCommand):
                             r"[\r\n<>\[\]\"]", "",
                             str(r.get("emoji") or ""),
                         )[:16]
-                        sender = re.sub(
-                            r"[\r\n<>\[\]\"]", "",
-                            str(r.get("sender") or "unknown"),
-                        )[:80]
-                        target = re.sub(
-                            r"\s+", " ", str(r.get("target") or "")
-                        ).replace("<", "‹").replace(">", "›").replace(
-                            '"', "”"
-                        )[:500]
-                        lines.append(
-                            f"  {emoji} on [{sender}] \"{target}\""
+                        target_turn = reaction_turns.get(
+                            str(r.get("target_timestamp"))
                         )
+                        if target_turn:
+                            # The referenced turn already carries author and
+                            # text, so an id is both clearer and much smaller.
+                            lines.append(f"  {emoji} turn={target_turn}")
+                        else:
+                            # The target fell outside visible history. Retain a
+                            # bounded snippet so questions about it remain
+                            # answerable without widening history.
+                            sender = re.sub(
+                                r"[\r\n<>\[\]\"]", "",
+                                str(r.get("sender") or "unknown"),
+                            )[:80]
+                            target = re.sub(
+                                r"\s+", " ", str(r.get("target") or "")
+                            ).replace("<", "‹").replace(">", "›").replace(
+                                '"', "”"
+                            )[:160]
+                            lines.append(
+                                f"  {emoji} on [{sender}] \"{target}\""
+                            )
                     if len(lines) > 1:
                         reactor_log_block = "\n".join(lines)
 
@@ -3000,10 +3138,9 @@ class AskCommand(BaseCommand):
                     "the default is 5s which is often too tight for "
                     "yfinance fetches or matrix math. The hard ceiling "
                     "from the bot side is 30s per call.\n\n"
-                    "Pattern: either fetch data via existing tools "
-                    "(bot__price, bot__chart) and paste it into your "
-                    "script as a Python literal, OR import yfinance "
-                    "inside the sandbox and fetch directly. After "
+                    "For market data, import yfinance inside the sandbox "
+                    "or discover an allowed data capability through the "
+                    "MCP broker. After "
                     "computing, weave the result into your reply in "
                     "plain prose — DO NOT dump raw stdout / DataFrame "
                     "reprs / matplotlib output to the user."
@@ -3154,7 +3291,9 @@ class AskCommand(BaseCommand):
                         "Conversation-history rows may begin with a stable "
                         "`[turn h<ID>; ...]` pointer. The current message's "
                         "`parent`/`follows` attributes and <turn_graph> refer "
-                        "to those IDs. Use the pointers for reference "
+                        "to those IDs. Graph rows use `child parent=target`: "
+                        "the child replied to the target. Linear history "
+                        "edges are omitted. Use pointers for reference "
                         "resolution, but never copy them into your reply.",
                     ),
                 ),
@@ -3381,11 +3520,13 @@ class AskCommand(BaseCommand):
                     answer = await self._run_tool_loop(
                         messages, tools, ctx, attachments,
                         cache_plan=cache_plan,
+                        question=question,
                     )
             else:
                 answer = await self._run_tool_loop(
                     messages, tools, ctx, attachments,
                     cache_plan=cache_plan,
+                    question=question,
                 )
         except LLMDisabled:
             return CommandResult.error(

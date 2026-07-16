@@ -495,11 +495,12 @@ Configure once at `/admin/llm`. All values apply live — no restart.
 | Base URL | Any OpenAI-compatible endpoint (`https://api.openai.com/v1`, `https://openrouter.ai/api/v1`, `https://api.groq.com/openai/v1`, `http://host:11434/v1` for Ollama, etc.) |
 | Model | e.g. `gpt-4o-mini`, `anthropic/claude-haiku-4-5` (via OpenRouter), `llama3.1:8b` |
 | API key | Write-only field — once saved, the form shows "configured" and never echoes the value back |
-| Temperature, Max tokens, Timeout | Standard knobs |
+| Temperature, Max tokens, Timeout | Max tokens is the conversational budget used for ordinary chat |
+| Extended-response max tokens | Larger ceiling selected for requested summaries, explanations, comparisons, detailed answers, research handoffs, and synthesis after tools return |
 | Conversation turns kept per user | Rolling window depth for `!ask` history |
 | Retention days | Auto-purge for both conversation history and group message logs |
 | Max tool-call rounds | Hard ceiling on chained tool calls per `!ask` (default 25). On cap-hit, the bot returns an honest "task incomplete" error with the tool sequence — never fabricates a summary from partial work |
-| Group chat context messages | When `!ask` runs in a group, add this many recent messages to the volatile user tail. `0` disables both context injection and group-message recording |
+| Group chat context messages | When `!ask` runs in a group, add up to this many ambient messages newer than the bot's latest persisted turn. `0` disables both context injection and group-message recording |
 | Augment these commands | Comma-separated list (e.g. `ta, tldr, earnings, news, economy, rating`). When a listed command succeeds, the LLM appends a brief plain-language interpretation. Respects per-context policy |
 | Augmentation prompt | Instruction template for augmentation calls |
 | Ask command alias | Adds an extra alias for `!ask` (the canonical name always works too) |
@@ -516,7 +517,7 @@ Deep-think gets its own block with separate base URL / API key / model / tempera
 - The configured (or per-context) system prompt + persona
 - **Always** the current UTC + ET time with weekday — so the model never has to guess "now"
 - Per-context conversation history. In groups, user turns prefix `[Name, time ago]` (or `[...4137, time ago]` for unregistered users) and the bot's own past replies prefix `[to Name, time ago]` so question/answer pairing across speakers is unambiguous
-- Optional `<group_context>` block — last N inbound messages (configurable per chat) plus the bot's own posts back into the chat, time-ordered with the same bracket attribution
+- Optional `<group_context>` block — the ambient-message delta since this bot's newest persisted turn, capped by the configured window. Older room chatter does not repeat on every request
 - All bot commands the context allows, as `bot__<name>` tools
 - A fixed MCP broker pair: `mcp__discover` searches the allowed catalog and returns a small set of detailed schemas; `mcp__invoke` runs one exact discovered tool
 - Tweet URLs in the user's question are auto-expanded to `[@handle] tweet text` before sending
@@ -528,12 +529,13 @@ Deep-think gets its own block with separate base URL / API key / model / tempera
   - **`<mcp_broker>` / `<python_tool>`** — discovery/invocation rules, plus Pyodide runtime guidance when that server is available
 - Volatile user-tail blocks, rebuilt for the current turn:
   - **`<group_context>` / `<recent_reactions>`** — recent chat and reflex state
+  - **`<turn_graph>`** — visible non-linear reply branches only, encoded as `child parent=target`; ordinary chronological edges stay implicit in history order
   - **`<context_memories>`** — recalled facts for the active speaker, room, and named subjects
   - **`<conversation_memory>` / `<conversation_status>`** — rolling summary and staleness advisory
   - **`<spontaneous_reply>`** — when the reactor's `should_respond` flagged this message; instructs the writer to bail to empty content if a real reply isn't warranted
   - **`<deep_think_trigger>` / `<research_handoff>`** — current-turn delegation pressure and returned research notes
 
-Every writer and deep-think round records SHA-256 fingerprints for the rendered system prefix and tool payload, named stable/volatile block hashes, serialized sizes, and provider cache usage. Prompt text stays out of this telemetry. The admin dashboard flags stable-block changes and large cache misses where the system/tool fingerprints remained unchanged.
+Every writer and deep-think round records SHA-256 fingerprints for the rendered system prefix and tool payload, named stable/volatile block hashes, serialized sizes, and provider cache usage. Prompt text stays out of this telemetry. Transcript exports hash the Signal group id, and structured mention tokens are removed before they reach model input. The admin dashboard flags stable-block changes and large cache misses where the system/tool fingerprints remained unchanged.
 
 Tool calls are idempotent within one model invocation. Repeated call IDs and repeated canonical name/argument pairs reuse the first result, preventing duplicate portfolio orders, prediction writes, memory changes, and MCP side effects. HTTP completion calls retry transient `408`/`425`/`429`/`5xx` responses and connection failures twice, honor `Retry-After` up to five seconds, share one end-to-end deadline, and open a 60-second circuit after five consecutive transient failures.
 
@@ -571,7 +573,7 @@ A separate fire-and-forget LLM that decides whether to react to inbound group me
 **Coordination with the writing LLM.** The reactor and the writing LLM (`!ask` and `llm_intent` routing) are separate processes. A small bridge gives the writer enough state to own and explain its reactions:
 
 1. A **reflex directive** in the stable system suffix explains that emoji reactions belong to the bot and tells the writer how to use the event log when one is present.
-2. A **rolling log** carries the last 5 reactions in the current group with target message and emoji (for example, `💀 on [Tyler] "housing crash tweet…"`). This volatile block sits in the current user turn beside `<group_context>`, preserving the provider's cached system/history prefix when a new reaction arrives. The backing log is in-memory per process, capped at 20 per group, and clears on restart.
+2. A **rolling log** carries the last 5 reactions in the current group. When the target remains visible, the entry is a compact pointer such as `💀 turn=h2935`; targets outside the visible window retain a short author/text fallback. This volatile block sits in the current user turn beside `<group_context>`, preserving the provider's cached system/history prefix when a new reaction arrives. The backing log is in-memory per process, capped at 20 per group, and clears on restart.
 
 Both pieces are gated on `reactor_enabled` being true globally **and** for the current context — they don't appear in the prompt for chats where the reactor is off.
 

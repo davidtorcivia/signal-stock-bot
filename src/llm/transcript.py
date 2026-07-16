@@ -41,6 +41,16 @@ def _redacted_binary(value: str) -> str:
     return f"[inline binary omitted: sha256={digest}, chars={len(value)}]"
 
 
+def _redacted_identifier(value: Optional[str], label: str) -> Optional[str]:
+    """Keep identifiers correlatable inside an export without exposing them."""
+    if not value:
+        return None
+    digest = hashlib.sha256(
+        str(value).encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    return f"[{label} sha256={digest}]"
+
+
 def snapshot_payload(value: Any, *, key: Optional[str] = None) -> Any:
     """Freeze an API payload and omit inline attachment bytes.
 
@@ -327,7 +337,9 @@ def build_record(
             "context_id": context_id,
             "context_label": context_label,
             "sender_tail": sender_tail,
-            "group_id": group_id,
+            # A raw Signal group id is stable identifying metadata and is not
+            # needed to replay or train on the captured provider payload.
+            "group_id": _redacted_identifier(group_id, "group"),
             "latency_ms": latency_ms,
             # Fingerprints and sizes only — no duplicate prompt plaintext.
             "cache_manifest": frozen_manifest,

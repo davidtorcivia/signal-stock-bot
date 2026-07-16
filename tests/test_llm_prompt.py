@@ -17,8 +17,10 @@ import pytest
 
 from src.commands.ask_command import (
     AskCommand,
+    _adaptive_response_overrides,
     _strip_addressee_leak,
     _strip_meta_leak,
+    _wants_extended_response,
     _wrap_xml,
     STALENESS_THRESHOLD_SECONDS,
 )
@@ -27,6 +29,7 @@ from src.bots.models import Bot
 from src.llm.client import DEFAULT_SYSTEM_PROMPT
 from src.llm.history import ConversationHistory, format_history_timestamp
 from src.group_log import GroupMessageLog
+from src.commands.tools import BotCommandTools
 
 
 # Matches the `YYYY-MM-DD HH:MM UTC` stamp the history renderer now emits.
@@ -79,6 +82,32 @@ def test_wrap_xml_non_empty_wraps():
 
 def test_wrap_xml_strips_inner_whitespace():
     assert _wrap_xml("x", "\n  body  \n") == "<x>\nbody\n</x>"
+
+
+def test_bot_tool_args_description_does_not_advertise_other_tools():
+    cmd = SimpleNamespace(
+        name="economy", description="Get economic data", usage="!eco CPI",
+    )
+    schema = BotCommandTools._tool_schema(cmd)
+    rendered = str(schema)
+    assert "!eco CPI" in rendered
+    assert "!price" not in rendered
+    assert "!chart" not in rendered
+
+
+def test_adaptive_response_budget_uses_extended_ceiling_by_intent_or_evidence():
+    writer = SimpleNamespace(_config=lambda: {
+        "max_tokens": 200, "extended_max_tokens": 800,
+    })
+    messages = [{"role": "user", "content": "hello"}]
+    assert _adaptive_response_overrides(writer, "hello", messages) is None
+    assert _wants_extended_response("summarize this article")
+    assert _adaptive_response_overrides(
+        writer, "summarize this article", messages,
+    ) == {"max_tokens": 800}
+    assert _adaptive_response_overrides(
+        writer, "price?", [*messages, {"role": "tool", "content": "42"}],
+    ) == {"max_tokens": 800}
 
 
 # ---------- identity authority ----------------------------------------------
@@ -223,6 +252,18 @@ class _MutableReactor:
         return True
 
 
+class _PointerReactor(_MutableReactor):
+    def __init__(self, target_timestamp):
+        super().__init__()
+        self.target_timestamp = target_timestamp
+
+    def recent_reactions(self, group_id, limit=5, bot_id=None):
+        return [{
+            "emoji": "🔥", "sender": "David", "target": self.target,
+            "target_timestamp": self.target_timestamp,
+        }]
+
+
 @pytest.mark.asyncio
 async def test_recent_reactions_change_only_tail_user_message():
     """Changing reflex state must not change the static system prefix.
@@ -265,6 +306,41 @@ async def test_recent_reactions_change_only_tail_user_message():
     assert "<recent_reactions>" in first_user
     assert "first message" in first_user
     assert "second message" in second_user
+
+
+@pytest.mark.asyncio
+async def test_recent_reaction_uses_visible_turn_pointer_without_copying_text(tmp_path):
+    llm = _CapturingLLM()
+    history = ConversationHistory(
+        db_path=str(tmp_path / "history.db"), turns_per_user=10,
+    )
+    source_ts = 7001
+    turn_id = await history.append(
+        "group:group-1", "user", "a very long source message",
+        sender_tail="4123", source_message_ts=source_ts,
+    )
+    await history.append(
+        "group:group-1", "assistant", "seen", sender_tail="4123",
+        parent_turn_ref=f"h{turn_id}",
+    )
+    reactor = _PointerReactor(source_ts)
+    reactor.target = "a very long source message"
+    ask = AskCommand(llm, history, reactor=reactor)
+    ctx = CommandContext(
+        sender="+15551234123", group_id="group-1",
+        raw_message="!ask why the reaction?", command="ask",
+        args=["why", "the", "reaction?"],
+        bot=Bot(id=1, slug="sigil", display_name="Sigil"),
+        message_timestamp=7002,
+    )
+
+    assert (await ask.execute(ctx)).success
+    tail = llm.calls[0][-1]["content"]
+    block = re.search(
+        r"<recent_reactions>\n(.*?)\n</recent_reactions>", tail, re.S,
+    ).group(1)
+    assert f"🔥 turn=h{turn_id}" in block
+    assert "a very long source message" not in block
 
 
 @pytest.mark.asyncio
@@ -657,6 +733,59 @@ async def test_group_context_dedupes_history_and_points_followup(tmp_path):
     current_answer = stored[stored.index(current_user) + 1]
     assert current_user["_parent_turn_ref"] == turn_match.group(1)
     assert current_answer["_parent_turn_ref"] == current_user["_turn_id"]
+
+
+def test_turn_graph_keeps_only_visible_non_linear_edges():
+    prior = [
+        {"_turn_id": "h1", "_parent_turn_ref": None},
+        {"_turn_id": "h2", "_parent_turn_ref": "h1"},
+        {"_turn_id": "h3", "_parent_turn_ref": "h1"},
+        {"_turn_id": "h4", "_parent_turn_ref": "h3"},
+        {"_turn_id": "h5", "_parent_turn_ref": "g999"},
+    ]
+    visible = [{"turn_id": f"h{i}"} for i in range(1, 6)]
+    assert AskCommand._render_turn_graph(prior, [], visible) == (
+        "h3 parent=h1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_context_is_only_ambient_delta_since_latest_history(tmp_path):
+    class _GroupPromptStore(_PromptStore):
+        def get_int(self, key, default, *, min_value=None):
+            value = 20 if key == "group_context_messages" else default
+            return max(min_value, value) if min_value is not None else value
+
+    llm = _CapturingLLM()
+    llm.store = _GroupPromptStore()
+    history = ConversationHistory(
+        db_path=str(tmp_path / "history.db"), turns_per_user=10,
+    )
+    group_log = GroupMessageLog(db_path=str(tmp_path / "group.db"))
+
+    await group_log.append("group-1", "+15550000001", "stale ambient")
+    await history.append(
+        "group:group-1", "user", "handled question", sender_tail="4123",
+    )
+    await history.append(
+        "group:group-1", "assistant", "handled answer", sender_tail="4123",
+    )
+    await group_log.append("group-1", "+15550000002", "fresh ambient")
+    # The dispatcher logs the current inbound row last; AskCommand excludes it.
+    await group_log.append("group-1", "+15551234123", "new question")
+
+    ask = AskCommand(llm, history, group_log=group_log)
+    ctx = CommandContext(
+        sender="+15551234123", group_id="group-1",
+        raw_message="!ask new question", command="ask",
+        args=["new", "question"],
+        bot=Bot(id=2, slug="artaud", display_name="Artaud"),
+    )
+
+    assert (await ask.execute(ctx)).success
+    tail = llm.calls[0][-1]["content"]
+    assert "fresh ambient" in tail
+    assert "stale ambient" not in tail
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ LIVE_KEYS = {
     "llm_model",
     "llm_temperature",
     "llm_max_tokens",
+    "llm_extended_max_tokens",
     "llm_system_prompt",
     "llm_timeout_seconds",
     "llm_history_turns",

@@ -132,6 +132,8 @@ def test_build_record_shape():
     assert rec["_meta"]["bot_id"] == 5
     assert rec["_meta"]["context_id"] == 10
     assert rec["_meta"]["latency_ms"] == 123.4
+    assert rec["_meta"]["group_id"].startswith("[group sha256=")
+    assert "grp-abc" not in rec["_meta"]["group_id"]
 
 
 def test_build_record_freezes_inputs_and_redacts_inline_images():

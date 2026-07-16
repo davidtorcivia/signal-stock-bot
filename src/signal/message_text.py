@@ -9,11 +9,43 @@ text descriptor while preserving ordinary Unicode emoji verbatim.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 
 OBJECT_REPLACEMENT_CHARACTER = "\ufffc"
 GENERIC_SIGNAL_OBJECT = "[unrendered Signal object]"
+
+
+def _strip_structured_mention_tokens(
+    value: str, data_message: Optional[dict],
+) -> str:
+    """Remove Signal's bracketed account identifiers for real mentions.
+
+    Some signal-cli payloads render a tapped mention as ``[+15551234567]``
+    in the text while also supplying the same account in ``mentions``.  The
+    structured field already drives bot routing, so retaining the bracketed
+    phone in model input is redundant, confusing (it looks like a second
+    speaker), and leaks a full phone number into transcripts.  Only tokens
+    corroborated by structured mention metadata are removed; a user typing a
+    bracketed number normally is left untouched.
+    """
+    if not isinstance(data_message, dict):
+        return value
+    for mention in data_message.get("mentions") or []:
+        if not isinstance(mention, dict):
+            continue
+        identifiers = {
+            str(mention.get(key) or "").strip()
+            for key in ("number", "uuid", "aci", "author")
+        }
+        for identifier in identifiers - {""}:
+            token = re.escape(f"[{identifier}]")
+            # Consume adjacent horizontal whitespace, but preserve newlines.
+            value = re.sub(
+                rf"(?<!\S){token}(?:[ \t]+)?", "", value,
+            )
+    return value
 
 
 def _clean_label(value: object, *, limit: int = 80) -> str:
@@ -91,6 +123,7 @@ def normalize_signal_text(
     object explicitly instead of assigning it an invented meaning.
     """
     value = "" if text is None else str(text)
+    value = _strip_structured_mention_tokens(value, data_message)
     if OBJECT_REPLACEMENT_CHARACTER not in value:
         return value
 

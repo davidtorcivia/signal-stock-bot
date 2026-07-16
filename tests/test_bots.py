@@ -30,6 +30,7 @@ from src.bots import (
 from src.commands.base import CommandContext
 from src.contexts.policy import ContextPolicy
 from src.llm.factory import LLMClientFactory
+from src.llm.client import LLMClient
 from src.settings_store import SettingsStore
 from src.signal.handler import SignalConfig, SignalHandler
 
@@ -213,6 +214,19 @@ def test_resolve_chain_bot_then_global_then_default(store: SettingsStore):
         store, 1, "writer", "max_tokens",
         global_keys=["llm_max_tokens"], default=99,
     ) == 250
+
+
+def test_writer_extended_budget_resolves_separately_from_chat_budget(
+    store: SettingsStore,
+):
+    store.set("llm_extended_max_tokens", 900)
+    store.set_bot(1, "writer", "max_tokens", 200)
+    client = LLMClient(store, bot_id=1)
+    assert client._config()["max_tokens"] == 200
+    assert client._config()["extended_max_tokens"] == 900
+
+    store.set_bot(1, "writer", "extended_max_tokens", 650)
+    assert client._config()["extended_max_tokens"] == 650
 
 
 def test_resolve_deep_think_falls_back_to_writer(store: SettingsStore):

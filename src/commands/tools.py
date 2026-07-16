@@ -64,10 +64,9 @@ class BotCommandTools:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": (
-                                "Positional arguments for the command, exactly as a "
-                                "user would type them after the command word. "
-                                "Example for !price: [\"AAPL\"]. Example for "
-                                "!chart with flags: [\"AAPL\", \"1m\", \"-c\"]."
+                                "Arguments after the command name, as separate "
+                                "strings. Follow the usage shown above; use [] "
+                                "when every argument is optional."
                             ),
                         },
                     },

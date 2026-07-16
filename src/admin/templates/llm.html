@@ -46,6 +46,17 @@
         <input type="number" name="llm_max_tokens" id="llm_max_tokens" min="1"
                value="{{ values.llm_max_tokens or '' }}" placeholder="1000">
 
+        <label for="llm_extended_max_tokens">Extended-response max tokens</label>
+        <input type="number" name="llm_extended_max_tokens"
+               id="llm_extended_max_tokens" min="1"
+               value="{{ values.llm_extended_max_tokens or '' }}"
+               placeholder="1000">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Used for requested summaries, explanations, comparisons, detailed
+            answers, research handoffs, and final synthesis after tool calls.
+            Ordinary chat keeps the smaller max-token budget above.
+        </p>
+
         <label for="llm_timeout_seconds">Request timeout (seconds)</label>
         <input type="number" name="llm_timeout_seconds" id="llm_timeout_seconds" min="1"
                value="{{ values.llm_timeout_seconds or '' }}" placeholder="30">

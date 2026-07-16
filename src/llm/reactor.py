@@ -591,6 +591,7 @@ class EmojiReactor:
     def _record_recent(
         self, *, group_id: str, sender_label: str, target_text: str,
         emoji: str, bot_id: Optional[int] = None,
+        target_timestamp: Optional[int] = None,
     ) -> None:
         snippet = (target_text or "").replace("\n", " ").strip()
         if len(snippet) > RECENT_TARGET_SNIPPET_LEN:
@@ -600,7 +601,9 @@ class EmojiReactor:
         if log is None:
             log = deque(maxlen=RECENT_REACTIONS_PER_GROUP)
             self._recent[gkey] = log
-        log.append((time.time(), sender_label, snippet, emoji))
+        log.append((
+            time.time(), sender_label, snippet, emoji, target_timestamp,
+        ))
 
     def clear_recent(self, group_id: str) -> int:
         """Drop the in-process reactor-decision log for ALL bots in
@@ -635,8 +638,14 @@ class EmojiReactor:
         items = list(log)[-max(1, limit):]
         items.reverse()
         return [
-            {"ts": ts, "sender": sender, "target": target, "emoji": emoji}
-            for ts, sender, target, emoji in items
+            {
+                "ts": ts,
+                "sender": sender,
+                "target": target,
+                "emoji": emoji,
+                "target_timestamp": target_timestamp,
+            }
+            for ts, sender, target, emoji, target_timestamp in items
         ]
 
     async def _build_user_content(
@@ -1045,6 +1054,7 @@ class EmojiReactor:
                         target_text=text,
                         emoji=emoji_pick,
                         bot_id=bot_id_for_scope,
+                        target_timestamp=int(target_timestamp),
                     )
                     get_bus().publish(
                         "reactor",
