@@ -15,7 +15,7 @@ import logging
 from typing import Optional, TypeVar, Generic, Dict, Any
 from dataclasses import dataclass, field
 from datetime import datetime
-from collections import deque
+from collections import OrderedDict, deque
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,7 @@ class ProviderMetrics:
     last_error_message: Optional[str] = None
     circuit_open: bool = False
     circuit_open_until: Optional[float] = None
+    consecutive_errors: int = 0
     
     # Recent request latencies for percentile calculation
     recent_latencies: deque = field(default_factory=lambda: deque(maxlen=100))
@@ -180,13 +181,16 @@ class ProviderMetrics:
         self.successes += 1
         self.total_latency_ms += latency_ms
         self.recent_latencies.append(latency_ms)
+        self.consecutive_errors = 0
     
-    def record_error(self, error_msg: str):
+    def record_error(self, error_msg: str, *, consecutive: bool = True):
         """Record a failed request."""
         self.requests += 1
         self.errors += 1
         self.last_error_time = time.time()
         self.last_error_message = error_msg
+        if consecutive:
+            self.consecutive_errors += 1
     
     @property
     def success_rate(self) -> float:
@@ -246,6 +250,7 @@ class ProviderMetrics:
             "p95_latency_ms": f"{self.p95_latency_ms:.0f}ms",
             "healthy": self.is_healthy(),
             "circuit_open": self.circuit_open,
+            "consecutive_errors": self.consecutive_errors,
         }
 
 
@@ -265,6 +270,14 @@ class LLMMetrics:
     last_error_msg: Optional[str] = None
     by_purpose: dict = field(default_factory=dict)   # purpose -> count
     by_model: dict = field(default_factory=dict)     # model   -> count
+    retries: int = 0
+    circuit_rejections: int = 0
+    prompt_observations: int = 0
+    system_fingerprint_changes: int = 0
+    tool_fingerprint_changes: int = 0
+    stable_block_changes: int = 0
+    unexpected_cache_misses: int = 0
+    recent_prompt_cache: deque = field(default_factory=lambda: deque(maxlen=20))
 
     @property
     def avg_latency_ms(self) -> float:
@@ -355,6 +368,9 @@ class MetricsCollector:
         self._llm = LLMMetrics()
         self._deep_think = DeepThinkMetrics()
         self._reactor = ReactorMetrics()
+        # Last prompt fingerprints are bounded so a bot that sees many
+        # one-off DMs cannot grow telemetry memory forever.
+        self._prompt_fingerprints: OrderedDict[tuple, dict] = OrderedDict()
         self._lock = threading.RLock()
     
     def register_cache(self, name: str, cache: TTLCache):
@@ -437,6 +453,114 @@ class MetricsCollector:
             "llm_error",
             purpose=purpose, model=model, error_msg=(error_msg or "")[:200],
         )
+
+    def record_llm_retry(self, *, reason: str, purpose: str, model: str) -> None:
+        with self._lock:
+            self._llm.retries += 1
+        logger.info(
+            "LLM retry purpose=%s model=%s reason=%s",
+            purpose, model, reason,
+        )
+
+    def record_llm_circuit_rejection(self, *, purpose: str, model: str) -> None:
+        with self._lock:
+            self._llm.circuit_rejections += 1
+        logger.warning(
+            "LLM circuit rejected request purpose=%s model=%s",
+            purpose, model,
+        )
+
+    def record_prompt_cache_observation(
+        self,
+        manifest: dict,
+        *,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
+        latency_ms: float = 0.0,
+    ) -> dict:
+        """Compare one privacy-safe prompt fingerprint with its predecessor."""
+
+        key = (
+            manifest.get("context_id"),
+            manifest.get("bot_id"),
+            manifest.get("purpose"),
+        )
+        with self._lock:
+            previous = self._prompt_fingerprints.get(key)
+            system_changed = bool(
+                previous
+                and previous.get("system_hash") != manifest.get("system_hash")
+            )
+            tools_changed = bool(
+                previous
+                and previous.get("tools_hash") != manifest.get("tools_hash")
+            )
+            stable_changed: list[str] = []
+            if previous:
+                old_blocks = {
+                    row.get("name"): row.get("hash")
+                    for row in previous.get("stable_blocks", [])
+                }
+                new_blocks = {
+                    row.get("name"): row.get("hash")
+                    for row in manifest.get("stable_blocks", [])
+                }
+                stable_changed = sorted(
+                    name for name in (old_blocks.keys() | new_blocks.keys())
+                    if old_blocks.get(name) != new_blocks.get(name)
+                )
+
+            unexpected_miss = bool(
+                previous
+                and not system_changed
+                and not tools_changed
+                and int(cache_hit_tokens or 0) == 0
+                and int(cache_miss_tokens or 0) >= 1024
+            )
+            event = {
+                "ts": time.time(),
+                "context_id": manifest.get("context_id"),
+                "bot_id": manifest.get("bot_id"),
+                "purpose": manifest.get("purpose"),
+                "system_hash": str(manifest.get("system_hash") or "")[:12],
+                "tools_hash": str(manifest.get("tools_hash") or "")[:12],
+                "system_changed": system_changed,
+                "tools_changed": tools_changed,
+                "stable_changed": stable_changed,
+                "unexpected_miss": unexpected_miss,
+                "cache_hit_tokens": int(cache_hit_tokens or 0),
+                "cache_miss_tokens": int(cache_miss_tokens or 0),
+                "latency_ms": int(latency_ms or 0),
+                "system_chars": int(manifest.get("system_chars") or 0),
+                "tool_schema_chars": int(manifest.get("tool_schema_chars") or 0),
+                "tool_count": int(manifest.get("tool_count") or 0),
+            }
+            m = self._llm
+            m.prompt_observations += 1
+            m.system_fingerprint_changes += int(system_changed)
+            m.tool_fingerprint_changes += int(tools_changed)
+            m.stable_block_changes += len(stable_changed)
+            m.unexpected_cache_misses += int(unexpected_miss)
+            m.recent_prompt_cache.appendleft(event)
+            self._prompt_fingerprints[key] = manifest
+            self._prompt_fingerprints.move_to_end(key)
+            while len(self._prompt_fingerprints) > 256:
+                self._prompt_fingerprints.popitem(last=False)
+
+        if stable_changed:
+            logger.warning(
+                "Stable prompt blocks changed context=%s bot=%s: %s",
+                manifest.get("context_id"), manifest.get("bot_id"),
+                ", ".join(stable_changed),
+            )
+        if unexpected_miss:
+            logger.warning(
+                "Prompt cache miss with unchanged system/tools context=%s "
+                "bot=%s miss_tokens=%s",
+                manifest.get("context_id"), manifest.get("bot_id"),
+                cache_miss_tokens,
+            )
+        return event
 
     # ── Deep think metrics ────────────────────────────────────────────
 
@@ -566,12 +690,23 @@ class MetricsCollector:
                     ),
                     "tokens_in": llm.tokens_in,
                     "tokens_out": llm.tokens_out,
+                    "cache_hit_tokens": llm.cache_hit_tokens,
+                    "cache_miss_tokens": llm.cache_miss_tokens,
+                    "cache_hit_ratio": llm.cache_hit_ratio,
                     "avg_latency_ms": f"{llm.avg_latency_ms:.0f}",
                     "last_call_at": llm.last_call_at,
                     "last_error_at": llm.last_error_at,
                     "last_error_msg": llm.last_error_msg,
                     "by_purpose": dict(llm.by_purpose),
                     "by_model": dict(llm.by_model),
+                    "retries": llm.retries,
+                    "circuit_rejections": llm.circuit_rejections,
+                    "prompt_observations": llm.prompt_observations,
+                    "system_fingerprint_changes": llm.system_fingerprint_changes,
+                    "tool_fingerprint_changes": llm.tool_fingerprint_changes,
+                    "stable_block_changes": llm.stable_block_changes,
+                    "unexpected_cache_misses": llm.unexpected_cache_misses,
+                    "recent_prompt_cache": list(llm.recent_prompt_cache),
                 },
                 "reactor": {
                     "evaluations": self._reactor.evaluations,
@@ -594,6 +729,9 @@ class MetricsCollector:
                     ),
                     "tokens_in": self._deep_think.tokens_in,
                     "tokens_out": self._deep_think.tokens_out,
+                    "cache_hit_tokens": self._deep_think.cache_hit_tokens,
+                    "cache_miss_tokens": self._deep_think.cache_miss_tokens,
+                    "cache_hit_ratio": self._deep_think.cache_hit_ratio,
                     "avg_latency_ms": f"{self._deep_think.avg_latency_ms:.0f}",
                     "last_call_at": self._deep_think.last_call_at,
                     "last_error_at": self._deep_think.last_error_at,

@@ -198,7 +198,7 @@ def _mcp_tool(server, name):
     )
 
 
-def test_writer_sends_only_allowlisted_mcp_servers_in_stable_order():
+def test_writer_sends_stable_mcp_broker_for_nonempty_allowlist():
     probe = _probe()
     probe.mcp_manager = FakeMCPManager([
         _mcp_tool("blocked", "zeta"),
@@ -215,12 +215,12 @@ def test_writer_sends_only_allowlisted_mcp_servers_in_stable_order():
 
     tools = probe._collect_tools(policy=policy)
     assert [t["function"]["name"] for t in tools] == [
-        "web__alpha",
-        "web__zeta",
+        "mcp__discover",
+        "mcp__invoke",
     ]
 
 
-def test_deep_think_uses_same_mcp_allowlist_and_order():
+def test_deep_think_uses_same_stable_mcp_broker():
     client = DeepThinkClient.__new__(DeepThinkClient)
     client.bot_tools = None
     client.mcp_manager = FakeMCPManager([
@@ -238,8 +238,8 @@ def test_deep_think_uses_same_mcp_allowlist_and_order():
 
     tools = client._collect_tools(policy=policy)
     assert [t["function"]["name"] for t in tools] == [
-        "web__alpha",
-        "web__zeta",
+        "mcp__discover",
+        "mcp__invoke",
     ]
 
 
@@ -252,7 +252,7 @@ def test_research_mode_gates_on_deep_think_enabled():
     guard against the predicate silently losing the gate.
     """
     import src.commands.ask_command as ask_mod
-    src_text = open(ask_mod.__file__).read()
+    src_text = open(ask_mod.__file__, encoding="utf-8").read()
     # Walk the predicate by paren-balance instead of first ")", which
     # would stop inside getattr(ctx.bot, "deep_think_mode", ...).
     start = src_text.find("use_research_mode = (")
@@ -277,5 +277,5 @@ def test_dispatch_rejects_call_when_bot_flag_off():
     """Defense-in-depth: even if a stale schema leaks through, the tool
     dispatcher rejects deep_think calls when the bot has it disabled."""
     import src.commands.ask_command as ask_mod
-    src_text = open(ask_mod.__file__).read()
+    src_text = open(ask_mod.__file__, encoding="utf-8").read()
     assert "deep_think unavailable: disabled for this bot" in src_text

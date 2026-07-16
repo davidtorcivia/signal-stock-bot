@@ -12,6 +12,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -24,6 +25,8 @@ from ..bots.settings import (
     resolve_stripped,
 )
 from ..cache import get_metrics
+from .prompt_cache import PromptCachePlan, automatic_cache_plan
+from .resilience import LLMHTTPFailure, resilient_chat_post
 from .transcript import (
     LOGGED_PURPOSES,
     build_record,
@@ -289,6 +292,7 @@ class LLMClient:
         overrides: Optional[dict] = None,
         suppress_response_style: bool = False,
         purpose: str = "ask",
+        cache_plan: Optional[PromptCachePlan] = None,
     ) -> dict:
         """Send a full messages array and return the assistant message dict.
 
@@ -320,6 +324,7 @@ class LLMClient:
         messages = _inject_current_time(list(messages))
         messages = _ensure_reasoning_content(messages)
 
+        style = ""
         if not suppress_response_style:
             # Always append the configured response style — last in the system
             # prompt so it has recency-bias weight against any per-context
@@ -396,7 +401,6 @@ class LLMClient:
             "Content-Type": "application/json",
         }
         url = f"{cfg['base_url']}/chat/completions"
-        timeout = aiohttp.ClientTimeout(total=cfg["timeout"], connect=10)
 
         # One-line summary of the outbound payload's shape — specifically:
         # whether any user message uses the OpenAI multimodal parts array.
@@ -407,59 +411,57 @@ class LLMClient:
 
         metrics = get_metrics()
         started = time.time()
-
-        # aiohttp's ClientTimeout doesn't reliably fire on slow-trickle
-        # connections (e.g. OpenRouter holding a TCP socket open while a
-        # thinking model deliberates server-side), so we belt-and-braces it
-        # with an asyncio.wait_for at +5s past the configured timeout.
         session = await self._get_session()
 
-        async def _do_call():
-            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-                body = await resp.text()
-                if resp.status == 401:
-                    raise LLMError("LLM rejected the API key (401).")
-                if resp.status == 429:
-                    raise LLMError("LLM rate-limited (429). Try again in a moment.")
-                if resp.status >= 400:
-                    # Truncate body — upstream errors can be verbose
-                    snippet = body[:200].replace("\n", " ")
-                    raise LLMError(f"LLM HTTP {resp.status}: {snippet}")
-                return await resp.json(content_type=None)
+        # Snapshot the ACTUAL rendered request after time/style injection.
+        # Copy the caller's declarations so repeated tool rounds cannot append
+        # response_style to the same plan over and over.
+        declared = cache_plan or automatic_cache_plan(messages)
+        runtime_plan = PromptCachePlan(
+            stable_blocks=list(declared.stable_blocks),
+            volatile_blocks=list(declared.volatile_blocks),
+        )
+        if style and cache_plan is not None:
+            runtime_plan.with_stable("response_style", style)
+        active = get_active_transcript_context()
+        cache_manifest = runtime_plan.snapshot(
+            messages,
+            tools,
+            purpose=purpose,
+            context_id=(active.context_id if active is not None else None),
+            bot_id=(active.bot_id if active is not None else self.bot_id),
+        )
 
-        # Backstop tracks the configured timeout instead of a constant:
-        # aiohttp's total= should fire first on a normal slow request; this
-        # only kicks in for the pathological slow-trickle case where
-        # aiohttp's timer never trips. It was once hardcoded to 120s —
-        # which silently capped every bot the moment admins configured
-        # timeout_seconds above it (Artaud's 600s writer hit it in Woo,
-        # 2026-06-12).
+        # Retries and pinned-provider fallback share this one deadline. This
+        # retains the slow-trickle backstop without multiplying the configured
+        # timeout by the number of attempts.
         hard_timeout = cfg["timeout"] + 15
+        host = urlparse(cfg["base_url"]).netloc or cfg["base_url"]
+        provider_metrics = metrics.get_provider_metrics(
+            f"llm:{host}:{effective_model}"
+        )
+
+        def _on_retry(reason: str, attempt: int, delay: float) -> None:
+            metrics.record_llm_retry(
+                reason=reason, purpose=purpose, model=effective_model,
+            )
+            logger.warning(
+                "LLM retry reason=%s after_attempt=%s delay=%.2fs",
+                reason, attempt, delay,
+            )
+
         try:
-            try:
-                data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
-            except LLMError as e:
-                # Provider-pinned routing (provider.order +
-                # allow_fallbacks=false) turns any upstream wobble into a
-                # hard failure: when the pinned provider returns 402/5xx
-                # ("Provider returned error" — e.g. DeepSeek first-party
-                # answering "Insufficient Balance" on 2026-06-10),
-                # OpenRouter is forbidden from failing over to another
-                # host of the same model. Retry ONCE with the pin removed
-                # so the chat degrades to a slower provider instead of
-                # erroring out.
-                if not _should_retry_without_pin(payload, str(e)):
-                    raise
-                metrics.record_llm_error(
-                    purpose=purpose, model=effective_model,
-                    error_msg=f"pinned provider failed, retrying unpinned: {e}",
-                )
-                logger.warning(
-                    f"LLM pinned-provider call failed ({e}); "
-                    f"retrying once without provider pin"
-                )
-                payload.pop("provider", None)
-                data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
+            data = await resilient_chat_post(
+                session=session,
+                url=url,
+                payload=payload,
+                headers=headers,
+                request_timeout=cfg["timeout"],
+                hard_timeout=hard_timeout,
+                provider_metrics=provider_metrics,
+                should_retry_unpinned=_should_retry_without_pin,
+                on_retry=_on_retry,
+            )
         except asyncio.TimeoutError as e:
             metrics.record_llm_error(
                 purpose=purpose, model=effective_model,
@@ -469,11 +471,31 @@ class LLMClient:
                 f"LLM exceeded hard timeout ({hard_timeout}s) — likely the "
                 f"model is thinking too long for the configured budget."
             ) from e
+        except LLMHTTPFailure as e:
+            if e.status == 401:
+                message = "LLM rejected the API key (401)."
+            elif e.status == 429:
+                message = "LLM rate-limited after bounded retries (429)."
+            else:
+                message = str(e)
+            metrics.record_llm_error(
+                purpose=purpose, model=effective_model, error_msg=message,
+            )
+            raise LLMError(message) from e
         except aiohttp.ClientError as e:
             metrics.record_llm_error(
                 purpose=purpose, model=effective_model, error_msg=str(e),
             )
             raise LLMError(f"Network error: {e}") from e
+        except RuntimeError as e:
+            if "circuit is open" in str(e):
+                metrics.record_llm_circuit_rejection(
+                    purpose=purpose, model=effective_model,
+                )
+            metrics.record_llm_error(
+                purpose=purpose, model=effective_model, error_msg=str(e),
+            )
+            raise LLMError(str(e)) from e
         except LLMError as e:
             metrics.record_llm_error(
                 purpose=purpose, model=effective_model, error_msg=str(e),
@@ -498,6 +520,12 @@ class LLMClient:
                 cache_hit_tokens=cache_hit,
                 cache_miss_tokens=cache_miss,
             )
+            cache_event = metrics.record_prompt_cache_observation(
+                cache_manifest,
+                cache_hit_tokens=cache_hit,
+                cache_miss_tokens=cache_miss,
+                latency_ms=latency_ms,
+            )
             # Per-context transcript capture. Only writer rounds (ask /
             # augment) — reactor/summary/healthcheck are intentionally
             # excluded. Fire-and-forget background task so the write
@@ -511,6 +539,8 @@ class LLMClient:
                 payload=payload,
                 latency_ms=latency_ms,
                 usage=usage,
+                cache_manifest=cache_manifest,
+                cache_event=cache_event,
             )
             return msg
         except (KeyError, IndexError, AttributeError, TypeError) as e:
@@ -532,6 +562,8 @@ class LLMClient:
         payload: dict,
         latency_ms: float,
         usage: dict,
+        cache_manifest: dict,
+        cache_event: dict,
     ) -> None:
         """Append the round to this context's JSONL — if logging is on.
 
@@ -571,6 +603,8 @@ class LLMClient:
             sender_tail=active.sender_tail,
             group_id=active.group_id,
             usage=usage,
+            cache_manifest=cache_manifest,
+            cache_event=cache_event,
         )
         try:
             asyncio.create_task(

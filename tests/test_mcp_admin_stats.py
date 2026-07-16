@@ -1,11 +1,13 @@
-"""Context-admin MCP payload accounting."""
+"""Context-admin MCP payload and catalog accounting."""
 
 import json
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-from src.admin.blueprint import _mcp_tool_stats
+from src.admin.blueprint import _mcp_tool_stats, _tool_payload_stats
+from src.contexts.policy import ContextPolicy, MODE_ALLOW_LIST
+from src.llm.mcp_broker import MCP_BROKER_TOOLS
 from src.mcp_integration import MCPTool
 
 
@@ -58,3 +60,29 @@ def test_context_editor_template_compiles():
     templates = Path(__file__).parents[1] / "src" / "admin" / "templates"
     env = Environment(loader=FileSystemLoader(str(templates)))
     env.get_template("context_edit.html")
+
+
+def test_total_payload_stats_include_native_and_compact_broker():
+    native = {
+        "type": "function",
+        "function": {
+            "name": "bot__price",
+            "description": "Get price",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    class _Ask:
+        def _collect_tools(self, policy=None, bot=None):
+            return [native, *MCP_BROKER_TOOLS]
+
+    policy = ContextPolicy(
+        id=1, kind="group", key="g",
+        mcp_mode=MODE_ALLOW_LIST, mcp_servers=["web"],
+    )
+    stats = _tool_payload_stats(_Ask(), policy)
+    assert stats["native_tools"] == 1
+    assert stats["broker_tools"] == 2
+    assert stats["total_tools"] == 3
+    assert stats["total_chars"] == stats["native_chars"] + stats["broker_chars"]
+    assert stats["broker_available_chars"] == stats["broker_chars"]

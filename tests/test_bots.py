@@ -468,7 +468,7 @@ async def test_research_handoff_substitutes_notes_placeholder():
     ask.llm_factory = None
     captured = {}
 
-    async def chat(messages, tools=None):
+    async def chat(messages, tools=None, **kwargs):
         captured["messages"] = messages
         captured["tools"] = tools
         return {"role": "assistant", "content": "composed reply"}
@@ -493,9 +493,10 @@ async def test_research_handoff_substitutes_notes_placeholder():
         attachments=[], user_hash="abc",
     )
     assert answer == "composed reply"
-    sys_msg = captured["messages"][0]["content"]
-    assert "RESEARCH FINDINGS" in sys_msg
-    assert "Compose." in sys_msg
+    assert captured["messages"][0]["content"] == "base"
+    user_msg = captured["messages"][-1]["content"]
+    assert "RESEARCH FINDINGS" in user_msg
+    assert "Compose." in user_msg
     assert captured["tools"] is None  # no tools in research mode
 
 

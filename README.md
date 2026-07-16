@@ -499,7 +499,7 @@ Configure once at `/admin/llm`. All values apply live — no restart.
 | Conversation turns kept per user | Rolling window depth for `!ask` history |
 | Retention days | Auto-purge for both conversation history and group message logs |
 | Max tool-call rounds | Hard ceiling on chained tool calls per `!ask` (default 25). On cap-hit, the bot returns an honest "task incomplete" error with the tool sequence — never fabricates a summary from partial work |
-| Group chat context messages | When `!ask` runs in a group, inject this many recent messages from that group into the system prompt. `0` disables both context injection and group-message recording |
+| Group chat context messages | When `!ask` runs in a group, add this many recent messages to the volatile user tail. `0` disables both context injection and group-message recording |
 | Augment these commands | Comma-separated list (e.g. `ta, tldr, earnings, news, economy, rating`). When a listed command succeeds, the LLM appends a brief plain-language interpretation. Respects per-context policy |
 | Augmentation prompt | Instruction template for augmentation calls |
 | Ask command alias | Adds an extra alias for `!ask` (the canonical name always works too) |
@@ -518,18 +518,24 @@ Deep-think gets its own block with separate base URL / API key / model / tempera
 - Per-context conversation history. In groups, user turns prefix `[Name, time ago]` (or `[...4137, time ago]` for unregistered users) and the bot's own past replies prefix `[to Name, time ago]` so question/answer pairing across speakers is unambiguous
 - Optional `<group_context>` block — last N inbound messages (configurable per chat) plus the bot's own posts back into the chat, time-ordered with the same bracket attribution
 - All bot commands the context allows, as `bot__<name>` tools
-- All MCP tools the context allows, as `<server>__<tool>` tools
+- A fixed MCP broker pair: `mcp__discover` searches the allowed catalog and returns a small set of detailed schemas; `mcp__invoke` runs one exact discovered tool
 - Tweet URLs in the user's question are auto-expanded to `[@handle] tweet text` before sending
-- Conditional system-suffix injections, gated on per-context state:
+- Stable system-prefix blocks, gated on bot and context configuration:
   - **`<attribution_rules>`** — multi-speaker rules: `[Name]` and `[to Name]` brackets are internal metadata only; never echoed into visible replies (a regex-based stripper enforces this on the way out, just in case)
-  - **`<context_memories>`** — auto-injected memory preamble for the active speaker, the room, and any names mentioned in the message (no `recall` tool call needed for in-frame subjects)
-  - **`<conversation_memory>`** — long-running rolling summary when conversation history gets long
-  - **`<reactor_reflex>` + recent-reactions log** — when reactor is enabled, so the model can answer "why did you react with X?" honestly
+  - **`<reactor_reflex>`** — stable ownership and interpretation rules for the reaction log
   - **`<tarot_tool>` / `<iching_tool>`** — force-route divination through the actual rendering tools rather than fabricating cards in text
   - **`<deep_think_tool>`** — when the deep client is wired and the context allows it
-  - **`<python_tool>`** — when the Pyodide MCP is up: tells Sigil it has a real Python interpreter with numpy/pandas/scipy/yfinance/statsmodels, when to use it, and to set a 30s timeout for non-trivial work
+  - **`<mcp_broker>` / `<python_tool>`** — discovery/invocation rules, plus Pyodide runtime guidance when that server is available
+- Volatile user-tail blocks, rebuilt for the current turn:
+  - **`<group_context>` / `<recent_reactions>`** — recent chat and reflex state
+  - **`<context_memories>`** — recalled facts for the active speaker, room, and named subjects
+  - **`<conversation_memory>` / `<conversation_status>`** — rolling summary and staleness advisory
   - **`<spontaneous_reply>`** — when the reactor's `should_respond` flagged this message; instructs the writer to bail to empty content if a real reply isn't warranted
-  - **Identity / staleness notes** — e.g. "real names are now available, disregard older turns where you claimed not to know them"
+  - **`<deep_think_trigger>` / `<research_handoff>`** — current-turn delegation pressure and returned research notes
+
+Every writer and deep-think round records SHA-256 fingerprints for the rendered system prefix and tool payload, named stable/volatile block hashes, serialized sizes, and provider cache usage. Prompt text stays out of this telemetry. The admin dashboard flags stable-block changes and large cache misses where the system/tool fingerprints remained unchanged.
+
+Tool calls are idempotent within one model invocation. Repeated call IDs and repeated canonical name/argument pairs reuse the first result, preventing duplicate portfolio orders, prediction writes, memory changes, and MCP side effects. HTTP completion calls retry transient `408`/`425`/`429`/`5xx` responses and connection failures twice, honor `Retry-After` up to five seconds, share one end-to-end deadline, and open a 60-second circuit after five consecutive transient failures.
 
 ### Memory tools
 
@@ -719,16 +725,16 @@ Two protected default rows always exist:
 
 | Mode | Behavior |
 |------|----------|
-| Allow all | No restriction. For MCP, every schema from every running server is sent. |
+| Allow all | No restriction. The broker can discover tools from every running MCP server. |
 | Allow only selected | Whitelist |
 | Block selected | Blacklist (use this to hide just `corn` etc. without re-enabling everything else) |
 
-Gating is by canonical command name, so allowing `price` automatically allows `!p`, `!pr`, `$`. Bot tools and MCP tools exposed to the LLM are filtered through the same policy — disallowed tools simply don't appear in the LLM's tool list.
+Gating is by canonical command name, so allowing `price` automatically allows `!p`, `!pr`, `$`. Bot tools are filtered before the request is built. MCP discovery and invocation enforce the same server policy at call time.
 
-New and auto-registered contexts start with an empty MCP allow-list. This keeps
-large server schemas out of the writer prompt until an admin selects them.
-Existing contexts retain their stored access mode. The context editor shows the
-effective live tool count and serialized schema size; selections are ignored
+New and auto-registered contexts start with an empty MCP allow-list. Existing
+contexts retain their stored access mode. The context editor separates the
+schemas charged on every writer round (native tools plus the fixed broker) from
+the detailed MCP catalog loaded after discovery. Server selections are ignored
 when the mode is **Allow all servers**.
 
 ---

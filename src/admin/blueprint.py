@@ -25,6 +25,11 @@ from .events import get_bus
 from ..contexts.policy import MODE_ALLOW_ALL, MODE_ALLOW_LIST, MODE_DENY_LIST, MODES
 from ..mcp_integration import MCPManager, MCPRegistry, MCPServerConfig
 from ..mcp_integration.models import TRANSPORTS
+from ..llm.mcp_broker import (
+    MCP_BROKER_TOOLS,
+    MCP_DISCOVER_NAME,
+    MCP_INVOKE_NAME,
+)
 from ..settings_store import ALLOWED_KEYS, LIVE_KEYS, RESTART_KEYS, SettingsStore
 from .auth import (
     SESSION_LIFETIME_SECONDS,
@@ -65,6 +70,7 @@ def create_admin_blueprint(
     reactor=None,
     signal_pool=None,
     daily_oracle=None,
+    ask_command=None,
 ) -> Blueprint:
     """Build the admin blueprint and register it on `app`."""
     bp = Blueprint(
@@ -134,6 +140,7 @@ def create_admin_blueprint(
             group_log=group_log,
             reactor=reactor,
             daily_oracle=daily_oracle,
+            ask_command=ask_command,
         )
 
     if name_registry is not None:
@@ -265,10 +272,21 @@ def _register_dashboard_routes(
                 # existing template reads (llm/deep_think/reactor) — keeps
                 # the template diff minimal and the cumulative-since-boot
                 # numbers still available under the *_lifetime keys.
-                metrics["llm_lifetime"] = metrics.get("llm")
+                runtime_llm = metrics.get("llm") or {}
+                metrics["llm_lifetime"] = runtime_llm
                 metrics["deep_think_lifetime"] = metrics.get("deep_think")
                 metrics["reactor_lifetime"] = metrics.get("reactor")
                 metrics["llm"] = windowed["llm"]
+                # Prompt fingerprints are deliberately in-memory and
+                # privacy-safe. Preserve them when windowed counters replace
+                # the lifetime LLM aggregate.
+                for key in (
+                    "retries", "circuit_rejections", "prompt_observations",
+                    "system_fingerprint_changes", "tool_fingerprint_changes",
+                    "stable_block_changes", "unexpected_cache_misses",
+                    "recent_prompt_cache",
+                ):
+                    metrics["llm"][key] = runtime_llm.get(key)
                 metrics["deep_think"] = windowed["deep_think"]
                 metrics["reactor"] = windowed["reactor"]
                 metrics["window_request_count"] = windowed["request_count"]
@@ -1455,6 +1473,7 @@ def _register_context_routes(
     group_log=None,
     reactor=None,
     daily_oracle=None,
+    ask_command=None,
 ) -> None:
     """Context CRUD + (when memory_store is wired) memory CRUD nested under
     each context. Memory routes are mounted unconditionally so the template
@@ -1516,6 +1535,8 @@ def _register_context_routes(
 
         all_commands, all_servers = _available_commands_and_servers(dispatcher, mcp_registry, loop)
         mcp_tool_stats = _mcp_tool_stats(mcp_manager)
+        preview_policy = _preview_policy(values)
+        tool_payload_stats = _tool_payload_stats(ask_command, preview_policy)
         return render_template(
             "context_edit.html",
             is_new=True,
@@ -1525,6 +1546,7 @@ def _register_context_routes(
             all_commands=all_commands,
             all_servers=all_servers,
             mcp_tool_stats=mcp_tool_stats,
+            tool_payload_stats=tool_payload_stats,
             all_bots=_bots_for_template(),
             error=error,
         )
@@ -1581,6 +1603,11 @@ def _register_context_routes(
 
         all_commands, all_servers = _available_commands_and_servers(dispatcher, mcp_registry, loop)
         mcp_tool_stats = _mcp_tool_stats(mcp_manager)
+        preview_policy = (
+            _preview_policy(values, existing_id=context_id)
+            if request.method == "POST" else policy
+        )
+        tool_payload_stats = _tool_payload_stats(ask_command, preview_policy)
 
         # Per-context oracles. Only group contexts can have them; for
         # default/dm rows we still pass an empty list so the template
@@ -1618,6 +1645,7 @@ def _register_context_routes(
             all_commands=all_commands,
             all_servers=all_servers,
             mcp_tool_stats=mcp_tool_stats,
+            tool_payload_stats=tool_payload_stats,
             all_bots=_bots_for_template(),
             oracles=oracles_view,
             oracle_kinds=_ORACLE_KIND_OPTIONS,
@@ -2386,13 +2414,11 @@ def _available_commands_and_servers(dispatcher, mcp_registry, loop):
 
 
 def _mcp_tool_stats(mcp_manager: Optional[MCPManager]) -> dict[str, dict[str, int]]:
-    """Return the live schema footprint grouped by MCP server.
+    """Return the live detailed catalog footprint grouped by MCP server.
 
-    Context policy filters whole servers, while the provider bills the JSON
-    schema for every tool on an allowed server. Showing only a server name hid
-    the important distinction between a one-tool server and, for example, an
-    astrology server with twenty large schemas. This helper uses the exact
-    OpenAI payload representation emitted by the harness.
+    These schemas are loaded through discovery rather than billed on every
+    writer call. Their size still matters because a broad discovery result can
+    make a later tool round expensive.
     """
     stats: dict[str, dict[str, int]] = {}
     if mcp_manager is None:
@@ -2418,6 +2444,73 @@ def _mcp_tool_stats(mcp_manager: Optional[MCPManager]) -> dict[str, dict[str, in
             # page should still render and show its tool count.
             pass
     return stats
+
+
+def _preview_policy(values: dict, *, existing_id: Optional[int] = 1) -> ContextPolicy:
+    """Build the policy shape used for the context editor's tool preview."""
+
+    return ContextPolicy(
+        id=existing_id,
+        kind=str(values.get("kind") or "group"),
+        key=str(values.get("key") or "__preview__"),
+        command_mode=str(values.get("command_mode") or MODE_ALLOW_ALL),
+        commands=list(values.get("commands") or []),
+        mcp_mode=str(values.get("mcp_mode") or MODE_ALLOW_LIST),
+        mcp_servers=list(values.get("mcp_servers") or []),
+        deep_think_enabled=bool(values.get("deep_think_enabled", True)),
+        memory_writes_enabled=bool(values.get("memory_writes_enabled", True)),
+    )
+
+
+def _tool_payload_stats(ask_command, policy: ContextPolicy) -> dict[str, int]:
+    """Exact schema footprint sent by the writer for one saved policy.
+
+    MCP catalog schemas are deliberately absent: only the stable broker pair
+    is sent. The separate per-server stats show how much schema can be loaded
+    later through discovery without charging every turn.
+    """
+
+    out = {
+        "native_tools": 0,
+        "native_chars": 0,
+        "broker_tools": 0,
+        "broker_chars": 0,
+        "broker_available_tools": 0,
+        "broker_available_chars": 0,
+        "total_tools": 0,
+        "total_chars": 0,
+    }
+    if ask_command is None:
+        return out
+    out["broker_available_tools"] = len(MCP_BROKER_TOOLS)
+    out["broker_available_chars"] = sum(
+        len(json.dumps(
+            schema, ensure_ascii=False, separators=(",", ":"),
+        ))
+        for schema in MCP_BROKER_TOOLS
+    )
+    try:
+        schemas = ask_command._collect_tools(policy=policy, bot=None) or []
+    except Exception as e:
+        logger.debug(f"Writer tool payload stats unavailable: {e}")
+        return out
+    for schema in schemas:
+        name = str((schema.get("function") or {}).get("name") or "")
+        try:
+            chars = len(json.dumps(
+                schema, ensure_ascii=False, separators=(",", ":"),
+            ))
+        except (TypeError, ValueError):
+            chars = 0
+        if name in (MCP_DISCOVER_NAME, MCP_INVOKE_NAME):
+            out["broker_tools"] += 1
+            out["broker_chars"] += chars
+        else:
+            out["native_tools"] += 1
+            out["native_chars"] += chars
+    out["total_tools"] = out["native_tools"] + out["broker_tools"]
+    out["total_chars"] = out["native_chars"] + out["broker_chars"]
+    return out
 
 
 def _form_to_values(form) -> dict:

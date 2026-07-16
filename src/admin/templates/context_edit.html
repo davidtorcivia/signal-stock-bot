@@ -66,19 +66,35 @@
         </select>
 
         <div id="mcp-schema-summary"
+             data-native-tools="{{ tool_payload_stats.get('native_tools', 0) }}"
+             data-native-chars="{{ tool_payload_stats.get('native_chars', 0) }}"
+             data-broker-tools="{{ tool_payload_stats.get('broker_available_tools', 0) }}"
+             data-broker-chars="{{ tool_payload_stats.get('broker_available_chars', 0) }}"
              style="margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:4px;background:#0b0d10;font-size:12px;color:var(--text);">
-            Effective payload: <strong id="mcp-effective-tools">0 tool schemas</strong>,
-            <strong id="mcp-effective-size">0 JSON characters</strong>
-            <span class="muted" id="mcp-effective-tokens"></span>
+            Sent on every writer round:
+            <strong id="tool-effective-tools">{{ tool_payload_stats.get('total_tools', 0) }} tool schemas</strong>,
+            <strong id="tool-effective-size">{{ '{:,}'.format(tool_payload_stats.get('total_chars', 0)) }} JSON characters</strong>
+            <span class="muted" id="tool-effective-tokens"></span>
+            <br>
+            <span class="muted" id="tool-effective-breakdown">
+                {{ tool_payload_stats.get('native_tools', 0) }} native +
+                {{ tool_payload_stats.get('broker_tools', 0) }} MCP broker
+            </span>
+            <br>
+            Available behind the broker:
+            <strong id="mcp-catalog-tools">0 MCP tools</strong>,
+            <strong id="mcp-catalog-size">0 catalog characters</strong>
+            <span class="muted">(loaded only after discovery)</span>
         </div>
         <p id="mcp-allow-all-warning" class="muted"
            style="font-size:11px;margin-top:5px;color:var(--warn,#d9a441);display:none;">
-            “Allow all servers” sends every tool from every running MCP server.
-            The selections below have no effect in this mode.
+            “Allow all servers” lets the broker discover every tool from every
+            running MCP server. The selections below have no effect in this mode.
         </p>
         <p class="muted" style="font-size:11px;margin-top:5px;">
-            Keep this list stable for the chat. Changing schemas between turns can
-            invalidate the provider's prompt cache.
+            Once MCP access is enabled, the writer receives the same compact
+            broker pair. Changing servers alters capability while the broker
+            payload stays fixed.
         </p>
 
         {% if all_servers %}
@@ -591,34 +607,52 @@
     });
   }
 
-  // Show the exact live MCP schema footprint for the access rule being edited.
-  // The token figure is deliberately labeled approximate: providers tokenize
-  // function schemas differently, while character count is exact.
+  // Show both layers: the fixed writer payload (native schemas + a stable
+  // two-tool MCP broker) and the detailed catalog available after discovery.
   (function () {
     var mode = document.getElementById('mcp_mode');
-    var toolOut = document.getElementById('mcp-effective-tools');
-    var sizeOut = document.getElementById('mcp-effective-size');
-    var tokenOut = document.getElementById('mcp-effective-tokens');
+    var summary = document.getElementById('mcp-schema-summary');
+    var toolOut = document.getElementById('tool-effective-tools');
+    var sizeOut = document.getElementById('tool-effective-size');
+    var tokenOut = document.getElementById('tool-effective-tokens');
+    var breakdown = document.getElementById('tool-effective-breakdown');
+    var catalogToolsOut = document.getElementById('mcp-catalog-tools');
+    var catalogSizeOut = document.getElementById('mcp-catalog-size');
     var warning = document.getElementById('mcp-allow-all-warning');
-    if (!mode || !toolOut || !sizeOut || !tokenOut || !warning) return;
+    if (!mode || !summary || !toolOut || !sizeOut || !tokenOut ||
+        !breakdown || !catalogToolsOut || !catalogSizeOut || !warning) return;
 
     var boxes = Array.from(document.querySelectorAll('input[name="mcp_servers"]'));
     function refreshMcpFootprint() {
-      var toolCount = 0;
-      var schemaChars = 0;
+      var catalogToolCount = 0;
+      var catalogChars = 0;
+      var selectedServers = 0;
       boxes.forEach(function (box) {
         var included = mode.value === 'allow_all' ||
           (mode.value === 'allow_list' && box.checked) ||
           (mode.value === 'deny_list' && !box.checked);
         if (!included) return;
-        toolCount += parseInt(box.dataset.toolCount || '0', 10);
-        schemaChars += parseInt(box.dataset.schemaChars || '0', 10);
+        selectedServers += 1;
+        catalogToolCount += parseInt(box.dataset.toolCount || '0', 10);
+        catalogChars += parseInt(box.dataset.schemaChars || '0', 10);
       });
+      var nativeTools = parseInt(summary.dataset.nativeTools || '0', 10);
+      var nativeChars = parseInt(summary.dataset.nativeChars || '0', 10);
+      var brokerAvailable = mode.value !== 'allow_list' || selectedServers > 0;
+      var brokerTools = brokerAvailable ? parseInt(summary.dataset.brokerTools || '0', 10) : 0;
+      var brokerChars = brokerAvailable ? parseInt(summary.dataset.brokerChars || '0', 10) : 0;
+      var toolCount = nativeTools + brokerTools;
+      var schemaChars = nativeChars + brokerChars;
       toolOut.textContent = toolCount.toLocaleString() +
         (toolCount === 1 ? ' tool schema' : ' tool schemas');
       sizeOut.textContent = schemaChars.toLocaleString() + ' JSON characters';
       tokenOut.textContent = '(roughly ' + Math.ceil(schemaChars / 3).toLocaleString() +
         ' prompt tokens)';
+      breakdown.textContent = nativeTools.toLocaleString() + ' native + ' +
+        brokerTools.toLocaleString() + ' MCP broker';
+      catalogToolsOut.textContent = catalogToolCount.toLocaleString() +
+        (catalogToolCount === 1 ? ' MCP tool' : ' MCP tools');
+      catalogSizeOut.textContent = catalogChars.toLocaleString() + ' catalog characters';
       warning.style.display = mode.value === 'allow_all' ? 'block' : 'none';
     }
     mode.addEventListener('change', refreshMcpFootprint);

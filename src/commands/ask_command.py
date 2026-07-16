@@ -3,7 +3,7 @@
 
 Flow per request:
   1. Build messages (system prompt + optional group-chat suffix + history + user).
-  2. If MCP servers expose tools, pass them to the LLM.
+  2. If policy permits MCP, pass the fixed discovery/invocation broker.
   3. Loop up to MAX_TOOL_ROUNDS: if the assistant returns tool_calls, run them
      through the MCP manager and feed the results back as tool messages.
   4. Persist the final user question + assistant answer to per-user history.
@@ -66,6 +66,16 @@ from ..llm import (
     format_history_timestamp,
 )
 from ..llm.client import DEFAULT_SYSTEM_PROMPT
+from ..llm.mcp_broker import (
+    MCP_BROKER_TOOLS,
+    MCP_DISCOVER_NAME,
+    MCP_INVOKE_NAME,
+    broker_should_be_exposed,
+    discover_mcp_tools,
+    invoke_mcp_tool,
+)
+from ..llm.prompt_cache import PromptCachePlan
+from ..llm.tool_runtime import ToolCallLedger
 from ..memory import (
     FORGET_TOOL,
     KINDS,
@@ -374,7 +384,7 @@ class AskCommand(BaseCommand):
         # Optional MemoryStore — when set, the writer LLM gets remember/
         # recall/forget tools (gated per-context via memory_writes_enabled)
         # and stored memories about active speakers in the chat are
-        # auto-injected into the system suffix.
+        # auto-injected into the volatile user tail.
         self.memory_store = memory_store
         # Optional PredictionStore — when set and the per-context policy
         # allows the !predict command, the writer LLM gets a `predict_self`
@@ -420,7 +430,7 @@ class AskCommand(BaseCommand):
         self.name_registry = name_registry
         # Optional rolling-summary writer. When set, each successful !ask
         # fires a fire-and-forget call that may (re)compress older turns
-        # into a paragraph injected into future system prompts.
+        # into a paragraph injected into future user-tail context.
         self.summarizer = summarizer
         # Optional reactor — used here only as a read-only source for the
         # in-memory log of recent reactions, so the writing LLM can answer
@@ -730,11 +740,11 @@ class AskCommand(BaseCommand):
         schemas: list[dict] = []
         if self.bot_tools is not None:
             schemas.extend(self.bot_tools.list_tools(policy=policy))
-        if self.mcp_manager is not None:
-            mcp_tools = self.mcp_manager.all_tools()
-            if policy is not None:
-                mcp_tools = [t for t in mcp_tools if policy.allows_mcp(t.server_name)]
-            schemas.extend(t.to_openai_tool() for t in mcp_tools)
+        # MCP uses a fixed two-schema broker. Detailed schemas are returned
+        # only by mcp__discover after the model identifies a need, avoiding a
+        # permanent multi-thousand-token catalog on every chat turn.
+        if broker_should_be_exposed(self.mcp_manager, policy):
+            schemas.extend(MCP_BROKER_TOOLS)
         # deep_think is exposed only when the client is wired AND the global
         # flag is on AND the per-context policy permits AND the per-bot
         # `deep_think_enabled` is True. The client returns "(unavailable)"
@@ -831,6 +841,7 @@ class AskCommand(BaseCommand):
         tools: Optional[list[dict]],
         caller_ctx: CommandContext,
         attachments: list,
+        cache_plan: Optional[PromptCachePlan] = None,
     ) -> str:
         """Drive the assistant/tool back-and-forth until we have final text.
 
@@ -850,13 +861,16 @@ class AskCommand(BaseCommand):
         llm = self._llm_for(caller_ctx)
         max_rounds = self._live_max_tool_rounds()
         tool_call_history: list[str] = []
+        ledger = ToolCallLedger()
 
         for round_idx in range(max_rounds):
             logger.info(
                 f"LLM round {round_idx + 1}/{max_rounds}: "
                 f"requesting completion ({len(messages)} msgs in context)"
             )
-            assistant_msg = await llm.chat_messages(messages, tools=tools)
+            assistant_msg = await llm.chat_messages(
+                messages, tools=tools, cache_plan=cache_plan,
+            )
             messages.append(assistant_msg)
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
@@ -871,6 +885,7 @@ class AskCommand(BaseCommand):
                 tool_call_history.append(fn_name)
                 await self._execute_tool_call(
                     call, messages, caller_ctx, attachments, tools=tools,
+                    ledger=ledger,
                 )
 
         # Cap hit — log the full sequence and return an honest error. We
@@ -911,6 +926,7 @@ class AskCommand(BaseCommand):
         messages: list[dict],
         attachments: list,
         user_hash: str,
+        cache_plan: Optional[PromptCachePlan] = None,
     ) -> str:
         """Two-LLM research-mode handoff: deep_think does the tool work
         and produces structured notes, then the writer composes the
@@ -923,8 +939,8 @@ class AskCommand(BaseCommand):
         # the factory means each invocation hits the bot's own clients.
         deep_think = self._deep_think_for(ctx)
         writer = self._llm_for(ctx)
-        # Defensive copy: we mutate `messages[0]` below (replacing the
-        # system message with one that includes the research notes).
+        # Defensive copy: we mutate the tail user message below when adding
+        # research notes.
         # If the caller passed a list it intends to reuse, mutating
         # in place would leak notes into a future call.
         messages = list(messages)
@@ -949,7 +965,9 @@ class AskCommand(BaseCommand):
             attachments=attachments,
         )
 
-        # Inject notes into the system message via a final sub-block.
+        # Inject notes into the volatile user tail. Research output changes on
+        # every request; putting it in the system message invalidated the whole
+        # provider prefix immediately before the final writer call.
         # The handoff prompt is per-bot (set in /admin/bots) so each
         # bot can phrase the handoff in its own voice; an empty value
         # falls back to the default scaffolding above.
@@ -969,20 +987,29 @@ class AskCommand(BaseCommand):
         except (KeyError, IndexError, ValueError):
             handoff_block = f"{handoff_template}\n\n{notes}"
 
-        # Prepend to the system message in-place. Using a system role
-        # (not user) keeps the writer's framing as "compose a reply"
-        # rather than "respond to the notes."
-        if messages and messages[0].get("role") == "system":
-            existing = (messages[0].get("content") or "").rstrip()
-            messages[0] = dict(messages[0])
-            messages[0]["content"] = (
-                f"{existing}\n\n{handoff_block}" if existing else handoff_block
-            )
+        rendered_handoff = _wrap_xml("research_handoff", handoff_block)
+        if messages and messages[-1].get("role") == "user":
+            messages[-1] = dict(messages[-1])
+            existing = messages[-1].get("content")
+            if isinstance(existing, list):
+                messages[-1]["content"] = list(existing) + [
+                    {"type": "text", "text": rendered_handoff}
+                ]
+            else:
+                current = str(existing or "").rstrip()
+                messages[-1]["content"] = (
+                    f"{current}\n\n{rendered_handoff}"
+                    if current else rendered_handoff
+                )
         else:
-            messages.insert(0, {"role": "system", "content": handoff_block})
+            messages.append({"role": "user", "content": rendered_handoff})
+        if cache_plan is not None:
+            cache_plan.with_volatile("research_handoff", rendered_handoff)
 
         # Single-shot: no tools. The writer's only job is to compose.
-        assistant_msg = await writer.chat_messages(messages, tools=None)
+        assistant_msg = await writer.chat_messages(
+            messages, tools=None, cache_plan=cache_plan,
+        )
         return (assistant_msg.get("content") or "").strip()
 
     async def _handle_predict_self_tool(
@@ -1979,6 +2006,7 @@ class AskCommand(BaseCommand):
         caller_ctx: CommandContext,
         attachments: list,
         tools: Optional[list[dict]] = None,
+        ledger: Optional[ToolCallLedger] = None,
     ) -> None:
         call_id = call.get("id") or ""
         fn = call.get("function") or {}
@@ -2019,6 +2047,30 @@ class AskCommand(BaseCommand):
                     f"conversational — no tool is needed. Respond to the "
                     f"user directly in your own voice."
                 )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": content,
+                })
+                return
+
+        if ledger is not None:
+            duplicate_reason, duplicate_content = ledger.lookup(
+                call_id=call_id, name=name, arguments=args,
+            )
+            if duplicate_reason is not None:
+                logger.warning(
+                    "Suppressing duplicate LLM tool call name=%s reason=%s",
+                    name, duplicate_reason,
+                )
+                if duplicate_reason == "duplicate_call_id_conflict":
+                    content = duplicate_content or "ERROR: duplicate tool call suppressed"
+                else:
+                    content = (
+                        f"(duplicate tool call suppressed: {duplicate_reason}; "
+                        f"reusing prior result)\n{duplicate_content or '(no result)'}"
+                    )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -2141,8 +2193,29 @@ class AskCommand(BaseCommand):
                 content = result.text if result else "(no result)"
                 if result and result.attachments:
                     attachments.extend(result.attachments)
+            elif name == MCP_DISCOVER_NAME:
+                content = discover_mcp_tools(
+                    self.mcp_manager,
+                    caller_ctx.policy,
+                    query=str(args.get("query") or ""),
+                    server=str(args.get("server") or ""),
+                    limit=args.get("limit", 5),
+                )
+            elif name == MCP_INVOKE_NAME:
+                content = await invoke_mcp_tool(
+                    self.mcp_manager,
+                    caller_ctx.policy,
+                    name=str(args.get("name") or ""),
+                    arguments=args.get("arguments"),
+                )
             elif self.mcp_manager is not None:
-                content = await self.mcp_manager.call_tool(name, args)
+                # Direct MCP schemas are no longer exposed. Refuse a stale or
+                # hallucinated direct call instead of bypassing the broker's
+                # policy validation.
+                content = (
+                    f"ERROR: direct MCP call {name!r} is not available. "
+                    f"Use {MCP_DISCOVER_NAME}, then {MCP_INVOKE_NAME}."
+                )
             else:
                 content = f"ERROR: unknown tool {name}"
         except Exception as e:
@@ -2156,6 +2229,14 @@ class AskCommand(BaseCommand):
         # learning and the writer starts answering as Sigil. Hygiene
         # generally: don't pass raw tool errors verbatim.
         content = _scrub_tool_content(content)
+
+        if ledger is not None:
+            ledger.record(
+                call_id=call_id,
+                name=name,
+                arguments=args,
+                content=str(content),
+            )
 
         messages.append({
             "role": "tool",
@@ -2699,28 +2780,30 @@ class AskCommand(BaseCommand):
                     if len(lines) > 1:
                         reactor_log_block = "\n".join(lines)
 
-            # Python sandbox: when the Pyodide MCP server is running, the
-            # writer LLM gets `pyodide__pyodide_execute(code, timeout)` and
-            # `pyodide__pyodide_install-packages(package)` exposed
-            # automatically. The directive tells Sigil what's pre-loaded,
+            # Python sandbox: when the Pyodide MCP server is allowed, its
+            # execution tools are available through the compact MCP broker.
+            # The directive tells the writer what's pre-loaded,
             # what to use it for (real computation, not paraphrasing
             # data), and to bump the default 5s timeout — finance work
             # routinely overruns that.
             python_tool_directive = ""
-            if self.mcp_manager is not None and any(
-                t.server_name == "pyodide"
-                for t in self.mcp_manager.all_tools()
+            if (
+                self.mcp_manager is not None
+                and (
+                    ctx.policy is None
+                    or ctx.policy.allows_mcp("pyodide")
+                )
             ):
                 python_tool_directive = (
                     "Python sandbox (Pyodide): you have a real Python "
-                    "interpreter via `pyodide__pyodide_execute(code, "
-                    "timeout)`. State persists across calls in the "
+                    "interpreter. Discover its exact schema with "
+                    "`mcp__discover(query=\"pyodide execute python\")`, "
+                    "then run it through `mcp__invoke`. State persists across calls in the "
                     "same conversation — variables stick. "
                     "Pre-loaded: numpy, pandas, scipy, matplotlib, "
                     "scikit-learn (Pyodide bundle), plus yfinance and "
                     "statsmodels (pre-cached). For other PyPI packages "
-                    "call `pyodide__pyodide_install-packages(package)` "
-                    "first.\n\n"
+                    "discover and invoke the Pyodide package installer first.\n\n"
                     "USE IT for actual computation: correlations, "
                     "regressions, NPV/IRR, Black-Scholes from formula, "
                     "volatility estimation, custom indicators, "
@@ -2737,6 +2820,18 @@ class AskCommand(BaseCommand):
                     "computing, weave the result into your reply in "
                     "plain prose — DO NOT dump raw stdout / DataFrame "
                     "reprs / matplotlib output to the user."
+                )
+
+            mcp_broker_directive = ""
+            if broker_should_be_exposed(self.mcp_manager, ctx.policy):
+                mcp_broker_directive = (
+                    "External MCP capabilities use a compact catalog. When "
+                    "live or specialized data may help, call `mcp__discover` "
+                    "with the capability you need. It returns a small set of "
+                    "exact tool names and argument schemas. Then call "
+                    "`mcp__invoke` with one returned name and matching "
+                    "arguments. Do not invent or directly call hidden MCP "
+                    "tool names."
                 )
 
             # Implicit / spontaneous trigger: the reactor's should_respond
@@ -2757,7 +2852,7 @@ class AskCommand(BaseCommand):
                 # closing "do not echo" rule + the response-style no-echo
                 # rule + _strip_meta_leak give us defense in depth.
                 # The reason is reactor-LLM output derived from raw user
-                # text — sanitize before it lands in the system suffix:
+                # text — sanitize before it lands in the volatile prompt tail:
                 # cap the length and drop angle brackets so it can't
                 # open/close XML-ish blocks or smuggle directive-shaped
                 # markup into the prompt. It's informational scaffolding;
@@ -2788,12 +2883,9 @@ class AskCommand(BaseCommand):
                     "empty content instead."
                 )
 
-            # System suffix: persona-adjacent directives + long memory +
-            # staleness advisory. Each block gets its own XML tag so the
-            # model can scan the structure instead of guessing at section
-            # boundaries in a wall of text. Group context + the live
-            # trigger are NOT placed here — they belong to the user-role
-            # message below so they read as situational input, not persona.
+            # Prompt blocks keep their own XML boundaries so the model can
+            # distinguish configuration from situational state. Only the
+            # former is admitted to the cacheable system prefix below.
             # Late-binding hint that fires only on this turn — the user
             # just asked you to think hard. Place it AFTER conversation_
             # memory so it has stronger recency-weight than any "answer
@@ -2863,21 +2955,23 @@ class AskCommand(BaseCommand):
                 ctx, authoritative_prompt=base_system_prompt,
             )
 
+            # Cache contract: only persona/configuration blocks may enter the
+            # system prefix. Anything derived from this message, recalled
+            # state, or another model belongs in the volatile user tail.
+            stable_system_blocks = [
+                ("your_identity", _wrap_xml("your_identity", identity_block)),
+                ("attribution_rules", _wrap_xml("attribution_rules", attribution_rules)),
+                ("identity_note", _wrap_xml("identity_note", names_directive)),
+                ("reactor_reflex", _wrap_xml("reactor_reflex", reactor_directive)),
+                ("tarot_tool", _wrap_xml("tarot_tool", tarot_directive)),
+                ("iching_tool", _wrap_xml("iching_tool", iching_directive)),
+                ("portfolio_journal", _wrap_xml("portfolio_journal", journal_directive)),
+                ("deep_think_tool", _wrap_xml("deep_think_tool", deep_think_directive)),
+                ("mcp_broker", _wrap_xml("mcp_broker", mcp_broker_directive)),
+                ("python_tool", _wrap_xml("python_tool", python_tool_directive)),
+            ]
             system_suffix_parts = [
-                _wrap_xml("your_identity", identity_block),
-                _wrap_xml("attribution_rules", attribution_rules),
-                _wrap_xml("identity_note", names_directive),
-                _wrap_xml("reactor_reflex", reactor_directive),
-                _wrap_xml("tarot_tool", tarot_directive),
-                _wrap_xml("iching_tool", iching_directive),
-                _wrap_xml("portfolio_journal", journal_directive),
-                _wrap_xml("deep_think_tool", deep_think_directive),
-                _wrap_xml("python_tool", python_tool_directive),
-                _wrap_xml("spontaneous_reply", implicit_directive),
-                _wrap_xml("conversation_memory", summary_block),
-                _wrap_xml("context_memories", memory_block),
-                _wrap_xml("conversation_status", staleness_block),
-                _wrap_xml("deep_think_trigger", deep_think_trigger_hint),
+                content for _, content in stable_system_blocks if content
             ]
             system_suffix_parts = [p for p in system_suffix_parts if p]
             system_suffix = "\n\n".join(system_suffix_parts) or None
@@ -2910,6 +3004,17 @@ class AskCommand(BaseCommand):
                     _wrap_xml("recent_reactions", reactor_log_block)
                 )
 
+            volatile_prompt_blocks = [
+                ("spontaneous_reply", _wrap_xml("spontaneous_reply", implicit_directive)),
+                ("conversation_memory", _wrap_xml("conversation_memory", summary_block)),
+                ("context_memories", _wrap_xml("context_memories", memory_block)),
+                ("conversation_status", _wrap_xml("conversation_status", staleness_block)),
+                ("deep_think_trigger", _wrap_xml("deep_think_trigger", deep_think_trigger_hint)),
+            ]
+            trigger_parts.extend(
+                content for _, content in volatile_prompt_blocks if content
+            )
+
             if ctx.quote_text:
                 # Flag this turn as a quote-reply but DON'T embed the
                 # quoted text. The original message is already in
@@ -2929,7 +3034,7 @@ class AskCommand(BaseCommand):
             sender_label = self._sender_label(ctx.sender) if is_group else "user"
             # For implicit / spontaneous asks the closing instruction softens
             # — the user didn't ask the bot anything, so "Respond to this"
-            # would override the bail-freely guidance in the system suffix.
+            # would override the bail-freely guidance in the volatile tail.
             closing = (
                 "Decide whether to respond. Empty output = stay silent."
                 if getattr(ctx, "implicit_reason", None)
@@ -2982,6 +3087,16 @@ class AskCommand(BaseCommand):
             messages.append({"role": "user", "content": user_message_content})
 
             tools = self._collect_tools(policy=ctx.policy, bot=ctx.bot)
+            cache_plan = PromptCachePlan.from_blocks(
+                stable=[("base_system", base_system_prompt)] + stable_system_blocks,
+                volatile=[
+                    ("group_context", group_ctx_block),
+                    ("recent_reactions", _wrap_xml("recent_reactions", reactor_log_block)),
+                    *volatile_prompt_blocks,
+                    ("reply_target", ctx.quote_text or ""),
+                    ("current_message", question),
+                ],
+            )
             attachments: list = []
 
             # Research mode: when the active bot is configured for it
@@ -3029,6 +3144,7 @@ class AskCommand(BaseCommand):
                         messages=messages,
                         attachments=attachments,
                         user_hash=user_hash,
+                        cache_plan=cache_plan,
                     )
             elif use_research_mode:
                 answer = await self._run_research_handoff(
@@ -3038,6 +3154,7 @@ class AskCommand(BaseCommand):
                     messages=messages,
                     attachments=attachments,
                     user_hash=user_hash,
+                    cache_plan=cache_plan,
                 )
             elif typing_handler is not None:
                 # Show a typing indicator in the chat while the tool loop runs.
@@ -3046,10 +3163,14 @@ class AskCommand(BaseCommand):
                     ctx.sender, ctx.group_id
                 ):
                     answer = await self._run_tool_loop(
-                        messages, tools, ctx, attachments
+                        messages, tools, ctx, attachments,
+                        cache_plan=cache_plan,
                     )
             else:
-                answer = await self._run_tool_loop(messages, tools, ctx, attachments)
+                answer = await self._run_tool_loop(
+                    messages, tools, ctx, attachments,
+                    cache_plan=cache_plan,
+                )
         except LLMDisabled:
             return CommandResult.error(
                 "LLM is not enabled. An admin can turn it on at /admin/llm."

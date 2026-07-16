@@ -49,6 +49,7 @@ def create_app(
     reactor=None,
     signal_pool=None,
     daily_oracle=None,
+    ask_command=None,
 ) -> Flask:
     """
     Create Flask application with webhook endpoint and optional admin UI.
@@ -148,6 +149,7 @@ def create_app(
             reactor=reactor,
             signal_pool=signal_pool,
             daily_oracle=daily_oracle,
+            ask_command=ask_command,
         )
         logger.info("Admin UI mounted at /admin")
     else:

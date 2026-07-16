@@ -32,6 +32,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -43,6 +44,17 @@ from ..bots.settings import (
 )
 from ..cache import get_metrics
 from .client import _ensure_reasoning_content, _extract_cache_tokens
+from .mcp_broker import (
+    MCP_BROKER_TOOLS,
+    MCP_DISCOVER_NAME,
+    MCP_INVOKE_NAME,
+    broker_should_be_exposed,
+    discover_mcp_tools,
+    invoke_mcp_tool,
+)
+from .prompt_cache import PromptCachePlan
+from .resilience import LLMHTTPFailure, resilient_chat_post
+from .tool_runtime import ToolCallLedger
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +71,9 @@ lookups, charts, news, fundamentals, calendars) and any configured MCP
 servers (SEC EDGAR filings, Yahoo finance MCP, etc.). USE THESE TOOLS
 LIBERALLY when the answer depends on live data, specific numbers, or
 factual information beyond your training. Don't guess at a price, P/E,
-or recent event — fetch it.
+or recent event — fetch it. MCP capabilities use a compact broker: call
+mcp__discover with what you need, then mcp__invoke with the exact returned
+name and argument schema.
 
 Take your time. Think step-by-step where it helps. Chain multiple tool
 calls when one finding leads to the next question. Show your work when the
@@ -316,6 +330,9 @@ class DeepThinkClient:
         cfg: dict,
         sender_tail: str,
         group_id: Optional[str],
+        context_id: Optional[int] = None,
+        bot_id: Optional[int] = None,
+        cache_plan: Optional[PromptCachePlan] = None,
     ) -> dict:
         """One chat-completion call. Records per-round metrics. Raises
         RuntimeError on failure — the outer loop catches and converts to
@@ -352,7 +369,6 @@ class DeepThinkClient:
             "Content-Type": "application/json",
         }
         url = f"{cfg['base_url']}/chat/completions"
-        timeout = aiohttp.ClientTimeout(total=cfg["timeout"], connect=10)
         # Hard-ceiling defense against the slow-trickle case (matches
         # LLMClient): aiohttp's total= is unreliable on stalled sockets.
         hard_timeout = max(cfg["timeout"] + 30, 60)
@@ -361,30 +377,60 @@ class DeepThinkClient:
         started = time.time()
 
         session = await self._get_session()
+        declared = cache_plan or PromptCachePlan.from_blocks(
+            stable=[("deep_think_system", messages[0].get("content") if messages else "")],
+            volatile=[("deep_think_tail", messages[-1].get("content") if messages else "")],
+        )
+        cache_manifest = declared.snapshot(
+            messages,
+            tools,
+            purpose="deep_think",
+            context_id=context_id,
+            bot_id=bot_id,
+        )
+        host = urlparse(cfg["base_url"]).netloc or cfg["base_url"]
+        provider_metrics = metrics.get_provider_metrics(
+            f"deep_think:{host}:{cfg['model']}"
+        )
 
-        async def _do_call():
-            async with session.post(
-                url, json=payload, headers=headers, timeout=timeout
-            ) as resp:
-                body = await resp.text()
-                if resp.status >= 400:
-                    snippet = body[:200].replace("\n", " ")
-                    raise RuntimeError(f"HTTP {resp.status}: {snippet}")
-                return await resp.json(content_type=None)
+        def _on_retry(reason: str, attempt: int, delay: float) -> None:
+            metrics.record_llm_retry(
+                reason=reason, purpose="deep_think", model=cfg["model"],
+            )
+            logger.warning(
+                "DeepThink retry reason=%s after_attempt=%s delay=%.2fs",
+                reason, attempt, delay,
+            )
 
         try:
-            data = await asyncio.wait_for(_do_call(), timeout=hard_timeout)
+            data = await resilient_chat_post(
+                session=session,
+                url=url,
+                payload=payload,
+                headers=headers,
+                request_timeout=cfg["timeout"],
+                hard_timeout=hard_timeout,
+                provider_metrics=provider_metrics,
+                on_retry=_on_retry,
+            )
         except asyncio.TimeoutError:
             metrics.record_deep_think_error(
                 model=cfg["model"], error_msg=f"hard timeout {hard_timeout}s",
             )
             raise RuntimeError(f"timeout {hard_timeout}s")
+        except LLMHTTPFailure as e:
+            metrics.record_deep_think_error(model=cfg["model"], error_msg=str(e))
+            raise RuntimeError(str(e)) from e
         except aiohttp.ClientError as e:
             metrics.record_deep_think_error(
                 model=cfg["model"], error_msg=f"network: {e}",
             )
             raise RuntimeError(f"network: {e}")
         except RuntimeError as e:
+            if "circuit is open" in str(e):
+                metrics.record_llm_circuit_rejection(
+                    purpose="deep_think", model=cfg["model"],
+                )
             metrics.record_deep_think_error(model=cfg["model"], error_msg=str(e))
             raise
 
@@ -410,6 +456,12 @@ class DeepThinkClient:
             tokens_in=tokens_in, tokens_out=tokens_out,
             cache_hit_tokens=cache_hit, cache_miss_tokens=cache_miss,
         )
+        metrics.record_prompt_cache_observation(
+            cache_manifest,
+            cache_hit_tokens=cache_hit,
+            cache_miss_tokens=cache_miss,
+            latency_ms=latency_ms,
+        )
         logger.debug(
             f"DeepThink round: {tokens_in}+{tokens_out} tok, "
             f"{latency_ms:.0f}ms (...{sender_tail})"
@@ -427,11 +479,8 @@ class DeepThinkClient:
         schemas: list[dict] = []
         if self.bot_tools is not None:
             schemas.extend(self.bot_tools.list_tools(policy=policy))
-        if self.mcp_manager is not None:
-            mcp_tools = self.mcp_manager.all_tools()
-            if policy is not None:
-                mcp_tools = [t for t in mcp_tools if policy.allows_mcp(t.server_name)]
-            schemas.extend(t.to_openai_tool() for t in mcp_tools)
+        if broker_should_be_exposed(self.mcp_manager, policy):
+            schemas.extend(MCP_BROKER_TOOLS)
         # Match the writer's canonical ordering. Session restart order should
         # not rewrite an otherwise identical request prefix.
         schemas.sort(
@@ -450,6 +499,7 @@ class DeepThinkClient:
         cfg: dict,
         sender_tail: str,
         group_id: Optional[str],
+        cache_plan: Optional[PromptCachePlan] = None,
     ) -> tuple[str, list[str], int, int]:
         """Drive the deep model through tool calls until it produces text.
 
@@ -465,11 +515,19 @@ class DeepThinkClient:
         tool_call_history: list[str] = []
         total_in = 0
         total_out = 0
+        ledger = ToolCallLedger()
+        context_id = None
+        bot_id = None
+        if caller_ctx is not None:
+            policy = getattr(caller_ctx, "policy", None)
+            context_id = getattr(policy, "id", None)
+            bot_id = getattr(caller_ctx, "bot_id", None)
 
         for round_idx in range(max_rounds):
             assistant_msg = await self._chat_call(
                 messages, tools=tools, cfg=cfg, sender_tail=sender_tail,
-                group_id=group_id,
+                group_id=group_id, context_id=context_id, bot_id=bot_id,
+                cache_plan=cache_plan,
             )
             total_in += assistant_msg.pop("_dt_tokens_in", 0)
             total_out += assistant_msg.pop("_dt_tokens_out", 0)
@@ -514,7 +572,10 @@ class DeepThinkClient:
             for call in tool_calls:
                 fn_name = (call.get("function") or {}).get("name") or "?"
                 tool_call_history.append(fn_name)
-                await self._dispatch_tool_call(call, messages, caller_ctx, attachments)
+                await self._dispatch_tool_call(
+                    call, messages, caller_ctx, attachments,
+                    tools=tools, ledger=ledger,
+                )
 
         logger.warning(
             f"DeepThink: tool loop hit cap ({max_rounds} rounds). "
@@ -534,6 +595,8 @@ class DeepThinkClient:
         messages: list[dict],
         caller_ctx,
         attachments: list,
+        tools: Optional[list[dict]] = None,
+        ledger: Optional[ToolCallLedger] = None,
     ) -> None:
         """Run one tool call and append its result to `messages`.
 
@@ -555,6 +618,49 @@ class DeepThinkClient:
             log_args = json.dumps(args)[:200]
         logger.info(f"DeepThink tool call: {name} args={log_args}")
 
+        if tools:
+            valid_names = {
+                (tool.get("function") or {}).get("name")
+                for tool in tools
+                if isinstance(tool, dict)
+            }
+            if name not in valid_names:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": (
+                        f"ERROR: no tool named {name!r} is available. "
+                        f"Use {MCP_DISCOVER_NAME} for MCP capabilities."
+                    ),
+                })
+                return
+
+        if ledger is not None:
+            duplicate_reason, duplicate_content = ledger.lookup(
+                call_id=call_id, name=name, arguments=args,
+            )
+            if duplicate_reason is not None:
+                logger.warning(
+                    "Suppressing duplicate DeepThink tool call name=%s reason=%s",
+                    name, duplicate_reason,
+                )
+                content = (
+                    duplicate_content
+                    if duplicate_reason == "duplicate_call_id_conflict"
+                    else (
+                        f"(duplicate tool call suppressed: {duplicate_reason}; "
+                        f"reusing prior result)\n{duplicate_content or '(no result)'}"
+                    )
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": content,
+                })
+                return
+
         is_bot_tool = (
             self.bot_tools is not None
             and name.startswith(self.bot_tools.NAMESPACE + "__")
@@ -573,13 +679,41 @@ class DeepThinkClient:
                     content = result.text if result else "(no result)"
                     if result and result.attachments:
                         attachments.extend(result.attachments)
+            elif name == MCP_DISCOVER_NAME:
+                policy = getattr(caller_ctx, "policy", None) if caller_ctx else None
+                content = discover_mcp_tools(
+                    self.mcp_manager,
+                    policy,
+                    query=str(args.get("query") or ""),
+                    server=str(args.get("server") or ""),
+                    limit=args.get("limit", 5),
+                )
+            elif name == MCP_INVOKE_NAME:
+                policy = getattr(caller_ctx, "policy", None) if caller_ctx else None
+                content = await invoke_mcp_tool(
+                    self.mcp_manager,
+                    policy,
+                    name=str(args.get("name") or ""),
+                    arguments=args.get("arguments"),
+                )
             elif self.mcp_manager is not None:
-                content = await self.mcp_manager.call_tool(name, args)
+                content = (
+                    f"ERROR: direct MCP call {name!r} is unavailable. "
+                    f"Use {MCP_DISCOVER_NAME}, then {MCP_INVOKE_NAME}."
+                )
             else:
                 content = f"ERROR: unknown tool {name}"
         except Exception as e:
             logger.warning(f"DeepThink tool {name} failed: {e}")
             content = f"ERROR: {e}"
+
+        if ledger is not None:
+            ledger.record(
+                call_id=call_id,
+                name=name,
+                arguments=args,
+                content=str(content),
+            )
 
         messages.append({
             "role": "tool",
@@ -651,6 +785,10 @@ class DeepThinkClient:
             {"role": "system", "content": cfg["system_prompt"]},
             {"role": "user", "content": user_content},
         ]
+        cache_plan = PromptCachePlan.from_blocks(
+            stable=[("deep_think_system", cfg["system_prompt"])],
+            volatile=[("deep_think_request", user_content)],
+        )
 
         sender_tail = user_hash[:8] if user_hash else "????"
 
@@ -674,6 +812,7 @@ class DeepThinkClient:
                 cfg=cfg,
                 sender_tail=sender_tail,
                 group_id=group_id,
+                cache_plan=cache_plan,
             )
         except Exception as e:
             latency_ms = (time.time() - outer_started) * 1000.0

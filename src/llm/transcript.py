@@ -257,6 +257,8 @@ def build_record(
     sender_tail: Optional[str],
     group_id: Optional[str],
     usage: Optional[dict] = None,
+    cache_manifest: Optional[dict] = None,
+    cache_event: Optional[dict] = None,
 ) -> dict:
     """Compose the JSONL line for one writer round.
 
@@ -285,5 +287,8 @@ def build_record(
             "sender_tail": sender_tail,
             "group_id": group_id,
             "latency_ms": latency_ms,
+            # Fingerprints and sizes only — no duplicate prompt plaintext.
+            "cache_manifest": cache_manifest or {},
+            "cache_event": cache_event or {},
         },
     }

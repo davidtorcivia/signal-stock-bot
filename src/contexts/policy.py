@@ -25,10 +25,9 @@ class ContextPolicy:
     label: str = ""
     command_mode: str = MODE_ALLOW_ALL
     commands: list[str] = field(default_factory=list)
-    # MCP schemas are unusually expensive: a handful of enabled servers can
-    # add tens of thousands of tokens to every writer request. New contexts
-    # therefore start with an empty, stable allow-list and must opt servers in
-    # deliberately. Existing database rows keep their stored mode.
+    # MCP access is opt-in for new contexts. The compact broker keeps schemas
+    # cheap, while an empty allow-list also prevents accidental access to new
+    # servers that appear later. Existing database rows keep their stored mode.
     mcp_mode: str = MODE_ALLOW_LIST
     mcp_servers: list[str] = field(default_factory=list)
     system_prompt: Optional[str] = None   # None / empty => use global LLM prompt

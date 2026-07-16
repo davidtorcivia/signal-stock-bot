@@ -27,7 +27,7 @@ def _client():
 async def test_reasoning_only_returns_stub_not_trace():
     client = _client()
 
-    async def fake_chat_call(messages, tools, cfg, sender_tail, group_id):
+    async def fake_chat_call(messages, tools, cfg, sender_tail, group_id, **kwargs):
         return {
             "role": "assistant",
             "content": "",
@@ -51,7 +51,7 @@ async def test_reasoning_only_returns_stub_not_trace():
 async def test_real_content_is_returned_verbatim():
     client = _client()
 
-    async def fake_chat_call(messages, tools, cfg, sender_tail, group_id):
+    async def fake_chat_call(messages, tools, cfg, sender_tail, group_id, **kwargs):
         return {
             "role": "assistant",
             "content": "Here is the finished article body.",

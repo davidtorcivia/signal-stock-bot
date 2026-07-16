@@ -152,7 +152,7 @@ class _CapturingLLM:
         base = override or "You are Artaud and you engage with brevity."
         return f"{base}\n\n{suffix}" if suffix else base
 
-    async def chat_messages(self, messages, tools=None):
+    async def chat_messages(self, messages, tools=None, **kwargs):
         # The harness mutates its local list after this call, so snapshot the
         # strings needed for cache-locality assertions now.
         self.calls.append([dict(m) for m in messages])
@@ -205,6 +205,10 @@ class _OneShotPolicy:
 
     def allows_mcp(self, server):
         return False
+
+
+class _SummaryPolicy(_OneShotPolicy):
+    history_turns_override = 2
 
 
 class _MutableReactor:
@@ -286,6 +290,26 @@ async def test_zero_history_mode_skips_summary_and_persistence():
     assert history.summary_read_count == 0
     assert history.append_count == 0
     assert "SECRET OLD SUMMARY" not in llm.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_summary_is_volatile_user_tail_not_system_prefix():
+    llm = _CapturingLLM()
+    history = _StaleSummaryHistory()
+    ask = AskCommand(llm, history)
+    ctx = CommandContext(
+        sender="+15551234123", group_id=None, raw_message="!ask continue",
+        command="ask", args=["continue"], policy=_SummaryPolicy(),
+        bot=Bot(id=1, slug="sigil", display_name="Sigil"),
+    )
+
+    result = await ask.execute(ctx)
+
+    assert result.success
+    assert history.summary_read_count == 1
+    assert "SECRET OLD SUMMARY" not in llm.calls[0][0]["content"]
+    assert "<conversation_memory>" in llm.calls[0][-1]["content"]
+    assert "SECRET OLD SUMMARY" in llm.calls[0][-1]["content"]
 
 
 @pytest.mark.asyncio

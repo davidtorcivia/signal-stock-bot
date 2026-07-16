@@ -80,6 +80,26 @@
             </td>
         </tr>
         <tr>
+            <th>Cache contract</th>
+            <td>
+                {{ llm.prompt_observations or 0 }} observations &nbsp;·&nbsp;
+                {{ llm.system_fingerprint_changes or 0 }} system changes &nbsp;·&nbsp;
+                {{ llm.tool_fingerprint_changes or 0 }} tool changes
+                {% if llm.unexpected_cache_misses %}
+                    <span style="color:var(--warn,#d9a441);margin-left:8px;">
+                        {{ llm.unexpected_cache_misses }} unchanged-prefix misses
+                    </span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Resilience</th>
+            <td>
+                {{ llm.retries or 0 }} retries &nbsp;·&nbsp;
+                {{ llm.circuit_rejections or 0 }} circuit rejections
+            </td>
+        </tr>
+        <tr>
             <th>Avg latency</th>
             <td>{% if llm.avg_latency_ms %}{{ '%.0f'|format(llm.avg_latency_ms) }}ms{% else %}—{% endif %}</td>
         </tr>
@@ -101,6 +121,39 @@
         <tr><th>{{ model }}</th><td>{{ count }}</td></tr>
         {% endfor %}
     </table>
+    {% endif %}
+
+    {% if llm.recent_prompt_cache %}
+    <h3 style="margin-top:16px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Recent prompt fingerprints</h3>
+    <div style="overflow-x:auto;">
+    <table>
+        <tr>
+            <th>Context</th><th>Purpose</th><th>System</th><th>Tools</th>
+            <th>Payload</th><th>Cache</th><th>Change</th>
+        </tr>
+        {% for row in llm.recent_prompt_cache %}
+        <tr>
+            <td>#{{ row.context_id if row.context_id is not none else '—' }}</td>
+            <td>{{ row.purpose }}</td>
+            <td><code>{{ row.system_hash }}</code></td>
+            <td><code>{{ row.tools_hash }}</code></td>
+            <td>{{ row.tool_count }} tools · {{ '{:,}'.format(row.tool_schema_chars) }} chars</td>
+            <td>{{ '{:,}'.format(row.cache_hit_tokens) }} hit / {{ '{:,}'.format(row.cache_miss_tokens) }} miss</td>
+            <td>
+                {% if row.stable_changed %}
+                    <span style="color:var(--warn,#d9a441);">stable: {{ row.stable_changed|join(', ') }}</span>
+                {% elif row.system_changed or row.tools_changed %}
+                    {{ 'system ' if row.system_changed else '' }}{{ 'tools' if row.tools_changed else '' }}
+                {% elif row.unexpected_miss %}
+                    <span style="color:var(--warn,#d9a441);">miss, prefix unchanged</span>
+                {% else %}
+                    <span class="muted">unchanged</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    </div>
     {% endif %}
 </div>
 

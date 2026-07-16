@@ -1196,6 +1196,7 @@ def build_app(config: Config):
         reactor=reactor,
         signal_pool=signal_pool,
         daily_oracle=daily_oracle,
+        ask_command=ask_command,
     )
     # Keep references so these aren't garbage-collected
     app.signal_poller = poller

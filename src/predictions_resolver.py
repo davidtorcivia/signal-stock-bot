@@ -24,7 +24,16 @@ import logging
 from typing import Optional
 
 from .commands.base import CommandContext
-from .contexts.policy import ContextPolicy, MODE_ALLOW_LIST
+from .contexts.policy import ContextPolicy, MODE_ALLOW_ALL, MODE_ALLOW_LIST
+from .llm.mcp_broker import (
+    MCP_BROKER_TOOLS,
+    MCP_DISCOVER_NAME,
+    MCP_INVOKE_NAME,
+    broker_should_be_exposed,
+    discover_mcp_tools,
+    invoke_mcp_tool,
+)
+from .llm.tool_runtime import ToolCallLedger
 from .predictions import (
     Prediction,
     PredictionStore,
@@ -87,6 +96,8 @@ specific URL
 
 Don't skip the tools. A confident-sounding "wrong" without a lookup is \
 worse than "unclear". After at most a few tool calls, return your verdict.
+MCP tools use a compact broker: call mcp__discover for the capability, then
+mcp__invoke with an exact returned name and matching arguments.
 
 Final reply MUST be a single JSON object with no other text:
 
@@ -341,6 +352,7 @@ class PredictionResolver:
             key="__resolver__",
             command_mode=MODE_ALLOW_LIST,
             commands=list(_RESEARCH_COMMANDS),
+            mcp_mode=MODE_ALLOW_ALL,
         )
         # Stamp the resolving bot so per-bot writer overrides apply.
         # If the prediction lived in a context pinned to a non-default
@@ -383,6 +395,7 @@ class PredictionResolver:
             {"role": "system", "content": _LLM_VERDICT_PROMPT_WITH_TOOLS},
             {"role": "user", "content": user_content},
         ]
+        ledger = ToolCallLedger()
 
         for round_idx in range(_MAX_RESOLVER_ROUNDS):
             try:
@@ -416,7 +429,9 @@ class PredictionResolver:
 
             # Dispatch every tool call this round, then re-prompt.
             for call in tool_calls:
-                await self._dispatch_tool_call(call, messages, caller_ctx)
+                await self._dispatch_tool_call(
+                    call, messages, caller_ctx, ledger=ledger,
+                )
 
         logger.warning(
             f"Resolver: hit tool-round cap ({_MAX_RESOLVER_ROUNDS}) "
@@ -428,12 +443,14 @@ class PredictionResolver:
         out: list[dict] = []
         if self.bot_tools is not None:
             out.extend(self.bot_tools.list_tools(policy=policy))
-        if self.mcp_manager is not None:
-            out.extend(t.to_openai_tool() for t in self.mcp_manager.all_tools())
+        if broker_should_be_exposed(self.mcp_manager, policy):
+            out.extend(MCP_BROKER_TOOLS)
+        out.sort(key=lambda tool: (tool.get("function") or {}).get("name") or "")
         return out
 
     async def _dispatch_tool_call(
-        self, call: dict, messages: list[dict], caller_ctx: CommandContext
+        self, call: dict, messages: list[dict], caller_ctx: CommandContext,
+        *, ledger: Optional[ToolCallLedger] = None,
     ) -> None:
         """Run one tool call and append its result message. Errors come
         back as tool-result text so the model can recover, mirroring
@@ -447,6 +464,22 @@ class PredictionResolver:
         except json.JSONDecodeError:
             args = {}
 
+        if ledger is not None:
+            reason, previous = ledger.lookup(
+                call_id=call_id, name=name, arguments=args,
+            )
+            if reason is not None:
+                content = (
+                    previous
+                    if reason == "duplicate_call_id_conflict"
+                    else f"(duplicate tool call suppressed; prior result reused)\n{previous}"
+                )
+                messages.append({
+                    "role": "tool", "tool_call_id": call_id,
+                    "name": name, "content": content,
+                })
+                return
+
         is_bot_tool = (
             self.bot_tools is not None
             and name.startswith(self.bot_tools.NAMESPACE + "__")
@@ -455,19 +488,41 @@ class PredictionResolver:
             if is_bot_tool:
                 result = await self.bot_tools.call(name, args, caller_ctx)
                 content = result.text if result else "(no result)"
+            elif name == MCP_DISCOVER_NAME:
+                content = discover_mcp_tools(
+                    self.mcp_manager, caller_ctx.policy,
+                    query=str(args.get("query") or ""),
+                    server=str(args.get("server") or ""),
+                    limit=args.get("limit", 5),
+                )
+            elif name == MCP_INVOKE_NAME:
+                content = await invoke_mcp_tool(
+                    self.mcp_manager, caller_ctx.policy,
+                    name=str(args.get("name") or ""),
+                    arguments=args.get("arguments"),
+                )
             elif self.mcp_manager is not None:
-                content = await self.mcp_manager.call_tool(name, args)
+                content = (
+                    f"ERROR: direct MCP call {name!r} is unavailable. "
+                    f"Use {MCP_DISCOVER_NAME}, then {MCP_INVOKE_NAME}."
+                )
             else:
                 content = f"ERROR: unknown tool {name}"
         except Exception as e:
             logger.warning(f"Resolver: tool {name} failed: {e}")
             content = f"ERROR: {e}"
 
+        content = content if isinstance(content, str) else str(content)
+        if ledger is not None:
+            ledger.record(
+                call_id=call_id, name=name, arguments=args, content=content,
+            )
+
         messages.append({
             "role": "tool",
             "tool_call_id": call_id,
             "name": name,
-            "content": content if isinstance(content, str) else str(content),
+            "content": content,
         })
 
     async def _post_resolution(
