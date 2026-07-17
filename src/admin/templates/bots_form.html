@@ -94,15 +94,22 @@
           <span class="muted" style="font-size: 11px;">
             <code>replace</code>: deep_think writes the user-facing reply directly
             (Sigil's behavior).
-            <code>research</code>: deep_think runs the tool loop and returns notes;
-            the writer composes the final reply with those notes injected as a
-            handoff prompt (Artaud's flow when paired with a locally-trained writer).
+            <code>research</code>: deep_think runs the tool loop <em>every</em> turn
+            and returns notes; the writer composes the final reply with those notes
+            injected as a handoff prompt (Artaud's flow when paired with a
+            locally-trained writer).
+            <code>tool_bot</code>: like <code>research</code>, but the tool loop runs
+            on the dedicated <code>tool_bot</code> role (its own model/key/url below)
+            and self-gates — it answers <code>NOTOOLS</code> when the turn needs no
+            live data, so the writer replies directly and only pays for the tool
+            model when tools are actually needed. Best for writer models with poor
+            native tool-calling.
           </span>
         </label>
 
-        <label>Handoff prompt (research mode only)
+        <label>Handoff prompt (research / tool_bot modes)
           <textarea name="deep_think_handoff_prompt" rows="3"
-                    placeholder="Optional. Instructs the writer how to fold the research notes into its reply.">{{ values.deep_think_handoff_prompt }}</textarea>
+                    placeholder="Optional. Instructs the writer how to fold the tool/research notes into its reply.">{{ values.deep_think_handoff_prompt }}</textarea>
         </label>
 
         {# Hidden marker so the backend can tell "unchecked" apart from
@@ -148,7 +155,7 @@
           <h2 style="margin-top: 24px;">{{ role|capitalize }} LLM overrides</h2>
           <p class="muted" style="font-size: 11px;">
             Leave fields blank to inherit the global
-            {% if role == 'writer' %}<code>llm_*</code>{% elif role == 'reactor' %}<code>reactor_*</code> (with <code>llm_*</code> fallback){% else %}<code>deep_think_*</code> (with <code>llm_*</code> fallback){% endif %}
+            {% if role == 'writer' %}<code>llm_*</code>{% elif role == 'reactor' %}<code>reactor_*</code> (with <code>llm_*</code> fallback){% elif role == 'tool_bot' %}<code>deep_think_*</code> then <code>llm_*</code> (these per-bot fields are the tool_bot executor's config){% else %}<code>deep_think_*</code> (with <code>llm_*</code> fallback){% endif %}
             settings from the LLM page. Save with a value to pin it for this bot.
           </p>
 

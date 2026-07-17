@@ -707,6 +707,22 @@ _BOT_LLM_FIELDS = {
         ("system_prompt", "str"),
         ("extra_body", "json"),
     ],
+    # tool_bot role — the executor for deep_think_mode='tool_bot'. Reads
+    # bot_llm_settings(bot.id, 'tool_bot', <key>) as the per-bot override;
+    # global inheritance falls to deep_think_* then llm_* (there is no
+    # global tool_bot_* block). Same LLM-call shape as deep_think; the
+    # extra behaviour keys (max_tool_rounds, context caps) inherit the
+    # deep_think globals unless set per-bot here.
+    "tool_bot": [
+        ("base_url", "str"),
+        ("api_key", "secret"),
+        ("model", "str"),
+        ("temperature", "float"),
+        ("max_tokens", "int"),
+        ("timeout_seconds", "int"),
+        ("system_prompt", "str"),
+        ("extra_body", "json"),
+    ],
 }
 
 
@@ -1052,17 +1068,17 @@ def _register_bots_routes(
         result without a full page reload (LLM calls take seconds —
         a redirect would be a poor UX).
 
-        Roles: 'writer', 'reactor', or 'deep_think'. Bot's own per-bot
-        overrides compose with the global keys per the resolver chain —
-        same path a real !ask / reactor evaluation would take, so a
+        Roles: 'writer', 'reactor', 'deep_think', or 'tool_bot'. Bot's own
+        per-bot overrides compose with the global keys per the resolver
+        chain — same path a real !ask / reactor evaluation would take, so a
         green check here means real traffic should also land.
         """
-        if role not in ("writer", "reactor", "deep_think"):
+        if role not in ("writer", "reactor", "deep_think", "tool_bot"):
             return jsonify(
                 ok=False,
                 error=(
-                    f"role must be 'writer', 'reactor', or 'deep_think', "
-                    f"got {role!r}"
+                    "role must be 'writer', 'reactor', 'deep_think', or "
+                    f"'tool_bot', got {role!r}"
                 ),
             ), 400
         if not verify_csrf():
@@ -1082,6 +1098,8 @@ def _register_bots_routes(
             client = llm_factory.get_writer(bot_id)
         elif role == "reactor":
             client = llm_factory.get_reactor(bot_id)
+        elif role == "tool_bot":
+            client = llm_factory.get_tool_bot(bot_id)
         else:
             client = llm_factory.get_deep_think(bot_id)
         # Generous timeout: LAN MLX can be slow to first-token on a

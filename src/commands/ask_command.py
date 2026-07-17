@@ -448,6 +448,18 @@ class AskCommand(BaseCommand):
             return self.deep_think
         return self.llm_factory.get_deep_think(bot.id)
 
+    def _tool_bot_for(self, ctx):
+        """Resolve the tool-executor client for `deep_think_mode='tool_bot'`.
+
+        Returns None when no factory is wired or the context has no
+        bot — tool_bot mode is an inherently per-bot, factory-driven
+        feature, so legacy single-bot / no-factory paths simply never
+        enter it (the gate below treats None as 'mode inactive')."""
+        bot = getattr(ctx, "bot", None) if ctx is not None else None
+        if self.llm_factory is None or bot is None or bot.id is None:
+            return None
+        return self.llm_factory.get_tool_bot(bot.id)
+
     def _live_turns(self, ctx=None) -> int:
         """Resolve turns-per-user, preferring the per-context override.
 
@@ -1241,6 +1253,101 @@ class AskCommand(BaseCommand):
             ),
         )
         return (assistant_msg.get("content") or "").strip()
+
+    async def _run_tool_bot_handoff(
+        self,
+        *,
+        ctx: CommandContext,
+        question: str,
+        research_input: str,
+        messages: list[dict],
+        attachments: list,
+        user_hash: str,
+        tool_bot,
+        cache_plan: Optional[PromptCachePlan] = None,
+    ) -> str:
+        """Gated two-model handoff for `deep_think_mode='tool_bot'`.
+
+        The dedicated tool-bot client runs the tool loop AND self-gates:
+        it replies with the `NOTOOLS` sentinel when the turn needs no
+        live data. On that signal we skip the handoff entirely and let
+        the writer answer directly — no wasted notes, no misleading
+        scaffolding. Otherwise the notes are injected into the volatile
+        user tail (cache-preserving) and the writer composes tool-free,
+        exactly like research mode.
+
+        The writer never gets tools in either branch — that's the whole
+        point of the mode: the persona model only ever writes."""
+        from ..llm.tool_bot import ToolBotClient
+
+        writer = self._llm_for(ctx)
+        # Defensive copy — we may append a notes block to the tail.
+        messages = list(messages)
+
+        # Tool-bot runs the loop against the same situational frame the
+        # writer would have seen. Never raises: any failure comes back as
+        # a "(tool_bot unavailable: ...)" string we hand on honestly.
+        notes = await tool_bot.think(
+            question,
+            context=research_input,
+            user_hash=user_hash,
+            group_id=ctx.group_id,
+            caller_ctx=ctx,
+            attachments=attachments,
+        )
+
+        async def _compose(compose_messages: list[dict]) -> str:
+            assistant_msg = await writer.chat_messages(
+                compose_messages, tools=None, cache_plan=cache_plan,
+                overrides=_adaptive_response_overrides(
+                    writer, question, compose_messages,
+                ),
+            )
+            return (assistant_msg.get("content") or "").strip()
+
+        # Gate: nothing to fold in — writer answers the message directly,
+        # same as the ordinary no-tool path. This is the cheap common
+        # case for conversational turns.
+        if ToolBotClient.is_no_tools(notes):
+            logger.info(
+                "tool_bot: NOTOOLS gate — writer answering directly "
+                f"(bot={getattr(ctx.bot, 'slug', None)})"
+            )
+            return await _compose(messages)
+
+        # Tools were run (or the tool-bot reported a failure): inject the
+        # notes into the volatile tail so the writer composes with them.
+        # Reuse the per-bot handoff template — same field research mode
+        # uses, so a bot switching modes keeps its handoff voice.
+        handoff_template = (
+            getattr(ctx.bot, "deep_think_handoff_prompt", None)
+            or self._DEFAULT_RESEARCH_HANDOFF
+        )
+        try:
+            handoff_block = handoff_template.format(notes=notes)
+        except (KeyError, IndexError, ValueError):
+            handoff_block = f"{handoff_template}\n\n{notes}"
+
+        rendered_handoff = _wrap_xml("research_handoff", handoff_block)
+        if messages and messages[-1].get("role") == "user":
+            messages[-1] = dict(messages[-1])
+            existing = messages[-1].get("content")
+            if isinstance(existing, list):
+                messages[-1]["content"] = list(existing) + [
+                    {"type": "text", "text": rendered_handoff}
+                ]
+            else:
+                current = str(existing or "").rstrip()
+                messages[-1]["content"] = (
+                    f"{current}\n\n{rendered_handoff}"
+                    if current else rendered_handoff
+                )
+        else:
+            messages.append({"role": "user", "content": rendered_handoff})
+        if cache_plan is not None:
+            cache_plan.with_volatile("research_handoff", rendered_handoff)
+
+        return await _compose(messages)
 
     async def _handle_predict_self_tool(
         self,
@@ -2698,6 +2805,9 @@ class AskCommand(BaseCommand):
             # prompt/execution gate in this request. The default client on
             # self.deep_think may have different readiness and settings.
             deep_think_client = self._deep_think_for(ctx)
+            # Tool-executor client for `deep_think_mode='tool_bot'`. None on
+            # legacy / no-factory paths — the mode gate treats that as off.
+            tool_bot_client = self._tool_bot_for(ctx)
 
             # Long-term rolling summary, if one exists. Lives in the system
             # suffix so it bookends the persona; the XML tag tells the
@@ -3487,8 +3597,54 @@ class AskCommand(BaseCommand):
                 )
                 use_research_mode = False
 
+            # Tool-bot mode: a dedicated sibling runs the tool loop and
+            # self-gates (NOTOOLS) so the writer — a model with poor native
+            # tool-calling — never emits a tool call. Mutually exclusive
+            # with research mode (a bot's deep_think_mode is exactly one
+            # value). Same vision short-circuit rationale as research mode:
+            # the tool-bot can't see the pixels, so image turns route to
+            # the writer's own loop instead.
+            use_tool_bot_mode = (
+                ctx.bot is not None
+                and getattr(ctx.bot, "deep_think_mode", "replace") == "tool_bot"
+                and tool_bot_client is not None
+                and tool_bot_client.status().get("ready")
+                and (ctx.policy is None or ctx.policy.allows_deep_think())
+            )
+            if use_tool_bot_mode and vision_active:
+                logger.info(
+                    "Vision active — bypassing tool_bot mode for this turn "
+                    f"(bot={ctx.bot.slug})"
+                )
+                use_tool_bot_mode = False
+
             typing_handler = self._handler_for_ctx(ctx)
-            if use_research_mode and typing_handler is not None:
+            if use_tool_bot_mode and typing_handler is not None:
+                async with typing_handler.typing_indicator(
+                    ctx.sender, ctx.group_id
+                ):
+                    answer = await self._run_tool_bot_handoff(
+                        ctx=ctx,
+                        question=question,
+                        research_input=current_user_content,
+                        messages=messages,
+                        attachments=attachments,
+                        user_hash=user_hash,
+                        tool_bot=tool_bot_client,
+                        cache_plan=cache_plan,
+                    )
+            elif use_tool_bot_mode:
+                answer = await self._run_tool_bot_handoff(
+                    ctx=ctx,
+                    question=question,
+                    research_input=current_user_content,
+                    messages=messages,
+                    attachments=attachments,
+                    user_hash=user_hash,
+                    tool_bot=tool_bot_client,
+                    cache_plan=cache_plan,
+                )
+            elif use_research_mode and typing_handler is not None:
                 async with typing_handler.typing_indicator(
                     ctx.sender, ctx.group_id
                 ):

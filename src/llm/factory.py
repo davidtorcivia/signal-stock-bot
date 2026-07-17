@@ -28,6 +28,7 @@ from typing import Optional
 
 from .client import LLMClient
 from .deep_think import DeepThinkClient
+from .tool_bot import ToolBotClient
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class LLMClientFactory:
         self._writers: dict[Optional[int], LLMClient] = {}
         self._reactors: dict[Optional[int], LLMClient] = {}
         self._deep_thinks: dict[Optional[int], DeepThinkClient] = {}
+        self._tool_bots: dict[Optional[int], ToolBotClient] = {}
         # Late-bound; updated via attach_bot_tools / attach_mcp_manager.
         self._bot_tools = None
         self._mcp_manager = None
@@ -127,19 +129,44 @@ class LLMClientFactory:
                 self._deep_thinks[bot_id] = client
             return client
 
+    def get_tool_bot(self, bot_id: Optional[int]) -> ToolBotClient:
+        """Tool-executor client for `deep_think_mode='tool_bot'`.
+
+        Same tool loop as deep_think but reads the bot's `tool_bot` role
+        config (falling back deep_think_* -> llm_*) and self-gates via the
+        NOTOOLS sentinel. Shares the late-bound bot_tools / mcp_manager so
+        it can actually run the tool kit, exactly like the deep_think
+        clients above.
+        """
+        with self._lock:
+            client = self._tool_bots.get(bot_id)
+            if client is None:
+                client = ToolBotClient(
+                    self.store,
+                    bot_tools=self._bot_tools,
+                    mcp_manager=self._mcp_manager,
+                    bot_id=bot_id,
+                )
+                self._tool_bots[bot_id] = client
+            return client
+
     def attach_bot_tools(self, bot_tools) -> None:
         """Late-bound after dispatcher exists. Backfills every cached
-        DeepThinkClient so already-constructed clients pick up the
-        tools, and remembers it for future lookups."""
+        DeepThinkClient / ToolBotClient so already-constructed clients
+        pick up the tools, and remembers it for future lookups."""
         with self._lock:
             self._bot_tools = bot_tools
             for client in self._deep_thinks.values():
+                client.bot_tools = bot_tools
+            for client in self._tool_bots.values():
                 client.bot_tools = bot_tools
 
     def attach_mcp_manager(self, mcp_manager) -> None:
         with self._lock:
             self._mcp_manager = mcp_manager
             for client in self._deep_thinks.values():
+                client.mcp_manager = mcp_manager
+            for client in self._tool_bots.values():
                 client.mcp_manager = mcp_manager
 
     def forget(self, bot_id: int) -> None:
@@ -151,6 +178,7 @@ class LLMClientFactory:
             self._writers.pop(bot_id, None)
             self._reactors.pop(bot_id, None)
             self._deep_thinks.pop(bot_id, None)
+            self._tool_bots.pop(bot_id, None)
 
     async def close_all(self) -> None:
         """Close every cached client's aiohttp session. Called from
@@ -159,10 +187,13 @@ class LLMClientFactory:
             clients = (
                 list(self._writers.values())
                 + list(self._reactors.values())
+                + list(self._deep_thinks.values())
+                + list(self._tool_bots.values())
             )
             self._writers.clear()
             self._reactors.clear()
             self._deep_thinks.clear()
+            self._tool_bots.clear()
         for client in clients:
             try:
                 await client.close()

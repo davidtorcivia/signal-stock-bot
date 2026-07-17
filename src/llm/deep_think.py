@@ -112,13 +112,38 @@ class DeepThinkClient:
         bot_tools=None,
         mcp_manager=None,
         bot_id: Optional[int] = None,
+        *,
+        role: str = "deep_think",
+        role_label: str = "deep_think",
+        own_prefixes: tuple[str, ...] = ("deep_think",),
+        shared_fallback: tuple[str, ...] = ("llm",),
+        default_enabled: bool = False,
+        default_system_prompt: Optional[str] = None,
     ):
         self.store = settings_store
-        # bot_id scopes config reads to bot_llm_settings(bot_id, 'deep_think', ...)
-        # before falling back to admin_settings.deep_think_* / .llm_*.
+        # bot_id scopes config reads to bot_llm_settings(bot_id, role, ...)
+        # before falling back to admin_settings globals.
         # None = legacy global-only read (back-compat for tests / single-bot).
         self.bot_id = bot_id
-        self.role = "deep_think"
+        # `role` is the bot_llm_settings namespace this client reads
+        # (`deep_think` here; subclasses override, e.g. `tool_bot`). The
+        # config resolver composes global keys from two prefix tiers:
+        #   * own_prefixes   — the client's own global settings, in priority
+        #                      order (deep_think -> [tool_bot, deep_think]).
+        #   * shared_fallback— appended AFTER own_prefixes for the keys that
+        #                      historically fall back to the writer (llm_*):
+        #                      base_url/api_key/model/temperature/max_tokens/
+        #                      timeout/extra_body. Behaviour keys (enabled,
+        #                      system_prompt, caps, rounds) use own_prefixes
+        #                      ONLY so a subclass never inherits the writer's.
+        self.role = role
+        self._role_label = role_label
+        self._own_prefixes = list(own_prefixes)
+        self._shared_fallback = list(shared_fallback)
+        self._default_enabled = default_enabled
+        self._default_system_prompt = (
+            default_system_prompt or DEFAULT_DEEP_THINK_PROMPT
+        )
         # Tool plumbing — both late-bindable since bot_tools depends on the
         # dispatcher, which depends on this client via ask_command. Wired in
         # main.py after both exist. When unset (or unconfigured), think()
@@ -215,43 +240,57 @@ class DeepThinkClient:
                     continue
             return default
 
+        # `_own` = this client's own global tiers only (e.g. deep_think_*,
+        # or tool_bot_* -> deep_think_*). `_shared` appends the writer
+        # fallback (llm_*) for the connection/model keys that historically
+        # inherit it. Behaviour keys use `_own` so a subclass never picks
+        # up the writer's enabled flag or system prompt by accident.
+        def _own(key: str) -> list[str]:
+            return [f"{p}_{key}" for p in self._own_prefixes]
+
+        def _shared(key: str) -> list[str]:
+            return [
+                f"{p}_{key}"
+                for p in (self._own_prefixes + self._shared_fallback)
+            ]
+
         sys_prompt = resolve_setting(
             store, bot_id, role, "system_prompt",
-            global_keys=["deep_think_system_prompt"],
+            global_keys=_own("system_prompt"),
         )
 
         return {
             "enabled": resolve_bool(
                 store, bot_id, role, "enabled",
-                global_keys=["deep_think_enabled"], default=False,
+                global_keys=_own("enabled"), default=self._default_enabled,
             ),
-            "base_url": _str("base_url", "deep_think_base_url", "llm_base_url").strip().rstrip("/"),
-            "api_key": _str("api_key", "deep_think_api_key", "llm_api_key").strip(),
-            "model": _str("model", "deep_think_model", "llm_model").strip(),
-            "temperature": _num("temperature", 0.7, "deep_think_temperature", "llm_temperature"),
-            "max_tokens": int(_num("max_tokens", 8000, "deep_think_max_tokens", "llm_max_tokens")),
-            "timeout": int(_num("timeout_seconds", 120, "deep_think_timeout_seconds", "llm_timeout_seconds")),
-            "extra_body": _str("extra_body", "deep_think_extra_body", "llm_extra_body"),
-            "system_prompt": sys_prompt or DEFAULT_DEEP_THINK_PROMPT,
+            "base_url": _str("base_url", *_shared("base_url")).strip().rstrip("/"),
+            "api_key": _str("api_key", *_shared("api_key")).strip(),
+            "model": _str("model", *_shared("model")).strip(),
+            "temperature": _num("temperature", 0.7, *_shared("temperature")),
+            "max_tokens": int(_num("max_tokens", 8000, *_shared("max_tokens"))),
+            "timeout": int(_num("timeout_seconds", 120, *_shared("timeout_seconds"))),
+            "extra_body": _str("extra_body", *_shared("extra_body")),
+            "system_prompt": sys_prompt or self._default_system_prompt,
             "context_max_chars": resolve_int(
                 store, bot_id, role, "context_max_chars",
-                global_keys=["deep_think_context_max_chars"], default=8000,
+                global_keys=_own("context_max_chars"), default=8000,
             ),
             "max_tool_rounds": resolve_int(
                 store, bot_id, role, "max_tool_rounds",
-                global_keys=["deep_think_max_tool_rounds"], default=15,
+                global_keys=_own("max_tool_rounds"), default=15,
             ),
             "caps_enabled": resolve_bool(
                 store, bot_id, role, "caps_enabled",
-                global_keys=["deep_think_caps_enabled"], default=False,
+                global_keys=_own("caps_enabled"), default=False,
             ),
             "user_daily_cap": resolve_int(
                 store, bot_id, role, "user_daily_cap",
-                global_keys=["deep_think_user_daily_cap"], default=0,
+                global_keys=_own("user_daily_cap"), default=0,
             ),
             "group_daily_cap": resolve_int(
                 store, bot_id, role, "group_daily_cap",
-                global_keys=["deep_think_group_daily_cap"], default=0,
+                global_keys=_own("group_daily_cap"), default=0,
             ),
         }
 
@@ -498,6 +537,20 @@ class DeepThinkClient:
         )
         return schemas or None
 
+    async def _handle_direct_mcp_call(self, name, args, caller_ctx) -> str:
+        """Handle a tool call whose name isn't a bot tool or the broker.
+
+        Base (deep_think) behaviour: reject — deep_think reaches MCP only
+        through the compact broker (mcp__discover / mcp__invoke), so a
+        direct `server__tool` call is a model mistake. ToolBotClient
+        overrides this to invoke the tool directly, because it exposes MCP
+        tools expanded rather than brokered.
+        """
+        return (
+            f"ERROR: direct MCP call {name!r} is unavailable. "
+            f"Use {MCP_DISCOVER_NAME}, then {MCP_INVOKE_NAME}."
+        )
+
     async def _run_tool_loop(
         self,
         messages: list[dict],
@@ -574,12 +627,12 @@ class DeepThinkClient:
             source_key=source_key,
             durable_ledger=getattr(self, "durable_tool_ledger", None),
             empty_response=(
-                "(deep_think produced no final answer — the model stopped "
-                "while still reasoning)"
+                f"({self._role_label} produced no final answer — the model "
+                "stopped while still reasoning)"
             ),
             incomplete_fallback=(
-                f"(deep_think exhausted its {max_rounds}-round tool budget "
-                "without enough completed evidence for a safe answer)"
+                f"({self._role_label} exhausted its {max_rounds}-round tool "
+                "budget without enough completed evidence for a safe answer)"
             ),
         )
         logger.info(
@@ -708,9 +761,8 @@ class DeepThinkClient:
                     arguments=args.get("arguments"),
                 )
             elif self.mcp_manager is not None:
-                content = (
-                    f"ERROR: direct MCP call {name!r} is unavailable. "
-                    f"Use {MCP_DISCOVER_NAME}, then {MCP_INVOKE_NAME}."
+                content = await self._handle_direct_mcp_call(
+                    name, args, caller_ctx,
                 )
             else:
                 content = f"ERROR: unknown tool {name}"
@@ -758,7 +810,7 @@ class DeepThinkClient:
         """
         question = (question or "").strip()
         if not question:
-            return "(deep_think unavailable: empty question)"
+            return f"({self._role_label} unavailable: empty question)"
         if attachments is None:
             attachments = []
 
@@ -767,17 +819,17 @@ class DeepThinkClient:
         if not cfg["enabled"]:
             self._publish("skip", question=question, reason="disabled",
                           user_hash=user_hash, group_id=group_id)
-            return "(deep_think unavailable: feature disabled)"
+            return f"({self._role_label} unavailable: feature disabled)"
         if not all([cfg["base_url"], cfg["api_key"], cfg["model"]]):
             self._publish("skip", question=question, reason="not_configured",
                           user_hash=user_hash, group_id=group_id)
-            return "(deep_think unavailable: not configured)"
+            return f"({self._role_label} unavailable: not configured)"
 
         cap_reason = self._check_cap(user_hash=user_hash, group_id=group_id, cfg=cfg)
         if cap_reason:
             self._publish("skip", question=question, reason=cap_reason,
                           user_hash=user_hash, group_id=group_id)
-            return f"(deep_think rate-limited: {cap_reason})"
+            return f"({self._role_label} rate-limited: {cap_reason})"
 
         # Cap context to budget. Hard cut at the boundary so a runaway writer
         # stuffing the entire chat history can't push the deep model into a
@@ -840,7 +892,7 @@ class DeepThinkClient:
                 "error", question=question, user_hash=user_hash,
                 group_id=group_id, error_msg=err,
             )
-            return "(deep_think unavailable: loop error)"
+            return f"({self._role_label} unavailable: loop error)"
 
         latency_ms = (time.time() - outer_started) * 1000.0
 
@@ -866,7 +918,7 @@ class DeepThinkClient:
             f"{latency_ms:.0f}ms ({cfg['model']})"
         )
 
-        return content or "(deep_think returned no content)"
+        return content or f"({self._role_label} returned no content)"
 
     async def health_check(self, prompt: Optional[str] = None) -> dict:
         """Single round-trip connectivity test for the deep_think
@@ -878,7 +930,7 @@ class DeepThinkClient:
         if not cfg["enabled"]:
             return {
                 "ok": False,
-                "error": "deep_think is disabled for this bot.",
+                "error": f"{self._role_label} is disabled for this bot.",
                 "model": cfg.get("model") or "",
                 "latency_ms": 0,
             }

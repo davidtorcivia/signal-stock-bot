@@ -10,10 +10,24 @@ from typing import Optional
 #   'research' — deep_think runs the tool loop and returns notes; the
 #                writer LLM composes the final reply with those notes
 #                injected as a system suffix (used for Artaud, whose
-#                voice is a locally-trained model).
+#                voice is a locally-trained model). ALWAYS delegates —
+#                every turn pays for a deep_think pass.
+#   'tool_bot' — like 'research', but the tool loop runs on the bot's
+#                dedicated `tool_bot`-role client (its own model/key/url,
+#                falling back deep_think_* -> llm_*) AND it self-gates:
+#                the tool-bot answers with the sentinel `NOTOOLS` when the
+#                turn needs no live data, so the writer composes directly
+#                without a wasted handoff. For writer models with poor
+#                native tool-calling: a capable sibling does the tools, the
+#                persona model only ever writes.
 DEEP_THINK_MODE_REPLACE = "replace"
 DEEP_THINK_MODE_RESEARCH = "research"
-DEEP_THINK_MODES = (DEEP_THINK_MODE_REPLACE, DEEP_THINK_MODE_RESEARCH)
+DEEP_THINK_MODE_TOOL_BOT = "tool_bot"
+DEEP_THINK_MODES = (
+    DEEP_THINK_MODE_REPLACE,
+    DEEP_THINK_MODE_RESEARCH,
+    DEEP_THINK_MODE_TOOL_BOT,
+)
 
 
 @dataclass
