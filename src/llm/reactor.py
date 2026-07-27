@@ -35,6 +35,7 @@ from ..bots.settings import (
     resolve_stripped,
 )
 from ..cache import get_metrics
+from ..enrichment.links import URL_RE
 from ..group_log import BOT_SENDER
 from ..memory import (
     NOTE_MEMORY_TOOL,
@@ -62,6 +63,14 @@ RECENT_TARGET_SNIPPET_LEN = 120
 # Rolling windows for the reaction budget, in seconds.
 BUDGET_HOUR_SECONDS = 3600.0
 BUDGET_DAY_SECONDS = 86400.0
+
+# The no-repeat window is a count ("don't reuse an emoji from the last N
+# reactions"), which needs a time bound as well. Under a 3-per-hour budget
+# those N reactions can span days, and an emoji nobody remembers seeing
+# stays barred — which suppresses good reactions rather than repetitive
+# ones. Six hours is about as far back as a reader plausibly carries "you
+# just used that" within a chat.
+REPEAT_MAX_AGE_SECONDS = 6 * 3600.0
 
 logger = logging.getLogger(__name__)
 
@@ -705,7 +714,8 @@ class EmojiReactor:
         bot_id: Optional[int] = None,
     ) -> bool:
         """True when `emoji` appears among this (group, bot)'s last
-        `repeat_window` reactions.
+        `repeat_window` reactions AND that reuse is recent enough to read
+        as repetition (see REPEAT_MAX_AGE_SECONDS).
 
         Guards against the failure mode where one emoji becomes the
         model's house style and every reaction starts looking automatic.
@@ -722,8 +732,10 @@ class EmojiReactor:
         key = self._emoji_key(emoji)
         if not key:
             return False
+        cutoff = time.time() - REPEAT_MAX_AGE_SECONDS
         return any(
-            self._emoji_key(e[3]) == key for e in list(log)[-window:]
+            e[0] >= cutoff and self._emoji_key(e[3]) == key
+            for e in list(log)[-window:]
         )
 
     def _record_cooldowns(
@@ -883,12 +895,13 @@ class EmojiReactor:
                 return
 
             cfg = self._config(bot)
+            metric_bot_id = getattr(bot, "id", None) if bot is not None else None
             if not cfg["enabled"]:
-                metrics.record_reactor_skip("disabled")
+                metrics.record_reactor_skip("disabled", bot_id=metric_bot_id)
                 return
 
             if policy is not None and not getattr(policy, "reactor_enabled", True):
-                metrics.record_reactor_skip("disabled")
+                metrics.record_reactor_skip("disabled", bot_id=metric_bot_id)
                 return
 
             text = message.strip()
@@ -901,7 +914,20 @@ class EmojiReactor:
             emoji_skip_reason: Optional[str] = None
             if bot_will_reply:
                 emoji_skip_reason = "will_reply"
-            elif cfg["min_length"] and len(text) < cfg["min_length"]:
+            elif (
+                cfg["min_length"]
+                and len(text) < cfg["min_length"]
+                # min_length is measured on the RAW message, before link
+                # enrichment, so a bare short link would fail it on the
+                # strength of its own URL length: "https://youtu.be/xxxxxxxxxxx"
+                # is 28 chars. That made reactability depend on whether the
+                # sender happened to type a sentence around the link, while
+                # the same link with 40 chars of comment sailed through. Let
+                # URL-bearing messages past the length gate and be judged on
+                # their enriched content, which is what the enricher exists
+                # for. The post-LLM brakes still ration them.
+                and not URL_RE.search(text)
+            ):
                 emoji_skip_reason = "short"
             elif self._within_cooldown(
                 sender, group_id, cfg, bot_id=bot_id_for_scope,
@@ -970,7 +996,9 @@ class EmojiReactor:
             # gate that actually fired so the dashboard stays honest about
             # which brake is doing the work.
             if not tools:
-                metrics.record_reactor_skip(emoji_skip_reason or "no_tools")
+                metrics.record_reactor_skip(
+                    emoji_skip_reason or "no_tools", bot_id=bot_id_for_scope,
+                )
                 return
 
             # Tell the model the reaction path is closed, so it doesn't keep
@@ -991,7 +1019,7 @@ class EmojiReactor:
                 except Exception as e:
                     logger.debug(f"Reactor: link enrichment failed: {e}")
 
-            metrics.record_reactor_evaluation()
+            metrics.record_reactor_evaluation(bot_id=bot_id_for_scope)
 
             bot_floor_at = (
                 getattr(policy, "purge_floor_at", None)
@@ -1035,13 +1063,13 @@ class EmojiReactor:
                     purpose="reactor",
                 )
             except Exception as e:
-                metrics.record_reactor_error()
+                metrics.record_reactor_error(bot_id=bot_id_for_scope)
                 logger.warning(f"Reactor LLM call failed for ...{sender_tail}: {e}")
                 return
 
             tool_calls = assistant_msg.get("tool_calls") or []
             if not tool_calls:
-                metrics.record_reactor_skip("no_tool")
+                metrics.record_reactor_skip("no_tool", bot_id=bot_id_for_scope)
                 # Capture text from wherever the model put it. Different
                 # providers stash reasoning in different fields:
                 #   - OpenAI/Anthropic style → "content"
@@ -1183,7 +1211,7 @@ class EmojiReactor:
                 # bot from re-firing inside the cooldown window, while
                 # leaving the OTHER bot free to be picked next time.
                 self.mark_implicit_response(group_id, bot_id=responder_bot_id)
-                metrics.record_reactor_response()
+                metrics.record_reactor_response(bot_id=responder_bot_id)
                 picked_label = (
                     f" → {getattr(responder_bot, 'slug', None)!r}"
                     if responder_bot is not None
@@ -1232,7 +1260,10 @@ class EmojiReactor:
                     and emoji_score is not None
                     and emoji_score < min_score
                 ):
-                    metrics.record_reactor_skip("low_score", score=emoji_score)
+                    metrics.record_reactor_skip(
+                        "low_score", score=emoji_score,
+                        bot_id=bot_id_for_scope,
+                    )
                     logger.info(
                         f"Reactor: dropped {emoji_pick} on ...{sender_tail} — "
                         f"score {emoji_score} < min {min_score}"
@@ -1249,7 +1280,9 @@ class EmojiReactor:
                 if self._is_repeat(
                     group_id, emoji_pick, cfg, bot_id=bot_id_for_scope,
                 ):
-                    metrics.record_reactor_skip("repeat", score=emoji_score)
+                    metrics.record_reactor_skip(
+                        "repeat", score=emoji_score, bot_id=bot_id_for_scope,
+                    )
                     logger.info(
                         f"Reactor: dropped {emoji_pick} on ...{sender_tail} — "
                         f"used within last {cfg['repeat_window']} reactions"
@@ -1267,7 +1300,9 @@ class EmojiReactor:
                     group_id, cfg, bot_id=bot_id_for_scope,
                 )
                 if spent:
-                    metrics.record_reactor_skip("budget", score=emoji_score)
+                    metrics.record_reactor_skip(
+                        "budget", score=emoji_score, bot_id=bot_id_for_scope,
+                    )
                     logger.info(
                         f"Reactor: dropped {emoji_pick} on ...{sender_tail} — "
                         f"budget spent ({spent})"
@@ -1298,7 +1333,9 @@ class EmojiReactor:
                     group_id=group_id,
                 )
                 if ok:
-                    metrics.record_reactor_reaction(emoji_pick, score=emoji_score)
+                    metrics.record_reactor_reaction(
+                        emoji_pick, score=emoji_score, bot_id=bot_id_for_scope,
+                    )
                     logger.info(
                         f"Reactor: {emoji_pick} on ...{(sender or '')[-4:]} "
                         f"({len(text)}-char msg"
@@ -1320,11 +1357,15 @@ class EmojiReactor:
                         group_id=group_id,
                     )
                 else:
-                    metrics.record_reactor_error()
+                    metrics.record_reactor_error(bot_id=bot_id_for_scope)
                 return
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            metrics.record_reactor_error()
+            # bot_id_for_scope may not be bound yet if we failed early, so
+            # read the bot directly.
+            metrics.record_reactor_error(
+                bot_id=getattr(bot, "id", None) if bot is not None else None,
+            )
             logger.error(f"Reactor unexpected error: {e}")

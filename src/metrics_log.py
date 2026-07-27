@@ -59,6 +59,25 @@ KIND_REACTOR_RESPONSE = "reactor_response"
 KIND_REACTOR_ERROR = "reactor_error"
 KIND_REQUEST = "request"
 
+# Reactor skip reasons that get a pre-seeded zero in the windowed aggregate,
+# so the dashboard renders "budget: 0" rather than a blank when nothing has
+# been skipped for that reason yet. This list is cosmetic ONLY — the
+# aggregate accumulates whatever reasons it actually finds, so a reason
+# added to the reactor without being added here still shows up in the data.
+# Keep it in sync with MetricsCollector._REACTOR_SKIP_FIELDS; a test
+# enforces that.
+REACTOR_SKIP_REASONS = (
+    "disabled",
+    "cooldown",
+    "short",
+    "no_tool",
+    "will_reply",
+    "budget",
+    "repeat",
+    "low_score",
+    "no_tools",
+)
+
 
 class MetricsLog:
     def __init__(self, db_path: str = "data/watchlist.db"):
@@ -151,6 +170,7 @@ class MetricsLog:
             fields.get("skip_reason"),
             fields.get("error_msg"),
             fields.get("score"),
+            fields.get("bot_id"),
         )
         with self._queue_lock:
             self._queue.append(ev)
@@ -178,8 +198,8 @@ class MetricsLog:
                        (occurred_at, kind, purpose, model, latency_ms,
                         tokens_in, tokens_out, cache_hit_tokens,
                         cache_miss_tokens, emoji, skip_reason, error_msg,
-                        score)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        score, bot_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     batch,
                 )
                 await db.commit()
@@ -301,16 +321,10 @@ class MetricsLog:
             "reactions_sent": 0,
             "responses_triggered": 0,
             "errors": 0,
-            "skipped_disabled": 0,
-            "skipped_cooldown": 0,
-            "skipped_short": 0,
-            "skipped_no_tool": 0,
-            "skipped_will_reply": 0,
-            "skipped_budget": 0,
-            "skipped_repeat": 0,
-            "skipped_low_score": 0,
-            "skipped_no_tools": 0,
         }
+        # Pre-seed the known reasons so the dashboard shows explicit zeros.
+        for reason in REACTOR_SKIP_REASONS:
+            out[f"skipped_{reason}"] = 0
         for kind, reason, n in rows:
             if kind == KIND_REACTOR_EVAL:
                 out["evaluations"] += n
@@ -321,9 +335,12 @@ class MetricsLog:
             elif kind == KIND_REACTOR_ERROR:
                 out["errors"] += n
             elif kind == KIND_REACTOR_SKIP:
-                key = f"skipped_{reason}" if reason else None
-                if key in out:
-                    out[key] += n
+                # Accumulate whatever reason the row carries, seeded or not.
+                # The old `if key in out` dropped unrecognised reasons on the
+                # floor, so a reason added to the reactor without being
+                # registered here vanished from the dashboard with no error.
+                key = f"skipped_{reason}" if reason else "skipped_unknown"
+                out[key] = out.get(key, 0) + n
 
         cursor = await db.execute(
             """SELECT emoji, COUNT(*) FROM metric_events

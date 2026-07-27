@@ -438,3 +438,97 @@ def test_default_prompt_states_the_score_rubric():
     from src.llm.reactor import DEFAULT_REACTOR_PROMPT
     assert "score" in DEFAULT_REACTOR_PROMPT
     assert "9-10" in DEFAULT_REACTOR_PROMPT
+
+
+# ── Follow-up fixes ────────────────────────────────────────────────────────
+
+
+def test_repeat_window_ignores_stale_reactions(store):
+    """The window is a COUNT, so under a 3-per-hour budget its N reactions
+    can span days. An emoji nobody remembers seeing must not stay barred."""
+    from src.llm.reactor import REPEAT_MAX_AGE_SECONDS
+    reactor, _, _ = _reactor(store)
+    cfg = dict(repeat_window=3)
+    stale = time.time() - REPEAT_MAX_AGE_SECONDS - 60
+    reactor._recent[("group:abc", 1)] = deque([(stale, "A", "x", "😬", None)])
+    assert reactor._is_repeat("group:abc", "😬", cfg, bot_id=1) is False
+    # Same emoji, but recent — still a repeat.
+    reactor._recent[("group:abc", 1)] = deque(
+        [(time.time() - 60, "A", "x", "😬", None)]
+    )
+    assert reactor._is_repeat("group:abc", "😬", cfg, bot_id=1) is True
+
+
+@pytest.mark.asyncio
+async def test_bare_short_link_is_exempt_from_min_length(store):
+    """min_length is measured pre-enrichment, so a bare link failed it on
+    its own URL length. Reactability must not depend on whether the sender
+    happened to type a sentence around the link."""
+    store.set("reactor_min_length", "40")
+    reactor, llm, signal = _reactor(store, tool_calls=[_react_call("😋")])
+    await _fire(reactor, message="https://youtu.be/dQw4w9WgXcQ")
+    assert "emoji_react" in _tool_names(llm)
+    signal.send_reaction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_short_message_without_url_still_gated(store):
+    """The exemption is for links only — plain short filler stays gated."""
+    store.set("reactor_min_length", "40")
+    reactor, llm, signal = _reactor(store, tool_calls=[_react_call("😋")])
+    await _fire(reactor, message="lol yeah")
+    llm.chat_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reaction_records_bot_id(store):
+    """metric_events.bot_id was never written at insert time, so the boot
+    backfill attributed every row to the default bot. Reactor events must
+    carry the bot that actually produced them."""
+    seen = []
+    reactor, llm, signal = _reactor(store, tool_calls=[_react_call("🔥", score=9)])
+    from src.cache import get_metrics
+    m = get_metrics()
+    orig = m.record_reactor_reaction
+    m.record_reactor_reaction = lambda emoji, score=None, bot_id=None: seen.append(
+        (emoji, score, bot_id)
+    )
+    try:
+        await _fire(reactor, bot=_bot(bot_id=7))
+    finally:
+        m.record_reactor_reaction = orig
+    assert seen == [("🔥", 9, 7)]
+
+
+def test_metrics_log_persists_bot_id_and_score():
+    """record() dropped bot_id on the floor before — the tuple it builds and
+    the INSERT column list have to stay aligned."""
+    from src.metrics_log import MetricsLog
+    ml = MetricsLog(":memory:")
+    ml.record("reactor_react", emoji="🔥", score=8, bot_id=2)
+    (ev,) = ml._queue
+    assert 8 in ev and 2 in ev
+
+
+def test_skip_reason_lists_are_in_sync():
+    """The seeded reason list is cosmetic, but drift between it and the
+    counter map means the dashboard shows blanks for a live reason."""
+    from src.cache import MetricsCollector
+    from src.metrics_log import REACTOR_SKIP_REASONS
+    assert set(MetricsCollector._REACTOR_SKIP_FIELDS) == set(REACTOR_SKIP_REASONS)
+
+
+@pytest.mark.asyncio
+async def test_unregistered_skip_reason_still_aggregates(tmp_path):
+    """The footgun this fixes: the old `if key in out` silently dropped any
+    reason not hand-added to the aggregate dict, so a reason added to the
+    reactor vanished from the dashboard with no error anywhere."""
+    from src.metrics_log import MetricsLog
+    ml = MetricsLog(str(tmp_path / "m.db"))
+    await ml._ensure_initialized()
+    ml.record("reactor_skip", skip_reason="some_future_reason")
+    await ml.flush()
+    r = (await ml.query_window(3600))["reactor"]
+    assert r["skipped_some_future_reason"] == 1
+    # Known reasons are still pre-seeded to zero for the dashboard.
+    assert r["skipped_budget"] == 0

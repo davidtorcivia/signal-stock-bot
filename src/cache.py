@@ -638,8 +638,14 @@ class MetricsCollector:
         "no_tools": "skipped_no_tools",
     }
 
+    # Every reactor recorder takes an explicit `bot_id`. The reactor runs as
+    # a background task and can route a response to a bot OTHER than the one
+    # owning the inbound context, so the ambient ContextVar that `_persist`
+    # falls back to would attribute the event to the wrong bot.
+
     def record_reactor_skip(
         self, reason: str, score: Optional[int] = None,
+        bot_id: Optional[int] = None,
     ) -> None:
         """Count one reactor skip. `score` is set for the post-LLM brakes
         (budget / repeat / low_score), where the model did pick an emoji and
@@ -655,21 +661,28 @@ class MetricsCollector:
                 self._reactor.by_score[score] = (
                     self._reactor.by_score.get(score, 0) + 1
                 )
-        _persist("reactor_skip", skip_reason=reason, score=score)
+        _persist(
+            "reactor_skip", skip_reason=reason, score=score, bot_id=bot_id,
+        )
 
-    def record_reactor_evaluation(self) -> None:
+    def record_reactor_evaluation(self, bot_id: Optional[int] = None) -> None:
         with self._lock:
             self._reactor.evaluations += 1
-        _persist("reactor_eval")
+        _persist("reactor_eval", bot_id=bot_id)
 
-    def record_reactor_response(self) -> None:
-        """The reactor's should_respond tool fired (natural-response feature)."""
+    def record_reactor_response(self, bot_id: Optional[int] = None) -> None:
+        """The reactor's should_respond tool fired (natural-response feature).
+
+        `bot_id` is the RESPONDER, which in a multi-bot chat may not be the
+        bot that owns the context.
+        """
         with self._lock:
             self._reactor.responses_triggered += 1
-        _persist("reactor_response")
+        _persist("reactor_response", bot_id=bot_id)
 
     def record_reactor_reaction(
         self, emoji: str, score: Optional[int] = None,
+        bot_id: Optional[int] = None,
     ) -> None:
         with self._lock:
             r = self._reactor
@@ -679,12 +692,12 @@ class MetricsCollector:
                 r.by_emoji[emoji] = r.by_emoji.get(emoji, 0) + 1
             if score is not None:
                 r.by_score[score] = r.by_score.get(score, 0) + 1
-        _persist("reactor_react", emoji=emoji, score=score)
+        _persist("reactor_react", emoji=emoji, score=score, bot_id=bot_id)
 
-    def record_reactor_error(self) -> None:
+    def record_reactor_error(self, bot_id: Optional[int] = None) -> None:
         with self._lock:
             self._reactor.errors += 1
-        _persist("reactor_error")
+        _persist("reactor_error", bot_id=bot_id)
 
     # ── Aggregate snapshot ─────────────────────────────────────────────
 
@@ -868,8 +881,27 @@ def _persist(kind: str, **fields) -> None:
     Lazy-imported to avoid a top-level cycle (metrics_log itself imports
     from .database, which other stores import from). Failure is silent —
     metrics persistence must never affect the hot path it's measuring.
+
+    `bot_id` is resolved here rather than threaded through every caller.
+    `metric_events.bot_id` existed and was listed in the bot registry's
+    CONSUMER_TABLES, but nothing ever wrote it at insert time — so the
+    boot-time backfill stamped every row with the default bot, making
+    per-bot metrics silently wrong in a multi-bot install. The dispatcher
+    already publishes the owning bot on a ContextVar for transcript
+    capture, and asyncio.Task copies contextvars at create time, so
+    background tasks (the reactor) inherit it. An explicit bot_id in
+    `fields` always wins: the reactor can route a response to a different
+    bot than the one that owns the inbound context.
     """
     try:
+        if fields.get("bot_id") is None:
+            try:
+                from .llm.transcript import get_active
+                active = get_active()
+                if active is not None:
+                    fields["bot_id"] = active.bot_id
+            except Exception:
+                pass
         from .metrics_log import get_metrics_log
         get_metrics_log().record(kind, **fields)
     except Exception:
