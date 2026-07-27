@@ -60,6 +60,11 @@ LIVE_KEYS = {
     "reactor_sender_cooldown",
     "reactor_group_cooldown",
     "reactor_context_messages",
+    # Post-LLM brakes — applied after the model has already picked an emoji
+    "reactor_hourly_budget",
+    "reactor_daily_budget",
+    "reactor_repeat_window",
+    "reactor_min_score",
     # Natural response (piggybacks on the reactor LLM call)
     "natural_response_enabled",
     "natural_response_cooldown",

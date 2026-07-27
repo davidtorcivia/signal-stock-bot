@@ -326,9 +326,23 @@ class ReactorMetrics:
     skipped_cooldown: int = 0
     skipped_short: int = 0
     skipped_no_tool: int = 0      # LLM declined (no tool call returned)
+    # Emoji suppressed because the dispatcher already knew the message
+    # produces a reply. Counts only calls where NO other tool was offered
+    # either — otherwise the call proceeded without emoji_react and lands
+    # in `evaluations`.
+    skipped_will_reply: int = 0
+    # Post-LLM brakes: the model picked an emoji and we dropped it anyway.
+    skipped_budget: int = 0       # (group, bot) hourly/daily cap spent
+    skipped_repeat: int = 0       # emoji used within the no-repeat window
+    skipped_low_score: int = 0    # self-reported score below reactor_min_score
+    skipped_no_tools: int = 0     # defensive: gates left nothing to offer
     responses_triggered: int = 0  # should_respond tool was invoked (natural-response feature)
     errors: int = 0
     by_emoji: dict = field(default_factory=dict)
+    # Self-reported worthiness histogram (score -> count) across every
+    # emoji_react call, kept whether or not the score was enforced. This
+    # is what the log-only phase of reactor_min_score is for.
+    by_score: dict = field(default_factory=dict)
     last_reaction_at: Optional[float] = None
 
 
@@ -609,18 +623,39 @@ class MetricsCollector:
 
     # ── Reactor metrics ────────────────────────────────────────────────
 
-    def record_reactor_skip(self, reason: str) -> None:
+    # Skip reasons the reactor emits, mapped to their ReactorMetrics field.
+    # Unknown reasons still persist to metric_events; they just don't get an
+    # in-process counter.
+    _REACTOR_SKIP_FIELDS = {
+        "disabled": "skipped_disabled",
+        "cooldown": "skipped_cooldown",
+        "short": "skipped_short",
+        "no_tool": "skipped_no_tool",
+        "will_reply": "skipped_will_reply",
+        "budget": "skipped_budget",
+        "repeat": "skipped_repeat",
+        "low_score": "skipped_low_score",
+        "no_tools": "skipped_no_tools",
+    }
+
+    def record_reactor_skip(
+        self, reason: str, score: Optional[int] = None,
+    ) -> None:
+        """Count one reactor skip. `score` is set for the post-LLM brakes
+        (budget / repeat / low_score), where the model did pick an emoji and
+        rated it — worth keeping so a suppressed pick's score still lands in
+        the distribution.
+        """
         with self._lock:
-            r = self._reactor
-            if reason == "disabled":
-                r.skipped_disabled += 1
-            elif reason == "cooldown":
-                r.skipped_cooldown += 1
-            elif reason == "short":
-                r.skipped_short += 1
-            elif reason == "no_tool":
-                r.skipped_no_tool += 1
-        _persist("reactor_skip", skip_reason=reason)
+            field_name = self._REACTOR_SKIP_FIELDS.get(reason)
+            if field_name is not None:
+                r = self._reactor
+                setattr(r, field_name, getattr(r, field_name) + 1)
+            if score is not None:
+                self._reactor.by_score[score] = (
+                    self._reactor.by_score.get(score, 0) + 1
+                )
+        _persist("reactor_skip", skip_reason=reason, score=score)
 
     def record_reactor_evaluation(self) -> None:
         with self._lock:
@@ -633,14 +668,18 @@ class MetricsCollector:
             self._reactor.responses_triggered += 1
         _persist("reactor_response")
 
-    def record_reactor_reaction(self, emoji: str) -> None:
+    def record_reactor_reaction(
+        self, emoji: str, score: Optional[int] = None,
+    ) -> None:
         with self._lock:
             r = self._reactor
             r.reactions_sent += 1
             r.last_reaction_at = time.time()
             if emoji:
                 r.by_emoji[emoji] = r.by_emoji.get(emoji, 0) + 1
-        _persist("reactor_react", emoji=emoji)
+            if score is not None:
+                r.by_score[score] = r.by_score.get(score, 0) + 1
+        _persist("reactor_react", emoji=emoji, score=score)
 
     def record_reactor_error(self) -> None:
         with self._lock:
@@ -711,12 +750,27 @@ class MetricsCollector:
                 "reactor": {
                     "evaluations": self._reactor.evaluations,
                     "reactions_sent": self._reactor.reactions_sent,
+                    "responses_triggered": self._reactor.responses_triggered,
                     "skipped_disabled": self._reactor.skipped_disabled,
                     "skipped_cooldown": self._reactor.skipped_cooldown,
                     "skipped_short": self._reactor.skipped_short,
                     "skipped_no_tool": self._reactor.skipped_no_tool,
+                    "skipped_will_reply": self._reactor.skipped_will_reply,
+                    "skipped_budget": self._reactor.skipped_budget,
+                    "skipped_repeat": self._reactor.skipped_repeat,
+                    "skipped_low_score": self._reactor.skipped_low_score,
+                    "skipped_no_tools": self._reactor.skipped_no_tools,
                     "errors": self._reactor.errors,
                     "top_emojis": top_emojis,
+                    # Same shape the windowed SQL aggregate returns — a
+                    # sorted [[score, count], ...] list — so the template
+                    # renders identically from either source.
+                    "by_score": sorted(self._reactor.by_score.items()),
+                    "avg_score": (
+                        sum(s * n for s, n in self._reactor.by_score.items())
+                        / sum(self._reactor.by_score.values())
+                        if self._reactor.by_score else None
+                    ),
                     "last_reaction_at": self._reactor.last_reaction_at,
                 },
                 "deep_think": {

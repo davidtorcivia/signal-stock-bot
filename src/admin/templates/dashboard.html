@@ -328,12 +328,21 @@
             </td>
         </tr>
         <tr>
-            <th>Skips</th>
+            <th>Skipped before the call</th>
             <td>
                 <span class="muted">disabled:</span> {{ r.skipped_disabled }} ·
                 <span class="muted">cooldown:</span> {{ r.skipped_cooldown }} ·
                 <span class="muted">short:</span> {{ r.skipped_short }} ·
-                <span class="muted">no react:</span> {{ r.skipped_no_tool }}
+                <span class="muted">already replying:</span> {{ r.skipped_will_reply }}
+            </td>
+        </tr>
+        <tr>
+            <th>Dropped after the call</th>
+            <td>
+                <span class="muted">no react:</span> {{ r.skipped_no_tool }} ·
+                <span class="muted">budget:</span> {{ r.skipped_budget }} ·
+                <span class="muted">repeat:</span> {{ r.skipped_repeat }} ·
+                <span class="muted">low score:</span> {{ r.skipped_low_score }}
             </td>
         </tr>
         <tr><th>Errors</th><td>{{ r.errors }}</td></tr>
@@ -344,6 +353,21 @@
                 {% for emoji, n in r.top_emojis %}
                     {{ emoji }}<span class="muted">×{{ n }}</span>{% if not loop.last %} &nbsp; {% endif %}
                 {% endfor %}
+            </td>
+        </tr>
+        {% endif %}
+        {# Self-reported worthiness spread. The readout that tells you where to
+           set reactor_min_score once enough calls have been scored. #}
+        {% if r.by_score %}
+        <tr>
+            <th>Score spread</th>
+            <td>
+                {% for s, n in r.by_score %}
+                    <span class="muted">{{ s }}:</span>{{ n }}{% if not loop.last %} &nbsp; {% endif %}
+                {% endfor %}
+                {% if r.avg_score %}
+                    <span class="muted">(avg {{ '%.1f'|format(r.avg_score) }})</span>
+                {% endif %}
             </td>
         </tr>
         {% endif %}

@@ -49,8 +49,19 @@ from ..memory import (
 # reference when users ask "why did you react with X?". Small, in-memory,
 # wipes on restart — matches the natural conversational half-life of
 # "what just happened in chat?" questions.
-RECENT_REACTIONS_PER_GROUP = 20
+#
+# Also the counting window for the rolling reaction budget and the
+# no-repeat check, so it must comfortably exceed `daily_budget` — a
+# deque that evicts inside the 24h window would undercount and let the
+# budget drift upward. 60 is ~5x the default daily cap. Callers of
+# `recent_reactions()` pass their own (much smaller) limit, so growing
+# this does not enlarge anything in the writer's prompt.
+RECENT_REACTIONS_PER_GROUP = 60
 RECENT_TARGET_SNIPPET_LEN = 120
+
+# Rolling windows for the reaction budget, in seconds.
+BUDGET_HOUR_SECONDS = 3600.0
+BUDGET_DAY_SECONDS = 86400.0
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +81,44 @@ REACT_TOOL = {
                 "emoji": {
                     "type": "string",
                     "description": "A single Unicode emoji.",
-                }
+                },
+                # Self-reported worthiness. Thresholded server-side against
+                # `reactor_min_score`, which ships at 0 (log-only) so the
+                # score distribution can be observed before it gates
+                # anything — self-scores cluster high and the right cut
+                # can't be guessed cold. The rubric is repeated in the
+                # system prompt, without which scores bunch at 7-8 and
+                # carry no signal.
+                "score": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": (
+                        "How strongly THIS message warrants a reaction, 1-10. "
+                        "1-3 = you're reaching; nothing here really calls for "
+                        "one. 4-6 = mild; a reaction would be fine but silence "
+                        "is equally fine. 7-8 = clearly wants acknowledgement. "
+                        "9-10 = the room would notice if nobody reacted. Be "
+                        "honest — most messages are 1-5."
+                    ),
+                },
             },
-            "required": ["emoji"],
+            "required": ["emoji", "score"],
         },
     },
 }
+
+
+# Appended to the reactor system prompt when the emoji_react tool is NOT
+# offered (message already getting a reply, too short, or inside a
+# cooldown) but another tool still is. Without it the prompt keeps
+# instructing the model to react with an emoji it has no tool for, which
+# invites hallucinated tool calls and wasted tokens.
+NO_EMOJI_GUIDANCE = """\
+
+IMPORTANT: the emoji_react tool is NOT available for this message — a
+reaction is not an option right now, so do not attempt one or mention
+wanting to. Use only the tools you have actually been given, or none."""
 
 
 SHOULD_RESPOND_TOOL = {
@@ -218,17 +261,27 @@ Do NOT react when:
 - The message is short, transactional, or expects a written reply
 - It's logistics, scheduling, or a routine update
 - The bot is already answering it
-- The only thing that fits is a generic "thinking" emoji. Reacting with
-  🤔 to a shared link or tweet is a tell that you didn't have a real
-  reaction — skip it.
+- The only emoji that fits would just signal "I registered this." A
+  reaction has to say something a reader couldn't already guess. If it
+  carries no information beyond acknowledgement, stay silent — this rule
+  is about the emoji's emptiness, not about any particular emoji, so
+  swapping in a different vague one does not satisfy it.
 
 Match the emoji to the actual content, not its category. A tweet about a
-housing crash isn't 🤔, it's 🏚 or 😬 or 💀 depending on tone. A link to a
-recipe isn't 🤔, it's 🍳 or 😋. If nothing specific fits, don't react —
-silence is correct here far more often than a vague hum.
+housing crash isn't a vague hum, it's 🏚 or 😬 or 💀 depending on tone. A
+link to a recipe is 🍳 or 😋. If nothing specific fits, don't react —
+silence is correct here far more often than a hedge.
 
-Call the emoji_react tool with a SINGLE emoji that fits. Otherwise, don't
-call any tool."""
+You see EVERY message in this chat. React to roughly one in ten. Before
+reacting, ask whether the next message might deserve it more; if this one
+isn't clearly among the best you'll see this hour, skip it. Reacting to
+consecutive messages, or repeating an emoji you've used recently, reads
+as automatic rather than considered.
+
+Call the emoji_react tool with a SINGLE emoji that fits, plus an honest
+`score` for how much this message warranted it (1-3 = reaching, 4-6 =
+mild, 7-8 = clearly wants a nod, 9-10 = the room would notice its
+absence). Otherwise, don't call any tool."""
 
 
 class EmojiReactor:
@@ -365,6 +418,29 @@ class EmojiReactor:
             "context_messages": resolve_int(
                 store, bot_id, "reactor", "context_messages",
                 global_keys=["reactor_context_messages"], default=5,
+            ),
+            # Post-LLM brakes. The cheap gates above and the LLM's own
+            # judgement both rate messages in isolation; these three cap
+            # the aggregate so a chatty hour can't turn into a wall of
+            # reactions even when every individual call was defensible.
+            # 0 disables each independently.
+            "hourly_budget": resolve_int(
+                store, bot_id, "reactor", "hourly_budget",
+                global_keys=["reactor_hourly_budget"], default=3,
+            ),
+            "daily_budget": resolve_int(
+                store, bot_id, "reactor", "daily_budget",
+                global_keys=["reactor_daily_budget"], default=12,
+            ),
+            "repeat_window": resolve_int(
+                store, bot_id, "reactor", "repeat_window",
+                global_keys=["reactor_repeat_window"], default=3,
+            ),
+            # 0 = record scores without enforcing them (the log-only
+            # calibration phase). 1-10 = drop picks scoring below this.
+            "min_score": resolve_int(
+                store, bot_id, "reactor", "min_score",
+                global_keys=["reactor_min_score"], default=0,
             ),
             "natural_response_enabled": resolve_bool(
                 store, bot_id, "reactor", "natural_response_enabled",
@@ -580,6 +656,76 @@ class EmojiReactor:
             return True
         return False
 
+    def _budget_exceeded(
+        self, group_id: str, cfg: dict, bot_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """Return a short human-readable reason when this (group, bot) has
+        spent its reaction budget, else None.
+
+        Enforced AFTER the LLM decides, which is the point: the model's
+        judgement ranks candidates, the budget rations how many of them
+        actually land. Counts real sent reactions only — `_recent` is
+        appended just once Signal has accepted the reaction.
+
+        In-memory, so the budget resets on process restart. That's a
+        deliberate trade for not putting a write on the reaction path;
+        the failure mode is a brief burst after a deploy, not a leak.
+        """
+        hourly = cfg["hourly_budget"]
+        daily = cfg["daily_budget"]
+        if hourly <= 0 and daily <= 0:
+            return None
+        log = self._recent.get(self._gb_key(group_id, bot_id))
+        if not log:
+            return None
+        now = time.time()
+        if hourly > 0:
+            n = sum(1 for e in log if now - e[0] < BUDGET_HOUR_SECONDS)
+            if n >= hourly:
+                return f"{n}/{hourly} this hour"
+        if daily > 0:
+            n = sum(1 for e in log if now - e[0] < BUDGET_DAY_SECONDS)
+            if n >= daily:
+                return f"{n}/{daily} today"
+        return None
+
+    @staticmethod
+    def _emoji_key(emoji: str) -> str:
+        """Normalize an emoji for equality checks.
+
+        Signal and the various models disagree about the trailing
+        variation selector (U+FE0F), so ❤️ and ❤ arrive as different
+        strings for the same reaction. Stripping VS15/VS16 makes the
+        no-repeat check see them as one emoji instead of two.
+        """
+        return (emoji or "").replace("️", "").replace("︎", "").strip()
+
+    def _is_repeat(
+        self, group_id: str, emoji: str, cfg: dict,
+        bot_id: Optional[int] = None,
+    ) -> bool:
+        """True when `emoji` appears among this (group, bot)'s last
+        `repeat_window` reactions.
+
+        Guards against the failure mode where one emoji becomes the
+        model's house style and every reaction starts looking automatic.
+        There's no way to ask for a different pick without a second LLM
+        call, so a repeat drops the reaction entirely — which is the
+        outcome we want anyway.
+        """
+        window = cfg["repeat_window"]
+        if window <= 0:
+            return False
+        log = self._recent.get(self._gb_key(group_id, bot_id))
+        if not log:
+            return False
+        key = self._emoji_key(emoji)
+        if not key:
+            return False
+        return any(
+            self._emoji_key(e[3]) == key for e in list(log)[-window:]
+        )
+
     def _record_cooldowns(
         self, sender: str, group_id: str, bot_id: Optional[int] = None,
     ) -> None:
@@ -708,10 +854,21 @@ class EmojiReactor:
         """Background task. Logs and swallows every error.
 
         `bot_will_reply` is set by the dispatcher when it can already tell the
-        message will produce a reply (mention or prefixed command). The
-        reactor still emoji-evaluates, but suppresses the should_respond tool
-        so we don't fire a duplicate spontaneous reply on top of the explicit
-        one.
+        message will produce a reply (mention or prefixed command). It
+        suppresses BOTH tools that would add a second visible response:
+        should_respond (else the user gets two replies) and emoji_react
+        (else the bot decorates a message it is simultaneously answering).
+
+        The three cheap emoji gates — `bot_will_reply`, `min_length`, and
+        the sender/group cooldowns — suppress the emoji_react tool rather
+        than abandoning the call, because should_respond and note_memory
+        ride on the same LLM request and have their own, independent
+        gating. Returning early here would silently couple them: a raised
+        emoji cooldown would throttle spontaneous replies, and since
+        cooldowns are recorded only when a reaction is actually sent,
+        every reaction would mute that sender's natural-response path for
+        a full cooldown window. The call is abandoned only when the gates
+        leave no tools to offer at all.
 
         `candidate_bots` enumerates the enabled bots that COULD answer in
         this chat. When length > 1 and we're offering should_respond, the
@@ -735,27 +892,22 @@ class EmojiReactor:
                 return
 
             text = message.strip()
-            if cfg["min_length"] and len(text) < cfg["min_length"]:
-                metrics.record_reactor_skip("short")
-                return
-
             bot_id_for_scope = getattr(bot, "id", None) if bot is not None else None
-            if self._within_cooldown(sender, group_id, cfg, bot_id=bot_id_for_scope):
-                metrics.record_reactor_skip("cooldown")
-                return
 
-            # Inline-expand tweet/X URLs so the reactor sees actual content
-            # rather than an opaque link. Failures are non-fatal — fall back
-            # to the raw text.
-            if self.enricher is not None:
-                try:
-                    expanded = await self.enricher.expand(text)
-                    if expanded:
-                        text = expanded
-                except Exception as e:
-                    logger.debug(f"Reactor: link enrichment failed: {e}")
-
-            metrics.record_reactor_evaluation()
+            # The three cheap emoji gates. Each records WHY emoji_react is
+            # off the table without deciding on its own that the whole call
+            # is pointless — see the docstring. First match wins; the order
+            # runs most-definitive first.
+            emoji_skip_reason: Optional[str] = None
+            if bot_will_reply:
+                emoji_skip_reason = "will_reply"
+            elif cfg["min_length"] and len(text) < cfg["min_length"]:
+                emoji_skip_reason = "short"
+            elif self._within_cooldown(
+                sender, group_id, cfg, bot_id=bot_id_for_scope,
+            ):
+                emoji_skip_reason = "cooldown"
+            offer_emoji = emoji_skip_reason is None
 
             # Per-context prompt override wins over the global reactor prompt
             system_prompt = cfg["system_prompt"]
@@ -768,7 +920,7 @@ class EmojiReactor:
             # append guidance describing when to use it. Off by default; both
             # the global flag and per-context flag must be on. Suppressed when
             # the dispatcher already knows it will reply (mention/command).
-            tools = [REACT_TOOL]
+            tools = [REACT_TOOL] if offer_emoji else []
             offer_should_respond = (
                 not bot_will_reply
                 and self._natural_response_active(
@@ -813,6 +965,34 @@ class EmojiReactor:
             if offer_note_memory:
                 tools.append(NOTE_MEMORY_TOOL)
 
+            # Nothing left to ask the model about — this is where the cheap
+            # emoji gates finally do abandon the call, attributed to the
+            # gate that actually fired so the dashboard stays honest about
+            # which brake is doing the work.
+            if not tools:
+                metrics.record_reactor_skip(emoji_skip_reason or "no_tools")
+                return
+
+            # Tell the model the reaction path is closed, so it doesn't keep
+            # trying to use a tool it wasn't given.
+            if not offer_emoji:
+                system_prompt = f"{system_prompt}\n{NO_EMOJI_GUIDANCE}"
+
+            # Inline-expand tweet/X URLs so the reactor sees actual content
+            # rather than an opaque link. Failures are non-fatal — fall back
+            # to the raw text. Skipped when the only remaining tool is
+            # note_memory: paying a fetch to enrich a call that can't
+            # produce anything visible is wasted latency.
+            if self.enricher is not None and (offer_emoji or offer_should_respond):
+                try:
+                    expanded = await self.enricher.expand(text)
+                    if expanded:
+                        text = expanded
+                except Exception as e:
+                    logger.debug(f"Reactor: link enrichment failed: {e}")
+
+            metrics.record_reactor_evaluation()
+
             bot_floor_at = (
                 getattr(policy, "purge_floor_at", None)
                 if policy is not None else None
@@ -840,7 +1020,9 @@ class EmojiReactor:
             preview = text.replace("\n", " ")[:60]
             logger.info(
                 f"Reactor: evaluating ...{sender_tail} ({len(text)}c"
-                f"{', +respond' if offer_should_respond else ''}): {preview!r}"
+                f"{', +respond' if offer_should_respond else ''}"
+                f"{f', -emoji({emoji_skip_reason})' if not offer_emoji else ''}"
+                f"): {preview!r}"
             )
 
             llm_for_call = self._llm_for(bot)
@@ -920,6 +1102,7 @@ class EmojiReactor:
             respond_reason: Optional[str] = None
             respond_bot_slug: Optional[str] = None
             emoji_pick: Optional[str] = None
+            emoji_score: Optional[int] = None
             memory_notes: list[dict] = []
             for call in tool_calls:
                 fn = call.get("function") or {}
@@ -942,6 +1125,16 @@ class EmojiReactor:
                         respond_bot_slug = slug
                 elif fname == "emoji_react" and emoji_pick is None:
                     emoji_pick = (args.get("emoji") or "").strip()
+                    # `score` is required by the schema, but models drop
+                    # required fields often enough that a missing or
+                    # unparseable score must not be treated as a low one —
+                    # None means "unscored" and passes the threshold.
+                    raw_score = args.get("score")
+                    try:
+                        if raw_score is not None:
+                            emoji_score = int(raw_score)
+                    except (TypeError, ValueError):
+                        emoji_score = None
                 elif fname == "note_memory":
                     memory_notes.append(args)
 
@@ -1025,7 +1218,69 @@ class EmojiReactor:
                         )
                 return
 
-            if emoji_pick:
+            if emoji_pick and offer_emoji:
+                # ── Post-LLM brakes ───────────────────────────────────────
+                # The model rated this message in isolation; these three
+                # decide whether it earns one of a limited number of slots.
+                # All of them run BEFORE _record_cooldowns: a suppressed
+                # pick is a non-event the user never saw, so it must not
+                # start a cooldown — doing so would mute this sender's
+                # natural-response path for something invisible.
+                min_score = cfg["min_score"]
+                if (
+                    min_score > 0
+                    and emoji_score is not None
+                    and emoji_score < min_score
+                ):
+                    metrics.record_reactor_skip("low_score", score=emoji_score)
+                    logger.info(
+                        f"Reactor: dropped {emoji_pick} on ...{sender_tail} — "
+                        f"score {emoji_score} < min {min_score}"
+                    )
+                    get_bus().publish(
+                        "reactor",
+                        decision="decline",
+                        sender_tail=sender_tail,
+                        group_id=group_id,
+                        text=f"score {emoji_score} < min {min_score}",
+                    )
+                    return
+
+                if self._is_repeat(
+                    group_id, emoji_pick, cfg, bot_id=bot_id_for_scope,
+                ):
+                    metrics.record_reactor_skip("repeat", score=emoji_score)
+                    logger.info(
+                        f"Reactor: dropped {emoji_pick} on ...{sender_tail} — "
+                        f"used within last {cfg['repeat_window']} reactions"
+                    )
+                    get_bus().publish(
+                        "reactor",
+                        decision="decline",
+                        sender_tail=sender_tail,
+                        group_id=group_id,
+                        text=f"repeat of {emoji_pick}",
+                    )
+                    return
+
+                spent = self._budget_exceeded(
+                    group_id, cfg, bot_id=bot_id_for_scope,
+                )
+                if spent:
+                    metrics.record_reactor_skip("budget", score=emoji_score)
+                    logger.info(
+                        f"Reactor: dropped {emoji_pick} on ...{sender_tail} — "
+                        f"budget spent ({spent})"
+                    )
+                    get_bus().publish(
+                        "reactor",
+                        decision="decline",
+                        sender_tail=sender_tail,
+                        group_id=group_id,
+                        text=f"budget spent ({spent})",
+                    )
+                    return
+
                 self._record_cooldowns(sender, group_id, bot_id=bot_id_for_scope)
                 # Route the reaction through the bot's handler so multi-
                 # phone installs react from the right number.
@@ -1043,10 +1298,11 @@ class EmojiReactor:
                     group_id=group_id,
                 )
                 if ok:
-                    metrics.record_reactor_reaction(emoji_pick)
+                    metrics.record_reactor_reaction(emoji_pick, score=emoji_score)
                     logger.info(
                         f"Reactor: {emoji_pick} on ...{(sender or '')[-4:]} "
-                        f"({len(text)}-char msg)"
+                        f"({len(text)}-char msg"
+                        f"{f', score {emoji_score}' if emoji_score is not None else ''})"
                     )
                     self._record_recent(
                         group_id=group_id,

@@ -443,6 +443,10 @@ LLM_KEYS = [
     "reactor_sender_cooldown",
     "reactor_group_cooldown",
     "reactor_context_messages",
+    "reactor_hourly_budget",
+    "reactor_daily_budget",
+    "reactor_repeat_window",
+    "reactor_min_score",
     "reactor_system_prompt",
     # Natural response: piggybacks on the reactor model. Global kill switch +
     # tunables; per-context opt-in lives on ContextPolicy.natural_response.
@@ -500,6 +504,13 @@ LLM_DEFAULTS = {
     "reactor_sender_cooldown": 30,
     "reactor_group_cooldown": 10,
     "reactor_context_messages": 5,
+    # Post-LLM brakes. The cooldowns above rate-limit which messages get
+    # evaluated; these cap how many evaluations may become reactions, so a
+    # busy hour can't become a wall of emoji. 0 disables each.
+    "reactor_hourly_budget": 3,
+    "reactor_daily_budget": 12,
+    "reactor_repeat_window": 3,            # same emoji barred for N reactions
+    "reactor_min_score": 0,                # 0 => log scores without enforcing
     "reactor_system_prompt": "",           # empty => use the built-in DEFAULT_REACTOR_PROMPT
     # Natural response (piggybacks on reactor model)
     "natural_response_enabled": False,
@@ -587,6 +598,10 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
         "reactor_sender_cooldown",
         "reactor_group_cooldown",
         "reactor_context_messages",
+        "reactor_hourly_budget",
+        "reactor_daily_budget",
+        "reactor_repeat_window",
+        "reactor_min_score",
         "natural_response_cooldown",
         "deep_think_max_tokens",
         "deep_think_timeout_seconds",

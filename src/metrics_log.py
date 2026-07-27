@@ -94,7 +94,8 @@ class MetricsLog:
                         emoji TEXT,
                         skip_reason TEXT,
                         error_msg TEXT,
-                        bot_id INTEGER
+                        bot_id INTEGER,
+                        score INTEGER
                     )
                     """
                 )
@@ -114,6 +115,10 @@ class MetricsLog:
                 if "cache_miss_tokens" not in cols:
                     await db.execute(
                         "ALTER TABLE metric_events ADD COLUMN cache_miss_tokens INTEGER"
+                    )
+                if "score" not in cols:
+                    await db.execute(
+                        "ALTER TABLE metric_events ADD COLUMN score INTEGER"
                     )
                 # Two indexes: one for kind-scoped windowed queries (the
                 # common dashboard shape), one for time-only prunes.
@@ -145,6 +150,7 @@ class MetricsLog:
             fields.get("emoji"),
             fields.get("skip_reason"),
             fields.get("error_msg"),
+            fields.get("score"),
         )
         with self._queue_lock:
             self._queue.append(ev)
@@ -171,8 +177,9 @@ class MetricsLog:
                     """INSERT INTO metric_events
                        (occurred_at, kind, purpose, model, latency_ms,
                         tokens_in, tokens_out, cache_hit_tokens,
-                        cache_miss_tokens, emoji, skip_reason, error_msg)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        cache_miss_tokens, emoji, skip_reason, error_msg,
+                        score)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     batch,
                 )
                 await db.commit()
@@ -289,7 +296,7 @@ class MetricsLog:
             (cutoff,),
         )
         rows = await cursor.fetchall()
-        out = {
+        out: dict = {
             "evaluations": 0,
             "reactions_sent": 0,
             "responses_triggered": 0,
@@ -298,6 +305,11 @@ class MetricsLog:
             "skipped_cooldown": 0,
             "skipped_short": 0,
             "skipped_no_tool": 0,
+            "skipped_will_reply": 0,
+            "skipped_budget": 0,
+            "skipped_repeat": 0,
+            "skipped_low_score": 0,
+            "skipped_no_tools": 0,
         }
         for kind, reason, n in rows:
             if kind == KIND_REACTOR_EVAL:
@@ -322,6 +334,25 @@ class MetricsLog:
         out["top_emojis"] = [
             [emoji, n] for emoji, n in await cursor.fetchall()
         ]
+
+        # Self-reported worthiness distribution across every emoji_react
+        # pick — both the ones that landed and the ones a post-LLM brake
+        # dropped. This is the readout that turns reactor_min_score from a
+        # guess into a percentile: pick the threshold off the histogram
+        # rather than cold, since self-scores cluster high.
+        cursor = await db.execute(
+            """SELECT score, COUNT(*) FROM metric_events
+               WHERE kind IN (?, ?) AND occurred_at >= ? AND score IS NOT NULL
+               GROUP BY score ORDER BY score""",
+            (KIND_REACTOR_REACT, KIND_REACTOR_SKIP, cutoff),
+        )
+        score_rows = await cursor.fetchall()
+        out["by_score"] = [[int(s), n] for s, n in score_rows]
+        scored_total = sum(n for _, n in score_rows)
+        out["avg_score"] = (
+            sum(int(s) * n for s, n in score_rows) / scored_total
+            if scored_total else None
+        )
 
         cursor = await db.execute(
             """SELECT MAX(occurred_at) FROM metric_events

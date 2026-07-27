@@ -244,6 +244,49 @@
                value="{{ values.reactor_context_messages if values.reactor_context_messages is not none else '' }}"
                placeholder="5">
 
+        <h3 style="margin-top: 24px; font-size: 14px;">Post-LLM brakes</h3>
+        <p class="muted" style="font-size: 11px;">
+            The cooldowns above decide which messages get <em>evaluated</em>;
+            these decide how many evaluations may become actual reactions. They
+            run after the model has already picked an emoji, so they cap the
+            aggregate even when every individual decision was defensible.
+            Counted per (chat, bot) from in-memory history, which resets on
+            restart. <code>0</code> disables each independently.
+        </p>
+
+        <label for="reactor_hourly_budget">Max reactions per hour, per chat</label>
+        <input type="number" name="reactor_hourly_budget" id="reactor_hourly_budget" min="0"
+               value="{{ values.reactor_hourly_budget if values.reactor_hourly_budget is not none else '' }}"
+               placeholder="3">
+
+        <label for="reactor_daily_budget">Max reactions per day, per chat</label>
+        <input type="number" name="reactor_daily_budget" id="reactor_daily_budget" min="0"
+               value="{{ values.reactor_daily_budget if values.reactor_daily_budget is not none else '' }}"
+               placeholder="12">
+
+        <label for="reactor_repeat_window">No-repeat window (reactions)</label>
+        <input type="number" name="reactor_repeat_window" id="reactor_repeat_window" min="0"
+               value="{{ values.reactor_repeat_window if values.reactor_repeat_window is not none else '' }}"
+               placeholder="3">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Drop a pick whose emoji was already used within the last N reactions
+            in that chat. Stops one emoji becoming the model's house style,
+            which is what makes reactions read as automatic rather than
+            considered.
+        </p>
+
+        <label for="reactor_min_score">Minimum self-reported score (1-10, 0 = log only)</label>
+        <input type="number" name="reactor_min_score" id="reactor_min_score" min="0" max="10"
+               value="{{ values.reactor_min_score if values.reactor_min_score is not none else '' }}"
+               placeholder="0">
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            The model rates how much each message warranted its reaction; picks
+            below this are dropped. Leave at <code>0</code> at first — scores
+            are recorded either way, and the dashboard's score distribution
+            tells you where to actually put the threshold. Self-scores cluster
+            high, so guessing it cold sets it too low to matter.
+        </p>
+
         <label for="reactor_system_prompt">Reactor system prompt</label>
         <textarea name="reactor_system_prompt" id="reactor_system_prompt" rows="6"
                   placeholder="Empty = built-in default (sparing, sentiment-led, skip transactional).">{{ values.reactor_system_prompt or '' }}</textarea>
