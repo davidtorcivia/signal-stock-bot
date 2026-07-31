@@ -67,6 +67,14 @@ class CommandContext:
     # builder, then dropped: images are one-shot per message and not
     # written into conversation history.
     inbound_images: list[dict] = field(default_factory=list)
+    # Voice notes / audio files from the inbound message, already
+    # transcoded to mono 16k mp3. Each entry: {"mime", "format",
+    # "data_b64", "filename", "duration_sec", "voice_note"}. Populated
+    # when the resolved bot has audio_enabled=True. Unlike images, the
+    # bytes are never persisted to history at all — a replayed voice
+    # note costs an order of magnitude more than a replayed photo — so
+    # the turn text carries a `[voice note, 0:23]` descriptor instead.
+    inbound_audio: list[dict] = field(default_factory=list)
 
     @property
     def is_group(self) -> bool:

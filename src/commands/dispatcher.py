@@ -256,6 +256,7 @@ class CommandDispatcher:
         addressed_bot=None,
         policy=None,
         inbound_images: Optional[list[dict]] = None,
+        inbound_audio: Optional[list[dict]] = None,
     ) -> Optional[CommandResult]:
         """
         Dispatch a message to the appropriate command handler.
@@ -348,6 +349,31 @@ class CommandDispatcher:
                     ]
                 except Exception as e:
                     logger.debug(f"reactor candidate_bots lookup failed: {e}")
+            reactor_bot = self._resolve_bot(
+                group_id, policy=policy, addressed_bot=addressed_bot,
+            )
+            # An unaddressed voice note must land on a bot that can hear
+            # it. The per-context default is resolved from chat settings,
+            # not from capability, so in a mixed group it's a coin flip
+            # whether the responder can actually play the clip — and a
+            # bot that can't would be answering the bare descriptor.
+            # Narrow both the roster and the single-bot fallback to the
+            # bots with ears; if none exist the clip was never extracted
+            # anyway, so nothing changes.
+            if inbound_audio:
+                with_ears = [
+                    b for b in candidate_bots
+                    if getattr(b, "audio_enabled", False)
+                ]
+                if with_ears:
+                    candidate_bots = with_ears
+                    if not getattr(reactor_bot, "audio_enabled", False):
+                        logger.info(
+                            "Reactor: routing voice note to "
+                            f"{with_ears[0].slug} (default "
+                            f"{getattr(reactor_bot, 'slug', None)} can't hear)"
+                        )
+                        reactor_bot = with_ears[0]
             asyncio.create_task(
                 self.reactor.maybe_react(
                     sender=sender,
@@ -356,10 +382,16 @@ class CommandDispatcher:
                     target_timestamp=target_timestamp,
                     policy=policy,
                     bot_will_reply=bot_will_reply,
-                    bot=self._resolve_bot(
-                        group_id, policy=policy, addressed_bot=addressed_bot,
-                    ),
+                    bot=reactor_bot,
                     candidate_bots=candidate_bots,
+                    # The reactor's own model is text-only and scores the
+                    # `[voice note, 0:23]` descriptor, not the audio. It
+                    # carries the media so that IF it decides to answer,
+                    # the spontaneous !ask reaches the writer with the
+                    # bytes attached — otherwise an unaddressed voice
+                    # note gets replied to by a bot that never heard it.
+                    inbound_images=inbound_images,
+                    inbound_audio=inbound_audio,
                 )
             )
 
@@ -426,6 +458,7 @@ class CommandDispatcher:
                             message_timestamp=target_timestamp,
                             addressed_bot=addressed_bot,
                             inbound_images=inbound_images,
+                            inbound_audio=inbound_audio,
                         )
                         if result:
                             results.append(result)
@@ -445,6 +478,7 @@ class CommandDispatcher:
                 message_timestamp=target_timestamp,
                 addressed_bot=addressed_bot,
                 inbound_images=inbound_images,
+                inbound_audio=inbound_audio,
             )
 
         # Try inline symbol detection if enabled
@@ -460,6 +494,7 @@ class CommandDispatcher:
                     message_timestamp=target_timestamp,
                     addressed_bot=addressed_bot,
                     inbound_images=inbound_images,
+                    inbound_audio=inbound_audio,
                 )
         
         # Try natural language intent parsing
@@ -496,6 +531,7 @@ class CommandDispatcher:
                     quote_timestamp=quote_timestamp,
                     message_timestamp=target_timestamp,
                     inbound_images=inbound_images or [],
+                    inbound_audio=inbound_audio or [],
                 )
                 try:
                     return await self.ask_command.execute(synthetic_ctx)
@@ -612,6 +648,7 @@ class CommandDispatcher:
                         quote_timestamp=quote_timestamp,
                         message_timestamp=target_timestamp,
                         inbound_images=inbound_images,
+                        inbound_audio=inbound_audio,
                     )
                     if result:
                         results.append(result)
@@ -722,6 +759,7 @@ class CommandDispatcher:
         message_timestamp: Optional[int] = None,
         addressed_bot=None,
         inbound_images: Optional[list[dict]] = None,
+        inbound_audio: Optional[list[dict]] = None,
     ) -> CommandResult:
         """Execute a command with the given arguments."""
         # Resolve context (pronouns)
@@ -760,6 +798,7 @@ class CommandDispatcher:
             quote_timestamp=quote_timestamp,
             message_timestamp=message_timestamp,
             inbound_images=inbound_images or [],
+            inbound_audio=inbound_audio or [],
         )
 
         if handler.has_help_flag(ctx):
@@ -801,6 +840,8 @@ class CommandDispatcher:
         policy=None,
         reason: str = "",
         bot_override=None,
+        inbound_images: Optional[list[dict]] = None,
+        inbound_audio: Optional[list[dict]] = None,
     ) -> None:
         """Run !ask spontaneously on behalf of the reactor's should_respond tool.
 
@@ -868,6 +909,11 @@ class CommandDispatcher:
             policy=policy,
             bot=_resolve_responder(),
             implicit_reason=reason or "(reactor flagged this as worth a reply)",
+            # Media the reactor carried over from the inbound message.
+            # `message` here is the descriptor text ("[voice note, 0:23]"),
+            # so without these the writer would be answering a label.
+            inbound_images=inbound_images or [],
+            inbound_audio=inbound_audio or [],
         )
 
         get_audit_logger().info(

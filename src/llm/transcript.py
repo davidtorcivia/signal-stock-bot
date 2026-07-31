@@ -70,6 +70,12 @@ def snapshot_payload(value: Any, *, key: Optional[str] = None) -> Any:
     if isinstance(value, str):
         if key in {"data_b64", "base64", "bytes_b64"}:
             return _redacted_binary(value)
+        # `input_audio` parts carry raw base64 under the generic key
+        # "data" — no `data:` prefix to recognize it by. Length-gated
+        # because "data" is common enough that a short legitimate value
+        # (a tool argument, an id) must pass through untouched.
+        if key == "data" and len(value) > 1024:
+            return _redacted_binary(value)
         if value.startswith("data:") and ";base64," in value[:128]:
             header = value.split(",", 1)[0]
             return f"{header},{_redacted_binary(value)}"

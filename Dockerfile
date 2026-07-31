@@ -7,11 +7,14 @@ WORKDIR /app
 #   git           — uvx needs this to fetch MCP servers from git+https URLs
 #   ca-certs/gnupg — NodeSource repo signing
 #   nodejs (20)   — npx-launched MCP servers
+#   ffmpeg        — transcodes inbound Signal voice notes (AAC/m4a) to the
+#                   mono 16k mp3 that audio-capable models actually decode;
+#                   without it, audio input silently degrades to text-only
 #   fonts-noto-cjk — required by the I Ching composer to render hexagram
 #                   names in Chinese; falls back to PIL default otherwise
 #   fonts-dejavu-core — Latin serif/sans for tarot + I Ching titles
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates gnupg git \
+        curl ca-certificates gnupg git ffmpeg \
         fonts-noto-cjk fonts-dejavu-core \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \

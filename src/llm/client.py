@@ -690,10 +690,11 @@ def _log_payload_shape(payload: dict, *, purpose: str, url: str) -> None:
 
     Records: total msg count, role breakdown, and for every user message
     whose `content` is the OpenAI multimodal list-of-parts form — the
-    part types + image counts + total base64 length. Lets us confirm
-    from logs alone that vision payloads survive the trip from inbound
-    parsing to the HTTP body in the expected shape. Skipped silently on
-    any error so a diagnostic line never breaks the request path.
+    part types + media counts + total base64 length. Lets us confirm
+    from logs alone that vision/audio payloads survive the trip from
+    inbound parsing to the HTTP body in the expected shape. Skipped
+    silently on any error so a diagnostic line never breaks the request
+    path.
     """
     try:
         messages = payload.get("messages") or []
@@ -705,18 +706,22 @@ def _log_payload_shape(payload: dict, *, purpose: str, url: str) -> None:
             content = m.get("content")
             if isinstance(content, list):
                 types: dict[str, int] = {}
-                total_image_b64 = 0
+                total_media_b64 = 0
                 for part in content:
                     if not isinstance(part, dict):
                         continue
                     t = part.get("type") or "?"
                     types[t] = types.get(t, 0) + 1
-                    if t == "image_url":
-                        url_field = (part.get("image_url") or {}).get("url") or ""
-                        total_image_b64 += len(url_field)
+                    if t in ("image_url", "audio_url"):
+                        url_field = (part.get(t) or {}).get("url") or ""
+                        total_media_b64 += len(url_field)
+                    elif t == "input_audio":
+                        total_media_b64 += len(
+                            (part.get("input_audio") or {}).get("data") or ""
+                        )
                 parts_str = ",".join(f"{t}x{n}" for t, n in types.items())
                 multimodal_summaries.append(
-                    f"msg[{i}]={role}({parts_str},b64={total_image_b64}b)"
+                    f"msg[{i}]={role}({parts_str},b64={total_media_b64}b)"
                 )
         msg_count = len(messages)
         roles_str = ",".join(f"{r}={n}" for r, n in sorted(roles.items()))

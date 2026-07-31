@@ -813,6 +813,7 @@ class EmojiReactor:
         group_id: str,
         ctx_count: int,
         bot_floor_at: Optional[float] = None,
+        has_audio: bool = False,
     ) -> str:
         sender_label = self._sender_label(sender)
         ctx_lines: list[str] = []
@@ -839,6 +840,18 @@ class EmojiReactor:
             "inlined for context — they're part of the user's message, not "
             "a bot reply.)"
         )
+        if has_audio:
+            # Without this the model reads `[voice note, 0:23]` as an
+            # empty, contentless message and declines on the grounds
+            # that there's nothing to react to — exactly backwards. The
+            # bot it hands off to can play the clip; this one can't.
+            format_note += (
+                "\n(This message is a voice note. You cannot hear it, but "
+                "the bot you hand off to CAN — it receives the audio "
+                "itself. Judge it as a real message with real content, "
+                "not as an empty one. A voice note dropped into the chat "
+                "unaddressed is usually worth answering.)"
+            )
         if ctx_lines:
             return (
                 "Recent group chat (oldest first):\n"
@@ -862,6 +875,8 @@ class EmojiReactor:
         bot_will_reply: bool = False,
         bot=None,
         candidate_bots: Optional[list] = None,
+        inbound_images: Optional[list[dict]] = None,
+        inbound_audio: Optional[list[dict]] = None,
     ) -> None:
         """Background task. Logs and swallows every error.
 
@@ -887,6 +902,12 @@ class EmojiReactor:
         tool exposes a `bot_slug` enum and the system prompt prepends a
         roster so the LLM picks the right one. When None or length <= 1,
         behavior collapses to the legacy single-bot path (uses `bot`).
+
+        `inbound_images` / `inbound_audio` are passed through untouched to
+        the implicit-response handler. This model never looks at them —
+        it's a cheap text model scoring a `[voice note, 0:23]` descriptor
+        — but the writer it hands off to needs the actual media, or an
+        unaddressed voice note gets answered by a bot that can't hear it.
         """
         metrics = get_metrics()
         try:
@@ -1028,6 +1049,7 @@ class EmojiReactor:
             user_content = await self._build_user_content(
                 sender, text, group_id, cfg["context_messages"],
                 bot_floor_at=bot_floor_at,
+                has_audio=bool(inbound_audio),
             )
 
             messages = [
@@ -1239,6 +1261,8 @@ class EmojiReactor:
                             policy=policy,
                             reason=respond_reason,
                             bot_override=responder_bot,
+                            inbound_images=inbound_images,
+                            inbound_audio=inbound_audio,
                         )
                     except Exception as e:
                         logger.exception(

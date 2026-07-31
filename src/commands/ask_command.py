@@ -94,6 +94,11 @@ from ..llm.output_safety import (
     strip_tool_call_leak as _strip_tool_call_leak,
 )
 from ..signal.message_text import normalize_signal_text
+from ..signal.audio import AUDIO_OUTPUT_FORMAT, AUDIO_OUTPUT_MIME
+from ..bots.models import (
+    AUDIO_PART_STYLE_AUDIO_URL,
+    AUDIO_PART_STYLE_INPUT_AUDIO,
+)
 from ..memory import (
     FORGET_TOOL,
     KINDS,
@@ -302,6 +307,59 @@ def _scrub_tool_content(content: str) -> str:
     out = _USERAGENT_TAG_RE.sub("(useragent redacted)", content)
     out = _HEADER_UA_LINE_RE.sub("User-Agent: (redacted)", out)
     return out
+
+
+def _image_parts(images: list) -> list[dict]:
+    """Inbound images as OpenAI multimodal `image_url` parts.
+
+    Shared by the live-turn builder and the history re-inflater so both
+    emit byte-identical shapes — a mismatch there is invisible until a
+    provider rejects one of them mid-conversation.
+    """
+    parts: list[dict] = []
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        b64 = img.get("data_b64") or ""
+        if not b64:
+            continue
+        mime = img.get("mime") or "image/jpeg"
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    return parts
+
+
+def _audio_parts(clips: list, *, style: str) -> list[dict]:
+    """Inbound audio clips as multimodal parts in the bot's dialect.
+
+    `style` is the bot's `audio_part_style` — see AUDIO_PART_STYLES.
+    Anything unrecognized falls back to `input_audio` rather than
+    emitting a part no server will parse.
+    """
+    parts: list[dict] = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        b64 = clip.get("data_b64") or ""
+        if not b64:
+            continue
+        if style == AUDIO_PART_STYLE_AUDIO_URL:
+            mime = clip.get("mime") or AUDIO_OUTPUT_MIME
+            parts.append({
+                "type": "audio_url",
+                "audio_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        else:
+            parts.append({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": b64,
+                    "format": clip.get("format") or AUDIO_OUTPUT_FORMAT,
+                },
+            })
+    return parts
 
 
 def _wrap_xml(tag: str, body: str) -> str:
@@ -2651,20 +2709,21 @@ class AskCommand(BaseCommand):
                 continue
             text_content = turn.get("content") or ""
             parts: list[dict] = [{"type": "text", "text": text_content}]
-            for img in refs:
-                mime = (img.get("mime") or "image/jpeg") if isinstance(img, dict) else ""
-                b64 = (img.get("data_b64") or "") if isinstance(img, dict) else ""
-                if not b64:
-                    continue
-                parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"},
-                })
+            parts.extend(_image_parts(refs))
             if len(parts) > 1:
                 turn["content"] = parts
 
     async def execute(self, ctx: CommandContext) -> CommandResult:
-        if not ctx.args:
+        # A voice note or photo sent with no caption is a complete turn on
+        # its own — the media IS the question. Both empty-input guards
+        # here (and the `not question` one below) predate multimodal
+        # input and would answer "Ask something:" to someone who just
+        # asked something out loud.
+        has_media = bool(
+            getattr(ctx, "inbound_audio", None)
+            or getattr(ctx, "inbound_images", None)
+        )
+        if not ctx.args and not has_media:
             return CommandResult.error(
                 "Ask something: !ask what sectors are rotating this week?"
             )
@@ -2680,7 +2739,8 @@ class AskCommand(BaseCommand):
         # start with any of these words ("Reset the alarms", "Clear the
         # table") — we must not interpret it as a history wipe.
         if (
-            ctx.args[0].lower() in ("reset", "clear", "forget")
+            ctx.args
+            and ctx.args[0].lower() in ("reset", "clear", "forget")
             and not getattr(ctx, "implicit_reason", None)
         ):
             removed = await self.history.clear(context_key)
@@ -2690,7 +2750,18 @@ class AskCommand(BaseCommand):
         question = parts[1].strip() if len(parts) > 1 else " ".join(ctx.args)
         question = normalize_signal_text(question)
         if not question:
-            return CommandResult.error("Ask something: !ask <question>")
+            if not has_media:
+                return CommandResult.error("Ask something: !ask <question>")
+            # Stand-in text for a caption-less media turn. The handler
+            # normally supplies a richer descriptor (with the clip's
+            # duration) as the message text; this covers callers that
+            # build a context directly. It's also what lands in
+            # conversation history, since the bytes never do.
+            question = (
+                "[voice note]"
+                if getattr(ctx, "inbound_audio", None)
+                else "[image]"
+            )
 
         # Inline-expand any tweet/URL links the user pasted so the LLM
         # gets the substance, not just an opaque URL.
@@ -3502,34 +3573,44 @@ class AskCommand(BaseCommand):
             )
             current_user_content = "\n\n".join(trigger_parts)
 
-            # Vision: when the resolved bot is vision-enabled and the
-            # inbound message carried image attachments, swap the user
-            # message from a plain string to the OpenAI multimodal array
-            # form so the writer model receives the bytes. One-shot: we
-            # never persist the images into conversation history below,
-            # so follow-up turns won't re-see them (cheaper and usually
-            # the right semantics for "describe this picture" flows).
+            # Vision / audio: when the resolved bot is enabled for the
+            # media type and the inbound message carried attachments,
+            # swap the user message from a plain string to the OpenAI
+            # multimodal array form so the writer model receives the
+            # bytes. Images are one-shot per message but replayed from
+            # history for a few turns (see _inflate_image_history);
+            # audio is one-shot outright — the descriptor already in the
+            # turn text is what later rounds see.
             inbound_images = getattr(ctx, "inbound_images", None) or []
+            inbound_audio = getattr(ctx, "inbound_audio", None) or []
             vision_active = (
                 bool(inbound_images)
                 and ctx.bot is not None
                 and getattr(ctx.bot, "vision_enabled", False)
             )
-            if vision_active:
+            audio_active = (
+                bool(inbound_audio)
+                and ctx.bot is not None
+                and getattr(ctx.bot, "audio_enabled", False)
+            )
+            if vision_active or audio_active:
                 parts: list[dict] = [
                     {"type": "text", "text": current_user_content}
                 ]
-                for img in inbound_images:
-                    mime = img.get("mime") or "image/jpeg"
-                    b64 = img.get("data_b64") or ""
-                    if not b64:
-                        continue
-                    parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
-                    })
+                if vision_active:
+                    parts.extend(_image_parts(inbound_images))
+                if audio_active:
+                    parts.extend(_audio_parts(
+                        inbound_audio,
+                        style=getattr(
+                            ctx.bot, "audio_part_style",
+                            AUDIO_PART_STYLE_INPUT_AUDIO,
+                        ),
+                    ))
                 logger.info(
-                    f"Vision: attaching {len(parts) - 1} image(s) to "
+                    f"Multimodal: attaching {len(parts) - 1} media part(s) "
+                    f"({len(inbound_images) if vision_active else 0} image, "
+                    f"{len(inbound_audio) if audio_active else 0} audio) to "
                     f"writer round for bot={ctx.bot.slug}"
                 )
                 user_message_content = parts
@@ -3581,18 +3662,20 @@ class AskCommand(BaseCommand):
                 and deep_think_client.status().get("ready")
                 and (ctx.policy is None or ctx.policy.allows_deep_think())
             )
-            # Vision short-circuit: when the writer has images on this
-            # turn, bypass research mode and let the writer run its own
-            # tool loop. deep_think wouldn't see the pixels (its model is
-            # text-context only here), and its notes would actively
-            # mislead the writer — typical failure mode is the notes
-            # apologize "I can't see the image" and the writer parrots
-            # that even though it has the bytes in its multimodal payload.
-            # Image turns get writer-direct routing; subsequent text-only
-            # turns continue using research mode normally.
-            if use_research_mode and vision_active:
+            # Multimodal short-circuit: when the writer has images or
+            # audio on this turn, bypass research mode and let the writer
+            # run its own tool loop. deep_think wouldn't see the pixels or
+            # hear the clip (its model is text-context only here), and its
+            # notes would actively mislead the writer — typical failure
+            # mode is the notes apologize "I can't see the image" and the
+            # writer parrots that even though it has the bytes in its
+            # multimodal payload. Media turns get writer-direct routing;
+            # subsequent text-only turns continue using research mode
+            # normally.
+            if use_research_mode and (vision_active or audio_active):
                 logger.info(
-                    "Vision active — bypassing research mode for this turn "
+                    f"{'Vision' if vision_active else 'Audio'} active — "
+                    "bypassing research mode for this turn "
                     f"(bot={ctx.bot.slug})"
                 )
                 use_research_mode = False
@@ -3601,9 +3684,9 @@ class AskCommand(BaseCommand):
             # self-gates (NOTOOLS) so the writer — a model with poor native
             # tool-calling — never emits a tool call. Mutually exclusive
             # with research mode (a bot's deep_think_mode is exactly one
-            # value). Same vision short-circuit rationale as research mode:
-            # the tool-bot can't see the pixels, so image turns route to
-            # the writer's own loop instead.
+            # value). Same short-circuit rationale as research mode: the
+            # tool-bot can't see the pixels or hear the clip, so media
+            # turns route to the writer's own loop instead.
             use_tool_bot_mode = (
                 ctx.bot is not None
                 and getattr(ctx.bot, "deep_think_mode", "replace") == "tool_bot"
@@ -3611,9 +3694,10 @@ class AskCommand(BaseCommand):
                 and tool_bot_client.status().get("ready")
                 and (ctx.policy is None or ctx.policy.allows_deep_think())
             )
-            if use_tool_bot_mode and vision_active:
+            if use_tool_bot_mode and (vision_active or audio_active):
                 logger.info(
-                    "Vision active — bypassing tool_bot mode for this turn "
+                    f"{'Vision' if vision_active else 'Audio'} active — "
+                    "bypassing tool_bot mode for this turn "
                     f"(bot={ctx.bot.slug})"
                 )
                 use_tool_bot_mode = False

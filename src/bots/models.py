@@ -30,6 +30,26 @@ DEEP_THINK_MODES = (
 )
 
 
+# audio_part_style values — how the writer's endpoint wants inbound audio
+# framed inside a multimodal user message:
+#   'input_audio' — OpenAI's shape, also accepted by recent vLLM:
+#                   {"type": "input_audio",
+#                    "input_audio": {"data": "<b64>", "format": "mp3"}}
+#   'audio_url'   — vLLM's native shape, the exact analogue of the
+#                   `image_url` part this codebase already emits:
+#                   {"type": "audio_url",
+#                    "audio_url": {"url": "data:audio/mpeg;base64,<b64>"}}
+# Default to 'input_audio': it's the documented standard, and a server
+# that only speaks 'audio_url' fails loudly with a 400 rather than
+# silently ignoring the clip.
+AUDIO_PART_STYLE_INPUT_AUDIO = "input_audio"
+AUDIO_PART_STYLE_AUDIO_URL = "audio_url"
+AUDIO_PART_STYLES = (
+    AUDIO_PART_STYLE_INPUT_AUDIO,
+    AUDIO_PART_STYLE_AUDIO_URL,
+)
+
+
 @dataclass
 class Bot:
     id: Optional[int]
@@ -62,6 +82,21 @@ class Bot:
     # Images are NOT persisted into conversation_turns (one-shot per
     # message): the next round sees only the text.
     vision_enabled: bool = False
+    # Audio: when True, inbound voice notes / audio files are transcoded
+    # to mono 16k mp3 and passed to the writer LLM as a multimodal part.
+    # Off by default — a text-only model handed base64 audio either
+    # errors or hallucinates a transcript. Bytes are never persisted to
+    # conversation history; the turn text keeps a `[voice note, 0:23]`
+    # descriptor in their place.
+    audio_enabled: bool = False
+    # Which multimodal part shape the writer's endpoint expects for audio.
+    # There is no single convention: OpenAI (and recent vLLM builds) take
+    # `input_audio` with a bare base64 payload plus a format string, while
+    # vLLM's native shape is `audio_url` with a data URI — the exact
+    # mirror of how `image_url` already works here. Per-bot rather than
+    # global because a deployment can point two bots at two different
+    # servers, and getting it wrong is a 400 rather than a degradation.
+    audio_part_style: str = AUDIO_PART_STYLE_INPUT_AUDIO
     # Per-bot deep_think kill switch. When False, deep_think is fully
     # disabled FOR THIS BOT regardless of global / per-context settings:
     # the tool schema is hidden from the writer (so it can't invoke it)

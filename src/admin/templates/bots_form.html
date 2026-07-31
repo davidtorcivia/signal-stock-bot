@@ -151,6 +151,40 @@
           message.
         </p>
 
+        <label style="display:flex;align-items:center;gap:8px;margin-top:16px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+          <input type="checkbox" name="audio_enabled" value="1"
+                 {% if values.audio_enabled %}checked{% endif %} style="width:auto;">
+          <span>Audio (pass inbound voice notes to the writer LLM)</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+          When on, voice notes and audio attachments are transcoded to
+          mono 16&nbsp;kHz mp3 (via <code>ffmpeg</code>) and sent to the
+          writer as a multimodal audio part. Only enable for bots whose
+          writer model can actually listen — a text-only endpoint will
+          either reject the request or invent a transcript. Unlike
+          images, audio is <em>never</em> written to conversation
+          history; the turn keeps a <code>[voice note, 0:23]</code>
+          descriptor in its place, which is also what the reactor and
+          any tool-bot sibling see. A caption-less voice note is
+          answered on the audio alone. Caps: 2 clips per message, first
+          5 minutes of each, 25 MB source.
+        </p>
+
+        <label>Audio part shape
+          <select name="audio_part_style">
+            <option value="input_audio" {% if values.audio_part_style == 'input_audio' %}selected{% endif %}>input_audio (OpenAI, recent vLLM)</option>
+            <option value="audio_url" {% if values.audio_part_style == 'audio_url' %}selected{% endif %}>audio_url (vLLM native, data URI)</option>
+          </select>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+          Which shape this bot's endpoint wants audio framed in. There's
+          no single convention: <code>input_audio</code> carries bare
+          base64 plus a format string, <code>audio_url</code> carries a
+          <code>data:</code> URI exactly like <code>image_url</code>
+          does. If audio requests come back as HTTP 400, try the other
+          one. Ignored when audio is off.
+        </p>
+
         {% for role in roles %}
           <h2 style="margin-top: 24px;">{{ role|capitalize }} LLM overrides</h2>
           <p class="muted" style="font-size: 11px;">

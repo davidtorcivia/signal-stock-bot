@@ -32,7 +32,13 @@ from typing import Optional
 import aiosqlite
 
 from ..database import db_session
-from .models import Bot, DEEP_THINK_MODE_REPLACE, DEEP_THINK_MODES
+from .models import (
+    AUDIO_PART_STYLE_INPUT_AUDIO,
+    AUDIO_PART_STYLES,
+    Bot,
+    DEEP_THINK_MODE_REPLACE,
+    DEEP_THINK_MODES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +140,18 @@ class BotRegistry:
                     await db.execute(
                         "ALTER TABLE bots ADD COLUMN "
                         "deep_think_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                if "audio_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE bots ADD COLUMN "
+                        "audio_enabled INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "audio_part_style" not in existing_cols:
+                    # Text rather than a CHECK constraint: SQLite can't
+                    # add one via ALTER, and _row_to_bot normalizes an
+                    # unrecognized value back to the default anyway.
+                    await db.execute(
+                        "ALTER TABLE bots ADD COLUMN audio_part_style TEXT"
                     )
                 if "routing_blurb" not in existing_cols:
                     # Nullable: reactor multi-bot routing falls back to
@@ -266,6 +284,15 @@ class BotRegistry:
                         "ALTER TABLE bots ADD COLUMN "
                         "deep_think_enabled INTEGER NOT NULL DEFAULT 1"
                     )
+                if "audio_enabled" not in existing_cols:
+                    conn.execute(
+                        "ALTER TABLE bots ADD COLUMN "
+                        "audio_enabled INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "audio_part_style" not in existing_cols:
+                    conn.execute(
+                        "ALTER TABLE bots ADD COLUMN audio_part_style TEXT"
+                    )
                 if "routing_blurb" not in existing_cols:
                     conn.execute(
                         "ALTER TABLE bots ADD COLUMN routing_blurb TEXT"
@@ -322,7 +349,7 @@ class BotRegistry:
         "default_for_dm, default_for_group, "
         "deep_think_mode, deep_think_handoff_prompt, "
         "created_at, updated_at, vision_enabled, deep_think_enabled, "
-        "routing_blurb"
+        "routing_blurb, audio_enabled, audio_part_style"
     )
 
     @staticmethod
@@ -353,6 +380,17 @@ class BotRegistry:
                 bool(row[15]) if len(row) > 15 and row[15] is not None else True
             ),
             routing_blurb=(row[16] if len(row) > 16 else None),
+            audio_enabled=(
+                bool(row[17]) if len(row) > 17 and row[17] is not None else False
+            ),
+            # Normalize here so a hand-edited row (or a NULL from the
+            # ALTER) can never put an unknown part shape in front of the
+            # payload builder.
+            audio_part_style=(
+                row[18]
+                if len(row) > 18 and row[18] in AUDIO_PART_STYLES
+                else AUDIO_PART_STYLE_INPUT_AUDIO
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -461,9 +499,9 @@ class BotRegistry:
                         default_for_dm, default_for_group,
                         deep_think_mode, deep_think_handoff_prompt,
                         vision_enabled, deep_think_enabled,
-                        routing_blurb,
+                        routing_blurb, audio_enabled, audio_part_style,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         bot.slug,
                         bot.display_name,
@@ -479,6 +517,8 @@ class BotRegistry:
                         1 if bot.vision_enabled else 0,
                         1 if bot.deep_think_enabled else 0,
                         bot.routing_blurb or None,
+                        1 if bot.audio_enabled else 0,
+                        bot.audio_part_style or AUDIO_PART_STYLE_INPUT_AUDIO,
                         now,
                         now,
                     ),
@@ -496,7 +536,8 @@ class BotRegistry:
                            enabled = ?, default_for_dm = ?, default_for_group = ?,
                            deep_think_mode = ?, deep_think_handoff_prompt = ?,
                            vision_enabled = ?, deep_think_enabled = ?,
-                           routing_blurb = ?,
+                           routing_blurb = ?, audio_enabled = ?,
+                           audio_part_style = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -514,6 +555,8 @@ class BotRegistry:
                         1 if bot.vision_enabled else 0,
                         1 if bot.deep_think_enabled else 0,
                         bot.routing_blurb or None,
+                        1 if bot.audio_enabled else 0,
+                        bot.audio_part_style or AUDIO_PART_STYLE_INPUT_AUDIO,
                         now,
                         bot.id,
                     ),

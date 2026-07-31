@@ -18,7 +18,11 @@ from urllib.parse import urlparse
 from flask import Blueprint, Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, url_for
 
 from ..bots import Bot, BotRegistry
-from ..bots.models import DEEP_THINK_MODES
+from ..bots.models import (
+    AUDIO_PART_STYLE_INPUT_AUDIO,
+    AUDIO_PART_STYLES,
+    DEEP_THINK_MODES,
+)
 from ..cache import get_cache_manager, get_metrics
 from ..contexts import ContextPolicy, ContextRegistry
 from .events import get_bus
@@ -760,6 +764,18 @@ def _parse_deep_think_enabled(form, existing: Optional[Bot]) -> bool:
     )
 
 
+def _parse_audio_part_style(form) -> str:
+    """Resolve the per-bot audio part shape, defaulting on anything odd.
+
+    A select can only post one of the two options, but an API caller
+    posting the form directly can send whatever it likes — and an
+    unrecognized value here would reach the payload builder and produce
+    a message part no endpoint understands.
+    """
+    raw = (form.get("audio_part_style", "") or "").strip().lower()
+    return raw if raw in AUDIO_PART_STYLES else AUDIO_PART_STYLE_INPUT_AUDIO
+
+
 def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
     """Read identity fields from the form into a Bot. Aliases come in
     as comma- or newline-separated text; deduplicated and trimmed."""
@@ -818,6 +834,8 @@ def _form_to_bot(form, *, existing: Optional[Bot]) -> Bot:
         deep_think_mode=deep_think_mode,
         deep_think_handoff_prompt=(form.get("deep_think_handoff_prompt", "") or "").strip() or None,
         vision_enabled=(form.get("vision_enabled", "") or "").lower() in ("1", "true", "yes", "on"),
+        audio_enabled=(form.get("audio_enabled", "") or "").lower() in ("1", "true", "yes", "on"),
+        audio_part_style=_parse_audio_part_style(form),
         # HTML checkboxes don't post anything when unchecked, so we
         # can't tell "unchecked" from "form didn't render the field".
         # The template always includes a hidden `_deep_think_enabled_in_form`
@@ -996,6 +1014,8 @@ def _register_bots_routes(
             "deep_think_mode": "replace",
             "deep_think_handoff_prompt": "",
             "vision_enabled": False,
+            "audio_enabled": False,
+            "audio_part_style": AUDIO_PART_STYLE_INPUT_AUDIO,
             "deep_think_enabled": True,
             "routing_blurb": "",
         }
@@ -1060,6 +1080,8 @@ def _register_bots_routes(
             "deep_think_mode": bot.deep_think_mode,
             "deep_think_handoff_prompt": bot.deep_think_handoff_prompt or "",
             "vision_enabled": bot.vision_enabled,
+            "audio_enabled": bot.audio_enabled,
+            "audio_part_style": bot.audio_part_style,
             "deep_think_enabled": bot.deep_think_enabled,
             "routing_blurb": bot.routing_blurb or "",
         }

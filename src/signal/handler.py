@@ -16,6 +16,13 @@ import aiohttp
 
 from ..admin.events import get_bus
 from ..commands.dispatcher import CommandDispatcher
+from .audio import (
+    AUDIO_ALLOWED_MIMES,
+    AUDIO_MAX_CLIPS,
+    AUDIO_MAX_SOURCE_BYTES,
+    describe_clips,
+    transcode_to_mp3,
+)
 from .message_text import normalize_signal_text
 
 logger = logging.getLogger(__name__)
@@ -52,6 +59,43 @@ def _attachments_dir() -> Path:
     return Path(os.environ.get("SIGNAL_ATTACHMENTS_DIR", _DEFAULT_ATTACHMENTS_DIR))
 
 
+def _resolve_attachment_path(att_id: str, *, kind: str) -> Optional[Path]:
+    """Locate signal-cli's on-disk copy of an attachment by id.
+
+    signal-cli stores attachments by id; in some configs the filename
+    includes the original extension, in others it's just the id. Try the
+    id first, then glob for it as a fallback (rare path that costs one
+    directory listing). Returns None when the file isn't there yet — a
+    signal-cli write race, not an error worth surfacing.
+    """
+    base = _attachments_dir()
+    path = base / att_id
+    if path.exists():
+        return path
+    try:
+        matches = list(base.glob(f"{att_id}.*"))
+    except OSError:
+        matches = []
+    if not matches:
+        logger.debug(f"inbound {kind} not on disk yet: {att_id}; skipping")
+        return None
+    return matches[0]
+
+
+def _eligible_attachments(
+    data_message: dict, allowed_mimes: frozenset,
+) -> list[tuple[dict, str]]:
+    """`(attachment, mime)` pairs whose type we can actually consume."""
+    out: list[tuple[dict, str]] = []
+    for att in data_message.get("attachments") or []:
+        if not isinstance(att, dict):
+            continue
+        mime = (att.get("contentType") or "").strip().lower()
+        if mime in allowed_mimes and (att.get("id") or "").strip():
+            out.append((att, mime))
+    return out
+
+
 def _read_inbound_image_attachments(
     data_message: dict, *, max_images: int = VISION_MAX_IMAGES,
 ) -> list[dict]:
@@ -66,39 +110,14 @@ def _read_inbound_image_attachments(
 
     Capped at `max_images` to bound payload size per round.
     """
-    raw = data_message.get("attachments") or []
-    if not raw:
-        return []
     out: list[dict] = []
-    base = _attachments_dir()
-    for att in raw:
+    for att, mime in _eligible_attachments(data_message, VISION_ALLOWED_MIMES):
         if len(out) >= max_images:
             break
-        if not isinstance(att, dict):
-            continue
-        mime = (att.get("contentType") or "").strip().lower()
-        if mime not in VISION_ALLOWED_MIMES:
-            continue
         att_id = (att.get("id") or "").strip()
-        if not att_id:
+        path = _resolve_attachment_path(att_id, kind="image")
+        if path is None:
             continue
-        # signal-cli stores attachments by id; in some configs the
-        # filename includes the original extension, in others it's
-        # just the id. Try the id first, then glob for it as a
-        # fallback (rare path that costs one directory listing).
-        path = base / att_id
-        if not path.exists():
-            try:
-                matches = list(base.glob(f"{att_id}.*"))
-            except OSError:
-                matches = []
-            if not matches:
-                logger.debug(
-                    f"inbound image not on disk yet: {att_id} "
-                    f"(mime={mime}); skipping"
-                )
-                continue
-            path = matches[0]
         try:
             size = path.stat().st_size
         except OSError as e:
@@ -121,6 +140,64 @@ def _read_inbound_image_attachments(
             "data_b64": base64.b64encode(payload).decode("ascii"),
             "filename": att.get("filename") or att_id,
         })
+    return out
+
+
+def has_audio_attachments(data_message: dict) -> bool:
+    """Cheap metadata-only check — no disk reads, no transcode.
+
+    Used before the empty-text drop so a caption-less voice note isn't
+    discarded as a blank message before anyone has looked at it.
+    """
+    return bool(_eligible_attachments(data_message, AUDIO_ALLOWED_MIMES))
+
+
+async def _read_inbound_audio_attachments(
+    data_message: dict, *, max_clips: int = AUDIO_MAX_CLIPS,
+) -> list[dict]:
+    """Extract and transcode audio attachments from an inbound dataMessage.
+
+    Returns `{mime, format, data_b64, filename, duration_sec, voice_note}`
+    dicts — see `audio.AudioClip`. Every clip goes through ffmpeg on its
+    way out (mono 16k mp3); anything that fails to decode, exceeds the
+    source-size cap, or isn't on disk yet is dropped with a log line
+    rather than failing the message.
+
+    Async because transcoding shells out: a five-minute clip would
+    otherwise block the event loop — and with it every other bot in the
+    deployment — for the duration of the encode.
+    """
+    out: list[dict] = []
+    # The source mime only decided eligibility — every clip leaves here
+    # as mp3 regardless, so the transcoded AudioClip carries the mime
+    # the model is actually handed.
+    for att, _src_mime in _eligible_attachments(data_message, AUDIO_ALLOWED_MIMES):
+        if len(out) >= max_clips:
+            break
+        att_id = (att.get("id") or "").strip()
+        path = _resolve_attachment_path(att_id, kind="audio")
+        if path is None:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            logger.debug(f"inbound audio stat failed: {att_id}: {e}")
+            continue
+        if size > AUDIO_MAX_SOURCE_BYTES:
+            logger.info(
+                f"inbound audio {att_id} skipped: {size} bytes exceeds "
+                f"{AUDIO_MAX_SOURCE_BYTES} cap"
+            )
+            continue
+        clip = await transcode_to_mp3(path)
+        if clip is None:
+            continue
+        # signal-cli flags a held-mic recording as `voiceNote`; a shared
+        # music/podcast file arrives without it. Only the wording of the
+        # descriptor depends on this — both are sent to the model.
+        clip.voice_note = bool(att.get("voiceNote"))
+        clip.filename = att.get("filename") or att_id
+        out.append(clip.as_dict())
     return out
 
 
@@ -1033,6 +1110,32 @@ class SignalHandler:
                 _add(bot)
         return found
 
+    def _any_bot_hears_audio(self) -> bool:
+        """Whether any enabled bot in this deployment can consume audio.
+
+        Gates the caption-less-voice-note exception to the empty-text
+        drop. Without it, an install where nothing has `audio_enabled`
+        would start surfacing bare `[voice note]` placeholders to the
+        reactor — which could then make a bot answer a message it has no
+        way of hearing. When nobody can listen, the old behavior (drop
+        silently) is the correct one.
+        """
+        registry = (
+            getattr(self.dispatcher, "bot_registry", None)
+            if self.dispatcher is not None else None
+        )
+        if registry is None:
+            return False
+        try:
+            return any(
+                getattr(b, "audio_enabled", False)
+                for b in registry.list_sync()
+                if getattr(b, "enabled", True)
+            )
+        except Exception as e:
+            logger.debug(f"audio capability lookup failed: {e}")
+            return False
+
     async def handle_webhook(self, data: dict):
         """
         Handle incoming webhook from signal-cli-rest-api.
@@ -1067,10 +1170,29 @@ class SignalHandler:
             except Exception as e:
                 logger.error(f"Poll handler launch failed: {e}")
 
-        # Skip empty messages or non-text messages
-        if not sender or not message_text:
-            logger.debug("Skipping message: no sender or empty text")
+        # Skip empty messages or non-text messages. A caption-less voice
+        # note is the exception: it arrives with `message` = null and
+        # would be dropped here, before anything has looked at the
+        # attachment. Let it through on the strength of its metadata
+        # alone (no disk read, no transcode) and stand a descriptor in
+        # for the missing text — every downstream consumer, from mention
+        # routing to the reactor to conversation history, is written
+        # against a non-empty string.
+        if not sender:
+            logger.debug("Skipping message: no sender")
             return
+        if not message_text:
+            if not (
+                has_audio_attachments(data_message)
+                and self._any_bot_hears_audio()
+            ):
+                logger.debug("Skipping message: empty text")
+                return
+            # Refined with the real duration once the clip is transcoded.
+            message_text = "[voice note]"
+            audio_only_message = True
+        else:
+            audio_only_message = False
 
         # Self-message guard: drop envelopes whose sender is any phone
         # OR UUID this pool serves. Three flavors:
@@ -1272,14 +1394,49 @@ class SignalHandler:
                     f"bot={vision_candidate.slug}"
                 )
 
+        # Audio gates on the DEPLOYMENT's capability, not on the bot this
+        # message happens to resolve to. An unaddressed voice note
+        # resolves to the per-context default, which is picked from chat
+        # settings and has nothing to do with who can hear — so gating on
+        # it would leave the clip unextracted whenever the default bot is
+        # the deaf one, and everything downstream that keys off
+        # `inbound_audio` (the reactor reroute to a bot with ears, the
+        # duration descriptor, the reactor's prompt note) would go dark
+        # in exactly the mixed-roster case they exist for. Per-bot gating
+        # still happens where it matters: ask_command checks
+        # `ctx.bot.audio_enabled` before putting bytes in a payload, so a
+        # deaf responder never receives audio it can't decode.
+        #
+        # Cost of the wider gate: one ffmpeg subprocess per clip in any
+        # chat where some bot has ears, even if nobody ends up replying.
+        # Bounded by AUDIO_MAX_CLIPS and sub-second for a normal clip.
+        inbound_audio: list[dict] = []
+        if has_audio_attachments(data_message) and self._any_bot_hears_audio():
+            inbound_audio = await _read_inbound_audio_attachments(data_message)
+            if inbound_audio:
+                logger.info(f"Inbound audio: {len(inbound_audio)} clip(s)")
+
+        # Give the clip a text identity. The bytes are one-shot — they
+        # never reach conversation history — so this descriptor is what
+        # the reactor, the group log, the tool-bot, and every later turn
+        # see in place of the audio. Replaces the placeholder outright
+        # when there was no caption; otherwise trails the user's text.
+        audio_descriptor = describe_clips(inbound_audio)
+        if audio_descriptor:
+            message_text = (
+                audio_descriptor if audio_only_message
+                else f"{message_text} {audio_descriptor}"
+            )
+
         bot_label = f" [→{addressed_bot.slug}]" if addressed_bot else ""
         img_label = f" [+{len(inbound_images)} img]" if inbound_images else ""
+        audio_label = f" [+{len(inbound_audio)} audio]" if inbound_audio else ""
         takeover_label = " [takeover]" if took_over else ""
         logger.info(
             f"Received message from {sender[-4:]}:{takeover_label} "
             f"{'[group] ' if group_id else ''}"
             f"{'[@mentioned]' + bot_label + ' ' if is_mentioned else ''}"
-            f"{img_label} "
+            f"{img_label}{audio_label} "
             f"{message_text[:50]}..."
         )
 
@@ -1298,6 +1455,7 @@ class SignalHandler:
             addressed_bot=addressed_bot,
             policy=policy_for_routing,
             inbound_images=inbound_images,
+            inbound_audio=inbound_audio,
         )
 
         # Send response if command was processed. Route through the
@@ -1363,12 +1521,14 @@ class SignalHandler:
             quote_timestamp=quote_timestamp,
             message_timestamp=message_ts,
             primary_bot=effective_bot,
+            inbound_images=inbound_images,
+            inbound_audio=inbound_audio,
         )
 
     async def _fanout_secondary_bots(
         self, *, data_message, group_id, policy, sender, message_text,
         quote_text, quote_author, primary_bot, quote_timestamp=None,
-        message_timestamp=None,
+        message_timestamp=None, inbound_images=None, inbound_audio=None,
     ) -> None:
         """Fire replies from every addressed bot OTHER than the primary.
 
@@ -1419,12 +1579,15 @@ class SignalHandler:
                     quote_author=quote_author,
                     quote_timestamp=quote_timestamp,
                     message_timestamp=message_timestamp,
+                    inbound_images=inbound_images,
+                    inbound_audio=inbound_audio,
                 )
             )
 
     async def _answer_secondary(
         self, *, bot, ask_command, pool, sender, group_id, policy, cleaned,
         quote_text, quote_author, quote_timestamp=None, message_timestamp=None,
+        inbound_images=None, inbound_audio=None,
     ) -> None:
         """Produce + send one secondary bot's reply in a multi-bot fan-out.
 
@@ -1449,6 +1612,13 @@ class SignalHandler:
                 quote_timestamp=quote_timestamp,
                 message_timestamp=message_timestamp,
                 persist_user_turn=False,
+                # Media reaches every addressed bot, not just the primary:
+                # "@Sigil @Artaud what do you two make of this?" with a
+                # photo or a voice note should mean both of them saw it.
+                # AskCommand gates on each bot's own vision/audio flags,
+                # so a text-only sibling ignores what it can't consume.
+                inbound_images=inbound_images or [],
+                inbound_audio=inbound_audio or [],
             )
             result = await ask_command.execute(ctx)
         except Exception as e:

@@ -181,27 +181,31 @@ def test_max_images_cap(attachments_tmp):
     assert [o["filename"] for o in out] == [f"img{i}.jpg" for i in range(4)]
 
 
-def test_vision_bypasses_research_mode_message_present():
-    """Regression: when vision is active on a turn AND the bot is in
-    research mode, the dispatcher must short-circuit research mode so
-    the writer sees the image directly. deep_think can't see images
-    (text-only context) and would mislead the writer with "I can't see"
-    notes that the writer then parrots. Image turns must route writer-
-    direct; subsequent text-only turns keep research mode.
+def test_media_bypasses_research_and_tool_bot_modes():
+    """Regression: when vision OR audio is active on a turn AND the bot is
+    in research/tool_bot mode, ask_command must short-circuit the handoff
+    so the writer sees the media directly. The sibling model can't see
+    images or hear clips (text-only context) and would mislead the writer
+    with "I can't see/hear that" notes the writer then parrots. Media
+    turns must route writer-direct; subsequent text-only turns keep the
+    handoff.
 
-    This test verifies the LOG MESSAGE that signals the bypass — running
-    the full ask path needs the full LLM stack mocked, which is out of
-    scope. The log line lives in ask_command at the use_research_mode
-    fork and is the documented signal for the bypass.
+    This test verifies the source-level fork — running the full ask path
+    needs the whole LLM stack mocked, which is out of scope. Both
+    booleans must appear in both guards: wiring vision and forgetting
+    audio (or vice versa) is the easy mistake here.
     """
     import src.commands.ask_command as ask_mod
     src_text = open(ask_mod.__file__, encoding="utf-8").read()
-    assert "Vision short-circuit" in src_text, (
-        "Vision short-circuit comment missing — bypass logic may have "
-        "been removed. Image turns will be incorrectly routed through "
-        "deep_think notes."
+    assert "Multimodal short-circuit" in src_text, (
+        "Multimodal short-circuit comment missing — bypass logic may "
+        "have been removed. Media turns will be incorrectly routed "
+        "through deep_think notes."
     )
+    assert "if use_research_mode and (vision_active or audio_active):" in src_text
+    assert "if use_tool_bot_mode and (vision_active or audio_active):" in src_text
     assert "use_research_mode = False" in src_text
+    assert "use_tool_bot_mode = False" in src_text
 
 
 def test_allowed_mimes_constant():
