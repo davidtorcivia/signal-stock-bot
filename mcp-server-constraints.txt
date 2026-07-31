@@ -1,20 +1,25 @@
-# Dependency constraints for uvx-launched MCP *servers* only.
+# SDK pin for uvx-launched MCP *servers* that predate the 2.x SDK.
 #
-# Applied via UV_CONSTRAINT (see Dockerfile). This does NOT affect the bot's
-# own dependencies — those come from requirements.txt via pip, and the bot's
-# MCP *client* runs the current SDK.
+# Opt-in PER SERVER, not global: a server that needs it sets
+#   UV_CONSTRAINT=/app/mcp-server-constraints.txt
+# in its env config (admin UI -> MCP servers). Nothing sets it globally, so a
+# server that has migrated resolves 2.x freely -- a global pin silently blocks
+# exactly the servers that have caught up, which is how mcp-voidwire-astro
+# 0.3.0 (which requires mcp>=2.0.0,<3) broke when the pin was global.
 #
-# mcp<2 because the third-party servers we launch (mcp-server-fetch,
-# sec-edgar-mcp, yahoo-finance-mcp, mcp-voidwire-astro) still import APIs that
-# 2.0 removed:
-#   * `mcp.server.fastmcp`  — the bundled FastMCP server framework, split out
+# This does NOT affect the bot's own dependencies -- those come from
+# requirements.txt via pip, and the bot's MCP *client* runs the 2.x SDK.
+#
+# Currently needed by: mcp-server-fetch, sec-edgar-mcp, yahoo-finance-mcp.
+# They still import APIs that 2.0 removed:
+#   * `mcp.server.fastmcp`  -- the bundled FastMCP server framework, split out
 #     of the SDK in 2.0 (it lives in the separate `fastmcp` package now)
-#   * `McpError`            — renamed to `MCPError`
-# Each declares a bare `mcp>=1.x`, so an unconstrained uvx resolves 2.x and the
-# server dies on import at startup. Pinning here rather than waiting on four
-# upstream projects to migrate independently.
+#   * `McpError`            -- renamed to `MCPError`
+# Each declares a bare `mcp>=1.x`, so an unconstrained uvx resolves 2.x and
+# the server dies on import.
 #
-# Revisit when those servers ship 2.x-compatible releases: drop the pin, run
-# `docker compose up -d`, and confirm all six start in the logs. The bot's own
-# client is already version-agnostic (see `_field` in mcp_integration/manager.py).
+# Exit path: when one ships a 2.x-compatible release, clear UV_CONSTRAINT from
+# that server's env and restart. When the last one goes, delete this file and
+# the Dockerfile COPY. The bot's client already handles either SDK major
+# version (see `_field` in mcp_integration/manager.py).
 mcp<2

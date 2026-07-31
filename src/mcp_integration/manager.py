@@ -157,21 +157,13 @@ class _MCPSession:
         if cfg.transport == "stdio":
             if not cfg.command:
                 raise MCPSessionError("stdio server is missing command")
-            # The SDK passes only a safe allowlist of env vars to the child
-            # when `env` is None, so UV_CONSTRAINT — which pins the MCP SDK
-            # version that uvx-launched servers resolve — gets stripped and
-            # those servers silently resolve an SDK they can't import. Thread
-            # it through explicitly rather than inheriting the whole
-            # environment, which would hand every third-party server process
-            # the bot's API keys.
-            passthrough = {
-                k: v for k in ("UV_CONSTRAINT",)
-                if (v := os.environ.get(k))
-            }
-            merged_env = (
-                {**os.environ, **cfg.env} if cfg.env
-                else (passthrough or None)
-            )
+            # Only the server's own configured env, layered by the SDK over
+            # its safe allowlist (PATH, HOME, ...). Deliberately NOT merged
+            # over os.environ: that handed every third-party server process
+            # the bot's full environment — LLM keys, Signal credentials, the
+            # admin password hash — and nothing needs it, since every server
+            # that requires a credential already declares it explicitly.
+            merged_env = dict(cfg.env) if cfg.env else None
             params = StdioServerParameters(
                 command=cfg.command,
                 args=list(cfg.args or []),

@@ -37,13 +37,11 @@ RUN npm install -g \
         @brave/brave-search-mcp-server@latest \
         mcp-pyodide@1.0.0
 
-# Constrain the dependency resolution of uvx-launched MCP servers. Those run
-# in their own uv-managed environments, independent of the bot's site-packages,
-# and several still import APIs the MCP SDK removed in 2.0 — without this they
-# resolve 2.x and die on import. See mcp-server-constraints.txt for the why and
-# the exit criteria. Does not affect the pip install below.
+# Ships the SDK pin for uvx-launched MCP servers that haven't migrated to the
+# 2.x SDK. Deliberately NOT set as a global ENV: servers opt in individually by
+# pointing UV_CONSTRAINT at this path in their own env config, so a server that
+# has caught up resolves freely. See mcp-server-constraints.txt.
 COPY mcp-server-constraints.txt .
-ENV UV_CONSTRAINT=/app/mcp-server-constraints.txt
 
 # Install Python dependencies
 COPY requirements.txt .
