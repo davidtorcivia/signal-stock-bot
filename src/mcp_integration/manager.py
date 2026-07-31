@@ -36,6 +36,27 @@ from .registry import MCPRegistry
 
 logger = logging.getLogger(__name__)
 
+
+def _field(obj, *names, default=None):
+    """Read the first attribute that exists, by any of its historical names.
+
+    The MCP Python SDK renamed its pydantic model fields from the wire's
+    camelCase to snake_case in 2.0 (`Tool.inputSchema` → `Tool.input_schema`,
+    `CallToolResult.isError` → `is_error`). Both spellings are accepted here
+    so the client works against either SDK major version — the servers we
+    launch are third-party and pin their own `mcp`, so a single hard-coded
+    spelling would break on whichever side moved first.
+
+    This mattered silently: the old `getattr(result, "isError", False)` kept
+    returning False against a 2.x SDK, so every failed tool call was reported
+    to the model as a successful one.
+    """
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
 TOOL_CALL_TIMEOUT = 30.0
 # 60s allows a first-run `npx -y @some/package` to download its deps.
 STARTUP_TIMEOUT = 60.0
@@ -136,7 +157,21 @@ class _MCPSession:
         if cfg.transport == "stdio":
             if not cfg.command:
                 raise MCPSessionError("stdio server is missing command")
-            merged_env = {**os.environ, **cfg.env} if cfg.env else None
+            # The SDK passes only a safe allowlist of env vars to the child
+            # when `env` is None, so UV_CONSTRAINT — which pins the MCP SDK
+            # version that uvx-launched servers resolve — gets stripped and
+            # those servers silently resolve an SDK they can't import. Thread
+            # it through explicitly rather than inheriting the whole
+            # environment, which would hand every third-party server process
+            # the bot's API keys.
+            passthrough = {
+                k: v for k in ("UV_CONSTRAINT",)
+                if (v := os.environ.get(k))
+            }
+            merged_env = (
+                {**os.environ, **cfg.env} if cfg.env
+                else (passthrough or None)
+            )
             params = StdioServerParameters(
                 command=cfg.command,
                 args=list(cfg.args or []),
@@ -177,7 +212,10 @@ class _MCPSession:
                             server_name=self.config.name,
                             name=t.name,
                             description=(t.description or ""),
-                            input_schema=(t.inputSchema or {"type": "object", "properties": {}}),
+                            input_schema=(
+                                _field(t, "input_schema", "inputSchema")
+                                or {"type": "object", "properties": {}}
+                            ),
                         )
                         for t in listing.tools
                     ]
@@ -211,7 +249,7 @@ def _flatten_result(result) -> str:
             out_parts.append(f"<binary: {len(data)} bytes>")
             continue
         out_parts.append(json.dumps(_coerce(part)))
-    if getattr(result, "isError", False):
+    if _field(result, "is_error", "isError", default=False):
         return "ERROR: " + "\n".join(out_parts) if out_parts else "ERROR (no detail)"
     return "\n".join(out_parts) if out_parts else "(no result)"
 

@@ -1,0 +1,20 @@
+# Dependency constraints for uvx-launched MCP *servers* only.
+#
+# Applied via UV_CONSTRAINT (see Dockerfile). This does NOT affect the bot's
+# own dependencies — those come from requirements.txt via pip, and the bot's
+# MCP *client* runs the current SDK.
+#
+# mcp<2 because the third-party servers we launch (mcp-server-fetch,
+# sec-edgar-mcp, yahoo-finance-mcp, mcp-voidwire-astro) still import APIs that
+# 2.0 removed:
+#   * `mcp.server.fastmcp`  — the bundled FastMCP server framework, split out
+#     of the SDK in 2.0 (it lives in the separate `fastmcp` package now)
+#   * `McpError`            — renamed to `MCPError`
+# Each declares a bare `mcp>=1.x`, so an unconstrained uvx resolves 2.x and the
+# server dies on import at startup. Pinning here rather than waiting on four
+# upstream projects to migrate independently.
+#
+# Revisit when those servers ship 2.x-compatible releases: drop the pin, run
+# `docker compose up -d`, and confirm all six start in the logs. The bot's own
+# client is already version-agnostic (see `_field` in mcp_integration/manager.py).
+mcp<2
