@@ -213,6 +213,17 @@
         <code>explicit</code> = the writer LLM was told to remember;
         <code>admin</code> = saved from this page.
     </p>
+    {% if total %}
+    <form method="POST" action="{{ url_for('admin.memories_wipe', context_id=policy.id) }}"
+          onsubmit="return confirm('Delete all {{ total }} memories for this chat? This cannot be undone.');"
+          style="margin-top:10px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn"
+                style="background: transparent; color: var(--bad); border: 1px solid var(--bad); padding: 4px 10px; font-size: 12px;">
+            Wipe all memories in this chat
+        </button>
+    </form>
+    {% endif %}
 </div>
 
 <div class="panel">

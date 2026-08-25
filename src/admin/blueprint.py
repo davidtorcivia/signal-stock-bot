@@ -1574,6 +1574,7 @@ def _register_context_routes(
             "reactor_prompt": "",
             "natural_response": False,
             "deep_think_enabled": True,
+            "memory_enabled": True,
             "memory_writes_enabled": True,
             "reactor_memory_writes": False,
             "default_bot_id": "",
@@ -1643,6 +1644,7 @@ def _register_context_routes(
             "reactor_prompt": policy.reactor_prompt or "",
             "natural_response": policy.natural_response,
             "deep_think_enabled": policy.deep_think_enabled,
+            "memory_enabled": policy.memory_enabled,
             "memory_writes_enabled": policy.memory_writes_enabled,
             "reactor_memory_writes": policy.reactor_memory_writes,
             "default_bot_id": (
@@ -2357,6 +2359,26 @@ def _register_memory_routes(
             _memories_redirect_url(context_id, request.form.get("page"))
         )
 
+    @bp.route("/contexts/<int:context_id>/memories/wipe", methods=["POST"])
+    @admin_required
+    def memories_wipe(context_id: int):
+        _store_or_404()
+        if not verify_csrf():
+            flash("Session expired, please reload the page.", "error")
+            return redirect(
+                url_for("admin.context_memories", context_id=context_id)
+            )
+        policy = _run_on_loop(loop, registry.get(context_id))
+        if not policy:
+            abort(404)
+        try:
+            n = _run_on_loop(loop, memory_store.delete_for_context(context_id))
+            flash(f"Wiped {n} memories.", "ok")
+        except Exception as e:
+            logger.error(f"Memory wipe failed: {e}")
+            flash(f"Memory wipe failed: {e}", "error")
+        return redirect(url_for("admin.context_memories", context_id=context_id))
+
     @bp.route(
         "/contexts/<int:context_id>/memories/<int:memory_id>/delete",
         methods=["POST"],
@@ -2517,6 +2539,7 @@ def _preview_policy(values: dict, *, existing_id: Optional[int] = 1) -> ContextP
         mcp_mode=str(values.get("mcp_mode") or MODE_ALLOW_LIST),
         mcp_servers=list(values.get("mcp_servers") or []),
         deep_think_enabled=bool(values.get("deep_think_enabled", True)),
+        memory_enabled=bool(values.get("memory_enabled", True)),
         memory_writes_enabled=bool(values.get("memory_writes_enabled", True)),
     )
 
@@ -2587,6 +2610,7 @@ def _form_to_values(form) -> dict:
         "reactor_prompt": form.get("reactor_prompt", ""),
         "natural_response": form.get("natural_response", "") == "on",
         "deep_think_enabled": form.get("deep_think_enabled", "") == "on",
+        "memory_enabled": form.get("memory_enabled", "") == "on",
         "memory_writes_enabled": form.get("memory_writes_enabled", "") == "on",
         "reactor_memory_writes": form.get("reactor_memory_writes", "") == "on",
         "default_bot_id": form.get("default_bot_id", "").strip(),
@@ -2615,6 +2639,7 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
     reactor_prompt = (form.get("reactor_prompt") or "").strip() or None
     natural_response = form.get("natural_response", "") == "on"
     deep_think_enabled = form.get("deep_think_enabled", "") == "on"
+    memory_enabled = form.get("memory_enabled", "") == "on"
     memory_writes_enabled = form.get("memory_writes_enabled", "") == "on"
     reactor_memory_writes = form.get("reactor_memory_writes", "") == "on"
     raw_default_bot_id = (form.get("default_bot_id") or "").strip()
@@ -2675,6 +2700,7 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         reactor_prompt=reactor_prompt,
         natural_response=natural_response,
         deep_think_enabled=deep_think_enabled,
+        memory_enabled=memory_enabled,
         memory_writes_enabled=memory_writes_enabled,
         reactor_memory_writes=reactor_memory_writes,
         default_bot_id=default_bot_id,

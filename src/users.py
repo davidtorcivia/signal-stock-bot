@@ -68,7 +68,11 @@ class NameRegistry:
                     """
                 )
                 rows = conn.execute(
-                    "SELECT user_hash, name FROM user_names"
+                    # ORDER BY updated_at: dict preserves insertion order, so
+                    # SubjectResolver can break a duplicate-name tie by
+                    # taking the most recently registered match.
+                    "SELECT user_hash, name FROM user_names "
+                    "ORDER BY updated_at"
                 ).fetchall()
             self._cache = {r[0]: r[1] for r in rows}
             self._cache_loaded = True
@@ -101,7 +105,9 @@ class NameRegistry:
 
     async def _load_cache(self) -> None:
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT user_hash, name FROM user_names")
+            cursor = await db.execute(
+                "SELECT user_hash, name FROM user_names ORDER BY updated_at"
+            )
             rows = await cursor.fetchall()
         self._cache = {r[0]: r[1] for r in rows}
         self._cache_loaded = True

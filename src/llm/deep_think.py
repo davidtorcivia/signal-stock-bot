@@ -43,6 +43,7 @@ from ..bots.settings import (
     resolve_setting,
 )
 from ..cache import get_metrics
+from ..memory import dispatch_memory_tool, memory_tool_schemas
 from .client import _ensure_reasoning_content, _extract_cache_tokens
 from .mcp_broker import (
     MCP_BROKER_TOOLS,
@@ -150,6 +151,11 @@ class DeepThinkClient:
         # falls back to a single-shot text call without tools.
         self.bot_tools = bot_tools
         self.mcp_manager = mcp_manager
+        # Per-context memory. Late-bound like bot_tools (main.py wires
+        # them via the factory). When unset, the memory tools simply
+        # aren't exposed and remember/recall/forget aren't dispatched.
+        self.memory_store = None
+        self.subject_resolver = None
         self.durable_tool_ledger = DurableToolLedger()
         # Rolling log for the admin dashboard. (ts, question, latency_ms,
         # model, tokens_in, tokens_out, ok, error_msg, user_tail, group_id,
@@ -528,6 +534,7 @@ class DeepThinkClient:
             schemas.extend(self.bot_tools.list_tools(policy=policy))
         if broker_should_be_exposed(self.mcp_manager, policy):
             schemas.extend(MCP_BROKER_TOOLS)
+        schemas.extend(memory_tool_schemas(self.memory_store, policy))
         # Match the writer's canonical ordering. Session restart order should
         # not rewrite an otherwise identical request prefix.
         schemas.sort(
@@ -760,6 +767,20 @@ class DeepThinkClient:
                     name=str(args.get("name") or ""),
                     arguments=args.get("arguments"),
                 )
+            elif name in ("remember", "recall", "forget"):
+                if caller_ctx is None:
+                    content = "(memory unavailable: no caller context)"
+                else:
+                    content = await dispatch_memory_tool(
+                        store=self.memory_store,
+                        resolver=self.subject_resolver,
+                        name=name,
+                        args=args,
+                        caller_ctx=caller_ctx,
+                        bot_id=getattr(
+                            getattr(caller_ctx, "bot", None), "id", None
+                        ),
+                    )
             elif self.mcp_manager is not None:
                 content = await self._handle_direct_mcp_call(
                     name, args, caller_ctx,

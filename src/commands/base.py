@@ -60,6 +60,10 @@ class CommandContext:
     # command. The trading cron reads this to suppress the chat post
     # when the writer chose to sit out — no moves means no message.
     portfolio_mutation_count: int = 0
+    # Memory preamble built for this turn (see memory.build_preamble).
+    # Set by ask_command so the deep_think tool dispatch can pass the
+    # same memories to the deep model.
+    memory_block: str = ""
     # Image attachments captured from the inbound Signal message. Each
     # entry: {"mime": "image/jpeg", "data_b64": "<base64>", "filename": "..."}.
     # Populated by the signal handler when the resolved bot has

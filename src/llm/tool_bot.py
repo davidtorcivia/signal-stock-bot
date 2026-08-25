@@ -28,6 +28,7 @@ import logging
 import re
 from typing import Optional
 
+from ..memory import memory_tool_schemas
 from .deep_think import DeepThinkClient
 from .mcp_broker import allowed_mcp_tools, invoke_mcp_tool
 
@@ -63,6 +64,13 @@ FIRST decide whether this turn needs tools at all:
   reply with EXACTLY the single token:
       NOTOOLS
   Nothing else. No explanation, no punctuation. The writer will handle it.
+
+- EXCEPTION: a durable fact stated about the speaker, about another person,
+  or about this chat (a name, job, location, standing preference or plan) is
+  itself tool work, even in pure small talk. If `remember` is in your tool
+  list, call it with that fact before answering — and do NOT return NOTOOLS
+  on that turn. Use `recall` the same way when the turn depends on something
+  this chat may already have stored.
 
 - Otherwise, USE THE TOOLS. Don't guess at a price, P/E, or recent event —
   fetch it. Chain calls when one finding leads to the next. Then write
@@ -133,6 +141,7 @@ class ToolBotClient(DeepThinkClient):
         schemas: list[dict] = []
         if self.bot_tools is not None:
             schemas.extend(self.bot_tools.list_tools(policy=policy))
+        schemas.extend(memory_tool_schemas(self.memory_store, policy))
 
         expandable = []
         skipped = []

@@ -10,7 +10,7 @@ Schema:
   context_memories(id, context_id, subject_key, subject_label, kind,
                    content, confidence, source, source_user_hash,
                    source_message_at, distinct_speakers, corroborations,
-                   created_at, updated_at)
+                   created_at, updated_at, bot_id)
 
 Keys:
   * context_id    — FK to contexts.id (per-context isolation)
@@ -28,30 +28,17 @@ Audit columns:
                          whose message produced the memory; for admin writes,
                          empty. Lets admins trace a memory back to a message.
   * source_message_at  — unix ts of the triggering message
-  * distinct_speakers  — JSON-encoded set of source_user_hashes that have
-                         corroborated this memory. Promotion to confidence
-                         1.0 requires at least 2 distinct speakers — a
-                         single user can't self-promote a hallucination
-                         by repeating the same prompt.
 
-Confidence:
-  * 0.6  default for reactor passive-learning writes
-  * 1.0  for self / context-level explicit writes
-  * 0.7  for explicit writes about third parties (anti-poisoning soft tag —
-         the bot may be repeating something someone made up about another
-         user; corroboration from a second speaker promotes to 1.0)
-On corroboration (same kind/subject re-asserted with similar content), the
-existing row's `corroborations` increments and confidence rises toward 1.0.
-Reactor rows promote to confidence 1.0 only after corroborations from
-PROMOTION_CORROBORATION_THRESHOLD distinct speakers.
+The `confidence`, `corroborations` and `distinct_speakers` columns are
+vestigial — kept so old rows and the admin views still read, but every
+new row is written with confidence 1.0 and nothing promotes or decays.
 """
 
-import json
 import logging
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import aiosqlite
 
@@ -80,22 +67,13 @@ SOURCE_REACTOR = "reactor"
 SOURCE_EXPLICIT = "explicit"
 SOURCE_ADMIN = "admin"
 
-REACTOR_DEFAULT_CONFIDENCE = 0.6
-EXPLICIT_SELF_CONFIDENCE = 1.0
-# Third-party explicit confidence is intentionally below the
-# preamble's "(low confidence)" cutoff (0.8) so memories the bot
-# stored about user B from user A's prompt land tagged as soft —
-# corroboration from a second speaker raises it to 1.0.
-EXPLICIT_THIRD_PARTY_CONFIDENCE = 0.7
-EXPLICIT_DEFAULT_CONFIDENCE = EXPLICIT_SELF_CONFIDENCE  # legacy alias
-
-# Promote a reactor-sourced memory to confidence 1.0 once corroborated by
-# this many DISTINCT speakers. Single-speaker repetition can't promote —
-# stops a single user from self-priming a hallucination across messages.
-PROMOTION_CORROBORATION_THRESHOLD = 3
+# Vestigial column, written as a constant on every insert.
+DEFAULT_CONFIDENCE = 1.0
 
 _USER_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+# "[...4160]", "...4160", "4160" — the anonymous speaker label.
+_PHONE_TAIL_RE = re.compile(r"^\[?\.{0,3}\d{4}\]?$")
 
 
 def is_user_hash(subject_key: str) -> bool:
@@ -216,30 +194,21 @@ class MemoryStore:
         subject_label: str,
         kind: str,
         content: str,
-        confidence: float = EXPLICIT_SELF_CONFIDENCE,
         source: str = SOURCE_EXPLICIT,
         source_user_hash: str = "",
         source_message_at: Optional[float] = None,
         bot_id: Optional[int] = None,
     ) -> Optional[int]:
-        """Insert or corroborate a memory. Returns the row id, or None on bad input.
+        """Insert a memory. Returns the row id, or None on bad input.
 
-        Corroboration logic: if a row with the same (context_id, subject_key,
-        kind) exists and the new content is a near-duplicate, bump
-        corroborations + updated_at and lift confidence rather than inserting
-        a duplicate. The whole read+write happens under BEGIN IMMEDIATE so
-        two concurrent writers can't race past each other into parallel rows.
-
-        Reactor rows promote to confidence 1.0 only when corroborations come
-        from at least PROMOTION_CORROBORATION_THRESHOLD distinct speakers
-        (tracked via `distinct_speakers`). Single-speaker repetition can't
-        self-promote a hallucination — a different user has to say the same
-        thing for confidence to climb.
+        Dedup: if a row with the same (context_id, subject_key, kind)
+        already holds near-duplicate content, return that row's id
+        instead of inserting a parallel one. Read+write runs under
+        BEGIN IMMEDIATE so two concurrent writers can't both miss the
+        duplicate and insert.
         """
         if not subject_key or kind not in KINDS or not (content or "").strip():
             return None
-        if not 0.0 <= confidence <= 1.0:
-            confidence = max(0.0, min(1.0, confidence))
 
         await self._ensure_initialized()
         now = time.time()
@@ -247,21 +216,15 @@ class MemoryStore:
         speaker = source_user_hash or ""
 
         async with db_session(self) as db:
-            # BEGIN IMMEDIATE acquires the reserved lock at start of read,
-            # so a concurrent writer waits instead of read-then-double-insert.
             await db.execute("BEGIN IMMEDIATE")
             try:
                 # Dedup scope: each bot maintains its own mental model of
                 # the chat, but legacy NULL-bot rows (pre-multi-bot
                 # installs and admin-added rows without a bot tag) are
                 # treated as shared — a per-bot writer that finds a
-                # near-duplicate NULL-bot row corroborates it (keeping
-                # one row that all bots see) rather than creating a
-                # duplicate. Without this, list_for_subject would
-                # return BOTH rows to the per-bot reader because the
-                # read path is `(bot_id = ? OR bot_id IS NULL)`. When
-                # bot_id is None on the write we match NULL-only so the
-                # legacy code path stays exactly the same.
+                # near-duplicate NULL-bot row reuses it rather than
+                # creating a duplicate the reader would see twice (the
+                # read path is `(bot_id = ? OR bot_id IS NULL)`).
                 if bot_id is None:
                     bot_clause = " AND bot_id IS NULL"
                     bot_params: tuple = ()
@@ -269,65 +232,26 @@ class MemoryStore:
                     bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
                     bot_params = (bot_id,)
                 cursor = await db.execute(
-                    f"""SELECT id, content, confidence, corroborations, source,
-                              distinct_speakers
+                    """SELECT id, content
                        FROM context_memories
                        WHERE context_id = ? AND subject_key = ? AND kind = ?"""
                     + bot_clause,
                     (context_id, subject_key, kind) + bot_params,
                 )
-                existing = await cursor.fetchall()
-
-                dup: Optional[tuple] = None  # (id, conf, corr, distinct_json)
-                for row in existing:
+                for row in await cursor.fetchall():
                     if _is_near_duplicate(row[1], content):
-                        dup = (row[0], row[2], row[3], row[5])
-                        break
-
-                if dup is not None:
-                    dup_id, existing_conf, existing_corr, distinct_json = dup
-                    speakers = _decode_speakers(distinct_json)
-                    if speaker and speaker not in speakers:
-                        speakers.append(speaker)
-                    new_corr = existing_corr + 1
-                    new_conf = min(1.0, max(existing_conf, confidence))
-                    # Promotion gate: at least N DISTINCT speakers must have
-                    # corroborated. Reactor and explicit third-party writes
-                    # both ride this rule — explicit writes about a third
-                    # party that no one else corroborates stay tagged soft.
-                    if len(speakers) >= PROMOTION_CORROBORATION_THRESHOLD:
-                        new_conf = 1.0
-                    elif (
-                        source == SOURCE_EXPLICIT
-                        and existing_conf < EXPLICIT_SELF_CONFIDENCE
-                        and len(speakers) >= 2
-                    ):
-                        new_conf = max(new_conf, EXPLICIT_SELF_CONFIDENCE)
-                    await db.execute(
-                        """UPDATE context_memories
-                           SET confidence = ?, corroborations = ?,
-                               updated_at = ?, subject_label = ?,
-                               distinct_speakers = ?
-                           WHERE id = ?""",
-                        (
-                            new_conf, new_corr, now, subject_label,
-                            json.dumps(speakers), dup_id,
-                        ),
-                    )
-                    await db.commit()
-                    return dup_id
+                        await db.commit()
+                        return row[0]
 
                 cursor = await db.execute(
                     """INSERT INTO context_memories
                        (context_id, subject_key, subject_label, kind, content,
                         confidence, source, source_user_hash,
-                        source_message_at, distinct_speakers, corroborations,
-                        created_at, updated_at, bot_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                        source_message_at, created_at, updated_at, bot_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         context_id, subject_key, subject_label, kind, content,
-                        confidence, source, speaker, source_message_at,
-                        json.dumps([speaker] if speaker else []),
+                        DEFAULT_CONFIDENCE, source, speaker, source_message_at,
                         now, now, bot_id,
                     ),
                 )
@@ -340,7 +264,7 @@ class MemoryStore:
     _SELECT_COLS = (
         "id, subject_key, subject_label, kind, content, confidence, "
         "source, corroborations, created_at, updated_at, "
-        "source_user_hash, source_message_at, distinct_speakers"
+        "source_user_hash, source_message_at"
     )
 
     async def list_for_subject(
@@ -349,7 +273,6 @@ class MemoryStore:
         context_id: int,
         subject_key: str,
         kinds: Optional[tuple] = None,
-        min_confidence: float = 0.0,
         bot_id: Optional[int] = None,
     ) -> list[dict]:
         """Per-bot scoping (`bot_id` set): returns rows owned by this
@@ -361,9 +284,9 @@ class MemoryStore:
         sql = (
             f"SELECT {self._SELECT_COLS} "
             "FROM context_memories "
-            "WHERE context_id = ? AND subject_key = ? AND confidence >= ?"
+            "WHERE context_id = ? AND subject_key = ?"
         )
-        params: list = [context_id, subject_key, min_confidence]
+        params: list = [context_id, subject_key]
         if kinds:
             sql += f" AND kind IN ({','.join('?' * len(kinds))})"
             params.extend(kinds)
@@ -399,59 +322,6 @@ class MemoryStore:
             )
             rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
-
-    async def find_similar_for_subject(
-        self,
-        *,
-        context_id: int,
-        subject_key: str,
-        content: str,
-        threshold: float = 0.5,
-        bot_id: Optional[int] = None,
-    ) -> Optional[dict]:
-        """Return the first stored memory for `subject_key` whose content
-        is a near-duplicate of `content`, regardless of kind. None if
-        nothing matches.
-
-        Used by the reactor's pre-write skip so the same fact written
-        under a different `kind` (or in a slightly reworded way) doesn't
-        land as a parallel row. Distinct from the strict same-kind
-        corroboration in `add()` (Jaccard ≥ 0.85): this one uses the
-        looser bidirectional containment check (`_is_similar_for_dedup`)
-        because we explicitly WANT to catch the cross-kind / rephrasing
-        cases the strict path misses.
-
-        Bounded by `LIMIT 50` ordered by recency so a subject with a
-        runaway memory list doesn't make every reactor write expensive.
-        Recent memories matter more anyway — older near-duplicates can
-        coexist if the subject's facts have meaningfully changed.
-        """
-        if not content or not subject_key:
-            return None
-        # Same bot-scoping rule as add(): match same-bot rows + legacy
-        # NULL-bot rows so the dedup decision uses the right slice.
-        bot_clause = ""
-        params: tuple = (context_id, subject_key)
-        if bot_id is not None:
-            bot_clause = " AND (bot_id = ? OR bot_id IS NULL)"
-            params = params + (bot_id,)
-        async with db_session(self) as db:
-            cursor = await db.execute(
-                f"""SELECT {self._SELECT_COLS}
-                    FROM context_memories
-                    WHERE context_id = ? AND subject_key = ?"""
-                + bot_clause +
-                """
-                    ORDER BY updated_at DESC
-                    LIMIT 50""",
-                params,
-            )
-            rows = await cursor.fetchall()
-        for r in rows:
-            existing_content = r[4]
-            if _is_similar_for_dedup(content, existing_content, threshold):
-                return _row_to_dict(r)
-        return None
 
     async def search(
         self,
@@ -505,7 +375,7 @@ class MemoryStore:
         if not row:
             return None
         d = _row_to_dict(row)
-        d["context_id"] = row[13]
+        d["context_id"] = row[12]
         return d
 
     async def update(
@@ -513,6 +383,8 @@ class MemoryStore:
         memory_id: int,
         *,
         content: Optional[str] = None,
+        # Accepted and ignored — `confidence` is a vestigial column the
+        # admin form still posts. Kept so that route keeps working.
         confidence: Optional[float] = None,
         subject_key: Optional[str] = None,
         subject_label: Optional[str] = None,
@@ -523,9 +395,6 @@ class MemoryStore:
         if content is not None:
             sets.append("content = ?")
             params.append(content.strip())
-        if confidence is not None:
-            sets.append("confidence = ?")
-            params.append(max(0.0, min(1.0, confidence)))
         if subject_key is not None:
             sk = (subject_key or "").strip()
             if not sk:
@@ -588,53 +457,7 @@ def _row_to_dict(row) -> dict:
         "updated_at": row[9],
         "source_user_hash": row[10] if len(row) > 10 else "",
         "source_message_at": row[11] if len(row) > 11 else None,
-        "distinct_speakers": _decode_speakers(
-            row[12] if len(row) > 12 else None
-        ),
     }
-
-
-def _decode_speakers(raw) -> list[str]:
-    """Decode the JSON-encoded `distinct_speakers` set. Lenient on shape."""
-    if not raw:
-        return []
-    if isinstance(raw, list):
-        return [s for s in raw if isinstance(s, str)]
-    try:
-        decoded = json.loads(raw)
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(decoded, list):
-        return []
-    return [s for s in decoded if isinstance(s, str)]
-
-
-def compute_explicit_confidence(
-    *,
-    subject_key: str,
-    sender_user_hash: Optional[str],
-) -> float:
-    """Return the starting confidence for an explicit `remember` write.
-
-    Self-memories and context-level memories land at full confidence —
-    the user is presumably authoritative about themselves and about the
-    room. Memories about *other* people (or free-text entities) start
-    soft because the writer LLM was just told what to store via prompt
-    and may have been manipulated; corroboration from a second speaker
-    promotes them to full.
-    """
-    if not subject_key:
-        return EXPLICIT_THIRD_PARTY_CONFIDENCE
-    # Self / context / bot-self all land at full confidence: the speaker
-    # is presumably authoritative about themselves and the room, and a
-    # bot-self memory ("you are Sigil, a tarot reader" / "you are running
-    # Claude Opus 4.7") is an admin-or-user declaration *about the bot*
-    # that the bot should adopt, not a claim about a third party.
-    if subject_key in (SUBJECT_CONTEXT, SUBJECT_SELF):
-        return EXPLICIT_SELF_CONFIDENCE
-    if sender_user_hash and subject_key == sender_user_hash:
-        return EXPLICIT_SELF_CONFIDENCE
-    return EXPLICIT_THIRD_PARTY_CONFIDENCE
 
 
 _PUNCT_RE = re.compile(r"[^a-z0-9]+")
@@ -656,9 +479,9 @@ def _is_near_duplicate(a: str, b: str, threshold: float = 0.85) -> bool:
     """Cheap near-duplicate check for corroboration.
 
     Strips punctuation + stopwords, tokenizes, and computes Jaccard overlap.
-    Above threshold counts as the same memory and bumps the existing row's
-    corroboration counter rather than inserting a parallel one. Avoids
-    pulling in a real similarity library for what's a back-pocket dedup.
+    Above threshold counts as the same memory, so `add()` reuses the
+    existing row instead of inserting a parallel one. Avoids pulling in a
+    real similarity library for what's a back-pocket dedup.
     """
     ta = _tokenize_for_match(a)
     tb = _tokenize_for_match(b)
@@ -668,40 +491,6 @@ def _is_near_duplicate(a: str, b: str, threshold: float = 0.85) -> bool:
         return True
     overlap = len(ta & tb) / len(ta | tb)
     return overlap >= threshold
-
-
-def _is_similar_for_dedup(a: str, b: str, threshold: float = 0.5) -> bool:
-    """Looser similarity check used for the reactor's cross-kind pre-write
-    skip. Bidirectional containment: if most of either side's tokens
-    appear in the other, they're likely rephrasings of the same fact.
-
-    Distinct from `_is_near_duplicate` (Jaccard ≥ 0.85) which is the
-    strict same-kind corroboration rule in `MemoryStore.add()`. The
-    reactor needs a wider net because it also sneaks duplicates past
-    the strict check by writing the same content under a different
-    `kind` (fact vs. preference vs. identity) — those don't share a
-    WHERE clause in the corroboration query, so they slip through as
-    parallel rows.
-
-    Trade-off: this catches more rephrasings ("loves astrology" vs.
-    "is into astrology" → forward overlap 0.5) at the cost of some
-    false positives ("lives in Brooklyn" vs. "favorite borough is
-    Brooklyn"). For passive reactor learning, false-positive skips are
-    cheap (we just don't store a new variant) and the threshold is
-    tunable per-call.
-    """
-    ta = _tokenize_for_match(a)
-    tb = _tokenize_for_match(b)
-    if not ta or not tb:
-        return False
-    if ta == tb:
-        return True
-    intersection = len(ta & tb)
-    if intersection == 0:
-        return False
-    forward = intersection / len(ta)
-    backward = intersection / len(tb)
-    return max(forward, backward) >= threshold
 
 
 class SubjectResolver:
@@ -715,8 +504,9 @@ class SubjectResolver:
 
     Name resolution is best-effort: case-insensitive exact match against
     the NameRegistry cache. Ambiguity (two registered users sharing a
-    first name) falls back to free-text — admins can fix the mapping by
-    editing the resulting memory's subject in the admin UI.
+    first name) resolves to the speaker when they're one of the matches,
+    otherwise to the most recently updated match — never to free-text,
+    which would fragment a name that IS registered.
     """
 
     def __init__(self, name_registry):
@@ -727,12 +517,15 @@ class SubjectResolver:
         subject_hint: str,
         *,
         sender_phone: Optional[str] = None,
+        bot_names: Optional[Iterable[str]] = None,
     ) -> tuple[str, str]:
         """Return (subject_key, subject_label).
 
         Special hints:
           - "" / "self" / "me" / "the user" / "speaker" → the current sender
             (if `sender_phone` is set), otherwise free-text "self"
+          - a phone-tail placeholder ("...4160", "[...4160]") → the sender
+          - the running bot's own name/slug/alias (`bot_names`) → SUBJECT_SELF
           - "this chat" / "the room" / "context" / "here" → SUBJECT_CONTEXT
           - exact-match (case-insensitive) registered name → that user_hash
           - 64-char hex → assumed to be a user_hash directly
@@ -746,10 +539,14 @@ class SubjectResolver:
         # to pin it on the bot side. The unambiguous human-side keyword
         # is "speaker" / "the user" — the LLM is told to use those when
         # it means the human in the chat, not "self".
-        if low in (
+        self_aliases = {
             "yourself", "myself", "the bot", "you", "the assistant",
             "the ai", "bot", "you (the bot)", "self (bot)",
-        ):
+        }
+        self_aliases.update(
+            n.strip().lower() for n in (bot_names or []) if n and n.strip()
+        )
+        if low in self_aliases:
             return SUBJECT_SELF, "the bot"
 
         if low in ("", "self", "me", "the user", "speaker", "the speaker"):
@@ -764,6 +561,13 @@ class SubjectResolver:
                    "here", "this group", "this conversation"):
             return SUBJECT_CONTEXT, "this chat"
 
+        # Phone-tail placeholder ("[...4160]", "...4160", "4160") — that's
+        # the anonymous label the prompt shows for an unregistered speaker,
+        # not a name. Minting freetext:4160 would scatter one person's
+        # memories across every tail the model happens to echo.
+        if _PHONE_TAIL_RE.match(low) and sender_phone:
+            return self.resolve("speaker", sender_phone=sender_phone)
+
         if is_user_hash(s):
             label = ""
             if self.name_registry is not None:
@@ -777,8 +581,23 @@ class SubjectResolver:
                 if name.lower() == low
             ]
             if len(matches) == 1:
-                h, name = matches[0]
-                return h, name
+                return matches[0]
+            if len(matches) > 1:
+                # Never fall through to freetext for a name that IS
+                # registered — that fragments the person's memories.
+                # Prefer the speaker; else the most recently updated
+                # registration (the cache is loaded ORDER BY updated_at).
+                logger.warning(
+                    "Ambiguous memory subject %r: %d registered users share "
+                    "that name", s, len(matches),
+                )
+                if sender_phone:
+                    from .database import hash_phone
+                    h = hash_phone(sender_phone)
+                    for match in matches:
+                        if match[0] == h:
+                            return match
+                return matches[-1]
 
         return freetext_subject_key(s), s
 
@@ -789,9 +608,8 @@ class SubjectResolver:
 
 # Preamble cap. Memory rendering is cheap individually but multiplicative
 # across many active subjects, so cap total lines hard. Each subject gets
-# its highest-confidence rows first, then we fall through to other subjects.
+# its most recent rows first, then we fall through to other subjects.
 MAX_PREAMBLE_LINES = 30
-MIN_PREAMBLE_CONFIDENCE = 0.5
 
 # Always-visible subjects, in render order. Bot-self FIRST so the model
 # reads its own identity before anything else; room context next; then
@@ -892,7 +710,6 @@ async def build_preamble(
         rows = await memory_store.list_for_subject(
             context_id=context_id,
             subject_key=key,
-            min_confidence=MIN_PREAMBLE_CONFIDENCE,
             bot_id=bot_id,
         )
         if not rows:
@@ -901,21 +718,9 @@ async def build_preamble(
         for r in rows:
             if line_budget <= 0:
                 break
-            kind_part = _kind_label(r["kind"])
-            conf = r["confidence"]
-            tags: list[str] = []
-            if conf < 0.8:
-                tags.append(f"confidence {conf:.1f}")
-            # Surface provenance so the model can weigh reactor (passive,
-            # may have misread the chat) differently from explicit
-            # (someone in the chat told the bot to remember this).
-            src = r.get("source") or ""
-            if src == SOURCE_REACTOR:
-                tags.append("observed passively")
-            elif src == SOURCE_EXPLICIT:
-                tags.append("told to bot")
-            tail = f" ({'; '.join(tags)})" if tags else ""
-            rendered.append(f"  - [{kind_part}] {r['content']}{tail}")
+            rendered.append(
+                f"  - [{_kind_label(r['kind'])}] {r['content']}"
+            )
             line_budget -= 1
         if not rendered:
             continue
@@ -929,14 +734,10 @@ async def build_preamble(
         return ""
 
     intro = (
-        "Stored memories scoped to this chat. The first block — \"About you "
-        "(the bot)\" — is your own identity, persona, and capabilities as "
-        "set in this chat; treat it as authoritative. The rest are about "
-        "the room itself, the current speaker, and anyone they mentioned. "
-        "Use them when relevant; do not parrot them at users unprompted. "
-        "If a stored memory contradicts what the user just said about "
-        "themselves, trust the user and call `remember` (when available) "
-        "to update it."
+        "Stored memories scoped to this chat; the first block — \"About you "
+        "(the bot)\" — is your own identity and is authoritative. "
+        "If a memory contradicts what the user just said about themselves, "
+        "trust the user and call `remember` (when available) to update it."
     )
     return intro + "\n\n" + "\n\n".join(blocks)
 
@@ -985,11 +786,9 @@ REMEMBER_TOOL = {
             "role, preferences, a meaningful fact, or an event worth "
             "recalling later. Memories you save are auto-injected into "
             "future replies in this chat when the subject is active. "
-            "Don't save banter, jokes the user is making, anything the "
-            "user clearly doesn't want stored, or the same fact you "
-            "already saved (corroborations dedupe automatically). One "
-            "memory per call — make multiple calls if you need to record "
-            "several distinct facts."
+            "Skip banter, jokes, and anything the speaker clearly doesn't "
+            "want stored. One memory per call — make multiple calls if you "
+            "need to record several distinct facts."
         ),
         "parameters": {
             "type": "object",
@@ -998,13 +797,14 @@ REMEMBER_TOOL = {
                     "type": "string",
                     "description": (
                         "Who/what this memory is about. Options:\n"
-                        "  - a registered name (e.g. 'David') → that user\n"
-                        "  - 'speaker' or 'the user' → the human currently "
-                        "talking\n"
-                        "  - 'yourself' or 'the bot' → YOU, the bot — your "
-                        "own identity, persona, model, voice, capabilities. "
-                        "These are what the chat has told you about who "
-                        "YOU are in this room.\n"
+                        "  - 'speaker' → the human currently talking. Use "
+                        "this for anything they state about THEMSELVES.\n"
+                        "  - 'yourself' → YOU, the bot — your own identity, "
+                        "persona, model, voice, capabilities as the chat "
+                        "has described them.\n"
+                        "  - a registered name (e.g. 'David') → that other "
+                        "user, when the speaker is talking about someone "
+                        "else\n"
                         "  - 'this chat' → the room itself\n"
                         "  - free-text label → non-Signal entities ('the "
                         "cat', 'their boss')\n"
@@ -1052,7 +852,7 @@ RECALL_TOOL = {
             "use this tool when you need memories about someone NOT in "
             "the current message, or a free-form search across everyone "
             "('what do we know about astrology in this chat?'). Returns "
-            "matching memories with their kind and confidence."
+            "matching memories with their id and kind."
         ),
         "parameters": {
             "type": "object",
@@ -1116,11 +916,11 @@ NOTE_MEMORY_TOOL = {
             "use for slow-changing facts: identity (role, where they "
             "live, astrological/personality identifiers they've named), "
             "preference (what they like or dislike), or general fact. "
-            "Skip events, banter, jokes, sarcasm, and anything the "
-            "speaker clearly doesn't want recorded. You can call this "
-            "alongside emoji_react in the same message — they're not "
-            "mutually exclusive. If nothing memory-worthy is here, "
-            "don't call this tool."
+            "Skip banter, jokes, sarcasm, and anything the speaker "
+            "clearly doesn't want recorded. You can call this alongside "
+            "emoji_react in the same message — they're not mutually "
+            "exclusive. If nothing memory-worthy is here, don't call "
+            "this tool."
         ),
         "parameters": {
             "type": "object",
@@ -1128,13 +928,13 @@ NOTE_MEMORY_TOOL = {
                 "subject": {
                     "type": "string",
                     "description": (
-                        "Who the memory is about. Registered names "
-                        "('David'), 'this chat' for the room, 'speaker' "
-                        "for the human currently talking, or 'yourself' "
-                        "for the bot itself (its persona / model / voice "
-                        "as set in this chat). Use the registered name "
-                        "when the speaker is talking about themselves — "
-                        "the system maps it to the right person."
+                        "Who the memory is about. Use 'speaker' for "
+                        "anything the current talker states about "
+                        "themselves, 'yourself' for the bot itself (its "
+                        "persona / model / voice as set in this chat), "
+                        "'this chat' for the room, or another person's "
+                        "registered name when the speaker is talking "
+                        "about someone else."
                     ),
                 },
                 "kind": {
@@ -1171,18 +971,160 @@ def render_recall_results(
         return "(no matching memories)"
     lines: list[str] = []
     for r in rows:
-        conf = r["confidence"]
-        tags: list[str] = []
-        if conf < 0.8:
-            tags.append(f"confidence {conf:.1f}")
-        src = r.get("source") or ""
-        if src and src != "explicit":
-            tags.append(f"source: {src}")
-        tag = f" ({'; '.join(tags)})" if tags else ""
         live = _live_label_for_key(r["subject_key"], name_registry)
         label = live or r["subject_label"] or r["subject_key"][:8]
         lines.append(
             f"#{r['id']} [{_kind_label(r['kind'])}] about "
-            f"{label}{tag}: {r['content']}"
+            f"{label}: {r['content']}"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool exposure + dispatch — shared by the writer (ask_command) and the
+# deep_think / tool_bot loops so all three see the same memory tools.
+# ---------------------------------------------------------------------------
+
+
+def memory_tool_schemas(store, policy) -> list[dict]:
+    """Which memory tools this chat gets.
+
+    `recall` needs a wired store, the per-context memory_enabled master
+    switch, and a real (non-default) context row — default rows are
+    excluded so writes/reads don't bleed across unregistered DMs sharing
+    the default:dm policy. `remember`/`forget` additionally need the
+    per-context memory_writes_enabled flag.
+    """
+    if (
+        store is None
+        or policy is None
+        or getattr(policy, "id", None) is None
+        or getattr(policy, "kind", None) == "default"
+        or not getattr(policy, "memory_enabled", True)
+    ):
+        return []
+    schemas = [RECALL_TOOL]
+    if getattr(policy, "memory_writes_enabled", True):
+        schemas.extend((REMEMBER_TOOL, FORGET_TOOL))
+    return schemas
+
+
+def bot_names_of(bot) -> list[str]:
+    """Name/slug/aliases of the running bot, for self-subject matching."""
+    if bot is None:
+        return []
+    names = [
+        getattr(bot, "display_name", None) or "",
+        getattr(bot, "slug", None) or "",
+    ]
+    names.extend(getattr(bot, "aliases", None) or [])
+    return [n for n in names if n]
+
+
+async def dispatch_memory_tool(
+    *,
+    store,
+    resolver,
+    name: str,
+    args: dict,
+    caller_ctx,
+    bot_id: Optional[int] = None,
+) -> str:
+    """Run one remember/recall/forget call. Returns the tool result text."""
+    policy = getattr(caller_ctx, "policy", None) if caller_ctx else None
+    if caller_ctx is None:
+        return "(memory unavailable: no caller context)"
+    if (
+        store is None
+        or policy is None
+        or policy.id is None
+        or not getattr(policy, "memory_enabled", True)
+    ):
+        return "(memory unavailable in this chat)"
+    if policy.kind == "default":
+        return "(memory unavailable: this chat has no explicit context row)"
+
+    from .database import hash_phone
+
+    sender_phone = getattr(caller_ctx, "sender", None)
+    sender_user_hash = hash_phone(sender_phone) if sender_phone else ""
+    name_registry = getattr(resolver, "name_registry", None)
+    bot_names = bot_names_of(getattr(caller_ctx, "bot", None))
+
+    if name == "recall":
+        subject_hint = (args.get("subject") or "").strip()
+        query = (args.get("query") or "").strip()
+        # Multi-bot scoping: each bot recalls only its own memories
+        # (plus legacy NULL-bot rows). Other bots' impressions of the
+        # same chat/people stay private to them.
+        if subject_hint and resolver is not None:
+            key, _ = resolver.resolve(
+                subject_hint, sender_phone=sender_phone, bot_names=bot_names,
+            )
+            if not key:
+                return "(could not resolve subject)"
+            rows = await store.list_for_subject(
+                context_id=policy.id, subject_key=key, bot_id=bot_id,
+            )
+            if query:
+                ql = query.lower()
+                rows = [r for r in rows if ql in r["content"].lower()]
+        elif query:
+            rows = await store.search(
+                context_id=policy.id, query=query, limit=12, bot_id=bot_id,
+            )
+        else:
+            rows = await store.list_for_context(
+                policy.id, limit=20, bot_id=bot_id,
+            )
+        return render_recall_results(rows, name_registry=name_registry)
+
+    if name == "remember":
+        if not getattr(policy, "memory_writes_enabled", True):
+            return "(memory writes disabled for this chat)"
+        subject_hint = (args.get("subject") or "").strip()
+        kind = (args.get("kind") or "").strip().lower()
+        content = (args.get("content") or "").strip()
+        if not subject_hint or kind not in KINDS or not content:
+            return (
+                "ERROR: remember requires non-empty subject, content, "
+                f"and kind in {sorted(KINDS)}."
+            )
+        if resolver is None:
+            return "(subject resolver not configured)"
+        key, label = resolver.resolve(
+            subject_hint, sender_phone=sender_phone, bot_names=bot_names,
+        )
+        if not key:
+            return "(could not resolve subject)"
+        mem_id = await store.add(
+            context_id=policy.id,
+            subject_key=key,
+            subject_label=label,
+            kind=kind,
+            content=content,
+            source=SOURCE_EXPLICIT,
+            source_user_hash=sender_user_hash,
+            source_message_at=time.time(),
+            bot_id=bot_id,
+        )
+        if mem_id is None:
+            return "(memory not saved — invalid input)"
+        return f"saved memory #{mem_id} about {label or subject_hint}"
+
+    if name == "forget":
+        if not getattr(policy, "memory_writes_enabled", True):
+            return "(memory writes disabled for this chat)"
+        try:
+            memory_id = int(args.get("memory_id") or 0)
+        except (TypeError, ValueError):
+            return "ERROR: forget requires an integer memory_id"
+        if memory_id <= 0:
+            return "ERROR: memory_id must be a positive integer"
+        existing = await store.get(memory_id)
+        if not existing or existing.get("context_id") != policy.id:
+            return f"(no memory #{memory_id} in this chat)"
+        ok = await store.delete(memory_id)
+        return f"forgot memory #{memory_id}" if ok else "(forget failed)"
+
+    return f"(unknown memory tool: {name})"

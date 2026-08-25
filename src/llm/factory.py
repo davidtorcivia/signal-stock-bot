@@ -61,9 +61,12 @@ class LLMClientFactory:
         self._reactors: dict[Optional[int], LLMClient] = {}
         self._deep_thinks: dict[Optional[int], DeepThinkClient] = {}
         self._tool_bots: dict[Optional[int], ToolBotClient] = {}
-        # Late-bound; updated via attach_bot_tools / attach_mcp_manager.
+        # Late-bound; updated via attach_bot_tools / attach_mcp_manager /
+        # attach_memory.
         self._bot_tools = None
         self._mcp_manager = None
+        self._memory_store = None
+        self._subject_resolver = None
         self._lock = threading.RLock()
 
     def _persona_for(self, bot_id: int) -> Optional[str]:
@@ -126,6 +129,8 @@ class LLMClientFactory:
                     mcp_manager=self._mcp_manager,
                     bot_id=bot_id,
                 )
+                client.memory_store = self._memory_store
+                client.subject_resolver = self._subject_resolver
                 self._deep_thinks[bot_id] = client
             return client
 
@@ -147,6 +152,8 @@ class LLMClientFactory:
                     mcp_manager=self._mcp_manager,
                     bot_id=bot_id,
                 )
+                client.memory_store = self._memory_store
+                client.subject_resolver = self._subject_resolver
                 self._tool_bots[bot_id] = client
             return client
 
@@ -160,6 +167,18 @@ class LLMClientFactory:
                 client.bot_tools = bot_tools
             for client in self._tool_bots.values():
                 client.bot_tools = bot_tools
+
+    def attach_memory(self, memory_store, subject_resolver) -> None:
+        """Give the deep_think / tool_bot loops the same per-context
+        memory the writer has, so they can remember/recall/forget too."""
+        with self._lock:
+            self._memory_store = memory_store
+            self._subject_resolver = subject_resolver
+            for client in list(self._deep_thinks.values()) + list(
+                self._tool_bots.values()
+            ):
+                client.memory_store = memory_store
+                client.subject_resolver = subject_resolver
 
     def attach_mcp_manager(self, mcp_manager) -> None:
         with self._lock:

@@ -62,6 +62,7 @@ class ContextRegistry:
                         reactor_prompt TEXT,
                         natural_response INTEGER NOT NULL DEFAULT 0,
                         deep_think_enabled INTEGER NOT NULL DEFAULT 1,
+                        memory_enabled INTEGER NOT NULL DEFAULT 1,
                         memory_writes_enabled INTEGER NOT NULL DEFAULT 1,
                         reactor_memory_writes INTEGER NOT NULL DEFAULT 0,
                         first_seen REAL NOT NULL,
@@ -123,6 +124,11 @@ class ContextRegistry:
                         "ALTER TABLE contexts ADD COLUMN "
                         "purge_floor_at REAL"
                     )
+                if "memory_enabled" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN "
+                        "memory_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_contexts_key ON contexts(key)"
                 )
@@ -153,7 +159,7 @@ class ContextRegistry:
         "reactor_enabled, reactor_prompt, natural_response, "
         "deep_think_enabled, memory_writes_enabled, reactor_memory_writes, "
         "default_bot_id, transcript_logging_enabled, history_turns_override, "
-        "purge_floor_at"
+        "purge_floor_at, memory_enabled"
     )
 
     @staticmethod
@@ -184,6 +190,9 @@ class ContextRegistry:
             ),
             purge_floor_at=(
                 row[19] if len(row) > 19 and row[19] is not None else None
+            ),
+            memory_enabled=(
+                bool(row[20]) if len(row) > 20 and row[20] is not None else True
             ),
         )
 
@@ -276,11 +285,12 @@ class ContextRegistry:
                        (kind, key, label, command_mode, commands, mcp_mode,
                         mcp_servers, system_prompt, llm_intent,
                         reactor_enabled, reactor_prompt, natural_response,
-                        deep_think_enabled, memory_writes_enabled,
+                        deep_think_enabled, memory_enabled,
+                        memory_writes_enabled,
                         reactor_memory_writes, default_bot_id,
                         transcript_logging_enabled, history_turns_override,
                         first_seen, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy.kind,
                         policy.key,
@@ -295,6 +305,7 @@ class ContextRegistry:
                         policy.reactor_prompt or None,
                         1 if policy.natural_response else 0,
                         1 if policy.deep_think_enabled else 0,
+                        1 if policy.memory_enabled else 0,
                         1 if policy.memory_writes_enabled else 0,
                         1 if policy.reactor_memory_writes else 0,
                         policy.default_bot_id,
@@ -314,6 +325,7 @@ class ContextRegistry:
                            llm_intent = ?, reactor_enabled = ?,
                            reactor_prompt = ?, natural_response = ?,
                            deep_think_enabled = ?,
+                           memory_enabled = ?,
                            memory_writes_enabled = ?,
                            reactor_memory_writes = ?,
                            default_bot_id = ?,
@@ -333,6 +345,7 @@ class ContextRegistry:
                         policy.reactor_prompt or None,
                         1 if policy.natural_response else 0,
                         1 if policy.deep_think_enabled else 0,
+                        1 if policy.memory_enabled else 0,
                         1 if policy.memory_writes_enabled else 0,
                         1 if policy.reactor_memory_writes else 0,
                         policy.default_bot_id,

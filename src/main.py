@@ -804,6 +804,10 @@ def build_app(config: Config):
     # gets the same tool kit. Already-cached clients (default bot's)
     # are updated in place by the setter.
     llm_factory.attach_bot_tools(bot_tools)
+    # Same late-binding for per-context memory: the deep_think / tool_bot
+    # loops get remember/recall/forget with the writer's resolver, so a
+    # bot in research or tool_bot mode can still learn from the chat.
+    llm_factory.attach_memory(memory_store, ask_command.subject_resolver)
     # PredictionStore is constructed inside create_dispatcher (so the
     # background resolver can share it via dispatcher.prediction_store);
     # late-bind it onto ask_command here so the writer LLM gets the
@@ -825,6 +829,8 @@ def build_app(config: Config):
     # Same tool adapter for the deep model — late-binding is the same
     # circular-dep workaround as ask_command's.
     deep_think_client.bot_tools = bot_tools
+    deep_think_client.memory_store = memory_store
+    deep_think_client.subject_resolver = ask_command.subject_resolver
 
     logger.info(f"Registered {len(dispatcher.get_commands())} command(s)")
 

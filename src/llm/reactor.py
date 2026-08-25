@@ -40,9 +40,9 @@ from ..group_log import BOT_SENDER
 from ..memory import (
     NOTE_MEMORY_TOOL,
     REACTOR_ALLOWED_KINDS,
-    REACTOR_DEFAULT_CONFIDENCE,
     SOURCE_REACTOR,
     SubjectResolver,
+    bot_names_of,
 )
 
 
@@ -116,6 +116,23 @@ REACT_TOOL = {
         },
     },
 }
+
+
+# Appended to the reactor system prompt only when note_memory is exposed.
+# The quality bar matters more than the tool description: without it the
+# reactor stores what the chat is talking about today rather than what a
+# person would still want known about them next month.
+NOTE_MEMORY_GUIDANCE = """\
+
+You ALSO have a note_memory(subject, kind, content) tool for passive learning.
+The bar is high: store only slow-changing facts a person would still want
+known about them a month from now — where they live or work, what they do,
+a standing preference or commitment, a stable trait they named themselves.
+
+Do NOT store: opinions of the moment, reactions to today's news, requests,
+jokes, sarcasm, what someone is asking about right now, or anything that
+will be stale by next week. Most messages contain nothing worth storing —
+that is the normal case, and not calling the tool is the normal outcome."""
 
 
 # Appended to the reactor system prompt when the emoji_react tool is NOT
@@ -536,6 +553,8 @@ class EmojiReactor:
             return False
         if getattr(policy, "kind", None) == "default":
             return False
+        if not getattr(policy, "memory_enabled", True):
+            return False
         return bool(getattr(policy, "reactor_memory_writes", False))
 
     async def _persist_note_memory(
@@ -564,41 +583,13 @@ class EmojiReactor:
                 )
                 return
             key, label = resolver.resolve(
-                subject_hint, sender_phone=sender
+                subject_hint, sender_phone=sender,
+                bot_names=bot_names_of(bot),
             )
             if not key:
                 return
 
-            # Cross-kind pre-write skip: if a near-duplicate memory is
-            # already stored for this subject under ANY kind, don't write
-            # a new row. The strict same-kind corroboration in
-            # MemoryStore.add() (Jaccard ≥ 0.85) catches close rephrasings
-            # within the SAME kind, but the reactor commonly writes the
-            # same fact under different kinds ("fact: loves astrology"
-            # vs. "preference: is into astrology") and those don't share
-            # the WHERE clause there, so they slip through as duplicates.
-            # Looser threshold here is the right knob for a passive,
-            # low-confidence learning loop.
             reactor_bot_id = getattr(bot, "id", None) if bot is not None else None
-            try:
-                existing = await store.find_similar_for_subject(
-                    context_id=policy.id,
-                    subject_key=key,
-                    content=content,
-                    bot_id=reactor_bot_id,
-                )
-            except Exception as e:
-                logger.debug(f"Reactor: dedup lookup failed: {e}")
-                existing = None
-            if existing is not None:
-                logger.info(
-                    f"Reactor: skipping duplicate memory for {label!r}: "
-                    f"\"{content[:60]}\" already covered by "
-                    f"#{existing['id']} [{existing['kind']}]: "
-                    f"\"{(existing.get('content') or '')[:60]}\""
-                )
-                return
-
             from ..database import hash_phone
             sender_hash = hash_phone(sender) if sender else ""
             # target_timestamp is Signal's millisecond timestamp; normalize
@@ -614,7 +605,6 @@ class EmojiReactor:
                 subject_label=label,
                 kind=kind,
                 content=content,
-                confidence=REACTOR_DEFAULT_CONFIDENCE,
                 source=SOURCE_REACTOR,
                 source_user_hash=sender_hash,
                 source_message_at=msg_at,
@@ -1011,6 +1001,7 @@ class EmojiReactor:
             offer_note_memory = self._memory_writes_active(policy)
             if offer_note_memory:
                 tools.append(NOTE_MEMORY_TOOL)
+                system_prompt = f"{system_prompt}\n{NOTE_MEMORY_GUIDANCE}"
 
             # Nothing left to ask the model about — this is where the cheap
             # emoji gates finally do abandon the call, attributed to the

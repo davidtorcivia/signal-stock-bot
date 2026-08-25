@@ -100,16 +100,11 @@ from ..bots.models import (
     AUDIO_PART_STYLE_INPUT_AUDIO,
 )
 from ..memory import (
-    FORGET_TOOL,
-    KINDS,
     MemoryStore,
-    RECALL_TOOL,
-    REMEMBER_TOOL,
-    SOURCE_EXPLICIT,
     SubjectResolver,
     build_preamble,
-    compute_explicit_confidence,
-    render_recall_results,
+    dispatch_memory_tool,
+    memory_tool_schemas,
 )
 
 logger = logging.getLogger(__name__)
@@ -1050,21 +1045,7 @@ class AskCommand(BaseCommand):
             bot_ok = bot is None or getattr(bot, "deep_think_enabled", True)
             if dt_status.get("ready") and policy_ok and bot_ok:
                 schemas.append(_DEEP_THINK_TOOL_SCHEMA)
-        # Memory tools: recall is always exposed when a store is wired and
-        # the policy resolves to a real (non-default) row; remember/forget
-        # require the per-context memory_writes_enabled flag. Default rows
-        # are excluded so passive-learning writes don't bleed across
-        # unregistered DMs sharing the default:dm policy.
-        if (
-            self.memory_store is not None
-            and policy is not None
-            and policy.id is not None
-            and policy.kind != "default"
-        ):
-            schemas.append(RECALL_TOOL)
-            if getattr(policy, "memory_writes_enabled", True):
-                schemas.append(REMEMBER_TOOL)
-                schemas.append(FORGET_TOOL)
+        schemas.extend(memory_tool_schemas(self.memory_store, policy))
         # predict_self: the bot's own prediction logging tool. Distinct from
         # `bot__predict` (which the writer can already invoke to log a
         # prediction on the asker's behalf) — this one authors as the bot
@@ -2285,114 +2266,14 @@ class AskCommand(BaseCommand):
         caller_ctx: CommandContext,
     ) -> str:
         """Dispatch remember/recall/forget. Returns the tool result text."""
-        store = self.memory_store
-        policy = caller_ctx.policy
-        if store is None or policy is None or policy.id is None:
-            return "(memory unavailable in this chat)"
-        if policy.kind == "default":
-            return "(memory unavailable: this chat has no explicit context row)"
-
-        resolver = self.subject_resolver
-        sender_phone = caller_ctx.sender
-
-        sender_user_hash = hash_phone(sender_phone) if sender_phone else ""
-
-        if name == "recall":
-            subject_hint = (args.get("subject") or "").strip()
-            query = (args.get("query") or "").strip()
-            # Multi-bot scoping: each bot recalls only its own memories
-            # (plus legacy NULL-bot rows). Other bots' impressions of
-            # the same chat/people stay private to them.
-            recall_bot_id = (
-                caller_ctx.bot_id
-            )
-            if subject_hint and resolver is not None:
-                key, _ = resolver.resolve(
-                    subject_hint, sender_phone=sender_phone
-                )
-                if not key:
-                    return "(could not resolve subject)"
-                rows = await store.list_for_subject(
-                    context_id=policy.id,
-                    subject_key=key,
-                    bot_id=recall_bot_id,
-                )
-                if query:
-                    ql = query.lower()
-                    rows = [r for r in rows if ql in r["content"].lower()]
-            elif query:
-                rows = await store.search(
-                    context_id=policy.id, query=query, limit=12,
-                    bot_id=recall_bot_id,
-                )
-            else:
-                # Per-bot scope so the wildcard browse doesn't cross
-                # into another bot's mental model.
-                rows = await store.list_for_context(
-                    policy.id, limit=20,
-                    bot_id=recall_bot_id,
-                )
-            return render_recall_results(rows, name_registry=self.name_registry)
-
-        if name == "remember":
-            if not getattr(policy, "memory_writes_enabled", True):
-                return "(memory writes disabled for this chat)"
-            subject_hint = (args.get("subject") or "").strip()
-            kind = (args.get("kind") or "").strip().lower()
-            content = (args.get("content") or "").strip()
-            if not subject_hint or kind not in KINDS or not content:
-                return (
-                    "ERROR: remember requires non-empty subject, content, "
-                    f"and kind in {sorted(KINDS)}."
-                )
-            if resolver is None:
-                return "(subject resolver not configured)"
-            key, label = resolver.resolve(
-                subject_hint, sender_phone=sender_phone
-            )
-            if not key:
-                return "(could not resolve subject)"
-            # Third-party memories (about anyone other than the speaker or
-            # the room) start at lower confidence — the bot was just told
-            # what to store via prompt and can't independently verify it.
-            # Corroboration from a second speaker promotes them to full.
-            initial_conf = compute_explicit_confidence(
-                subject_key=key, sender_user_hash=sender_user_hash,
-            )
-            mem_id = await store.add(
-                context_id=policy.id,
-                subject_key=key,
-                subject_label=label,
-                kind=kind,
-                content=content,
-                confidence=initial_conf,
-                source=SOURCE_EXPLICIT,
-                source_user_hash=sender_user_hash,
-                source_message_at=time.time(),
-                bot_id=(
-                    caller_ctx.bot_id
-                ),
-            )
-            if mem_id is None:
-                return "(memory not saved — invalid input)"
-            return f"saved memory #{mem_id} about {label or subject_hint}"
-
-        if name == "forget":
-            if not getattr(policy, "memory_writes_enabled", True):
-                return "(memory writes disabled for this chat)"
-            try:
-                memory_id = int(args.get("memory_id") or 0)
-            except (TypeError, ValueError):
-                return "ERROR: forget requires an integer memory_id"
-            if memory_id <= 0:
-                return "ERROR: memory_id must be a positive integer"
-            existing = await store.get(memory_id)
-            if not existing or existing.get("context_id") != policy.id:
-                return f"(no memory #{memory_id} in this chat)"
-            ok = await store.delete(memory_id)
-            return f"forgot memory #{memory_id}" if ok else "(forget failed)"
-
-        return f"(unknown memory tool: {name})"
+        return await dispatch_memory_tool(
+            store=self.memory_store,
+            resolver=self.subject_resolver,
+            name=name,
+            args=args,
+            caller_ctx=caller_ctx,
+            bot_id=caller_ctx.bot_id,
+        )
 
     async def _execute_tool_call(
         self,
@@ -2580,9 +2461,16 @@ class AskCommand(BaseCommand):
                     # to the writer's attachment list. Per-bot deep_think
                     # routing here too — Artaud's deep_think config is
                     # different from Sigil's even when called as a tool.
+                    # Hand the deep model the same memories the writer
+                    # got — it has the memory tools now, and without the
+                    # preamble it would re-learn what is already stored.
+                    dt_context = str(args.get("context") or "")
+                    mem_block = getattr(caller_ctx, "memory_block", "")
+                    if mem_block:
+                        dt_context = f"{dt_context}\n\n{mem_block}".strip()
                     content = await deep_think_client.think(
                         question=str(args.get("question") or ""),
-                        context=str(args.get("context") or ""),
+                        context=dt_context,
                         user_hash=user_hash,
                         group_id=caller_ctx.group_id,
                         caller_ctx=caller_ctx,
@@ -3420,6 +3308,7 @@ class AskCommand(BaseCommand):
                 and ctx.policy is not None
                 and ctx.policy.id is not None
                 and ctx.policy.kind != "default"
+                and getattr(ctx.policy, "memory_enabled", True)
             ):
                 try:
                     memory_block = await build_preamble(
@@ -3439,6 +3328,33 @@ class AskCommand(BaseCommand):
                     )
                 except Exception as e:
                     logger.debug(f"Memory preamble build failed: {e}")
+            # Carried on the context so the deep_think tool dispatch can
+            # hand the same memories to the deep model.
+            ctx.memory_block = memory_block
+
+            # Positive trigger for the memory tools. Only when they're
+            # actually exposed — the same gate _collect_tools uses — and
+            # the remember half only when writes are on.
+            memory_directive = ""
+            exposed_memory = {
+                (t.get("function") or {}).get("name")
+                for t in memory_tool_schemas(self.memory_store, ctx.policy)
+            }
+            if "remember" in exposed_memory:
+                memory_directive = (
+                    "If `remember` is among your tools: when someone states "
+                    "a durable fact about themselves, another person, or "
+                    "this chat (name, job, location, preference, standing "
+                    "plan), call it before "
+                    "replying — the fact is the trigger, not a request to "
+                    "remember it. Use `recall` when a question depends on "
+                    "something you may have stored."
+                )
+            elif "recall" in exposed_memory:
+                memory_directive = (
+                    "Use `recall` when a question depends on something "
+                    "this chat may have stored about someone."
+                )
 
             prompt_override = None
             if ctx.policy is not None and ctx.policy.system_prompt:
@@ -3486,6 +3402,7 @@ class AskCommand(BaseCommand):
                 StablePromptBlock("portfolio_journal", _wrap_xml("portfolio_journal", journal_directive)),
                 StablePromptBlock("deep_think_tool", _wrap_xml("deep_think_tool", deep_think_directive)),
                 StablePromptBlock("mcp_broker", _wrap_xml("mcp_broker", mcp_broker_directive)),
+                StablePromptBlock("memory_tools", _wrap_xml("memory_tools", memory_directive)),
                 StablePromptBlock("python_tool", _wrap_xml("python_tool", python_tool_directive)),
             ]
 

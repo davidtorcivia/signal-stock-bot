@@ -223,6 +223,7 @@ def test_writer_sends_stable_mcp_broker_for_nonempty_allowlist():
 def test_deep_think_uses_same_stable_mcp_broker():
     client = DeepThinkClient.__new__(DeepThinkClient)
     client.bot_tools = None
+    client.memory_store = None
     client.mcp_manager = FakeMCPManager([
         _mcp_tool("blocked", "zeta"),
         _mcp_tool("web", "zeta"),

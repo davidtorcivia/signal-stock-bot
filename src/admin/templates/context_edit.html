@@ -192,6 +192,15 @@
 
         <h2 style="margin-top: 32px;">Memory</h2>
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
+            <input type="checkbox" name="memory_enabled" {% if values.memory_enabled %}checked{% endif %}>
+            <span>Memory on in this chat</span>
+        </label>
+        <p class="muted" style="font-size: 11px; margin-top: 4px;">
+            Master switch. Off = no memories injected, no recall/remember tools,
+            no reactor learning; stored memories are kept.
+        </p>
+
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;margin-top:12px;">
             <input type="checkbox" name="memory_writes_enabled" {% if values.memory_writes_enabled %}checked{% endif %}>
             <span>Let the writer LLM remember/forget in this chat</span>
         </label>

@@ -51,6 +51,10 @@ class ContextPolicy:
     # the reactor passively learns from messages even when the main bot
     # isn't called (default off — opt-in, since passive learning has
     # privacy implications).
+    # `memory_enabled` is the master switch: off = no memory preamble,
+    # no recall/remember/forget tools, no reactor learning. Stored rows
+    # are kept and stay visible/editable in the admin UI.
+    memory_enabled: bool = True
     memory_writes_enabled: bool = True
     reactor_memory_writes: bool = False
     # Multi-bot scoping: which bot answers in this context when no bot

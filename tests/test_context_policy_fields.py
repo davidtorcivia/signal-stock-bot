@@ -26,6 +26,7 @@ async def test_defaults_for_new_policy(registry):
     p = ContextPolicy(id=None, kind="group", key="grp-test", label="Test")
     assert p.transcript_logging_enabled is False
     assert p.history_turns_override is None
+    assert p.memory_enabled is True
     assert p.mcp_mode == MODE_ALLOW_LIST
     assert p.mcp_servers == []
     assert p.allows_mcp("large-server") is False
@@ -56,12 +57,14 @@ async def test_persist_and_reload_new_fields(registry):
         label="Persist test",
         transcript_logging_enabled=True,
         history_turns_override=12,
+        memory_enabled=False,
     )
     new_id = await registry.upsert(p)
     reloaded = await registry.get(new_id)
     assert reloaded is not None
     assert reloaded.transcript_logging_enabled is True
     assert reloaded.history_turns_override == 12
+    assert reloaded.memory_enabled is False
 
 
 @pytest.mark.asyncio
