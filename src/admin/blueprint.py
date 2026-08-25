@@ -2301,7 +2301,6 @@ def _register_memory_routes(
                 url_for("admin.context_memories", context_id=context_id)
             )
         content = (request.form.get("content") or "").strip()
-        confidence_raw = request.form.get("confidence")
         subject_hint = (request.form.get("subject") or "").strip()
         if not subject_hint:
             subject_hint = (request.form.get("subject_custom") or "").strip()
@@ -2313,12 +2312,6 @@ def _register_memory_routes(
                 if u["user_hash"] == subject_hint:
                     subject_label_in = u["name"]
                     break
-        confidence: Optional[float] = None
-        if confidence_raw is not None and confidence_raw != "":
-            try:
-                confidence = float(confidence_raw)
-            except ValueError:
-                confidence = None
         new_key: Optional[str] = None
         new_label: Optional[str] = None
         if subject_hint:
@@ -2333,7 +2326,7 @@ def _register_memory_routes(
                 new_label = resolved_label
         elif subject_label_in:
             new_label = subject_label_in
-        if not (content or confidence is not None or new_key or new_label):
+        if not (content or new_key or new_label):
             return redirect(
                 url_for("admin.context_memories", context_id=context_id)
             )
@@ -2343,7 +2336,6 @@ def _register_memory_routes(
                 memory_store.update(
                     memory_id,
                     content=content or None,
-                    confidence=confidence,
                     subject_key=new_key,
                     subject_label=new_label,
                 ),

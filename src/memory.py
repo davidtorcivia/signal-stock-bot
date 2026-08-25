@@ -263,7 +263,7 @@ class MemoryStore:
 
     _SELECT_COLS = (
         "id, subject_key, subject_label, kind, content, confidence, "
-        "source, corroborations, created_at, updated_at, "
+        "source, created_at, updated_at, "
         "source_user_hash, source_message_at"
     )
 
@@ -375,7 +375,7 @@ class MemoryStore:
         if not row:
             return None
         d = _row_to_dict(row)
-        d["context_id"] = row[12]
+        d["context_id"] = row[11]
         return d
 
     async def update(
@@ -383,9 +383,6 @@ class MemoryStore:
         memory_id: int,
         *,
         content: Optional[str] = None,
-        # Accepted and ignored — `confidence` is a vestigial column the
-        # admin form still posts. Kept so that route keeps working.
-        confidence: Optional[float] = None,
         subject_key: Optional[str] = None,
         subject_label: Optional[str] = None,
     ) -> bool:
@@ -452,11 +449,10 @@ def _row_to_dict(row) -> dict:
         "content": row[4],
         "confidence": row[5],
         "source": row[6],
-        "corroborations": row[7],
-        "created_at": row[8],
-        "updated_at": row[9],
-        "source_user_hash": row[10] if len(row) > 10 else "",
-        "source_message_at": row[11] if len(row) > 11 else None,
+        "created_at": row[7],
+        "updated_at": row[8],
+        "source_user_hash": row[9] if len(row) > 9 else "",
+        "source_message_at": row[10] if len(row) > 10 else None,
     }
 
 
@@ -491,6 +487,19 @@ def _is_near_duplicate(a: str, b: str, threshold: float = 0.85) -> bool:
         return True
     overlap = len(ta & tb) / len(ta | tb)
     return overlap >= threshold
+
+
+def canonical_key(name_registry, key: str) -> str:
+    """One person, one subject key.
+
+    The two Signal accounts report the same contact as a phone on one and
+    a UUID on the other, so a regular holds two user hashes under one
+    registered name. Everything that writes or reads a memory routes the
+    hash through here first (registry-cache only, no I/O). getattr'd so
+    a None / stub registry is a no-op.
+    """
+    fn = getattr(name_registry, "canonical_hash", None)
+    return fn(key) if fn and key else key
 
 
 class SubjectResolver:
@@ -552,7 +561,7 @@ class SubjectResolver:
         if low in ("", "self", "me", "the user", "speaker", "the speaker"):
             if sender_phone and self.name_registry is not None:
                 from .database import hash_phone
-                h = hash_phone(sender_phone)
+                h = canonical_key(self.name_registry, hash_phone(sender_phone))
                 label = self.name_registry.label_for(sender_phone)
                 return h, label
             return f"{SUBJECT_FREETEXT_PREFIX}self", "self"
@@ -581,7 +590,7 @@ class SubjectResolver:
                 if name.lower() == low
             ]
             if len(matches) == 1:
-                return matches[0]
+                return canonical_key(self.name_registry, matches[0][0]), matches[0][1]
             if len(matches) > 1:
                 # Never fall through to freetext for a name that IS
                 # registered — that fragments the person's memories.
@@ -591,13 +600,19 @@ class SubjectResolver:
                     "Ambiguous memory subject %r: %d registered users share "
                     "that name", s, len(matches),
                 )
+                # All matches share a name, so canonical_key folds any of
+                # them onto the same (oldest) hash — the speaker preference
+                # below only decides which label wins.
                 if sender_phone:
                     from .database import hash_phone
                     h = hash_phone(sender_phone)
                     for match in matches:
                         if match[0] == h:
-                            return match
-                return matches[-1]
+                            return canonical_key(self.name_registry, h), match[1]
+                return (
+                    canonical_key(self.name_registry, matches[-1][0]),
+                    matches[-1][1],
+                )
 
         return freetext_subject_key(s), s
 
@@ -686,17 +701,19 @@ async def build_preamble(
         _add(k, _label_for_key(k, name_registry))
 
     if sender_user_hash:
-        _add(sender_user_hash, sender_label or "the speaker")
+        _add(canonical_key(name_registry, sender_user_hash),
+             sender_label or "the speaker")
     elif sender_phone:
         _add(f"{SUBJECT_FREETEXT_PREFIX}sender",
              sender_label or "the speaker")
 
     for h, name in _detect_named_subjects(current_message_text, name_registry):
-        _add(h, name)
+        _add(canonical_key(name_registry, h), name)
 
     for key in recent_subject_keys or []:
         if not key:
             continue
+        key = canonical_key(name_registry, key)
         label = ""
         if name_registry is not None and is_user_hash(key):
             label = name_registry._cache.get(key, "") or ""

@@ -3320,6 +3320,13 @@ class AskCommand(BaseCommand):
                             if is_group else None,
                         current_message_text=question,
                         name_registry=self.name_registry,
+                        # Other people who spoke in the visible thread —
+                        # their memories belong in the preamble too, not
+                        # just the current sender's.
+                        recent_subject_keys=[
+                            hash_phone(t["sender"]) for t in group_turns
+                            if t.get("role") == "user" and t.get("sender")
+                        ],
                         bot_id=(
                             ctx.bot.id
                             if getattr(ctx, "bot", None) is not None

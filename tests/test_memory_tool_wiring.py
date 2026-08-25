@@ -92,3 +92,37 @@ def test_tool_loop_clients_expose_memory_tools(cls):
     assert _names(client._collect_tools(policy=_policy())) >= {
         "recall", "remember", "forget",
     }
+
+
+async def test_duplicate_registration_collapses_to_oldest_hash(tmp_path: Path):
+    """One person, two Signal identities (phone-era + UUID-era hash).
+
+    Both must resolve to the first-registered hash, and the preamble must
+    surface memories stored under it when the newer identity speaks.
+    """
+    from src.database import hash_phone
+    from src.memory import build_preamble
+    from src.users import NameRegistry
+
+    db = str(tmp_path / "names.db")
+    registry = NameRegistry(db_path=db)
+    old_phone, new_phone = "+15550001111", "uuid-abc-123"
+    old_hash, new_hash = hash_phone(old_phone), hash_phone(new_phone)
+    await registry.set_name("David", phone=old_phone)
+    await registry.set_name("David", phone=new_phone)
+
+    resolver = SubjectResolver(registry)
+    assert resolver.resolve("speaker", sender_phone=new_phone)[0] == old_hash
+    assert resolver.resolve("David")[0] == old_hash
+
+    store = MemoryStore(db_path=db)
+    await store.add(
+        context_id=7, subject_key=old_hash, subject_label="David",
+        kind="fact", content="runs a hedge fund out of Brooklyn", bot_id=3,
+    )
+    preamble = await build_preamble(
+        memory_store=store, context_id=7, sender_phone=new_phone,
+        sender_user_hash=new_hash, sender_label="David",
+        name_registry=registry, bot_id=3,
+    )
+    assert "hedge fund out of Brooklyn" in preamble

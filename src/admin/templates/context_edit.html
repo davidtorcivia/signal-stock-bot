@@ -222,11 +222,10 @@
             Off by default. When on, the reactor's per-message LLM call also
             gets a <code>note_memory</code> tool, so it can extract durable
             facts from messages even when the main bot isn't called. Reactor
-            writes land at confidence 0.6 and promote to 1.0 only after
-            corroborations from at least three distinct speakers — single-
-            user repetition can't self-promote a hallucination. Privacy-
-            sensitive: only enable in chats where passive learning is
-            appropriate.
+            notes are stored like any other memory — no separate review
+            step; near-duplicate content is folded into the existing row.
+            Privacy-sensitive: only enable in chats where passive learning
+            is appropriate.
         </p>
         <p class="muted" style="font-size: 11px; margin-top: 4px;">
             <em>Heads-up:</em> if you turn this on, you may need to bump

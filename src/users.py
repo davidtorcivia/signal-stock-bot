@@ -68,9 +68,10 @@ class NameRegistry:
                     """
                 )
                 rows = conn.execute(
-                    # ORDER BY updated_at: dict preserves insertion order, so
-                    # SubjectResolver can break a duplicate-name tie by
-                    # taking the most recently registered match.
+                    # ORDER BY updated_at: dict preserves insertion order,
+                    # so canonical_hash() can fold a person's several
+                    # hashes onto their first registration (and
+                    # SubjectResolver can pick the latest one for a label).
                     "SELECT user_hash, name FROM user_names "
                     "ORDER BY updated_at"
                 ).fetchall()
@@ -111,6 +112,23 @@ class NameRegistry:
             rows = await cursor.fetchall()
         self._cache = {r[0]: r[1] for r in rows}
         self._cache_loaded = True
+
+    def canonical_hash(self, user_hash: str) -> str:
+        """Collapse one person's several hashes onto their oldest one.
+
+        Two Signal accounts report the same contact differently (phone
+        vs UUID), so a regular ends up with two `user_names` rows sharing
+        one name. Reads and writes both route through here so memories
+        land on a single key. Cache-only; the cache is loaded ORDER BY
+        updated_at, so the first name match is the oldest registration.
+        """
+        name = (self._cache.get(user_hash) or "").lower()
+        if not name:
+            return user_hash
+        for h, n in self._cache.items():
+            if (n or "").lower() == name:
+                return h
+        return user_hash
 
     @staticmethod
     def _resolve_hash(*, user_hash: Optional[str], phone: Optional[str]) -> Optional[str]:
