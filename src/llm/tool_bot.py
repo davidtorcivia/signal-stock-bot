@@ -69,7 +69,9 @@ FIRST decide whether this turn needs tools at all:
   or about this chat (a name, job, location, standing preference or plan) is
   itself tool work, even in pure small talk. If `remember` is in your tool
   list, call it with that fact before answering — and do NOT return NOTOOLS
-  on that turn. Use `recall` the same way when the turn depends on something
+  on that turn. Same when the assistant itself takes a position, makes a
+  call, or commits to something in this turn: save it with subject
+  'yourself'. Use `recall` the same way when the turn depends on something
   this chat may already have stored.
 
 - Otherwise, USE THE TOOLS. Don't guess at a price, P/E, or recent event —

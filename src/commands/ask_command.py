@@ -3354,7 +3354,10 @@ class AskCommand(BaseCommand):
                     "this chat (name, job, location, preference, standing "
                     "plan), call it before "
                     "replying — the fact is the trigger, not a request to "
-                    "remember it. Use `recall` when a question depends on "
+                    "remember it. Do the same for yourself: when you form "
+                    "a real view, make a call or prediction, or commit to "
+                    "something, save it with subject 'yourself' so you "
+                    "stay consistent later. Use `recall` when a question depends on "
                     "something you may have stored."
                 )
             elif "recall" in exposed_memory:
