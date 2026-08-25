@@ -135,8 +135,14 @@ class PollVoter:
 
         author_phone = envelope.get("sourceNumber") or envelope.get("source") or ""
         author_uuid = envelope.get("sourceUuid") or ""
-        # Don't vote on our own polls.
-        if author_phone and author_phone == self.bot_phone:
+        # Don't vote on our own polls (or a sibling bot's). This runs
+        # before the handler's bot-echo guard, and the author arrives
+        # UUID-form on one of the two accounts, so match both shapes.
+        known_uuids = set(getattr(self.signal, "_known_uuids", ()) or ())
+        known_uuids.discard(None)
+        if (author_phone and author_phone == self.bot_phone) or (
+            author_uuid and author_uuid in known_uuids
+        ):
             logger.info("PollVoter: skipping self-authored poll")
             return
 

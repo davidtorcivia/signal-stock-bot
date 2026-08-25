@@ -55,6 +55,20 @@ _DEFAULT_ATTACHMENTS_DIR = "/app/data/signal-cli/attachments"
 POOL_TAKEOVER_DELAY_SEC = 2.5
 
 
+def sender_id(envelope: dict) -> str:
+    """Canonical sender identity for an envelope.
+
+    `envelope.source` is a phone number on one account's view of a contact
+    and a UUID on another's, so keying off it gives every person two
+    identities across our two Signal accounts. `sourceUuid` is always
+    present on real traffic and is stable across accounts — prefer it, and
+    fall back to `source` only for synthetic/legacy envelopes.
+    """
+    return (envelope.get("sourceUuid") or "").strip() or (
+        envelope.get("source") or ""
+    )
+
+
 def _attachments_dir() -> Path:
     return Path(os.environ.get("SIGNAL_ATTACHMENTS_DIR", _DEFAULT_ATTACHMENTS_DIR))
 
@@ -1144,7 +1158,10 @@ class SignalHandler:
         dispatches to command handler, and sends response.
         """
         envelope = data.get("envelope", {})
-        sender = envelope.get("source")
+        # `source` is a phone on one account's view of a contact and a UUID
+        # on another's; `sourceUuid` is always present. Key identity off the
+        # UUID so the same person isn't two users across our two accounts.
+        sender = sender_id(envelope)
         target_timestamp = envelope.get("timestamp")
 
         # Handle data message

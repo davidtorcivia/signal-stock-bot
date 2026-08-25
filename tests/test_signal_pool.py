@@ -277,6 +277,38 @@ async def test_handle_webhook_dedups_when_both_handlers_receive(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_webhook_prefers_source_uuid_as_sender(monkeypatch):
+    """Ingress identity is the UUID when signal-cli gives us one — the
+    same contact arrives phone-form on one account and UUID-form on the
+    other, and keying off `source` gave every person two identities.
+    Falls back to `source` when `sourceUuid` is absent."""
+    monkeypatch.setattr(
+        "src.signal.handler.POOL_TAKEOVER_DELAY_SEC", 0.01, raising=True,
+    )
+    bots = [
+        _bot(1, "sigil", default_group=True, default_dm=True),
+        _bot(2, "artaud", signal_phone="+15550000002"),
+    ]
+    pool = _make_pool(bots)
+    dispatch_mock, sigil_h, _artaud_h = _wire_dispatch_test(pool, bots)
+
+    def _env(ts, **extra):
+        return {"envelope": dict(
+            {"timestamp": ts, "dataMessage": {
+                "message": "Hey artaud", "timestamp": ts,
+                "mentions": [{"number": "+15550000002"}],
+            }}, **extra)}
+
+    await sigil_h.handle_webhook(
+        _env(1234567892, source="+15551112222", sourceUuid="uuid-1111-2222")
+    )
+    assert dispatch_mock.call_args.kwargs["sender"] == "uuid-1111-2222"
+
+    await sigil_h.handle_webhook(_env(1234567893, source="+15551112222"))
+    assert dispatch_mock.call_args.kwargs["sender"] == "+15551112222"
+
+
+@pytest.mark.asyncio
 async def test_handle_webhook_takes_over_when_owner_misses_delivery(monkeypatch):
     """Recovery path: signal-cli delivers the envelope only to Sigil's
     account (the owner's poller missed it). After the grace period the

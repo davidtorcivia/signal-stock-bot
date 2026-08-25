@@ -37,13 +37,6 @@ from ..bots.settings import (
 from ..cache import get_metrics
 from ..enrichment.links import URL_RE
 from ..group_log import BOT_SENDER
-from ..memory import (
-    NOTE_MEMORY_TOOL,
-    REACTOR_ALLOWED_KINDS,
-    SOURCE_REACTOR,
-    SubjectResolver,
-    bot_names_of,
-)
 
 
 # How many recent reactions to retain per group for the writing LLM to
@@ -116,23 +109,6 @@ REACT_TOOL = {
         },
     },
 }
-
-
-# Appended to the reactor system prompt only when note_memory is exposed.
-# The quality bar matters more than the tool description: without it the
-# reactor stores what the chat is talking about today rather than what a
-# person would still want known about them next month.
-NOTE_MEMORY_GUIDANCE = """\
-
-You ALSO have a note_memory(subject, kind, content) tool for passive learning.
-The bar is high: store only slow-changing facts a person would still want
-known about them a month from now — where they live or work, what they do,
-a standing preference or commitment, a stable trait they named themselves.
-
-Do NOT store: opinions of the moment, reactions to today's news, requests,
-jokes, sarcasm, what someone is asking about right now, or anything that
-will be stale by next week. Most messages contain nothing worth storing —
-that is the normal case, and not calling the tool is the normal outcome."""
 
 
 # Appended to the reactor system prompt when the emoji_react tool is NOT
@@ -319,7 +295,6 @@ class EmojiReactor:
         group_log=None,
         enricher=None,
         name_registry=None,
-        memory_store=None,
         llm_factory=None,
     ):
         self.store = settings_store
@@ -343,14 +318,6 @@ class EmojiReactor:
         # the actual content rather than just an opaque link.
         self.enricher = enricher
         self.name_registry = name_registry
-        # Optional MemoryStore — when set AND the per-context
-        # reactor_memory_writes flag is on, the reactor's LLM call also
-        # gets a note_memory tool so it can passively learn from messages
-        # the main bot never sees.
-        self.memory_store = memory_store
-        self._subject_resolver: Optional[SubjectResolver] = None
-        if name_registry is not None:
-            self._subject_resolver = SubjectResolver(name_registry)
         # Composite keys: (sender_or_group_id, bot_id_or_0). Per-bot
         # scoping so each bot in a multi-bot group has its own cooldown
         # arc — bot A's reply doesn't gate bot B's.
@@ -536,87 +503,6 @@ class EmojiReactor:
         if time.time() - last < cfg["natural_response_cooldown"]:
             return False
         return True
-
-    def _memory_writes_active(self, policy) -> bool:
-        """Decide whether to expose `note_memory` for this evaluation.
-
-        Two gates: a wired MemoryStore + subject resolver, and the
-        per-context `reactor_memory_writes` flag on a real (non-default)
-        policy row. Default rows are excluded so writes don't pool
-        across unregistered chats.
-        """
-        if self.memory_store is None or self._subject_resolver is None:
-            return False
-        if policy is None:
-            return False
-        if getattr(policy, "id", None) is None:
-            return False
-        if getattr(policy, "kind", None) == "default":
-            return False
-        if not getattr(policy, "memory_enabled", True):
-            return False
-        return bool(getattr(policy, "reactor_memory_writes", False))
-
-    async def _persist_note_memory(
-        self,
-        *,
-        policy,
-        sender: str,
-        target_timestamp: Optional[int],
-        args: dict,
-        bot=None,
-    ) -> None:
-        """Write a single reactor-sourced memory. Errors are logged + swallowed."""
-        store = self.memory_store
-        resolver = self._subject_resolver
-        if store is None or resolver is None or policy is None:
-            return
-        try:
-            subject_hint = (args.get("subject") or "").strip()
-            kind = (args.get("kind") or "").strip().lower()
-            content = (args.get("content") or "").strip()
-            if not subject_hint or not content:
-                return
-            if kind not in REACTOR_ALLOWED_KINDS:
-                logger.debug(
-                    f"Reactor note_memory: skipping disallowed kind {kind!r}"
-                )
-                return
-            key, label = resolver.resolve(
-                subject_hint, sender_phone=sender,
-                bot_names=bot_names_of(bot),
-            )
-            if not key:
-                return
-
-            reactor_bot_id = getattr(bot, "id", None) if bot is not None else None
-            from ..database import hash_phone
-            sender_hash = hash_phone(sender) if sender else ""
-            # target_timestamp is Signal's millisecond timestamp; normalize
-            # to seconds so it lines up with conversation_turns.created_at
-            # for cross-table audit lookups.
-            msg_at = (
-                float(target_timestamp) / 1000.0
-                if target_timestamp else None
-            )
-            mem_id = await store.add(
-                context_id=policy.id,
-                subject_key=key,
-                subject_label=label,
-                kind=kind,
-                content=content,
-                source=SOURCE_REACTOR,
-                source_user_hash=sender_hash,
-                source_message_at=msg_at,
-                bot_id=reactor_bot_id,
-            )
-            if mem_id is not None:
-                logger.info(
-                    f"Reactor: noted memory #{mem_id} "
-                    f"[{kind}] about {label!r}: {content[:80]!r}"
-                )
-        except Exception as e:
-            logger.debug(f"Reactor note_memory persist failed: {e}")
 
     @staticmethod
     def _gb_key(group_id: str, bot_id: Optional[int] = None) -> tuple:
@@ -878,9 +764,8 @@ class EmojiReactor:
 
         The three cheap emoji gates — `bot_will_reply`, `min_length`, and
         the sender/group cooldowns — suppress the emoji_react tool rather
-        than abandoning the call, because should_respond and note_memory
-        ride on the same LLM request and have their own, independent
-        gating. Returning early here would silently couple them: a raised
+        than abandoning the call, because should_respond rides on the same
+        LLM request and has its own, independent gating. Returning early here would silently couple them: a raised
         emoji cooldown would throttle spontaneous replies, and since
         cooldowns are recorded only when a reaction is actually sent,
         every reaction would mute that sender's natural-response path for
@@ -992,17 +877,6 @@ class EmojiReactor:
                 system_prompt = (
                     f"{system_prompt}\n{extra or NATURAL_RESPONSE_GUIDANCE}"
                 )
-            # Passive memory writes: the reactor already pays for an LLM
-            # call on every qualifying message, so memory extraction is
-            # essentially free. Gated per-context (off by default — opt-in
-            # in /admin/contexts) AND only when the policy belongs to a
-            # real, non-default row (so writes don't bleed across the
-            # default group/dm rows).
-            offer_note_memory = self._memory_writes_active(policy)
-            if offer_note_memory:
-                tools.append(NOTE_MEMORY_TOOL)
-                system_prompt = f"{system_prompt}\n{NOTE_MEMORY_GUIDANCE}"
-
             # Nothing left to ask the model about — this is where the cheap
             # emoji gates finally do abandon the call, attributed to the
             # gate that actually fired so the dashboard stays honest about
@@ -1020,10 +894,8 @@ class EmojiReactor:
 
             # Inline-expand tweet/X URLs so the reactor sees actual content
             # rather than an opaque link. Failures are non-fatal — fall back
-            # to the raw text. Skipped when the only remaining tool is
-            # note_memory: paying a fetch to enrich a call that can't
-            # produce anything visible is wasted latency.
-            if self.enricher is not None and (offer_emoji or offer_should_respond):
+            # to the raw text.
+            if self.enricher is not None:
                 try:
                     expanded = await self.enricher.expand(text)
                     if expanded:
@@ -1137,14 +1009,10 @@ class EmojiReactor:
 
             # should_respond wins over emoji_react when both are present —
             # a real reply already conveys whatever a reaction would.
-            # note_memory is collected separately because it's not mutually
-            # exclusive with either: the reactor can react and note in the
-            # same call, or just note silently.
             respond_reason: Optional[str] = None
             respond_bot_slug: Optional[str] = None
             emoji_pick: Optional[str] = None
             emoji_score: Optional[int] = None
-            memory_notes: list[dict] = []
             for call in tool_calls:
                 fn = call.get("function") or {}
                 fname = fn.get("name")
@@ -1176,8 +1044,6 @@ class EmojiReactor:
                             emoji_score = int(raw_score)
                     except (TypeError, ValueError):
                         emoji_score = None
-                elif fname == "note_memory":
-                    memory_notes.append(args)
 
             # Multi-bot pick: resolve the LLM's bot_slug to a Bot and
             # use it as the responder downstream. Unknown / blank
@@ -1202,20 +1068,6 @@ class EmojiReactor:
                 getattr(responder_bot, "id", None)
                 if responder_bot is not None else None
             )
-
-            # Persist any memory notes regardless of which reactor outcome
-            # wins below — passive learning is independent of the public
-            # reaction. Only fires when the per-context flag was on at
-            # offer-time.
-            if memory_notes and offer_note_memory:
-                for note in memory_notes:
-                    await self._persist_note_memory(
-                        policy=policy,
-                        sender=sender,
-                        target_timestamp=target_timestamp,
-                        args=note,
-                        bot=bot,
-                    )
 
             if respond_reason and offer_should_respond:
                 # Mark cooldown on the RESPONDER bot (which may differ

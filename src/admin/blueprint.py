@@ -1576,7 +1576,6 @@ def _register_context_routes(
             "deep_think_enabled": True,
             "memory_enabled": True,
             "memory_writes_enabled": True,
-            "reactor_memory_writes": False,
             "default_bot_id": "",
             "transcript_logging_enabled": False,
             "history_turns_override": "",
@@ -1646,7 +1645,6 @@ def _register_context_routes(
             "deep_think_enabled": policy.deep_think_enabled,
             "memory_enabled": policy.memory_enabled,
             "memory_writes_enabled": policy.memory_writes_enabled,
-            "reactor_memory_writes": policy.reactor_memory_writes,
             "default_bot_id": (
                 "" if policy.default_bot_id is None
                 else str(policy.default_bot_id)
@@ -2604,7 +2602,6 @@ def _form_to_values(form) -> dict:
         "deep_think_enabled": form.get("deep_think_enabled", "") == "on",
         "memory_enabled": form.get("memory_enabled", "") == "on",
         "memory_writes_enabled": form.get("memory_writes_enabled", "") == "on",
-        "reactor_memory_writes": form.get("reactor_memory_writes", "") == "on",
         "default_bot_id": form.get("default_bot_id", "").strip(),
         "transcript_logging_enabled": (
             form.get("transcript_logging_enabled", "") == "on"
@@ -2633,7 +2630,6 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
     deep_think_enabled = form.get("deep_think_enabled", "") == "on"
     memory_enabled = form.get("memory_enabled", "") == "on"
     memory_writes_enabled = form.get("memory_writes_enabled", "") == "on"
-    reactor_memory_writes = form.get("reactor_memory_writes", "") == "on"
     raw_default_bot_id = (form.get("default_bot_id") or "").strip()
     default_bot_id: Optional[int]
     if raw_default_bot_id == "":
@@ -2694,7 +2690,6 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         deep_think_enabled=deep_think_enabled,
         memory_enabled=memory_enabled,
         memory_writes_enabled=memory_writes_enabled,
-        reactor_memory_writes=reactor_memory_writes,
         default_bot_id=default_bot_id,
         transcript_logging_enabled=transcript_logging_enabled,
         history_turns_override=history_turns_override,

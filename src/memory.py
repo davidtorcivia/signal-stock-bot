@@ -58,11 +58,6 @@ KIND_FACT = "fact"
 KIND_EVENT = "event"
 KINDS = (KIND_IDENTITY, KIND_PREFERENCE, KIND_FACT, KIND_EVENT)
 
-# Reactor is restricted to slow-changing kinds. `event` is reserved for
-# explicit `remember` calls so the reactor doesn't litter with one-shot
-# observations like "David said hi today".
-REACTOR_ALLOWED_KINDS = (KIND_IDENTITY, KIND_PREFERENCE, KIND_FACT)
-
 SOURCE_REACTOR = "reactor"
 SOURCE_EXPLICIT = "explicit"
 SOURCE_ADMIN = "admin"
@@ -915,62 +910,6 @@ FORGET_TOOL = {
                 },
             },
             "required": ["memory_id"],
-        },
-    },
-}
-
-
-# Reactor uses a separate tool — narrower description, restricted kinds, and
-# never returns text to the model (the reactor doesn't iterate). Listed
-# alongside emoji_react / should_respond when reactor_memory_writes is on.
-NOTE_MEMORY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "note_memory",
-        "description": (
-            "PASSIVE LEARNING: save a durable memory about someone in "
-            "this chat from what they (or someone else) just said. Only "
-            "use for slow-changing facts: identity (role, where they "
-            "live, astrological/personality identifiers they've named), "
-            "preference (what they like or dislike), or general fact. "
-            "Skip banter, jokes, sarcasm, and anything the speaker "
-            "clearly doesn't want recorded. You can call this alongside "
-            "emoji_react in the same message — they're not mutually "
-            "exclusive. If nothing memory-worthy is here, don't call "
-            "this tool."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "subject": {
-                    "type": "string",
-                    "description": (
-                        "Who the memory is about. Use 'speaker' for "
-                        "anything the current talker states about "
-                        "themselves, 'yourself' for the bot itself (its "
-                        "persona / model / voice as set in this chat), "
-                        "'this chat' for the room, or another person's "
-                        "registered name when the speaker is talking "
-                        "about someone else."
-                    ),
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": list(REACTOR_ALLOWED_KINDS),
-                    "description": (
-                        "identity (stable trait), preference (likes/"
-                        "dislikes), or fact (neutral durable info)."
-                    ),
-                },
-                "content": {
-                    "type": "string",
-                    "description": (
-                        "The memory in one short sentence, phrased as a "
-                        "stand-alone fact."
-                    ),
-                },
-            },
-            "required": ["subject", "kind", "content"],
         },
     },
 }

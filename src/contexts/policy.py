@@ -47,15 +47,14 @@ class ContextPolicy:
     # Memory: per-context gates for the bot's per-context memory store.
     # `memory_writes_enabled` controls whether the writer LLM can call
     # `remember`/`forget` in this chat (default on — explicit user-driven
-    # writes are always wanted). `reactor_memory_writes` controls whether
-    # the reactor passively learns from messages even when the main bot
-    # isn't called (default off — opt-in, since passive learning has
-    # privacy implications).
+    # writes are always wanted).
     # `memory_enabled` is the master switch: off = no memory preamble,
-    # no recall/remember/forget tools, no reactor learning. Stored rows
-    # are kept and stay visible/editable in the admin UI.
+    # no recall/remember/forget tools. Stored rows are kept and stay
+    # visible/editable in the admin UI.
     memory_enabled: bool = True
     memory_writes_enabled: bool = True
+    # Vestigial: the reactor's passive-learning path is gone. Kept because
+    # the registry row mapping is positional; never read from the form.
     reactor_memory_writes: bool = False
     # Multi-bot scoping: which bot answers in this context when no bot
     # is named in the message. NULL = use the registry's

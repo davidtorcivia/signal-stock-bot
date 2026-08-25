@@ -6,8 +6,8 @@ like. These tests pin the two structural changes that fixed it:
 
   1. The cheap gates (`bot_will_reply` / `min_length` / cooldowns) suppress
      the emoji_react TOOL rather than abandoning the whole LLM call. That
-     matters because should_respond and note_memory ride on the same
-     request with their own independent gating — an early return silently
+     matters because should_respond rides on the same request with its
+     own independent gating — an early return silently
      coupled emoji throttling to the natural-response feature, and since
      cooldowns are recorded only on a real reaction, every reaction muted
      that sender's spontaneous-reply path for a full cooldown window.
@@ -133,8 +133,8 @@ async def test_bot_will_reply_does_not_react(store):
         reactor, bot_will_reply=True,
         policy=_policy(natural_response=True),
     )
-    # note_memory is off and should_respond is suppressed by bot_will_reply,
-    # so there is nothing to ask — no call, and certainly no reaction.
+    # should_respond is suppressed by bot_will_reply, so there is
+    # nothing to ask — no call, and certainly no reaction.
     signal.send_reaction.assert_not_called()
 
 
