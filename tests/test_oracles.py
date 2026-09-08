@@ -260,8 +260,47 @@ def test_fire_allowed_on_day_permits_weekday_for_weekdays_only():
 
 def test_fire_allowed_on_day_none_restriction_allows_every_day():
     o = _clock_oracle(clock_time="09:25", weekdays_only=False)
+    o.kind = "freeform"
     sat = dt.datetime(2026, 6, 13, 9, 26, tzinfo=_NY).astimezone(_UTC)
     assert fire_allowed_on_day(o, recent_fire_time(o, sat)) is True
+
+
+@pytest.mark.parametrize("kind", ["market_open", "market_close"])
+@pytest.mark.parametrize("date, expected", [
+    ("2026-09-07", False),  # Labor Day
+    ("2026-04-03", False),  # Good Friday
+    ("2026-07-03", False),  # Independence Day observed
+    ("2026-06-19", False),  # Juneteenth
+    ("2025-01-09", False),  # Carter national day of mourning
+    ("2026-09-05", False),  # Saturday
+    ("2026-09-06", False),  # Sunday
+    ("2026-09-08", True),
+    ("2026-11-27", True),  # Early close
+    ("2026-11-11", True),  # Veterans Day is not an NYSE holiday
+    ("2027-12-31", True),  # Saturday New Year's Day is not observed Friday
+])
+def test_market_oracles_require_trading_day(kind, date, expected):
+    o = _clock_oracle()
+    o.kind = kind
+    fire = dt.datetime.fromisoformat(date).replace(hour=16, tzinfo=_NY)
+    assert fire_allowed_on_day(o, fire.astimezone(_UTC)) is expected
+
+
+def test_market_holidays_use_new_york_date_and_preserve_weekday_filter():
+    o = _clock_oracle(tz="Asia/Tokyo")
+    # Tuesday in Tokyo and UTC, still Labor Day in New York.
+    fire = dt.datetime(2026, 9, 8, 0, 25, tzinfo=_UTC)
+    assert fire_allowed_on_day(o, fire) is False
+    o.days_of_week = frozenset({0})
+    assert fire_allowed_on_day(o, fire + dt.timedelta(days=1)) is False
+
+
+@pytest.mark.parametrize("kind", ["tarot", "iching", "freeform", "wsb_digest"])
+def test_other_oracles_still_fire_on_market_holidays(kind):
+    o = _clock_oracle()
+    o.kind = kind
+    fire = dt.datetime(2026, 9, 7, 16, tzinfo=_NY)
+    assert fire_allowed_on_day(o, fire) is True
 
 
 def test_fire_allowed_on_day_judges_local_day_across_utc_midnight():
@@ -570,3 +609,21 @@ async def test_prepopulate_without_legacy_settings_leaves_disabled(store):
     await prepopulate_for_existing_contexts(store, registry, settings_store=None)
     oracles = await store.list_for_context(1)
     assert all(not o.enabled for o in oracles)
+
+
+@pytest.mark.parametrize("date, hour", [
+    (dt.date(2026, 11, 27), 13),
+    (dt.date(2026, 12, 24), 13),
+    (dt.date(2025, 7, 3), 13),
+    (dt.date(2026, 9, 8), 16),
+    (dt.date(2026, 11, 30), 16),
+])
+def test_closing_recap_follows_session_close(date, hour):
+    o = _clock_oracle(clock_time="16:05", tz="Asia/Tokyo")
+    o.kind = "market_close"
+    expected = dt.datetime.combine(date, dt.time(hour, 5), tzinfo=_NY)
+    assert fire_time_for(o, date) == expected
+    assert next_fire_time(o, expected - dt.timedelta(seconds=1)) == expected
+    assert recent_fire_time(o, expected + dt.timedelta(minutes=1)) == expected
+    assert fire_allowed_on_day(o, expected)
+    assert "NYSE close +5m" in o.describe()

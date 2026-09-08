@@ -245,3 +245,36 @@ def test_already_fired_today_never_fired():
     oracle.last_fired_at = None
     now = dt.datetime(2026, 6, 3, 0, 9, 40, tzinfo=dt.timezone.utc)
     assert DailyOracleWorker._already_fired_today(oracle, now) is False
+
+
+@pytest.mark.parametrize("day, hour, minute, expected", [
+    (27, 13, 4, 0),
+    (27, 13, 5, 1),
+    (27, 16, 5, 0),
+    (26, 16, 5, 0),  # Thanksgiving
+    (30, 13, 5, 0),
+    (30, 16, 5, 1),
+])
+async def test_tick_follows_actual_close(monkeypatch, day, hour, minute, expected):
+    from unittest.mock import AsyncMock
+    from zoneinfo import ZoneInfo
+
+    now = dt.datetime(2026, 11, day, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+    class FrozenDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    worker, _, _ = _make_worker(ask_result=_StubResult(success=True))
+    oracle = _make_oracle()
+    worker.store.list_enabled = AsyncMock(return_value=[oracle])
+    worker._fire_oracle = AsyncMock()
+    monkeypatch.setattr("src.daily_oracle.dt.datetime", FrozenDateTime)
+    monkeypatch.setattr("src.daily_oracle.asyncio.sleep", AsyncMock())
+    await worker._tick()
+    assert worker._fire_oracle.await_count == expected
+    if expected:
+        oracle.last_fired_at = now.timestamp()
+        await worker._tick()
+        assert worker._fire_oracle.await_count == 1

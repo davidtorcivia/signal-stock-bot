@@ -27,11 +27,13 @@ import datetime as dt
 import logging
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+import pandas_market_calendars as mcal
 
 from ..database import db_session
 from astral import LocationInfo
@@ -53,6 +55,7 @@ SCHEDULE_KINDS = ("sunrise", "sunset", "clock")
 # Python weekday convention: Monday=0 .. Sunday=6 (matches datetime.weekday()).
 _DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _WEEKDAYS = frozenset({0, 1, 2, 3, 4})
+_NYSE = mcal.get_calendar("NYSE")
 
 # NYC anchors all sunrise/sunset calculations. The chat-side timezone
 # is configurable per oracle (used only for `clock` schedules) — the
@@ -84,8 +87,8 @@ KIND_DESCRIPTIONS = {
     ),
     "market_close": (
         "Close-of-day recap. Sigil pulls the day's index moves, "
-        "leaders/laggards, and any notable news. Best run shortly "
-        "after the 4pm ET close on weekdays."
+        "leaders/laggards, and any notable news. Runs five minutes after "
+        "the NYSE close, including early closes, overriding the clock setting."
     ),
     "freeform": (
         "Sigil generates a post from a custom prompt you supply. "
@@ -199,7 +202,9 @@ class ContextOracle:
 
     def describe(self) -> str:
         """Human-readable schedule string for admin UI / logs."""
-        if self.schedule_kind == "clock":
+        if self.kind == "market_close":
+            base = "NYSE close +5m (America/New_York)"
+        elif self.schedule_kind == "clock":
             base = f"{self.clock_time} {self.timezone}"
         else:
             sign = "+" if self.offset_minutes >= 0 else ""
@@ -210,6 +215,15 @@ class ContextOracle:
 
 # ---------- schedule math ----------------------------------------------------
 
+@lru_cache(maxsize=4)
+def _market_closes(year: int) -> dict[dt.date, dt.datetime]:
+    schedule = _NYSE.schedule(start_date=f"{year}-01-01", end_date=f"{year}-12-31")
+    return {
+        day.date(): close.to_pydatetime()
+        for day, close in schedule["market_close"].items()
+    }
+
+
 def _astro_event_for(date: dt.date, kind: str) -> dt.datetime:
     """Sunrise or sunset on `date` in NYC, returned as a tz-aware
     datetime in NYC local time."""
@@ -219,8 +233,9 @@ def _astro_event_for(date: dt.date, kind: str) -> dt.datetime:
 
 
 def _local_tz_for(oracle: ContextOracle):
-    """The frame an oracle's calendar day is reckoned in: the configured
-    timezone for clock schedules, NYC for the observer-anchored sun events."""
+    """Use NYC for closing recaps and sun events, otherwise the clock timezone."""
+    if oracle.kind == "market_close":
+        return _LOCATION.tzinfo
     return (
         ZoneInfo(oracle.timezone)
         if oracle.schedule_kind == "clock"
@@ -229,11 +244,13 @@ def _local_tz_for(oracle: ContextOracle):
 
 
 def fire_allowed_on_day(oracle: ContextOracle, fire_utc: dt.datetime) -> bool:
-    """True if the scheduled instant `fire_utc` lands on a weekday this oracle
-    is allowed to fire. Evaluated in the oracle's local frame so a clock oracle
-    whose UTC instant crosses midnight (e.g. 20:00 ET == 00:00 UTC) is judged by
-    its local calendar day, not the UTC one. `recent_fire_time` deliberately
-    ignores day-of-week, so the fire loop must apply this gate itself."""
+    """Apply configured weekdays in the oracle's timezone and, for market
+    checks/recaps, NYSE trading days in New York time. The worker applies this
+    gate because recent_fire_time deliberately ignores day restrictions."""
+    if oracle.kind in ("market_open", "market_close"):
+        market_date = fire_utc.astimezone(_LOCATION.tzinfo).date()
+        if market_date not in _market_closes(market_date.year):
+            return False
     allowed = oracle.effective_days()
     if allowed is None:
         return True
@@ -243,7 +260,13 @@ def fire_allowed_on_day(oracle: ContextOracle, fire_utc: dt.datetime) -> bool:
 def fire_time_for(oracle: ContextOracle, date: dt.date) -> dt.datetime:
     """Compute the firing instant for `oracle` on `date`. Returns a
     tz-aware datetime in the oracle's local timezone (or NYC for
-    sunrise/sunset, since those are observer-anchored)."""
+    sunrise/sunset and closing recaps)."""
+    if oracle.kind == "market_close":
+        # Closed days retain a nominal slot for idempotency; the day gate blocks them.
+        close = _market_closes(date.year).get(
+            date, dt.datetime.combine(date, dt.time(16), tzinfo=_LOCATION.tzinfo)
+        )
+        return (close + dt.timedelta(minutes=5)).astimezone(_LOCATION.tzinfo)
     if oracle.schedule_kind in ("sunrise", "sunset"):
         base = _astro_event_for(date, oracle.schedule_kind)
         return base + dt.timedelta(minutes=oracle.offset_minutes)

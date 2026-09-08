@@ -33,6 +33,9 @@ dateparser>=1.2
 # slim Python image without extra system packages.
 astral>=3.2
 
+# NYSE session dates and actual closing times for scheduled market posts.
+pandas_market_calendars>=5.0
+
 # Admin web UI
 bcrypt>=4.0
 

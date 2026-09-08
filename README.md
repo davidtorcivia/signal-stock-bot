@@ -637,6 +637,10 @@ Each group context can have any number of scheduled posts that fire once per day
 | `clock` | Fixed `HH:MM` in any IANA timezone |
 
 `weekdays_only` flag skips Saturday and Sunday — sensible default for the market kinds.
+Scheduled `market_open` and `market_close` posts also skip NYSE holidays and weekends,
+using the New York date. Closing recaps run five minutes after the NYSE session
+close (13:05 ET on 13:00 early closes; 16:05 ET on regular days), overriding the
+clock setting. Session dates and closing times come from `pandas_market_calendars`.
 
 ### Heuristic prepopulation
 
