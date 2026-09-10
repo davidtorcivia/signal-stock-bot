@@ -30,6 +30,8 @@ from .predict_command import (
 )
 from .portfolio_command import (
     PORTFOLIO_BUY_OPTION_TOOL,
+    PORTFOLIO_WRITE_OPTION_TOOL,
+    PORTFOLIO_CLOSE_OPTION_TOOL,
     PORTFOLIO_BUY_TOOL,
     PORTFOLIO_CANCEL_ORDER_TOOL,
     PORTFOLIO_JOURNAL_APPEND_TOOL,
@@ -1102,13 +1104,16 @@ class AskCommand(BaseCommand):
             schemas.append(PORTFOLIO_SELL_TOOL)
             schemas.append(PORTFOLIO_PLACE_ORDER_TOOL)
             schemas.append(PORTFOLIO_CANCEL_ORDER_TOOL)
-            # Options tools — long-only buy/sell + chain/quote lookup.
-            # Same gating as the equity tools; the executor handles
-            # OCC normalization so the LLM can pass friendly strings.
+            # Options tools — four explicit verbs rather than two
+            # overloaded ones: buy/sell open and close a long, write/
+            # close open and close a short. The executor handles OCC
+            # normalization so the LLM can pass friendly strings.
             schemas.append(PORTFOLIO_OPTIONS_CHAIN_TOOL)
             schemas.append(PORTFOLIO_OPTION_QUOTE_TOOL)
             schemas.append(PORTFOLIO_BUY_OPTION_TOOL)
             schemas.append(PORTFOLIO_SELL_OPTION_TOOL)
+            schemas.append(PORTFOLIO_WRITE_OPTION_TOOL)
+            schemas.append(PORTFOLIO_CLOSE_OPTION_TOOL)
             schemas.append(PORTFOLIO_PLACE_OPTION_ORDER_TOOL)
             # Journal tools are gated separately because the journal
             # store is wired independently — a deploy could have
@@ -1977,6 +1982,80 @@ class AskCommand(BaseCommand):
                 f"${result['proceeds']:,.2f}, multiplier "
                 f"{result.get('multiplier', 100)}). "
                 f"Position avg ${result['avg_premium_after']:.2f}/sh. "
+                f"Cash now ${result['cash_after']:,.2f}. "
+                f"Reason: {reason}"
+            )
+
+        if name == "portfolio_write_option":
+            contract_raw = str(args.get("contract") or "").strip()
+            reason = str(args.get("reason") or "").strip()
+            qty_raw = args.get("qty")
+            if not contract_raw:
+                return "ERROR: portfolio_write_option requires a contract."
+            if not reason:
+                return "ERROR: portfolio_write_option requires a one-sentence reason."
+            try:
+                qty_int = int(qty_raw) if qty_raw is not None else 0
+            except (TypeError, ValueError):
+                return "ERROR: qty must be a positive whole number of contracts."
+            if qty_int <= 0:
+                return "ERROR: qty must be a positive whole number of contracts."
+            try:
+                result = await executor.execute_write_option(
+                    ctx_key,
+                    contract=contract_raw,
+                    qty=qty_int,
+                    reason=reason,
+                    source=source_tag,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_write_option failed: {e}")
+                return f"ERROR: option write failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'write rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
+            collateral = result.get("collateral") or 0.0
+            pledge = (
+                f"${collateral:,.2f} collateral pledged"
+                if collateral > 0 else "covered by shares held"
+            )
+            return (
+                f"Wrote {qty_int} {result['friendly']} "
+                f"@ ${result['premium']:.2f}/sh — {result.get('structure', 'short')} "
+                f"(credit ${result['proceeds']:,.2f}, {pledge}). "
+                f"Short avg ${result['avg_premium_after']:.2f}/sh. "
+                f"Cash now ${result['cash_after']:,.2f}. "
+                f"Reason: {reason}"
+            )
+
+        if name == "portfolio_close_option":
+            contract_raw = str(args.get("contract") or "").strip()
+            reason = str(args.get("reason") or "").strip()
+            if not contract_raw:
+                return "ERROR: portfolio_close_option requires a contract."
+            if not reason:
+                return "ERROR: portfolio_close_option requires a one-sentence reason."
+            try:
+                result = await executor.execute_close_option(
+                    ctx_key,
+                    contract=contract_raw,
+                    qty=args.get("qty"),
+                    reason=reason,
+                    source=source_tag,
+                )
+            except Exception as e:
+                logger.exception(f"portfolio_close_option failed: {e}")
+                return f"ERROR: option close failed: {type(e).__name__}"
+            if not result.get("ok"):
+                return f"ERROR: {result.get('error', 'close rejected')}"
+            caller_ctx.portfolio_mutation_count += 1
+            realized = result.get("realized_pnl") or 0.0
+            return (
+                f"Closed short {result['friendly']} "
+                f"@ ${result['premium']:.2f}/sh (cost "
+                f"${result.get('cost', 0.0):,.2f}, "
+                f"${result.get('collateral_released', 0.0):,.2f} collateral "
+                f"released). Realized ${realized:+,.2f}. "
                 f"Cash now ${result['cash_after']:,.2f}. "
                 f"Reason: {reason}"
             )

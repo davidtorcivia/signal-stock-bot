@@ -30,9 +30,11 @@ from .options_symbols import (
 from .paper_portfolio import (
     KIND_LIMIT,
     KIND_STOP,
+    LONG,
     Order,
     ORDER_PENDING,
     PortfolioStore,
+    SHORT,
     SIDE_BUY,
     SIDE_SELL,
     SOURCE_ORDER,
@@ -41,6 +43,12 @@ from .paper_portfolio import (
     VALID_ORDER_KINDS,
     VALID_SOURCES,
 )
+
+
+# One expiry's chain, whole. Held positions can sit far from the money
+# after a move, and a centered slice would drop exactly the ones whose
+# mark matters most.
+_CHAIN_LOOKUP_LIMIT = 5000
 
 
 def _finite(value: Optional[float]) -> bool:
@@ -98,7 +106,8 @@ _MAX_OPTION_POSITIONS_PER_CONTEXT = 200
 # the row doesn't sit in options_positions forever, retried on every
 # tick of the worker. Realized PnL records the full premium loss —
 # worst-case for the user but the honest outcome when we can't
-# determine intrinsic.
+# determine intrinsic. LONG positions only: settling a SHORT at $0 is
+# its best case, not its worst, so those are left open instead.
 _SETTLEMENT_STALE_GRACE_SECONDS = 86400  # 24 hours
 
 
@@ -200,18 +209,24 @@ class PaperPortfolioExecutor:
         self, options_pos,
     ) -> list[tuple[Optional[float], Optional[str]]]:
         """Mark-to-market premium for each position, grouped by
-        underlying so multiple contracts on the same name share one
-        chain fetch. Result order matches input order so the caller
-        can zip directly against `options_pos`.
+        underlying AND expiry so contracts sharing an expiry share one
+        chain fetch. Result order matches input order so the caller can
+        zip directly against `options_pos`.
 
-        Single-contract underlyings fall back to per-contract quotes
-        (the chain endpoint returns up to 250 rows; querying it for
-        one strike wastes bandwidth and the provider's quota).
+        Grouping has to include the expiry: a chain request is per-expiry
+        on the Yahoo provider, so asking by underlying alone returned the
+        front expiry and missed every position in any other one.
+
+        Single-contract groups fall back to per-contract quotes.
         """
         from collections import defaultdict
-        groups: dict[str, list[int]] = defaultdict(list)
+        groups: dict[tuple[str, Optional[str]], list[int]] = defaultdict(list)
         for i, op in enumerate(options_pos):
-            groups[op.underlying].append(i)
+            try:
+                expiry = parse_occ(op.contract_symbol).expiration.isoformat()
+            except Exception:
+                expiry = None
+            groups[(op.underlying, expiry)].append(i)
 
         results: list[tuple[Optional[float], Optional[str]]] = [
             (None, "unfilled") for _ in options_pos
@@ -222,16 +237,23 @@ class PaperPortfolioExecutor:
         # parallel.
         tasks: list = []
         task_meta: list[tuple[str, list[int]]] = []  # (kind, indices)
-        for underlying, indices in groups.items():
-            if len(indices) >= 2:
-                tasks.append(self._safe_chain_lookup(underlying))
+        for (underlying, expiry), indices in groups.items():
+            if len(indices) >= 2 and expiry is not None:
+                tasks.append(self._safe_chain_lookup(underlying, expiry))
                 task_meta.append(("chain", indices))
-            else:
+            elif len(indices) == 1:
                 idx = indices[0]
                 tasks.append(self._fetch_option_premium(
                     options_pos[idx].contract_symbol,
                 ))
                 task_meta.append(("single", indices))
+            else:
+                # Unparseable expiry with several contracts: quote each.
+                for idx in indices:
+                    tasks.append(self._fetch_option_premium(
+                        options_pos[idx].contract_symbol,
+                    ))
+                    task_meta.append(("single", [idx]))
 
         responses = await asyncio.gather(*tasks, return_exceptions=False)
 
@@ -266,15 +288,15 @@ class PaperPortfolioExecutor:
         return results
 
     async def _safe_chain_lookup(
-        self, underlying: str,
+        self, underlying: str, expiration: Optional[str] = None,
     ) -> tuple[dict, Optional[str]]:
-        """Fetch the options chain for an underlying and reduce to a
+        """Fetch one expiry's chain and reduce it to a
         {contract_symbol -> premium} map. Errors are swallowed and
         surfaced as the `error` half so the caller can fall back to
         per-contract quotes instead of failing the whole snapshot."""
         try:
             chain = await self.providers.get_options_chain(
-                underlying, expiration=None, limit=250,
+                underlying, expiration=expiration, limit=_CHAIN_LOOKUP_LIMIT,
             )
         except Exception as e:
             logger.debug(
@@ -501,10 +523,16 @@ class PaperPortfolioExecutor:
         # case.
         option_views: list[dict] = []
         option_market_value = 0.0
+        option_collateral = 0.0
         if options_pos:
             option_quote_results = await self._fetch_option_premiums_batched(options_pos)
             for op, (premium, err) in zip(options_pos, option_quote_results):
+                # For a long this is what was paid; for a short, the
+                # credit collected. Sign handling below turns the short's
+                # mark into a liability rather than an asset.
                 cost = op.qty * op.multiplier * op.avg_premium
+                is_short = op.is_short
+                option_collateral += op.collateral
                 friendly = occ_friendly_name(op.contract_symbol)
                 if err is not None or premium is None:
                     logger.warning(
@@ -523,14 +551,19 @@ class PaperPortfolioExecutor:
                         "avg_premium": op.avg_premium,
                         "mark_premium": None,
                         "cost_basis": cost,
-                        "market_value": cost,
+                        "market_value": -cost if is_short else cost,
                         "unrealized_pnl": 0.0,
                         "unrealized_pct": 0.0,
+                        "side": SHORT if is_short else LONG,
+                        "collateral": op.collateral,
                     })
-                    option_market_value += cost
+                    option_market_value += -cost if is_short else cost
                     continue
-                mv = op.qty * op.multiplier * premium
-                unrealized = mv - cost
+                liability = op.qty * op.multiplier * premium
+                # A short owes the contract back, so it carries negative
+                # market value and gains as the premium decays.
+                mv = -liability if is_short else liability
+                unrealized = (cost - liability) if is_short else (liability - cost)
                 option_views.append({
                     "contract": op.contract_symbol,
                     "friendly": friendly,
@@ -546,13 +579,19 @@ class PaperPortfolioExecutor:
                     "market_value": mv,
                     "unrealized_pnl": unrealized,
                     "unrealized_pct": (unrealized / cost) if cost > 0 else 0.0,
+                    "side": SHORT if is_short else LONG,
+                    "collateral": op.collateral,
                 })
                 option_market_value += mv
                 unrealized_total += unrealized
 
         total_funded = portfolio.starting_balance + tip_total
         total_market_value = market_value + option_market_value
-        equity = portfolio.cash + total_market_value
+        # Pledged collateral was moved out of cash when the short was
+        # written so nothing else could spend it, but it still belongs
+        # to the book. Leaving it out would make every cash-secured put
+        # look like an instant loss the size of the strike.
+        equity = portfolio.cash + option_collateral + total_market_value
         total_pnl = equity - total_funded
         total_pnl_pct = (total_pnl / total_funded) if total_funded > 0 else 0.0
 
@@ -566,6 +605,7 @@ class PaperPortfolioExecutor:
             "market_value": total_market_value,
             "equity_market_value": market_value,
             "options_market_value": option_market_value,
+            "options_collateral": option_collateral,
             "equity": equity,
             "realized_pnl": realized_total,
             "unrealized_pnl": unrealized_total,
@@ -728,6 +768,21 @@ class PaperPortfolioExecutor:
                         "error": (
                             f"No {contract_symbol} options position to "
                             f"sell against. Buy contracts first."
+                        ),
+                    }
+                if opt_pos.is_short:
+                    # A sell order on a short would fire into
+                    # store.sell_option and be rejected there every time,
+                    # burning a pending slot and a quote per tick. The
+                    # protective order on a short is a BUY.
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{contract_symbol} is a SHORT position — "
+                            f"selling more would add to it, not protect "
+                            f"it. Place a buy+stop instead: it buys the "
+                            f"contract back when the premium rises to "
+                            f"your trigger."
                         ),
                     }
             else:
@@ -952,13 +1007,37 @@ class PaperPortfolioExecutor:
                 if is_option_order:
                     # contract_symbol is guaranteed set when
                     # is_option_order is True — guarded above.
-                    result = await self.execute_buy_option(
-                        order.context_key,
-                        contract=str(order.contract_symbol),
-                        qty=int(order.qty or 0),
-                        reason=reason,
-                        source=SOURCE_ORDER,
+                    #
+                    # A buy against a SHORT position is a buy-to-close,
+                    # which is the only automated risk management a
+                    # short can have: buy+stop fires when the premium
+                    # rises to the trigger. Routing it to
+                    # execute_buy_option instead would be rejected as
+                    # "use portfolio_close_option", leaving the one
+                    # position type with asymmetric downside as the one
+                    # type with no working stop.
+                    opt_pos = await self.store.get_option_position(
+                        order.context_key, str(order.contract_symbol),
                     )
+                    if opt_pos is not None and opt_pos.is_short:
+                        result = await self.execute_close_option(
+                            order.context_key,
+                            contract=str(order.contract_symbol),
+                            qty=(
+                                "all" if order.close_position
+                                else int(order.qty or 0) or "all"
+                            ),
+                            reason=reason,
+                            source=SOURCE_ORDER,
+                        )
+                    else:
+                        result = await self.execute_buy_option(
+                            order.context_key,
+                            contract=str(order.contract_symbol),
+                            qty=int(order.qty or 0),
+                            reason=reason,
+                            source=SOURCE_ORDER,
+                        )
                 else:
                     result = await self.execute_buy(
                         order.context_key,
@@ -1226,6 +1305,184 @@ class PaperPortfolioExecutor:
             result["expiration"] = exp_ts
         return result
 
+    def _validate_contract_qty(self, qty) -> tuple[int, Optional[str]]:
+        """Whole positive contracts under the per-fill cap, or an error.
+
+        Order matters: math.isfinite is checked before int() so NaN and
+        Inf don't escape as "cannot convert float NaN to integer".
+        """
+        if not isinstance(qty, (int, float)) or isinstance(qty, bool):
+            return 0, "qty must be a positive whole number of contracts."
+        if not math.isfinite(qty):
+            return 0, "qty must be a finite number."
+        if qty != int(qty) or int(qty) <= 0:
+            return 0, "qty must be a positive whole number of contracts."
+        if int(qty) > _MAX_OPTION_CONTRACTS_PER_FILL:
+            return 0, (
+                f"qty {int(qty)} exceeds sanity cap "
+                f"{_MAX_OPTION_CONTRACTS_PER_FILL}; split into smaller fills."
+            )
+        return int(qty), None
+
+    async def _prepare_option_open(
+        self, context_key: str, contract: str, force_market_open: bool,
+    ):
+        """`(occ, parts, exp_ts, error)` shared by buy-to-open and
+        write-to-open: parse the symbol, refuse a closed market, refuse
+        an expired contract, and enforce the per-context position cap."""
+        try:
+            occ = normalize_contract(contract)
+            parts = parse_occ(occ)
+        except ValueError as e:
+            return None, None, None, f"contract not parseable: {e}"
+
+        if not force_market_open:
+            closed = market_closed_reason()
+            if closed:
+                return None, None, None, f"Trade rejected — {closed}."
+
+        exp_ts = dt.datetime.combine(
+            parts.expiration, dt.time(16, 0), tzinfo=_ET,
+        ).timestamp()
+        if exp_ts < dt.datetime.now(_ET).timestamp():
+            return None, None, None, f"contract {occ} is already expired"
+
+        existing = await self.store.get_option_position(context_key, occ)
+        if existing is None:
+            current = await self.store.options_positions(context_key)
+            if len(current) >= _MAX_OPTION_POSITIONS_PER_CONTEXT:
+                return None, None, None, (
+                    f"Too many open option positions in this chat "
+                    f"({len(current)}/{_MAX_OPTION_POSITIONS_PER_CONTEXT}). "
+                    f"Close some before opening new contracts."
+                )
+        return occ, parts, exp_ts, None
+
+    async def execute_write_option(
+        self,
+        context_key: str,
+        *,
+        contract: str,
+        qty: int,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+        force_market_open: bool = False,
+        multiplier: int = 100,
+    ) -> dict:
+        """Sell to open: write `qty` contracts and collect the premium.
+
+        The store decides what collateral the obligation needs — cash
+        for a naked-but-secured put, the shares for a covered call, the
+        width for a spread — and refuses anything it cannot secure.
+        """
+        if source not in VALID_SOURCES:
+            return {"ok": False, "error": f"invalid source: {source!r}"}
+        qty_int, err = self._validate_contract_qty(qty)
+        if err:
+            return {"ok": False, "error": err}
+        if reason and len(reason) > _MAX_REASON_LEN:
+            reason = reason[:_MAX_REASON_LEN]
+
+        occ, parts, exp_ts, err = await self._prepare_option_open(
+            context_key, contract, force_market_open,
+        )
+        if err:
+            return {"ok": False, "error": err}
+
+        premium, err = await self._fetch_option_premium(occ)
+        if err is not None or premium is None:
+            return {"ok": False, "error": err or "no option quote"}
+
+        result = await self.store.write_option(
+            context_key,
+            contract_symbol=occ,
+            underlying=parts.root,
+            option_type=parts.option_type,
+            strike=parts.strike,
+            expiration=exp_ts,
+            qty=qty_int,
+            premium=premium,
+            multiplier=multiplier,
+            reason=reason,
+            source=source,
+        )
+        if result.get("ok"):
+            result["contract"] = occ
+            result["friendly"] = occ_friendly_name(occ)
+            result["premium"] = premium
+            result["multiplier"] = multiplier
+            result["underlying"] = parts.root
+            result["option_type"] = parts.option_type
+            result["strike"] = parts.strike
+            result["expiration"] = exp_ts
+        return result
+
+    async def execute_close_option(
+        self,
+        context_key: str,
+        *,
+        contract: str,
+        qty: Union[int, str, None] = None,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+        force_market_open: bool = False,
+    ) -> dict:
+        """Buy to close a short position. ``qty="all"`` (or None) closes
+        it outright; an integer closes that many contracts."""
+        if source not in VALID_SOURCES:
+            return {"ok": False, "error": f"invalid source: {source!r}"}
+        if reason and len(reason) > _MAX_REASON_LEN:
+            reason = reason[:_MAX_REASON_LEN]
+        try:
+            occ = normalize_contract(contract)
+        except ValueError as e:
+            return {"ok": False, "error": f"contract not parseable: {e}"}
+
+        position = await self.store.get_option_position(context_key, occ)
+        if position is None:
+            return {"ok": False, "error": f"No options position in {occ}."}
+        if not position.is_short:
+            return {
+                "ok": False,
+                "error": (
+                    f"{occ} is a long position. Use portfolio_sell_option "
+                    f"to close it."
+                ),
+            }
+
+        if qty is None or (isinstance(qty, str) and qty.strip().lower() == "all"):
+            qty_int = position.qty
+        else:
+            qty_int, err = self._validate_contract_qty(qty)
+            if err:
+                return {"ok": False, "error": err}
+
+        # A short is an obligation, so closing it stays available when
+        # the market is shut only if the caller forces it; otherwise the
+        # same session rules as every other fill apply.
+        if not force_market_open:
+            closed = market_closed_reason()
+            if closed:
+                return {"ok": False, "error": f"Trade rejected — {closed}."}
+
+        premium, err = await self._fetch_option_premium(occ)
+        if err is not None or premium is None:
+            return {"ok": False, "error": err or "no option quote"}
+
+        result = await self.store.close_short_option(
+            context_key,
+            contract_symbol=occ,
+            qty=qty_int,
+            premium=premium,
+            reason=reason,
+            source=source,
+        )
+        if result.get("ok"):
+            result["contract"] = occ
+            result["friendly"] = occ_friendly_name(occ)
+            result["premium"] = premium
+        return result
+
     async def execute_sell_option(
         self,
         context_key: str,
@@ -1357,6 +1614,22 @@ class PaperPortfolioExecutor:
             # every tick. We approximate "too long" with how stale the
             # expiration is relative to now — anything expired more
             # than 24h ago with no quote is treated as worthless.
+            if spot is None and op.is_short:
+                # The $0 shortcut below is the conservative answer for a
+                # long: worthless is the worst case. For a short it is
+                # the BEST case — close_short_option would book the whole
+                # credit as profit and hand back every dollar of
+                # collateral, on exactly the rows (delisted, renamed)
+                # most likely to have expired deep in the money. A stuck
+                # row is cheaper than invented PnL.
+                logger.warning(
+                    f"settle: {op.contract_symbol} is SHORT and "
+                    f"{op.underlying} is unquotable — leaving it open "
+                    f"rather than settling a short at $0, which would "
+                    f"book the full credit as profit"
+                )
+                errors += 1
+                continue
             if spot is None:
                 stale_seconds = now - op.expiration
                 if stale_seconds > _SETTLEMENT_STALE_GRACE_SECONDS:
@@ -1381,8 +1654,18 @@ class PaperPortfolioExecutor:
                     f"{op.underlying} @ ${op.strike:.2f} vs spot ${spot:.2f} "
                     f"→ intrinsic ${intrinsic:.4f}/sh"
                 )
+            # A short settles by paying intrinsic and getting its
+            # collateral back. That is economically the same as being
+            # assigned: a covered call paying (spot - strike) while
+            # keeping the shares nets out to selling them at the strike.
+            # Cash settlement therefore needs no delivery machinery.
+            is_short = getattr(op, "is_short", False)
+            settle_fn = (
+                self.store.close_short_option if is_short
+                else self.store.sell_option
+            )
             try:
-                result = await self.store.sell_option(
+                result = await settle_fn(
                     op.context_key,
                     contract_symbol=op.contract_symbol,
                     qty=op.qty,
@@ -1393,7 +1676,7 @@ class PaperPortfolioExecutor:
                 )
             except Exception as e:
                 logger.exception(
-                    f"settle: store.sell_option raised for "
+                    f"settle: store settlement raised for "
                     f"{op.contract_symbol}: {e}"
                 )
                 errors += 1
@@ -1418,6 +1701,8 @@ class PaperPortfolioExecutor:
                 "spot": spot,
                 "realized_pnl": result.get("realized_pnl") or 0.0,
                 "proceeds": result.get("proceeds") or 0.0,
+                "side": SHORT if is_short else LONG,
+                "collateral_released": result.get("collateral_released") or 0.0,
                 "force_settled": spot is None,
             })
             logger.info(

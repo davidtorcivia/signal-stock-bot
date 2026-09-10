@@ -941,11 +941,10 @@ PORTFOLIO_BUY_OPTION_TOOL = {
             "of contracts). Cost = premium × 100 × qty (deducted from "
             "cash immediately). Always include `reason` — a one-"
             "sentence thesis.\n\n"
-            "V1 is LONG-ONLY: you can only BUY calls or puts to OPEN a "
-            "position (or add to an existing long). You CANNOT write "
-            "(sell-to-open) options — that path is not implemented to "
-            "avoid modeling margin and unlimited-loss risk in paper "
-            "trading.\n\n"
+            "This is the BUY-TO-OPEN path. To sell premium instead, "
+            "use portfolio_write_option; to buy back something you "
+            "wrote, use portfolio_close_option. Calling this on a "
+            "contract you are short is rejected.\n\n"
             "Settlement: positions auto-settle at 16:00 ET on the "
             "expiration date. ITM contracts cash-settle at intrinsic × "
             "100 × qty (max(spot - strike, 0) for calls, max(strike - "
@@ -984,6 +983,113 @@ PORTFOLIO_BUY_OPTION_TOOL = {
                 },
             },
             "required": ["contract", "qty", "reason"],
+        },
+    },
+}
+
+
+PORTFOLIO_WRITE_OPTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_write_option",
+        "description": (
+            "SELL TO OPEN an options contract with YOUR paper portfolio "
+            "— collect the premium instead of paying it. Fills at the "
+            "live premium during regular US market hours. Pass "
+            "`contract` (OCC or friendly) and `qty` (whole contracts). "
+            "Credit = premium × 100 × qty, added to cash immediately. "
+            "Always include `reason`.\n\n"
+            "COLLATERAL is pledged out of cash when the write opens and "
+            "returned when it closes, so pledged money cannot be spent "
+            "on anything else. Which rule applies is decided for you:\n"
+            "  - Cash-secured put: strike × 100 × qty pledged.\n"
+            "  - Covered call: you must already hold 100 × qty shares "
+            "of the underlying. Nothing is pledged, but those shares "
+            "are locked until the call is closed or expires.\n"
+            "  - Credit spread: buy the protective long leg FIRST "
+            "(same underlying, same expiry, further OTM) with "
+            "portfolio_buy_option, then write this one. Only the width "
+            "between the strikes is pledged, which is far cheaper.\n"
+            "  - Naked calls are REFUSED — loss is unbounded. Buy the "
+            "long leg or the shares first.\n\n"
+            "Settlement: shorts auto-settle at 16:00 ET on the "
+            "expiration date. You pay intrinsic × 100 × qty and get the "
+            "collateral back; expiring worthless means you keep the "
+            "whole credit. Close early with portfolio_close_option to "
+            "take profit or cut a loss.\n\n"
+            "Selling premium is how you get paid for elevated implied "
+            "vol — check !rvol first so you know implied is actually "
+            "above realized, and !skew to see which side is bid."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "description": (
+                        "OCC ('AAPL250620C00175000') or friendly "
+                        "('AAPL 175C 2026-06-20') contract spec."
+                    ),
+                },
+                "qty": {
+                    "type": "integer",
+                    "description": (
+                        "Number of contracts to write. Whole number, "
+                        "minimum 1. Credit = qty × 100 × premium."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "One-sentence thesis: why this premium is worth "
+                        "collecting and where the position is wrong."
+                    ),
+                },
+            },
+            "required": ["contract", "qty", "reason"],
+        },
+    },
+}
+
+
+PORTFOLIO_CLOSE_OPTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "portfolio_close_option",
+        "description": (
+            "BUY TO CLOSE a short options position — the counterpart to "
+            "portfolio_write_option. Pays the current premium, returns "
+            "the pledged collateral, and books the realized PnL as "
+            "(credit collected - cost to close). Pass `qty` as a whole "
+            "number, or omit it (or pass \"all\") to close the whole "
+            "position.\n\n"
+            "Use this to take profit once most of the premium has "
+            "decayed, or to cut a short that has gone against you. For "
+            "a LONG position use portfolio_sell_option instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "description": (
+                        "OCC or friendly contract spec of the short "
+                        "position to buy back."
+                    ),
+                },
+                "qty": {
+                    "type": ["integer", "string"],
+                    "description": (
+                        "Contracts to buy back, or \"all\" / omitted "
+                        "for the whole position."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One sentence on why you're closing.",
+                },
+            },
+            "required": ["contract", "reason"],
         },
     },
 }

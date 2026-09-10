@@ -143,6 +143,8 @@ _DURABLE_MUTATIONS = frozenset({
     "portfolio_cancel_order",
     "portfolio_buy_option",
     "portfolio_sell_option",
+    "portfolio_write_option",
+    "portfolio_close_option",
     "portfolio_journal_append",
     "bot__watch",
     "bot__alert",

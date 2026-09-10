@@ -137,6 +137,11 @@ def _is_valid_amount(value: float) -> bool:
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
 
+# Which way an options position faces. Long pays premium and owns
+# optionality; short collects premium and owes it.
+LONG = "long"
+SHORT = "short"
+
 # Conditional-order kinds. `stop` triggers AGAINST the prevailing
 # direction (buy on rise, sell on fall — protective + breakout). `limit`
 # triggers WITH the direction (buy on dip, sell on rise — entry +
@@ -191,10 +196,19 @@ class Position:
 
 @dataclass
 class OptionPosition:
-    """Long options position. Quantity is whole contracts (always > 0;
-    V1 is long-only). `multiplier` is shares-per-contract — 100 for
-    standard US equity options. `avg_premium` is per-share, so cost
-    basis = qty × multiplier × avg_premium.
+    """An options position, long or short.
+
+    `qty` is whole contracts and is always > 0; `side` carries the
+    direction. `multiplier` is shares-per-contract — 100 for standard US
+    equity options. `avg_premium` is per-share, so a long position's
+    cost basis and a short position's credit are both
+    qty × multiplier × avg_premium.
+
+    `collateral` is dollars removed from cash when the short was opened
+    and returned when it closes. Holding it out of cash rather than
+    tracking a separate buying-power number means every existing cash
+    check in this file already refuses to spend money that is pledged
+    against a short. Long positions carry 0.
     """
     context_key: str
     contract_symbol: str   # canonical OCC, e.g. AAPL250620C00175000
@@ -205,6 +219,16 @@ class OptionPosition:
     qty: float
     avg_premium: float
     multiplier: int
+    side: str = LONG
+    collateral: float = 0.0
+
+    @property
+    def is_short(self) -> bool:
+        return self.side == SHORT
+
+    def signed_qty(self) -> float:
+        """Contracts, negative when short. For exposure arithmetic."""
+        return -self.qty if self.is_short else self.qty
 
 
 @dataclass
@@ -321,6 +345,100 @@ class Order:
         ):
             return "above"
         return "below"
+
+
+# ── Short-option collateral ────────────────────────────────────────────────
+#
+# Every short is either cash-secured, covered by stock, or defined by a
+# protective long leg. Naked calls are rejected outright: their loss is
+# unbounded, so no finite amount of collateral makes them safe, and a
+# paper book that allows them stops teaching anything.
+#
+# Collateral is held OUT of cash rather than tracked as a separate
+# buying-power figure. That way `buy`, `buy_option` and every other cash
+# check in this file already refuse to spend money pledged to a short,
+# with no changes to any of them.
+
+
+def _short_collateral(
+    option_type: str,
+    strike: float,
+    qty: float,
+    multiplier: int,
+    *,
+    shares_held: float,
+    protective_strike: Optional[float],
+) -> tuple[float, Optional[str]]:
+    """`(dollars_to_pledge, error)` for writing `qty` contracts.
+
+    `protective_strike` is the strike of a long leg in the same
+    underlying, type and expiry that caps the loss, or None.
+    """
+    notional = qty * multiplier
+    if option_type == "put":
+        if protective_strike is not None and protective_strike < strike:
+            # Put credit spread: the most it can lose is the width.
+            return (strike - protective_strike) * notional, None
+        # Cash-secured: enough to buy the stock if assigned.
+        return strike * notional, None
+
+    if shares_held + 1e-9 >= notional:
+        # Covered call. The shares are the collateral; sell() refuses to
+        # let them go while the call is open.
+        return 0.0, None
+    if protective_strike is not None and protective_strike > strike:
+        # Call credit spread: capped at the width.
+        return (protective_strike - strike) * notional, None
+    return 0.0, (
+        "Naked calls aren't allowed: loss is unbounded. Either hold "
+        f"{notional:g} shares of the underlying first (covered call) or "
+        "buy a higher-strike call in the same expiry (credit spread)."
+    )
+
+
+# The single definition of "this short call is backed by stock".
+#
+# `collateral` does double duty: how much cash is pledged, and — by
+# being zero — which backing a row uses. Four facts keep that
+# equivalence true, and breaking any one of them puts an unbounded-loss
+# position in the book:
+#
+#   1. write_option prices the WHOLE row on every write, never the
+#      incoming tranche alone.
+#   2. That price REPLACES the old pledge, downward as well as upward.
+#   3. _short_collateral returns exactly 0.0 for the covered branch and
+#      a strictly positive figure for both others.
+#   4. close_short_option scales collateral LINEARLY with qty, which is
+#      what lets 1-3 survive a partial close.
+#
+# Two consumers depend on the equivalence (the share reservation in
+# sell() and the reserve subtraction in _short_context); they share this
+# text so they cannot drift apart. tests/test_paper_portfolio_shorts.py
+# asserts the invariant directly after every multi-leg sequence.
+_SHARE_BACKED_CALLS_SQL = (
+    "SELECT COALESCE(SUM(qty * multiplier), 0) FROM options_positions "
+    "WHERE context_key = ? AND underlying = ? "
+    "AND option_type = 'call' AND side = ? AND collateral <= 0"
+)
+
+
+def _structure_label(
+    option_type: str,
+    shares_held: float,
+    protective_strike: Optional[float],
+    multiplier: int,
+    qty: float,
+) -> str:
+    """Name the structure a write creates, for the trade confirmation."""
+    if option_type == "call":
+        if shares_held + 1e-9 >= qty * multiplier:
+            return "covered call"
+        if protective_strike is not None:
+            return "call credit spread"
+        return "short call"
+    if protective_strike is not None:
+        return "put credit spread"
+    return "cash-secured put"
 
 
 def _et_day_bounds(now_ts: Optional[float] = None) -> tuple[float, float]:
@@ -516,9 +634,11 @@ class PortfolioStore:
                 "CREATE INDEX IF NOT EXISTS idx_orders_context_status "
                 "ON portfolio_orders(context_key, status, created_at DESC)"
             )
-            # Options positions (long-only). One row per
-            # (context_key, contract_symbol). Contract symbol is the
-            # canonical OCC form — see src/options_symbols.py for
+            # Options positions. One row per (context_key,
+            # contract_symbol) — a context is either long or short a
+            # given contract, never both, so buying while short reduces
+            # the short exactly as a real account nets. Contract symbol
+            # is the canonical OCC form — see src/options_symbols.py for
             # parsing helpers. `expiration` is unix-ts at start-of-day
             # for the expiration date so settlement can compare with
             # ``time.time()`` directly.
@@ -534,10 +654,26 @@ class PortfolioStore:
                     qty REAL NOT NULL,
                     avg_premium REAL NOT NULL,
                     multiplier INTEGER NOT NULL DEFAULT 100,
+                    side TEXT NOT NULL DEFAULT 'long',
+                    collateral REAL NOT NULL DEFAULT 0,
                     PRIMARY KEY (context_key, contract_symbol)
                 )
                 """
             )
+            # Migrate: rows written before shorts existed are all long
+            # with nothing pledged, which is what the defaults say.
+            cursor = await db.execute("PRAGMA table_info(options_positions)")
+            opt_cols = {r[1] for r in await cursor.fetchall()}
+            if "side" not in opt_cols:
+                await db.execute(
+                    "ALTER TABLE options_positions ADD COLUMN "
+                    "side TEXT NOT NULL DEFAULT 'long'"
+                )
+            if "collateral" not in opt_cols:
+                await db.execute(
+                    "ALTER TABLE options_positions ADD COLUMN "
+                    "collateral REAL NOT NULL DEFAULT 0"
+                )
             # Speeds up the settlement worker's "what's expiring at or
             # before now?" scan across all contexts.
             await db.execute(
@@ -883,6 +1019,25 @@ class PortfolioStore:
                             f"{qty:g}."
                         ),
                     }
+                # Shares backing a covered call are spoken for. Selling
+                # them would silently convert that call into a naked one,
+                # which write_option refuses to open in the first place.
+                cursor = await db.execute(
+                    _SHARE_BACKED_CALLS_SQL, (context_key, ticker, SHORT),
+                )
+                reserved_row = await cursor.fetchone()
+                reserved = float(reserved_row[0]) if reserved_row else 0.0
+                if reserved > 0 and old_qty - qty < reserved - 1e-6:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{reserved:g} {ticker} shares are covering "
+                            f"short calls. Sell at most "
+                            f"{max(0.0, old_qty - reserved):g}, or buy the "
+                            f"calls back first with portfolio_close_option."
+                        ),
+                    }
                 # Snap exact-close requests to the stored qty so the row
                 # cleanly deletes instead of leaving a 1e-12 stub.
                 if abs(qty - old_qty) < 1e-6:
@@ -984,7 +1139,8 @@ class PortfolioStore:
         return equity_realized + options_realized
 
     # ------------------------------------------------------------------
-    # Options trading (long-only; multiplier 100 by default)
+
+    # Options trading (long and short; multiplier 100 by default)
     # ------------------------------------------------------------------
 
     async def options_positions(self, context_key: str) -> list[OptionPosition]:
@@ -992,7 +1148,8 @@ class PortfolioStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT context_key, contract_symbol, underlying, option_type,
-                          strike, expiration, qty, avg_premium, multiplier
+                          strike, expiration, qty, avg_premium, multiplier,
+                          side, collateral
                    FROM options_positions
                    WHERE context_key = ? ORDER BY expiration, contract_symbol""",
                 (context_key,),
@@ -1003,6 +1160,7 @@ class PortfolioStore:
                 context_key=r[0], contract_symbol=r[1], underlying=r[2],
                 option_type=r[3], strike=float(r[4]), expiration=float(r[5]),
                 qty=float(r[6]), avg_premium=float(r[7]), multiplier=int(r[8]),
+                side=r[9] or LONG, collateral=float(r[10] or 0.0),
             ) for r in rows
         ]
 
@@ -1013,7 +1171,8 @@ class PortfolioStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT context_key, contract_symbol, underlying, option_type,
-                          strike, expiration, qty, avg_premium, multiplier
+                          strike, expiration, qty, avg_premium, multiplier,
+                          side, collateral
                    FROM options_positions
                    WHERE context_key = ? AND contract_symbol = ?""",
                 (context_key, contract_symbol.upper()),
@@ -1026,6 +1185,7 @@ class PortfolioStore:
             option_type=row[3], strike=float(row[4]), expiration=float(row[5]),
             qty=float(row[6]), avg_premium=float(row[7]),
             multiplier=int(row[8]),
+            side=row[9] or LONG, collateral=float(row[10] or 0.0),
         )
 
     async def list_options_positions_all(self) -> list[OptionPosition]:
@@ -1037,7 +1197,8 @@ class PortfolioStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT context_key, contract_symbol, underlying, option_type,
-                          strike, expiration, qty, avg_premium, multiplier
+                          strike, expiration, qty, avg_premium, multiplier,
+                          side, collateral
                    FROM options_positions ORDER BY expiration"""
             )
             rows = await cursor.fetchall()
@@ -1046,6 +1207,7 @@ class PortfolioStore:
                 context_key=r[0], contract_symbol=r[1], underlying=r[2],
                 option_type=r[3], strike=float(r[4]), expiration=float(r[5]),
                 qty=float(r[6]), avg_premium=float(r[7]), multiplier=int(r[8]),
+                side=r[9] or LONG, collateral=float(r[10] or 0.0),
             ) for r in rows
         ]
 
@@ -1061,10 +1223,11 @@ class PortfolioStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT context_key, contract_symbol, underlying, option_type,
-                          strike, expiration, qty, avg_premium, multiplier
+                          strike, expiration, qty, avg_premium, multiplier,
+                          side, collateral
                    FROM options_positions
                    WHERE expiration <= ?
-                   ORDER BY expiration""",
+                   ORDER BY expiration, side DESC""",
                 (float(now_ts),),
             )
             rows = await cursor.fetchall()
@@ -1073,6 +1236,7 @@ class PortfolioStore:
                 context_key=r[0], contract_symbol=r[1], underlying=r[2],
                 option_type=r[3], strike=float(r[4]), expiration=float(r[5]),
                 qty=float(r[6]), avg_premium=float(r[7]), multiplier=int(r[8]),
+                side=r[9] or LONG, collateral=float(r[10] or 0.0),
             ) for r in rows
         ]
 
@@ -1145,11 +1309,20 @@ class PortfolioStore:
                     }
 
                 cursor = await db.execute(
-                    "SELECT qty, avg_premium FROM options_positions "
+                    "SELECT qty, avg_premium, side FROM options_positions "
                     "WHERE context_key = ? AND contract_symbol = ?",
                     (context_key, contract_symbol),
                 )
                 pos_row = await cursor.fetchone()
+                if pos_row is not None and (pos_row[2] or LONG) == SHORT:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Short {pos_row[0]:g} {contract_symbol}. Use "
+                            f"portfolio_close_option to buy it back."
+                        ),
+                    }
                 if pos_row is None:
                     new_qty = qty
                     new_avg = premium
@@ -1207,6 +1380,467 @@ class PortfolioStore:
                 await db.rollback()
                 raise
 
+    async def _short_context(
+        self, db, context_key: str, underlying: str, option_type: str,
+        expiration: float, contract_symbol: str, add_qty: float,
+    ) -> tuple[float, Optional[float], Optional[str]]:
+        """`(shares_held, protective_strike, error)` for a prospective write.
+
+        The protective leg must be big enough to cover every short in
+        the same underlying/type/expiry once this one is added, so one
+        long call can't be counted as the cap for two separate spreads.
+        """
+        cursor = await db.execute(
+            "SELECT qty FROM positions WHERE context_key = ? AND ticker = ?",
+            (context_key, underlying),
+        )
+        row = await cursor.fetchone()
+        shares_held = float(row[0]) if row else 0.0
+        # Shares already covering a short call are spent. Without this,
+        # writing one contract at a time against the same 100 shares
+        # reports "covered call" every time and pledges nothing — three
+        # writes give three naked calls. Counts every expiry.
+        #
+        # This contract's own row is excluded because the caller re-prices
+        # the whole row, existing contracts included, rather than pricing
+        # each tranche on its own.
+        cursor = await db.execute(
+            _SHARE_BACKED_CALLS_SQL + " AND contract_symbol != ?",
+            (context_key, underlying, SHORT, contract_symbol),
+        )
+        reserved_row = await cursor.fetchone()
+        shares_held = max(
+            0.0, shares_held - (float(reserved_row[0]) if reserved_row else 0.0)
+        )
+
+        cursor = await db.execute(
+            """SELECT contract_symbol, strike, qty, side FROM options_positions
+               WHERE context_key = ? AND underlying = ? AND option_type = ?
+                 AND expiration = ?""",
+            (context_key, underlying, option_type, float(expiration)),
+        )
+        legs = await cursor.fetchall()
+
+        short_qty = add_qty + sum(
+            float(q) for sym, _k, q, side in legs
+            if side == SHORT and sym != contract_symbol
+        )
+        existing = next(
+            (float(q) for sym, _k, q, side in legs
+             if side == SHORT and sym == contract_symbol), 0.0,
+        )
+        short_qty += existing
+
+        longs = [
+            (float(k), float(q)) for _sym, k, q, side in legs
+            if side == LONG and float(q) + 1e-9 >= short_qty
+        ]
+        return shares_held, longs, None
+
+    async def write_option(
+        self,
+        context_key: str,
+        *,
+        contract_symbol: str,
+        underlying: str,
+        option_type: str,
+        strike: float,
+        expiration: float,
+        qty: float,
+        premium: float,
+        multiplier: int = 100,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+    ) -> dict:
+        """Sell to open: write `qty` contracts and collect the premium.
+
+        Credits the premium to cash and pledges collateral against the
+        obligation in the same transaction — see `_short_collateral` for
+        which of cash-secured, covered, or spread applies. A write that
+        would be a naked call is refused.
+        """
+        if source not in VALID_SOURCES:
+            raise ValueError(f"invalid source: {source!r}")
+        if option_type not in ("call", "put"):
+            return {"ok": False, "error": f"option_type must be 'call' or 'put', got {option_type!r}"}
+        if not _is_valid_amount(qty) or not _is_valid_amount(premium):
+            return {"ok": False, "error": "qty and premium must be finite numbers."}
+        if qty <= 0:
+            return {"ok": False, "error": "qty must be positive."}
+        if premium <= 0:
+            return {"ok": False, "error": "premium must be positive (no zero-bid writes)."}
+        if multiplier <= 0:
+            return {"ok": False, "error": "multiplier must be positive."}
+        if strike <= 0:
+            return {"ok": False, "error": "strike must be positive."}
+        contract_symbol = contract_symbol.strip().upper()
+        underlying = underlying.strip().upper()
+        if not contract_symbol or not underlying:
+            return {"ok": False, "error": "contract_symbol and underlying are required."}
+
+        proceeds = qty * premium * multiplier
+        await self.ensure_portfolio(context_key)
+
+        async with db_session(self) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """SELECT qty, avg_premium, side, collateral
+                       FROM options_positions
+                       WHERE context_key = ? AND contract_symbol = ?""",
+                    (context_key, contract_symbol),
+                )
+                pos_row = await cursor.fetchone()
+                if pos_row is not None and (pos_row[2] or LONG) == LONG:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Already long {pos_row[0]:g} {contract_symbol}. "
+                            f"Close that with portfolio_sell_option before "
+                            f"writing the same contract short."
+                        ),
+                    }
+
+                shares_held, long_legs, err = await self._short_context(
+                    db, context_key, underlying, option_type,
+                    float(expiration), contract_symbol, qty,
+                )
+                if err:
+                    await db.rollback()
+                    return {"ok": False, "error": err}
+
+                # Cheapest valid cap: for a short call the lowest long
+                # strike above it, for a short put the highest below.
+                if option_type == "call":
+                    candidates = [k for k, _q in long_legs if k > strike]
+                    protective = min(candidates) if candidates else None
+                else:
+                    candidates = [k for k, _q in long_legs if k < strike]
+                    protective = max(candidates) if candidates else None
+
+                # Price the ROW, not this tranche. Pricing tranches
+                # separately lets one row mix bases — a first contract
+                # covered by stock and a second capped by a leg — and
+                # then `collateral > 0` stops describing the whole row:
+                # the reservation check frees the shares while a
+                # contract is still relying on them, leaving the row
+                # short by a full width.
+                existing_qty = float(pos_row[0]) if pos_row is not None else 0.0
+                old_collateral = float(pos_row[3] or 0.0) if pos_row is not None else 0.0
+                total_needed, err = _short_collateral(
+                    option_type, float(strike), existing_qty + qty,
+                    int(multiplier),
+                    shares_held=shares_held, protective_strike=protective,
+                )
+                if err:
+                    await db.rollback()
+                    return {"ok": False, "error": err}
+                # The re-price IS the row's price, so it replaces the old
+                # pledge outright — including downward. Clamping it to
+                # never refund looks conservative and is the opposite: a
+                # row whose honest price falls to zero is one backed by
+                # stock, and leaving a pledge on it puts it outside the
+                # `collateral <= 0` bucket that both the share
+                # reservation in sell() and the reserve subtraction in
+                # _short_context use to find stock-backed rows. The
+                # shares then walk out from under it.
+                #
+                # Refunding is safe because every input here already
+                # excludes what other rows have claimed: `shares_held`
+                # nets off every other stock-backed short, sell() will
+                # not release shares a zero-collateral row is using, and
+                # _protective_obligation will not release a leg a
+                # pledged row depends on.
+                new_collateral = total_needed
+                collateral = new_collateral - old_collateral
+
+                cursor = await db.execute(
+                    "SELECT cash FROM portfolios WHERE context_key = ?",
+                    (context_key,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await db.rollback()
+                    return {"ok": False, "error": "Portfolio not found."}
+                cash = row[0]
+                # The premium lands before the collateral is pledged, so
+                # it counts toward covering it — same as a real
+                # cash-secured write.
+                if collateral > 0 and collateral > cash + proceeds + 1e-9:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Insufficient collateral: writing {qty:g} "
+                            f"{contract_symbol} pledges ${collateral:,.2f}; "
+                            f"have ${cash:,.2f} cash plus ${proceeds:,.2f} "
+                            f"premium."
+                        ),
+                    }
+
+                if pos_row is None:
+                    new_qty, new_avg = qty, premium
+                    await db.execute(
+                        """INSERT INTO options_positions
+                           (context_key, contract_symbol, underlying, option_type,
+                            strike, expiration, qty, avg_premium, multiplier,
+                            side, collateral)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            context_key, contract_symbol, underlying, option_type,
+                            float(strike), float(expiration), new_qty, new_avg,
+                            int(multiplier), SHORT, new_collateral,
+                        ),
+                    )
+                else:
+                    old_qty, old_avg = pos_row[0], pos_row[1]
+                    new_qty = old_qty + qty
+                    new_avg = ((old_qty * old_avg) + (qty * premium)) / new_qty
+                    await db.execute(
+                        "UPDATE options_positions SET qty = ?, avg_premium = ?, "
+                        "collateral = ? "
+                        "WHERE context_key = ? AND contract_symbol = ?",
+                        (new_qty, new_avg, new_collateral, context_key, contract_symbol),
+                    )
+
+                cash_after = cash + proceeds - collateral
+                await db.execute(
+                    "UPDATE portfolios SET cash = ? WHERE context_key = ?",
+                    (cash_after, context_key),
+                )
+
+                cursor = await db.execute(
+                    """INSERT INTO option_trades
+                       (context_key, ts, contract_symbol, underlying, option_type,
+                        strike, expiration, side, qty, premium, multiplier,
+                        proceeds, realized_pnl, reason, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                    (
+                        context_key, time.time(), contract_symbol, underlying,
+                        option_type, float(strike), float(expiration),
+                        SIDE_SELL, qty, premium, int(multiplier), proceeds,
+                        reason, source,
+                    ),
+                )
+                trade_id = cursor.lastrowid or 0
+                await db.commit()
+                return {
+                    "ok": True,
+                    "trade_id": trade_id,
+                    "cash_after": cash_after,
+                    "qty_after": new_qty,
+                    "avg_premium_after": new_avg,
+                    "proceeds": proceeds,
+                    "collateral": collateral,
+                    "collateral_total": new_collateral,
+                    # Labelled off the same total the pledge was priced
+                    # on, so a row that outgrew its share cover reports
+                    # the spread it actually became.
+                    "structure": _structure_label(
+                        option_type, shares_held, protective, int(multiplier),
+                        existing_qty + qty,
+                    ),
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def close_short_option(
+        self,
+        context_key: str,
+        *,
+        contract_symbol: str,
+        qty: float,
+        premium: float,
+        reason: Optional[str] = None,
+        source: str = SOURCE_REACTIVE,
+        settlement_intrinsic: Optional[float] = None,
+    ) -> dict:
+        """Buy to close (some of) a short position at `premium`.
+
+        Pays the cost, returns the pro-rata share of pledged collateral,
+        and books realized PnL as (credit received - cost to close).
+
+        `settlement_intrinsic` marks the expiry path: the trade is
+        recorded as 'settle' and `premium` is per-share intrinsic. A
+        short that expires worthless settles at 0 and simply hands the
+        collateral back.
+        """
+        if source not in VALID_SOURCES:
+            raise ValueError(f"invalid source: {source!r}")
+        if not _is_valid_amount(qty) or qty <= 0:
+            return {"ok": False, "error": "qty must be positive and finite."}
+        if not _is_valid_amount(premium) or premium < 0:
+            return {"ok": False, "error": "premium must be finite and non-negative."}
+        contract_symbol = contract_symbol.strip().upper()
+        if not contract_symbol:
+            return {"ok": False, "error": "contract_symbol required."}
+
+        await self.ensure_portfolio(context_key)
+        is_settlement = settlement_intrinsic is not None
+        side = "settle" if is_settlement else SIDE_BUY
+
+        async with db_session(self) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """SELECT qty, avg_premium, underlying, option_type,
+                              strike, expiration, multiplier, side, collateral
+                       FROM options_positions
+                       WHERE context_key = ? AND contract_symbol = ?""",
+                    (context_key, contract_symbol),
+                )
+                pos_row = await cursor.fetchone()
+                if pos_row is None:
+                    await db.rollback()
+                    return {"ok": False, "error": f"No options position in {contract_symbol}."}
+                if (pos_row[7] or LONG) != SHORT:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{contract_symbol} is a long position. Use "
+                            f"portfolio_sell_option to close it."
+                        ),
+                    }
+                old_qty, old_avg = pos_row[0], pos_row[1]
+                underlying, option_type = pos_row[2], pos_row[3]
+                strike, expiration = float(pos_row[4]), float(pos_row[5])
+                multiplier = int(pos_row[6])
+                old_collateral = float(pos_row[8] or 0.0)
+                if qty > old_qty + 1e-6:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Only short {old_qty:g} contracts of "
+                            f"{contract_symbol}; can't close {qty:g}."
+                        ),
+                    }
+                if abs(qty - old_qty) < 1e-6:
+                    qty = old_qty
+
+                cost = qty * premium * multiplier
+                # Short PnL is the mirror of long: the credit collected
+                # minus what it costs to buy back.
+                realized = (old_avg - premium) * qty * multiplier
+                new_qty = old_qty - qty
+                if new_qty <= 1e-9:
+                    released = old_collateral
+                    new_collateral = 0.0
+                    await db.execute(
+                        "DELETE FROM options_positions "
+                        "WHERE context_key = ? AND contract_symbol = ?",
+                        (context_key, contract_symbol),
+                    )
+                else:
+                    released = old_collateral * (qty / old_qty)
+                    new_collateral = old_collateral - released
+                    await db.execute(
+                        "UPDATE options_positions SET qty = ?, collateral = ? "
+                        "WHERE context_key = ? AND contract_symbol = ?",
+                        (new_qty, new_collateral, context_key, contract_symbol),
+                    )
+
+                cursor = await db.execute(
+                    "SELECT cash FROM portfolios WHERE context_key = ?",
+                    (context_key,),
+                )
+                row = await cursor.fetchone()
+                cash = row[0] if row else 0.0
+                # Settlement is not optional, so it is allowed to run the
+                # book negative; a discretionary buy-to-close is not.
+                if not is_settlement and cost > cash + released + 1e-9:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Insufficient cash to close: costs "
+                            f"${cost:,.2f}, have ${cash:,.2f} plus "
+                            f"${released:,.2f} released collateral."
+                        ),
+                    }
+                cash_after = cash - cost + released
+                await db.execute(
+                    "UPDATE portfolios SET cash = ? WHERE context_key = ?",
+                    (cash_after, context_key),
+                )
+
+                cursor = await db.execute(
+                    """INSERT INTO option_trades
+                       (context_key, ts, contract_symbol, underlying, option_type,
+                        strike, expiration, side, qty, premium, multiplier,
+                        proceeds, realized_pnl, reason, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        context_key, time.time(), contract_symbol, underlying,
+                        option_type, strike, expiration,
+                        side, qty, premium, multiplier, cost,
+                        realized, reason, source,
+                    ),
+                )
+                trade_id = cursor.lastrowid or 0
+                await db.commit()
+                return {
+                    "ok": True,
+                    "trade_id": trade_id,
+                    "cash_after": cash_after,
+                    "qty_after": new_qty if new_qty > 1e-9 else 0.0,
+                    "realized_pnl": realized,
+                    "cost": cost,
+                    "collateral_released": released,
+                    "underlying": underlying,
+                    "option_type": option_type,
+                    "strike": strike,
+                    "expiration": expiration,
+                    "multiplier": multiplier,
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def _protective_obligation(
+        self, db, context_key: str, underlying: str, option_type: str,
+        expiration: float, strike: float, multiplier: int,
+    ) -> float:
+        """Contracts of this long leg that shorts are relying on.
+
+        A short is relying on a leg when the leg caps its loss — a
+        higher-strike call above a short call, a lower-strike put below
+        a short put — AND the short was not collateralized on its own.
+        A short call with no collateral is covered by stock and needs no
+        leg; a short put pledged its full strike is cash-secured and
+        needs none either.
+        """
+        cursor = await db.execute(
+            """SELECT strike, qty, collateral FROM options_positions
+               WHERE context_key = ? AND underlying = ? AND option_type = ?
+                 AND expiration = ? AND side = ?""",
+            (context_key, underlying, option_type, float(expiration), SHORT),
+        )
+        needed = 0.0
+        for short_strike, short_qty, collateral in await cursor.fetchall():
+            short_strike = float(short_strike)
+            short_qty = float(short_qty)
+            collateral = float(collateral or 0.0)
+            capped_by_this_leg = (
+                strike > short_strike if option_type == "call"
+                else strike < short_strike
+            )
+            if not capped_by_this_leg:
+                continue
+            if option_type == "call":
+                # Zero pledged means stock is doing the work.
+                if collateral <= 1e-9:
+                    continue
+            else:
+                cash_secured = short_strike * short_qty * multiplier
+                if collateral + 1e-6 >= cash_secured:
+                    continue
+            needed += short_qty
+        return needed
+
     async def sell_option(
         self,
         context_key: str,
@@ -1247,7 +1881,7 @@ class PortfolioStore:
             try:
                 cursor = await db.execute(
                     """SELECT qty, avg_premium, underlying, option_type,
-                              strike, expiration, multiplier
+                              strike, expiration, multiplier, side
                        FROM options_positions
                        WHERE context_key = ? AND contract_symbol = ?""",
                     (context_key, contract_symbol),
@@ -1256,6 +1890,16 @@ class PortfolioStore:
                 if pos_row is None:
                     await db.rollback()
                     return {"ok": False, "error": f"No options position in {contract_symbol}."}
+                if (pos_row[7] or LONG) == SHORT:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{contract_symbol} is short. Use "
+                            f"portfolio_close_option to buy it back, or "
+                            f"portfolio_write_option to add to the short."
+                        ),
+                    }
                 old_qty, old_avg = pos_row[0], pos_row[1]
                 underlying = pos_row[2]
                 option_type = pos_row[3]
@@ -1274,6 +1918,32 @@ class PortfolioStore:
                 # Snap exact-close requests to the stored qty.
                 if abs(qty - old_qty) < 1e-6:
                     qty = old_qty
+
+                # A long leg that caps a short is load-bearing, exactly
+                # like shares behind a covered call: selling it would
+                # leave the short uncollateralized, which is the
+                # position write_option refuses to open in the first
+                # place. Same rule as _short_context applies in reverse.
+                # Settlement is not optional — both legs of a spread
+                # expire the same day, and refusing the long here would
+                # strand it until the next sweep and mark it against a
+                # different spot than its own short.
+                needed = 0.0 if is_settlement else await self._protective_obligation(
+                    db, context_key, underlying, option_type, expiration,
+                    float(strike), multiplier,
+                )
+                if needed > 0 and old_qty - qty < needed - 1e-6:
+                    await db.rollback()
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{needed:g} of these contracts are capping "
+                            f"short {underlying} {option_type}s in the same "
+                            f"expiry. Close those with "
+                            f"portfolio_close_option first, or sell at most "
+                            f"{max(0.0, old_qty - needed):g}."
+                        ),
+                    }
                 proceeds = qty * premium * multiplier
                 realized = (premium - old_avg) * qty * multiplier
                 new_qty = old_qty - qty
