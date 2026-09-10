@@ -4,9 +4,17 @@ Yahoo Finance provider - no API key required.
 Uses yfinance library which scrapes Yahoo Finance.
 Best for: development, fallback, users without API keys.
 Limitations: unofficial, may break if Yahoo changes their site.
+
+Options: the only free chain source in this deployment. Polygon serves
+chains on its paid tier only, so without this the whole options surface
+(!chain, !opt, the paper portfolio's options tools, skew, flow) returns
+"no providers available". Yahoo gives strike, bid/ask, last, volume,
+open interest and implied vol, but no greeks.
 """
 
 import logging
+import math
+import re
 from datetime import datetime
 
 import yfinance as yf
@@ -19,16 +27,54 @@ try:
 except Exception:
     pass  # Ignore if it fails
 
+from ..cache import TTLCache
+from ..options_symbols import parse_occ
 from .base import (
     BaseProvider,
     Quote,
     HistoricalBar,
     Fundamentals,
+    OptionQuote,
     ProviderCapability,
+    ProviderError,
     SymbolNotFoundError,
 )
 
 logger = logging.getLogger(__name__)
+
+# Raw yfinance chain frames, keyed by "SYMBOL:YYYY-MM-DD". Yahoo has no
+# per-contract endpoint, so every single-contract quote is a whole-chain
+# download; without this, pricing one portfolio's positions or drawing a
+# term structure re-downloads the same expiry several times over. Short
+# TTL because the paper executor fills at these marks.
+_CHAIN_CACHE: TTLCache = TTLCache(ttl_seconds=60, max_size=256, name="yahoo_option_chains")
+
+
+def _finite_float(value):
+    """None for NaN/inf/unparseable — yfinance frames are full of NaN."""
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _atm_pivot(calls_frame):
+    """Spot, near enough, from a calls frame's inTheMoney flag.
+
+    The boundary between in- and out-of-the-money calls is the
+    underlying price, so the highest ITM strike locates the money
+    without a second quote request. None when the column is absent.
+    """
+    try:
+        itm = calls_frame[calls_frame["inTheMoney"].astype(bool)]
+        if itm.empty:
+            return None
+        return float(itm["strike"].max())
+    except Exception:
+        return None
 
 
 class YahooFinanceProvider(BaseProvider):
@@ -37,6 +83,7 @@ class YahooFinanceProvider(BaseProvider):
         ProviderCapability.QUOTE,
         ProviderCapability.HISTORICAL,
         ProviderCapability.FUNDAMENTALS,
+        ProviderCapability.OPTIONS,
     }
     
     async def get_quote(self, symbol: str) -> Quote:
@@ -188,6 +235,179 @@ class YahooFinanceProvider(BaseProvider):
             provider=self.name,
         )
     
+
+    # ── Options ────────────────────────────────────────────────────────────
+
+    async def get_options_chain(
+        self,
+        underlying: str,
+        expiration: str = None,
+        limit: int = 100,
+    ) -> list[OptionQuote]:
+        """Contracts for one expiry, nearest the money first.
+
+        Differs from the Polygon implementation in two ways worth
+        knowing: `expiration=None` means the FRONT expiry rather than a
+        snapshot across all of them, and `limit` keeps the contracts
+        closest to the money rather than an arbitrary page.
+        """
+        return await run_blocking(
+            self._get_options_chain_sync, underlying, expiration, limit,
+            timeout=30.0,
+        )
+
+    def _get_options_chain_sync(
+        self, underlying: str, expiration, limit: int,
+    ) -> list[OptionQuote]:
+        underlying = (underlying or "").strip().upper()
+        if not re.match(r"^[A-Z][A-Z.\-]{0,9}$", underlying):
+            raise ProviderError(
+                f"get_options_chain: invalid underlying {underlying!r}"
+            )
+        if expiration and not re.match(r"^\d{4}-\d{2}-\d{2}$", str(expiration)):
+            raise ProviderError(
+                f"get_options_chain: invalid expiration {expiration!r}; "
+                f"expected YYYY-MM-DD"
+            )
+        ticker = yf.Ticker(underlying)
+        try:
+            expirations = list(ticker.options or ())
+        except Exception as e:
+            raise SymbolNotFoundError(f"No options for {underlying}: {e}")
+        if not expirations:
+            raise SymbolNotFoundError(f"No options for {underlying}")
+        target = str(expiration) if expiration else expirations[0]
+        if target not in expirations:
+            raise SymbolNotFoundError(
+                f"{underlying} has no {target} expiry; available: "
+                f"{', '.join(expirations[:8])}"
+            )
+        cache_key = f"{underlying}:{target}"
+        chain = _CHAIN_CACHE.get(cache_key)
+        if chain is None:
+            try:
+                chain = ticker.option_chain(target)
+            except Exception as e:
+                raise ProviderError(f"chain fetch failed for {underlying}: {e}")
+            _CHAIN_CACHE.set(cache_key, chain)
+
+        rows: list[OptionQuote] = []
+        pivot = None
+        for frame, kind in ((chain.calls, "call"), (chain.puts, "put")):
+            if frame is None or frame.empty:
+                continue
+            if kind == "call":
+                pivot = _atm_pivot(frame)
+            for row in frame.itertuples(index=False):
+                quote = self._row_to_option_quote(row, underlying, target, kind)
+                if quote is not None:
+                    rows.append(quote)
+        if not rows:
+            return rows
+        # `limit` takes the contracts nearest the money, not the lowest
+        # strikes. Truncating a strike-sorted chain would hand back deep
+        # ITM calls and worthless puts and never the strikes anyone
+        # trades — on SPY at 759, limit=100 returned 505 through 744.
+        limit = max(1, int(limit))
+        if len(rows) > limit:
+            if pivot is None:
+                strikes = sorted(q.strike for q in rows)
+                pivot = strikes[len(strikes) // 2]
+            rows.sort(key=lambda q: (abs(q.strike - pivot), q.strike, q.type))
+            rows = rows[:limit]
+        # Strike order with calls before puts at the same strike: callers
+        # that slice around the money get a symmetric window either way.
+        rows.sort(key=lambda q: (q.strike, q.type))
+        return rows
+
+    def _row_to_option_quote(
+        self, row, underlying: str, expiration: str, kind: str,
+    ):
+        symbol = str(getattr(row, "contractSymbol", "") or "")
+        if not symbol:
+            return None
+        try:
+            exp_dt = datetime.strptime(expiration, "%Y-%m-%d")
+        except ValueError:
+            exp_dt = datetime.now()
+        # Mid beats last: a contract that last printed hours ago still
+        # has a live two-sided market, and the paper executor fills at
+        # this price. A bid of exactly 0.00 against a live ask is the
+        # normal state of a cheap far-OTM contract, not a missing book,
+        # so it must not fall through to `lastPrice` — that print can be
+        # days old and well above the current offer, which would both
+        # overstate the mark and fill buys above the ask.
+        bid = _finite_float(getattr(row, "bid", None)) or 0.0
+        ask = _finite_float(getattr(row, "ask", None)) or 0.0
+        last = _finite_float(getattr(row, "lastPrice", None))
+        if ask > 0:
+            price = (bid + ask) / 2.0 if ask >= bid else ask
+        else:
+            price = last or 0.0
+        return OptionQuote(
+            symbol=symbol,
+            underlying=underlying,
+            expiration=exp_dt,
+            strike=_finite_float(getattr(row, "strike", None)) or 0.0,
+            type=kind,
+            price=price,
+            change=_finite_float(getattr(row, "change", None)) or 0.0,
+            change_percent=_finite_float(getattr(row, "percentChange", None)) or 0.0,
+            volume=int(_finite_float(getattr(row, "volume", None)) or 0),
+            open_interest=int(_finite_float(getattr(row, "openInterest", None)) or 0),
+            implied_volatility=_finite_float(
+                getattr(row, "impliedVolatility", None)
+            ),
+            greeks=None,
+            timestamp=datetime.now(),
+            provider=self.name,
+        )
+
+    async def get_option_expirations(self, underlying: str) -> list[str]:
+        return await run_blocking(
+            self._get_option_expirations_sync, underlying, timeout=20.0,
+        )
+
+    def _get_option_expirations_sync(self, underlying: str) -> list[str]:
+        underlying = (underlying or "").strip().upper()
+        if not re.match(r"^[A-Z][A-Z.\-]{0,9}$", underlying):
+            raise ProviderError(
+                f"get_option_expirations: invalid underlying {underlying!r}"
+            )
+        try:
+            out = [str(e) for e in (yf.Ticker(underlying).options or ())]
+        except Exception as e:
+            raise SymbolNotFoundError(f"No options for {underlying}: {e}")
+        if not out:
+            raise SymbolNotFoundError(f"No options for {underlying}")
+        return out
+
+    async def get_option_quote(self, symbol: str) -> OptionQuote:
+        return await run_blocking(
+            self._get_option_quote_sync, symbol, timeout=30.0,
+        )
+
+    def _get_option_quote_sync(self, symbol: str) -> OptionQuote:
+        """Single contract by OCC symbol.
+
+        Yahoo has no per-contract endpoint, so this pulls that contract's
+        expiry and picks the row out. `_CHAIN_CACHE` is what keeps that
+        affordable: quoting a dozen contracts on one expiry costs one
+        download, not a dozen.
+        """
+        occ = (symbol or "").strip().upper()
+        try:
+            parts = parse_occ(occ)
+        except Exception as e:
+            raise SymbolNotFoundError(f"Not an OCC contract symbol: {symbol!r} ({e})")
+        chain = self._get_options_chain_sync(
+            parts.root, parts.expiration.isoformat(), limit=10_000,
+        )
+        for quote in chain:
+            if quote.symbol.upper() == occ:
+                return quote
+        raise SymbolNotFoundError(f"Contract not listed: {occ}")
+
     async def health_check(self) -> bool:
         try:
             await self.get_quote("AAPL")

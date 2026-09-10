@@ -252,6 +252,30 @@ class FredProvider(BaseProvider):
             
             return await resp.json()
     
+    async def get_series(
+        self, series_id: str, limit: int = 30,
+    ) -> list[tuple[str, float]]:
+        """`(date, value)` newest-first for a raw FRED series id.
+
+        The public door onto `_fetch_series` for callers that want a
+        short window of one series rather than a formatted
+        EconomyIndicator — spread dashboards read a dozen series and do
+        their own arithmetic. FRED writes "." for holidays and other
+        missing prints; those rows are dropped rather than surfaced as
+        zero, which would read as a spread that collapsed to nothing.
+        """
+        data = await self._fetch_series(series_id, limit=limit)
+        out: list[tuple[str, float]] = []
+        for obs in data.get("observations") or []:
+            raw = (obs.get("value") or "").strip()
+            if not raw or raw == ".":
+                continue
+            try:
+                out.append((obs.get("date") or "", float(raw)))
+            except ValueError:
+                continue
+        return out
+
     async def get_economy_historical(
         self,
         indicator: str,

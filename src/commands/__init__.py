@@ -33,6 +33,15 @@ from .earnings_commands import (
 from .news_commands import (
     NewsCommand,
 )
+from .macro_commands import (
+    CreditCommand,
+    PricedInCommand,
+)
+from .options_analytics import (
+    SkewCommand,
+    FlowCommand,
+    RealizedVolCommand,
+)
 from .kalshi_command import (
     KalshiCommand,
 )
@@ -100,6 +109,11 @@ __all__ = [
     "DividendCommand",
     # News
     "NewsCommand",
+    "CreditCommand",
+    "PricedInCommand",
+    "SkewCommand",
+    "FlowCommand",
+    "RealizedVolCommand",
     "KalshiCommand",
     # Admin
     "MetricsCommand",

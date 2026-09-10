@@ -123,6 +123,11 @@ _READ_ONLY_TOOLS = frozenset({
     "bot__leaderboard",
     "bot__kalshi",
     "bot__numerology",
+    "bot__credit",
+    "bot__pricedin",
+    "bot__skew",
+    "bot__flow",
+    "bot__rvol",
 })
 
 _DURABLE_MUTATIONS = frozenset({

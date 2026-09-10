@@ -327,6 +327,37 @@ class ProviderManager:
                 last_error = e
         raise last_error or ProviderError("All providers failed to return option quote")
 
+    async def get_option_expirations(self, underlying: str) -> list[str]:
+        """Listed expiry dates (ISO, ascending) for `underlying`.
+
+        Separate from get_options_chain because every chain call needs an
+        expiry to ask for, and callers that pick one (nearest, first past
+        a horizon) would otherwise have to guess and retry.
+        """
+        providers = self._get_available_providers(ProviderCapability.OPTIONS)
+        if not providers:
+            raise ProviderError("No providers available for options")
+        last_error: Optional[Exception] = None
+        for provider in providers:
+            try:
+                return await self._call_provider(
+                    provider, 'get_option_expirations', underlying,
+                )
+            except RateLimitError as e:
+                self._mark_rate_limited(provider, e.retry_after or 60)
+                last_error = e
+            except (NotImplementedError, AttributeError) as e:
+                logger.debug(
+                    f"{provider.name} has no get_option_expirations: {e}"
+                )
+                last_error = e
+            except Exception as e:
+                logger.warning(
+                    f"Error fetching expirations from {provider.name}: {e}"
+                )
+                last_error = e
+        raise last_error or ProviderError("All providers failed for expirations")
+
     async def get_options_chain(
         self,
         underlying: str,

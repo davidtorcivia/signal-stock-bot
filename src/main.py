@@ -30,6 +30,7 @@ elif src_env.exists():
 
 from .config import Config
 from .providers import ProviderManager, YahooFinanceProvider, AlphaVantageProvider, MassiveProvider
+from .providers.base import ProviderCapability
 from .commands import (
     CommandDispatcher,
     PriceCommand,
@@ -55,6 +56,11 @@ from .commands import (
     EarningsCommand,
     DividendCommand,
     NewsCommand,
+    CreditCommand,
+    PricedInCommand,
+    SkewCommand,
+    FlowCommand,
+    RealizedVolCommand,
     KalshiCommand,
     MetricsCommand,
     CacheCommand,
@@ -208,7 +214,14 @@ def create_dispatcher(
 
     help_commands = [price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd, crypto_cmd, fx_cmd, fut_cmd]
 
-    if config.massive_pro:
+    # Options gate on whether ANY provider actually serves chains, not on
+    # the Polygon paid flag. Yahoo serves them for free, so keying off
+    # massive_pro left !opt, !chain and every portfolio options tool as
+    # dead stubs on a deployment that could answer them.
+    if any(
+        ProviderCapability.OPTIONS in p.capabilities
+        for p in provider_manager.providers
+    ):
         opt_cmd = OptionCommand(provider_manager)
         dispatcher.register(opt_cmd)
         help_commands.append(opt_cmd)
@@ -220,6 +233,23 @@ def create_dispatcher(
         dispatcher.register(opt_stub)
         chain_stub = ProRequiredCommand("chain", ["chains"], "List options chain", "!chain AAPL [2026-06-20]")
         dispatcher.register(chain_stub)
+
+    # Credit / rates dashboards and the options-derived vol surface.
+    credit_cmd = CreditCommand(provider_manager)
+    dispatcher.register(credit_cmd)
+    help_commands.append(credit_cmd)
+    pricedin_cmd = PricedInCommand(provider_manager)
+    dispatcher.register(pricedin_cmd)
+    help_commands.append(pricedin_cmd)
+    skew_cmd = SkewCommand(provider_manager)
+    dispatcher.register(skew_cmd)
+    help_commands.append(skew_cmd)
+    flow_cmd = FlowCommand(provider_manager)
+    dispatcher.register(flow_cmd)
+    help_commands.append(flow_cmd)
+    rvol_cmd = RealizedVolCommand(provider_manager)
+    dispatcher.register(rvol_cmd)
+    help_commands.append(rvol_cmd)
 
     eco_cmd = EconomyCommand(provider_manager, config.bot_name)
     dispatcher.register(eco_cmd)
