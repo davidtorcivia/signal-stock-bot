@@ -20,16 +20,14 @@ Behaviour:
 """
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import re
-import socket
 import time
 from typing import Optional
 
 import aiohttp
-from aiohttp.abc import AbstractResolver
-from aiohttp.resolver import DefaultResolver
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +48,9 @@ def _is_public_ip(host: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
+    # ::ffff:127.0.0.1 is loopback wearing a v6 costume.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
     if isinstance(ip, ipaddress.IPv4Address):
         return not (
             ip.is_private or ip.is_loopback or ip.is_link_local
@@ -61,36 +62,27 @@ def _is_public_ip(host: str) -> bool:
     )
 
 
-class _PublicOnlyResolver(AbstractResolver):
-    """aiohttp resolver that refuses non-public IPs.
+class _PublicOnlyConnector(aiohttp.TCPConnector):
+    """TCPConnector that refuses to open a socket to a non-public address.
 
-    Plugged into the ClientSession's TCPConnector so the SSRF check runs
-    at every DNS lookup — including the lookups aiohttp does for redirect
-    targets, which a hostname-only allow/deny list can't catch. Reject
-    paths: literal IPs in the URL (e.g. `http://169.254.169.254`), DNS
-    names that resolve to RFC1918/loopback/link-local, and DNS names where
-    any A/AAAA record points internal (DNS rebinding mitigation).
+    The check lives here, not in a custom resolver, because
+    `TCPConnector._resolve_host` returns IP literals without consulting
+    the resolver at all — so a resolver-based guard never sees
+    `http://127.0.0.1:8093/...` or `http://169.254.169.254/...`. Every
+    connection funnels through this method, which also covers the hops
+    aiohttp opens when following a redirect and the case where one of a
+    hostname's several A/AAAA records points inside (DNS rebinding).
+
+    `_resolve_host` is aiohttp-private. `test_connector_refuses_*` calls
+    it directly so a rename upstream fails the suite instead of silently
+    disabling the guard.
     """
 
-    def __init__(self) -> None:
-        self._inner = DefaultResolver()
-
-    async def resolve(self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET):
-        try:
-            ipaddress.ip_address(host)
-            is_literal = True
-        except ValueError:
-            is_literal = False
-        if is_literal and not _is_public_ip(host):
-            raise OSError(f"refusing private IP literal: {host}")
-        infos = await self._inner.resolve(host, port=port, family=family)
-        safe = [info for info in infos if _is_public_ip(info["host"])]
-        if not safe:
-            raise OSError(f"refusing host with only private resolutions: {host}")
-        return safe
-
-    async def close(self) -> None:
-        await self._inner.close()
+    async def _resolve_host(self, host: str, port: int, traces=None):
+        infos = await super()._resolve_host(host, port, traces=traces)
+        if not all(_is_public_ip(info["host"]) for info in infos):
+            raise OSError(f"refusing non-public host: {host}")
+        return infos
 SKIP_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
     ".mp4", ".mov", ".avi", ".webm", ".mp3", ".wav", ".ogg",
@@ -120,6 +112,10 @@ _OG_DESC_RE = re.compile(
     r"<meta[^>]*?(?:property|name)=[\"']og:description[\"'][^>]*?content=[\"']([^\"']+)[\"']",
     re.IGNORECASE | re.DOTALL,
 )
+_OG_IMAGE_RE = re.compile(
+    r"<meta[^>]*?(?:property|name)=[\"']og:image(?::url)?[\"'][^>]*?content=[\"']([^\"']+)[\"']",
+    re.IGNORECASE | re.DOTALL,
+)
 _OG_SITE_RE = re.compile(
     r"<meta[^>]*?(?:property|name)=[\"']og:site_name[\"'][^>]*?content=[\"']([^\"']+)[\"']",
     re.IGNORECASE | re.DOTALL,
@@ -134,7 +130,10 @@ _TITLE_RE = re.compile(r"<title[^>]*>([^<]+)</title>", re.IGNORECASE | re.DOTALL
 def _should_skip(url: str) -> bool:
     """Cheap pre-fetch filter for URLs we shouldn't try to expand."""
     lower = url.lower()
-    if lower.endswith(SKIP_SUFFIXES):
+    # Suffix test on the path only: `.../b.jpg?name=medium` is still a
+    # JPEG, and letting it through costs a page fetch that Content-Type
+    # throws away.
+    if lower.split("?", 1)[0].split("#", 1)[0].endswith(SKIP_SUFFIXES):
         return True
     # Crude host extraction — avoids importing urllib for hot path.
     host_start = lower.find("://") + 3
@@ -167,10 +166,92 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
+# Preview-image download caps. Deliberately tighter than the Signal
+# attachment caps in signal/handler.py: a link preview is a bonus, not
+# the point of the message, so it never gets to dominate the payload.
+IMAGE_MAX_BYTES = 3 * 1024 * 1024
+# Downloads per message, across every enricher. Matches the vision budget
+# in ask_command so we don't pay for bytes that get sliced off anyway.
+MAX_PREVIEW_IMAGES = 4
+IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+
+async def download_image(session, url: str) -> Optional[dict]:
+    """Fetch `url` as a `{mime, data_b64, filename}` part, or None.
+
+    Same dict shape `signal.handler._read_inbound_image_attachments`
+    produces, so link previews and real attachments travel the identical
+    path into `ask_command._image_parts`.
+
+    We download rather than handing the model a remote URL because
+    providers that fetch the URL themselves fail the WHOLE completion
+    when the host blocks them (OpenRouter returns a 400 for e.g.
+    Wikimedia's UA filter). Downloading here means a dead preview is one
+    dropped image, not a dead reply.
+    """
+    try:
+        async with session.get(url, allow_redirects=True) as resp:
+            if resp.status >= 400:
+                return None
+            mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if mime not in IMAGE_MIMES:
+                return None
+            declared = resp.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > IMAGE_MAX_BYTES:
+                return None
+            chunks: list[bytes] = []
+            read = 0
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                read += len(chunk)
+                if read > IMAGE_MAX_BYTES:
+                    return None
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        logger.debug(f"Preview image fetch failed for {url}: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"Preview image unexpected error for {url}: {e}")
+        return None
+    if not payload:
+        return None
+    return {
+        "mime": mime,
+        "data_b64": base64.b64encode(payload).decode("ascii"),
+        "filename": url.rsplit("/", 1)[-1][:80] or "preview",
+    }
+
+
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+def _direct_image_urls(text: str) -> list[str]:
+    """URLs in `text` that ARE an image rather than a page linking one.
+
+    `_should_skip` filters these out of the text expander (there are no
+    og: tags on a JPEG), which would otherwise make the simplest case of
+    all — someone pasting an image link — the one case vision misses.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in URL_RE.findall(text or ""):
+        u = u.rstrip(".,;:!?)\"'")
+        path = u.split("?", 1)[0].split("#", 1)[0].lower()
+        if not path.endswith(_IMAGE_SUFFIXES) or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        if len(out) >= MAX_PREVIEW_IMAGES:
+            break
+    return out
+
+
 class RichLinkExpander:
     def __init__(self):
-        # url -> (expires_at, formatted_snippet or None)
-        self._cache: dict[str, tuple[float, Optional[str]]] = {}
+        # url -> (expires_at, (formatted_snippet, og_image_url)) — either
+        # element may be None; the pair is cached together so pulling the
+        # preview image costs no extra page fetch.
+        self._cache: dict[str, tuple[float, tuple[Optional[str], Optional[str]]]] = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
 
@@ -178,15 +259,16 @@ class RichLinkExpander:
         async with self._session_lock:
             if self._session is None or self._session.closed:
                 timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT, connect=2.0)
-                connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver())
                 self._session = aiohttp.ClientSession(
                     timeout=timeout,
                     headers={"User-Agent": USER_AGENT, "Accept-Language": "en"},
-                    connector=connector,
+                    connector=_PublicOnlyConnector(),
                 )
             return self._session
 
-    def _cache_get(self, url: str) -> Optional[tuple[bool, Optional[str]]]:
+    def _cache_get(
+        self, url: str,
+    ) -> Optional[tuple[Optional[str], Optional[str]]]:
         entry = self._cache.get(url)
         if not entry:
             return None
@@ -194,10 +276,12 @@ class RichLinkExpander:
         if time.time() > expires_at:
             self._cache.pop(url, None)
             return None
-        return True, value
+        return value
 
-    def _cache_set(self, url: str, value: Optional[str]) -> None:
-        ttl = CACHE_TTL_SECONDS if value else NEGATIVE_TTL_SECONDS
+    def _cache_set(
+        self, url: str, value: tuple[Optional[str], Optional[str]],
+    ) -> None:
+        ttl = CACHE_TTL_SECONDS if any(value) else NEGATIVE_TTL_SECONDS
         self._cache[url] = (time.time() + ttl, value)
 
     @staticmethod
@@ -215,20 +299,26 @@ class RichLinkExpander:
         return f"{desc} ({url})"
 
     async def _fetch(self, url: str) -> Optional[str]:
+        return (await self._fetch_meta(url))[0]
+
+    async def _fetch_meta(
+        self, url: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """`(snippet, og_image_url)` for `url`. One fetch serves both."""
         cached = self._cache_get(url)
         if cached is not None:
-            return cached[1]
+            return cached
 
         session = await self._get_session()
         try:
             async with session.get(url, allow_redirects=True) as resp:
                 if resp.status >= 400:
-                    self._cache_set(url, None)
-                    return None
+                    self._cache_set(url, (None, None))
+                    return None, None
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 if "html" not in ctype and "xml" not in ctype:
-                    self._cache_set(url, None)
-                    return None
+                    self._cache_set(url, (None, None))
+                    return None, None
                 # Read at most MAX_BODY_BYTES — og: tags live in <head>, so
                 # we're not throwing away anything useful by capping.
                 chunks: list[bytes] = []
@@ -241,16 +331,17 @@ class RichLinkExpander:
                 body = b"".join(chunks).decode("utf-8", errors="replace")
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             logger.debug(f"Rich link fetch failed for {url}: {e}")
-            self._cache_set(url, None)
-            return None
+            self._cache_set(url, (None, None))
+            return None, None
         except Exception as e:
             logger.debug(f"Rich link fetch unexpected error for {url}: {e}")
-            self._cache_set(url, None)
-            return None
+            self._cache_set(url, (None, None))
+            return None, None
 
         title_match = _OG_TITLE_RE.search(body) or _TITLE_RE.search(body)
         desc_match = _OG_DESC_RE.search(body) or _DESC_RE.search(body)
         site_match = _OG_SITE_RE.search(body)
+        image_match = _OG_IMAGE_RE.search(body)
 
         formatted = self._format(
             url,
@@ -258,31 +349,58 @@ class RichLinkExpander:
             title_match.group(1) if title_match else None,
             desc_match.group(1) if desc_match else None,
         )
-        self._cache_set(url, formatted)
-        return formatted
+        image_url = (
+            _decode_entities(image_match.group(1)).strip()
+            if image_match else None
+        )
+        if image_url and not image_url.lower().startswith(("http://", "https://")):
+            image_url = None  # relative/data: og:image — not worth resolving
+        self._cache_set(url, (formatted, image_url))
+        return formatted, image_url
 
-    async def expand(self, text: str) -> str:
-        """Append link snippets after the original text, prefixed with `→ `."""
-        if not text:
-            return text
-        urls = URL_RE.findall(text)
-        if not urls:
-            return text
-
+    @staticmethod
+    def _urls(text: str) -> list[str]:
+        """Fetchable, deduped, capped URLs in `text` — in order."""
         seen: set[str] = set()
         unique: list[str] = []
-        for u in urls:
+        for u in URL_RE.findall(text or ""):
             # Strip trailing punctuation that often clings to URLs in chat.
             u = u.rstrip(".,;:!?)\"'")
-            if _should_skip(u):
-                continue
-            if u in seen:
+            if _should_skip(u) or u in seen:
                 continue
             seen.add(u)
             unique.append(u)
             if len(unique) >= MAX_URLS_PER_MESSAGE:
                 break
+        return unique
 
+    async def images(self, text: str) -> list[dict]:
+        """Downloaded preview images for the links in `text`.
+
+        Two sources, in that order of preference: a URL that is itself an
+        image, and the og:image of a URL that is a page.
+        """
+        image_urls = _direct_image_urls(text)
+        page_urls = self._urls(text)
+        if page_urls and len(image_urls) < MAX_PREVIEW_IMAGES:
+            metas = await asyncio.gather(
+                *(self._fetch_meta(u) for u in page_urls)
+            )
+            image_urls += [img for _snippet, img in metas if img]
+        image_urls = image_urls[:MAX_PREVIEW_IMAGES]
+        if not image_urls:
+            return []
+        session = await self._get_session()
+        parts = await asyncio.gather(
+            *(download_image(session, u) for u in image_urls)
+        )
+        return [p for p in parts if p]
+
+    async def expand(self, text: str) -> str:
+        """Append link snippets after the original text, prefixed with `→ `."""
+        if not text:
+            return text
+        unique = self._urls(text)
         if not unique:
             return text
 
@@ -318,6 +436,19 @@ class CompositeEnricher:
             except Exception as exc:
                 logger.debug(f"Enricher {type(e).__name__} failed: {exc}")
         return text
+
+    async def images(self, text: str) -> list[dict]:
+        """Preview images for every link in `text`, across all enrichers."""
+        out: list[dict] = []
+        for e in self.enrichers:
+            fetch = getattr(e, "images", None)
+            if fetch is None:
+                continue
+            try:
+                out.extend(await fetch(text))
+            except Exception as exc:
+                logger.debug(f"Enricher {type(e).__name__} images failed: {exc}")
+        return out
 
     async def close(self) -> None:
         for e in self.enrichers:

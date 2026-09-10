@@ -553,6 +553,38 @@ class AskCommand(BaseCommand):
             logger.debug(f"Read-time enrichment failed: {e}")
             return text
 
+    async def _link_images(self, text: str, ctx) -> list[dict]:
+        """Preview images for links in `text`, as vision parts.
+
+        Empty unless the answering bot has vision on — a blind bot would
+        pay the download and the tokens for pixels it can't read. Capped
+        at VISION_MAX_IMAGES minus whatever the user already attached, so
+        a link wall can't crowd out the actual screenshot.
+        """
+        enricher_images = getattr(self.enricher, "images", None)
+        if enricher_images is None or not text:
+            return []
+        bot = getattr(ctx, "bot", None)
+        if bot is None or not getattr(bot, "vision_enabled", False):
+            return []
+        # Deferred: signal.handler imports the dispatcher, which imports
+        # this module. One shared cap beats two that drift apart.
+        from ..signal.handler import VISION_MAX_IMAGES
+        room = VISION_MAX_IMAGES - len(getattr(ctx, "inbound_images", None) or [])
+        if room <= 0:
+            return []
+        try:
+            images = await enricher_images(text)
+        except Exception as e:
+            logger.debug(f"Link image enrichment failed: {e}")
+            return []
+        if images:
+            logger.info(
+                f"Link vision: {len(images[:room])} preview image(s) from "
+                f"pasted links for bot={bot.slug}"
+            )
+        return images[:room]
+
     @staticmethod
     def _canonical_turn_text(text: object) -> str:
         """Comparison form used only for legacy history/group deduplication."""
@@ -2653,7 +2685,24 @@ class AskCommand(BaseCommand):
 
         # Inline-expand any tweet/URL links the user pasted so the LLM
         # gets the substance, not just an opaque URL.
+        pasted = question
         question = await self._enrich(question)
+
+        # ...and when the bot can see, pull the preview images those links
+        # carry (tweet photos, og:image) into the same vision payload a
+        # real attachment would use. Reads the pre-enrichment text so we
+        # chase only what the user pasted, not every URL that turned up
+        # inside a quoted tweet. Current message only: history turns get
+        # re-enriched every round, and refetching their media each time
+        # would cost a download per turn per round.
+        # Attachments only — link previews are re-derivable from the URL
+        # that stays in the turn text, so persisting them would replay
+        # megabytes for VISION_HISTORY_USER_TURNS rounds to say what the
+        # link already says.
+        attached_images = list(getattr(ctx, "inbound_images", None) or [])
+        link_images = await self._link_images(pasted, ctx)
+        if link_images:
+            ctx.inbound_images = attached_images + link_images
 
         try:
             now_ts = time.time()
@@ -3735,7 +3784,7 @@ class AskCommand(BaseCommand):
             # vision the bytes aren't on inbound_images anyway, but we
             # also gate explicitly so a misconfigured handler can't
             # accidentally bloat history with bytes no one will read.
-            persisted_images = inbound_images if vision_active else None
+            persisted_images = (attached_images or None) if vision_active else None
             # bot_id pins multi-bot history: user turns get tagged with
             # the responding bot's id so load() can scope a bot's view to
             # its own conversation arc. Assistant turns get the same tag
