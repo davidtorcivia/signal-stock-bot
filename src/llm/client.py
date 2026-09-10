@@ -518,11 +518,32 @@ class LLMClient:
         latency_ms = (time.time() - started) * 1000.0
 
         try:
-            msg = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            msg = choice["message"]
             # Normalise: ensure content is a string (may be None when tool_calls are present)
             if msg.get("content") is None:
                 msg["content"] = ""
             usage = data.get("usage") or {}
+            # A thinking model spends ONE budget on reasoning and the
+            # reply, so a long chain of thought can consume max_tokens
+            # and leave nothing to say. That arrives as an empty content
+            # with finish_reason "length", and without this line it is
+            # indistinguishable from the model choosing to stay silent:
+            # the user sees "no answer" and the logs show a clean run.
+            finish = choice.get("finish_reason") or ""
+            if not msg["content"].strip() and not msg.get("tool_calls"):
+                logger.warning(
+                    f"LLM returned no content: finish_reason={finish!r} "
+                    f"completion_tokens={usage.get('completion_tokens')} "
+                    f"max_tokens={payload.get('max_tokens')} "
+                    f"reasoning_chars={len(msg.get('reasoning') or '')} "
+                    f"model={effective_model} purpose={purpose}"
+                    + (
+                        " — the reply was truncated by max_tokens; raise "
+                        "llm_max_tokens (it covers reasoning + content)."
+                        if finish == "length" else ""
+                    )
+                )
             cache_hit, cache_miss = _extract_cache_tokens(usage)
             metrics.record_llm_success(
                 purpose=purpose,
