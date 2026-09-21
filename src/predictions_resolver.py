@@ -489,7 +489,7 @@ class PredictionResolver:
                 result = await self.bot_tools.call(name, args, caller_ctx)
                 content = result.text if result else "(no result)"
             elif name == MCP_DISCOVER_NAME:
-                content = discover_mcp_tools(
+                content = await discover_mcp_tools(
                     self.mcp_manager, caller_ctx.policy,
                     query=str(args.get("query") or ""),
                     server=str(args.get("server") or ""),

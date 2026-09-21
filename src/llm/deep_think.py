@@ -752,7 +752,7 @@ class DeepThinkClient:
                         attachments.extend(result.attachments)
             elif name == MCP_DISCOVER_NAME:
                 policy = getattr(caller_ctx, "policy", None) if caller_ctx else None
-                content = discover_mcp_tools(
+                content = await discover_mcp_tools(
                     self.mcp_manager,
                     policy,
                     query=str(args.get("query") or ""),

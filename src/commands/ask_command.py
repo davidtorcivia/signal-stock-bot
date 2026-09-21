@@ -2595,7 +2595,7 @@ class AskCommand(BaseCommand):
                 if result and result.attachments:
                     attachments.extend(result.attachments)
             elif name == MCP_DISCOVER_NAME:
-                content = discover_mcp_tools(
+                content = await discover_mcp_tools(
                     self.mcp_manager,
                     caller_ctx.policy,
                     query=str(args.get("query") or ""),

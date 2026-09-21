@@ -49,6 +49,11 @@ LIVE_KEYS = {
     "llm_response_style",
     "ask_command_name",
     "group_context_messages",
+    "jev_enabled",
+    "jev_model",
+    "jev_api_key",
+    "jev_timeout_seconds",
+    "jev_min_confidence",
     # Emoji reactor (secondary cheap-LLM path)
     "reactor_enabled",
     "reactor_model",

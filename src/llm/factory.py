@@ -27,6 +27,7 @@ import threading
 from typing import Optional
 
 from .client import LLMClient
+from .jev import JevClient
 from .deep_think import DeepThinkClient
 from .tool_bot import ToolBotClient
 
@@ -50,6 +51,7 @@ class LLMClientFactory:
 
     def __init__(self, settings_store, bot_registry=None):
         self.store = settings_store
+        self.jev = JevClient(settings_store)
         # Optional BotRegistry — when wired, the writer's system-prompt
         # resolver falls back to bots.persona between the explicit
         # bot_llm_settings override and the global llm_system_prompt.
@@ -202,6 +204,7 @@ class LLMClientFactory:
     async def close_all(self) -> None:
         """Close every cached client's aiohttp session. Called from
         shutdown paths."""
+        await self.jev.close()
         with self._lock:
             clients = (
                 list(self._writers.values())

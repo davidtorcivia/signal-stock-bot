@@ -258,6 +258,7 @@ class MCPManager:
 
     def __init__(self, registry: MCPRegistry):
         self.registry = registry
+        self.jev = None
         self._sessions: dict[int, _MCPSession] = {}
         self._lock = asyncio.Lock()
 
