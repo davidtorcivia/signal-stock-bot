@@ -186,6 +186,32 @@
             preferred list to sort within it. Empty = no sort.
         </p>
 
+        <h2 style="margin-top: 32px;">JEV decisions via OpenRouter</h2>
+        <p class="muted" style="font-size: 12px;">
+            Routes background reactions and replies, votes in polls, classifies WSB sentiment
+            per ticker, and ranks allowed MCP tools. Uncertain or failed decisions use the
+            existing behavior. The reactor still chooses emojis with its configured model.
+        </p>
+        <label for="jev_enabled">JEV enabled for all four uses</label>
+        <select name="jev_enabled" id="jev_enabled">
+            <option value="true" {% if values.jev_enabled %}selected{% endif %}>Enabled</option>
+            <option value="false" {% if not values.jev_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <label for="jev_model">JEV model</label>
+        <input type="text" name="jev_model" id="jev_model" value="{{ values.jev_model }}">
+        <label for="jev_api_key">OpenRouter API key{% if jev_api_key_set %} (configured){% endif %}</label>
+        <input type="password" name="jev_api_key" id="jev_api_key" value="" autocomplete="new-password">
+        <p class="muted" style="font-size: 11px;">
+            Leave blank to keep the saved key. Without a dedicated key, uses OPENROUTER_API_KEY
+            or the global writer/research key when its URL is OpenRouter.
+        </p>
+        <label for="jev_timeout_seconds">Decision timeout (seconds)</label>
+        <input type="number" name="jev_timeout_seconds" id="jev_timeout_seconds" min="1" max="30"
+               value="{{ values.jev_timeout_seconds }}">
+        <label for="jev_min_confidence">Minimum confidence (0 to 1)</label>
+        <input type="number" name="jev_min_confidence" id="jev_min_confidence" min="0" max="1" step="0.05"
+               value="{{ values.jev_min_confidence }}">
+
         <h2 style="margin-top: 32px;">Emoji reactor</h2>
         <p class="muted" style="font-size: 12px;">
             Cheap secondary LLM call on every group message that decides whether

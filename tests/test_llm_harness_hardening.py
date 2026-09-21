@@ -143,7 +143,7 @@ async def test_mcp_broker_discovers_only_allowed_tools_and_invokes_exact_match()
         _tool("finance", "quote", "Get a stock quote"),
     ])
     policy = _web_policy()
-    result = json.loads(discover_mcp_tools(manager, policy, query="search"))
+    result = json.loads(await discover_mcp_tools(manager, policy, query="search"))
     assert [row["name"] for row in result["matches"]] == ["web__search"]
     assert result["matches"][0]["parameters"]["required"] == ["query"]
 

@@ -745,6 +745,7 @@ def build_app(config: Config):
     # factory and routes per-call via ctx.bot.
     from .llm.factory import LLMClientFactory
     llm_factory = LLMClientFactory(settings_store, bot_registry=bot_registry)
+    mcp_manager.jev = llm_factory.jev
     llm_factory.attach_mcp_manager(mcp_manager)
     llm_client = llm_factory.get_writer(default_bot_id)
     name_registry = NameRegistry(config.watchlist_db_path, bot_name=config.bot_name)
@@ -772,6 +773,7 @@ def build_app(config: Config):
     # reactor only fires after dispatch starts, so the handler is set by
     # the time any maybe_react() task actually runs.
     reactor = EmojiReactor(
+        jev=llm_factory.jev,
         settings_store=settings_store,
         llm_client=llm_client,
         signal_handler=None,
@@ -936,6 +938,7 @@ def build_app(config: Config):
             else llm_client
         )
         handler.poll_voter = PollVoter(
+            jev=llm_factory.jev,
             llm_client=per_bot_llm,
             signal_handler=handler,
             group_log=group_log,
@@ -1136,6 +1139,7 @@ def build_app(config: Config):
     from .wsb.service import WSBDigestService
 
     wsb_service = WSBDigestService(
+        jev=llm_factory.jev,
         settings_store=settings_store,
         store=WSBDigestStore(config.watchlist_db_path),
         static_dir=config.wsb_static_dir,

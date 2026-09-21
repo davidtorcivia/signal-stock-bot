@@ -711,6 +711,36 @@ Auto-started servers (`enabled = true`) come up at bot boot. Failed startups log
 
 ---
 
+## JEV decisions
+
+JEV is enabled by default for background reactor routing, Signal poll voting,
+WSB sentiment per ticker, and MCP tool discovery. Configure it in `/admin/llm`.
+It calls OpenRouter's `https://openrouter.ai/api/alpha/decisions` endpoint with
+`~typesafe/jev-latest`; it does not use chat completions or the writer's provider
+pinning. The API key comes from `jev_api_key`, then `OPENROUTER_API_KEY`, then a
+global writer/research key whose base URL is OpenRouter. Without a matching key,
+the existing paths remain active.
+
+The default minimum confidence is 0.8 and each decision request has a five-second
+deadline. Errors, missing answers, and uncertain decisions fall back to the
+existing model or keyword behavior. Three consecutive failures suspend JEV calls
+for one minute. The admin switch disables all four JEV paths immediately.
+
+Payloads contain only the context needed for each decision: recent chat and
+applicable rules for the reactor; poll question, options and chat for votes;
+small batches of ticker-bearing posts for WSB; names and descriptions of allowed
+tools for MCP discovery. Tool argument schemas and writer conversation history
+are not sent. Custom reactor rules are preserved. WSB posts longer than 6,000
+characters retain keyword sentiment, and oversized API payloads fall back rather
+than silently truncating context. JEV classifies sentiment; mention counts and
+ranking remain deterministic. The reactor's existing model still chooses the
+emoji and worthiness score after JEV selects a reaction.
+
+Usage and latency appear in LLM metrics under `jev_reactor`, `jev_poll_vote`,
+`jev_wsb_sentiment`, and `jev_mcp_discovery`. JEV receives chat data through
+OpenRouter for enabled chat features; existing per-chat reactor/reply controls
+and MCP permissions continue to apply.
+
 ## Per-Context Policies
 
 Manage at `/admin/contexts`. Every chat (group or DM) can have its own:

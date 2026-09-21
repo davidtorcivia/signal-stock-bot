@@ -29,6 +29,7 @@ from .events import get_bus
 from ..contexts.policy import MODE_ALLOW_ALL, MODE_ALLOW_LIST, MODE_DENY_LIST, MODES
 from ..mcp_integration import MCPManager, MCPRegistry, MCPServerConfig
 from ..mcp_integration.models import TRANSPORTS
+from ..llm.jev import JEV_DEFAULTS
 from ..llm.mcp_broker import (
     MCP_BROKER_TOOLS,
     MCP_DISCOVER_NAME,
@@ -398,7 +399,7 @@ def _register_dashboard_routes(
         return render_template(
             "settings.html",
             values=values,
-            live_keys=sorted(LIVE_KEYS),
+            live_keys=sorted(LIVE_KEYS - JEV_DEFAULTS.keys()),
             restart_keys=sorted(RESTART_KEYS),
             saved=saved,
             error=error,
@@ -414,6 +415,7 @@ def _register_dashboard_routes(
 
 # Keys exposed on /admin/llm. Ordering here controls display order.
 LLM_KEYS = [
+    *JEV_DEFAULTS,
     "llm_enabled",
     "llm_base_url",
     "llm_model",
@@ -481,6 +483,7 @@ def _default_response_style():
 
 
 LLM_DEFAULTS = {
+    **JEV_DEFAULTS,
     "llm_enabled": False,
     "llm_base_url": "https://api.openai.com/v1",
     "llm_model": "gpt-4o-mini",
@@ -566,12 +569,15 @@ def _register_llm_routes(bp: Blueprint, *, settings_store: SettingsStore) -> Non
         values["llm_api_key"] = ""
         deep_think_api_key_set = bool(values.get("deep_think_api_key"))
         values["deep_think_api_key"] = ""
+        jev_api_key_set = bool(values.get("jev_api_key"))
+        values["jev_api_key"] = ""
 
         return render_template(
             "llm.html",
             values=values,
             api_key_set=api_key_set,
             deep_think_api_key_set=deep_think_api_key_set,
+            jev_api_key_set=jev_api_key_set,
             saved=saved,
             error=error,
         )
@@ -582,6 +588,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
     import json
 
     bool_keys = {
+        "jev_enabled",
         "llm_enabled",
         "llm_provider_only",
         "reactor_enabled",
@@ -590,6 +597,7 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
         "deep_think_caps_enabled",
     }
     int_keys = {
+        "jev_timeout_seconds",
         "llm_max_tokens",
         "llm_extended_max_tokens",
         "llm_timeout_seconds",
@@ -614,10 +622,12 @@ def _apply_llm_form(store: SettingsStore, form) -> None:
         "deep_think_user_daily_cap",
         "deep_think_group_daily_cap",
     }
-    float_keys = {"llm_temperature", "reactor_temperature", "deep_think_temperature"}
+    float_keys = {"llm_temperature", "reactor_temperature", "deep_think_temperature", "jev_min_confidence"}
 
     for key in LLM_KEYS:
-        if key in ("llm_api_key", "deep_think_api_key"):
+        if key.startswith("jev_") and key not in form:
+            continue
+        if key in ("llm_api_key", "deep_think_api_key", "jev_api_key"):
             # Only overwrite when the user typed a new value; empty = keep existing.
             # Same masked-input pattern for both API keys.
             submitted = form.get(key, "").strip()

@@ -71,8 +71,8 @@ def _build_question(bot_name: str, subreddit: str, digest: WSBDigest) -> str:
         f"digest of today's top posts, the discussion threads broken into top "
         f"parent comments with their replies, and a PROGRAMMATIC tally of the "
         f"most-mentioned tickers (exact mention counts and bull/bear sentiment "
-        f"counts already computed from every comment). Treat those counts as "
-        f"ground truth for what the crowd is fixated on.\n\n"
+        f"counts already computed from every comment). Mention counts measure "
+        f"attention; bull/bear counts are estimated sentiment, not ground truth.\n\n"
         f"The crowd's most-mentioned names today: {top}.\n\n"
         f"USE YOUR TOOLS aggressively. For the top 4-6 tickers, pull current "
         f"price and percent move, recent news, and where available technicals "
@@ -231,8 +231,10 @@ class WSBDigestService:
         store: WSBDigestStore,
         static_dir: str,
         provider_manager=None,
+        jev=None,
     ):
         self.settings = settings_store
+        self.jev = jev
         self.store = store
         self.static_dir = static_dir
         # Optional: used to fetch historical closes for the per-ticker price
@@ -317,7 +319,7 @@ class WSBDigestService:
             user_agent=cfg["user_agent"],
         )
         try:
-            digest = await compile_wsb_digest(source, now=now)
+            digest = await compile_wsb_digest(source, now=now, jev=self.jev)
         finally:
             await source.close()
 
