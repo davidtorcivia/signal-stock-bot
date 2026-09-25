@@ -460,12 +460,17 @@ class MediaRequests:
             else:
                 # Sonarr fills in episodes a few seconds after the add; wait
                 # briefly for air dates, then fall back to the lookup's data.
+                # The series is already added: a failed read here must not
+                # turn it into ❓ and leave it untracked.
                 eps: list[dict] = []
-                for _ in range(EPISODE_WAIT_TRIES):
-                    eps = await arr.episodes(created["id"])
-                    if eps:
-                        break
-                    await asyncio.sleep(EPISODE_WAIT_SECONDS)
+                try:
+                    for attempt in range(EPISODE_WAIT_TRIES):
+                        eps = await arr.episodes(created["id"])
+                        if eps or attempt == EPISODE_WAIT_TRIES - 1:
+                            break
+                        await asyncio.sleep(EPISODE_WAIT_SECONDS)
+                except Exception as e:
+                    logger.warning(f"Episode read after adding series failed: {e}")
                 note = tv_progress(eps, seasons, now)[2]
                 first = _ts(found.get("firstAired"))
                 unknown = sorted(set(seasons or []) - {s["seasonNumber"] for s in found.get("seasons", [])})

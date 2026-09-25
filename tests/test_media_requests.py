@@ -387,3 +387,15 @@ async def test_future_season_on_monitored_show_turns_on_new_seasons(tmp_path):
     mr, h = make(tmp_path, req("Show", "tv", seasons=[3]), sonarr=sonarr)
     await mr.handle(h, "uuid-a", "show s3", "g1", 1)
     assert sonarr.searched == [(5, [3])] and h.reactions == [WAITING]
+
+
+async def test_episode_read_failure_after_add_still_tracks(tmp_path):
+    sonarr = FakeArr("tv", catalog=[{"title": "New", "year": 2026, "status": "continuing",
+                                     "seasons": [{"seasonNumber": 1}]}])
+
+    async def episodes(series_id):
+        raise aiohttp.ClientConnectionError("sonarr went away")
+    sonarr.episodes = episodes
+    mr, h = make(tmp_path, req("New", "tv"), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "new show", "g1", 1)
+    assert h.reactions == [WAITING] and len(mr.pending) == 1
