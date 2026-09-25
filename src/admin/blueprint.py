@@ -173,6 +173,15 @@ def create_admin_blueprint(
 
     _register_live_routes(bp, name_registry=name_registry, loop=loop)
 
+    if context_registry is not None:
+        _register_media_routes(
+            bp,
+            settings_store=settings_store,
+            context_registry=context_registry,
+            dispatcher=dispatcher,
+            loop=loop,
+        )
+
     # Make csrf_token available to every rendered template in this blueprint.
     @bp.context_processor
     def inject_csrf():
@@ -1518,6 +1527,109 @@ def _apply_settings_form(store: SettingsStore, form) -> None:
 
         # Default: string
         store.set(key, raw)
+
+
+# ---------------------------------------------------------------------------
+# Media routes (movie/TV request chats → Radarr/Sonarr)
+# ---------------------------------------------------------------------------
+
+
+def _register_media_routes(
+    bp: Blueprint,
+    *,
+    settings_store: SettingsStore,
+    context_registry: ContextRegistry,
+    dispatcher,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    from ..media_requests import MEDIA_DEFAULTS, _ago
+
+    @bp.route("/media", methods=["GET", "POST"])
+    @admin_required
+    def media_page():
+        saved = False
+        error = None
+        if request.method == "POST":
+            if not verify_csrf():
+                error = "Session expired, please reload the page."
+            else:
+                try:
+                    _apply_media_form(settings_store, request.form)
+                    saved = True
+                except ValueError as e:
+                    error = str(e)
+
+        values = {k: settings_store.get(k, d) for k, d in MEDIA_DEFAULTS.items()}
+        keys_set = {p: bool(values[f"{p}_api_key"]) for p in ("radarr", "sonarr")}
+        values["radarr_api_key"] = values["sonarr_api_key"] = ""
+
+        groups = [
+            c for c in _run_on_loop(loop, context_registry.list())
+            if c.kind == "group"
+        ]
+        labels = {c.key: c.label or c.key[:12] for c in groups}
+
+        media = getattr(dispatcher, "media_requests", None)
+        # Profiles double as the connection test: a dropdown when the
+        # server answers, the error when it doesn't.
+        profiles: dict[str, object] = {}
+        for prefix, kind in (("radarr", "movie"), ("sonarr", "tv")):
+            if media is None:
+                continue
+            try:
+                found = _run_on_loop(loop, media.profiles(kind), timeout=8)
+            except Exception as e:
+                found = f"{type(e).__name__}: {e}"
+            if found is not None:
+                profiles[prefix] = found
+
+        now = time.time()
+        pending = [
+            {
+                "group": labels.get(p["group_id"], p["group_id"][:12]),
+                "titles": [
+                    it["title"] + (" ✓" if it.get("done") else "")
+                    for it in p["items"]
+                ],
+                "requested": _ago(p.get("requested_at", now), now),
+                "next_check": min(
+                    (it.get("next_check", 0) for it in p["items"] if not it.get("done")),
+                    default=0,
+                ),
+            }
+            for p in (media.pending if media is not None else [])
+        ]
+        return render_template(
+            "media.html",
+            values=values,
+            keys_set=keys_set,
+            groups=groups,
+            profiles=profiles,
+            pending=pending,
+            now=now,
+            saved=saved,
+            error=error,
+        )
+
+
+def _apply_media_form(store: SettingsStore, form) -> None:
+    store.set("media_requests_enabled", form.get("media_requests_enabled") == "on")
+    store.set("media_request_groups", form.getlist("media_request_groups"))
+    try:
+        store.set("media_poll_minutes", max(1, int(form.get("media_poll_minutes") or 10)))
+    except ValueError:
+        raise ValueError("Check interval must be a whole number of minutes") from None
+    for prefix in ("radarr", "sonarr"):
+        url = (form.get(f"{prefix}_url") or "").strip()
+        parsed = urlparse(url)
+        if url and (parsed.scheme not in ("http", "https") or not parsed.hostname):
+            raise ValueError(f"{prefix.title()} URL must be an http(s) URL")
+        store.set(f"{prefix}_url", url)
+        key = (form.get(f"{prefix}_api_key") or "").strip()
+        if key:  # blank keeps the stored key
+            store.set(f"{prefix}_api_key", key)
+        profile = (form.get(f"{prefix}_quality_profile_id") or "").strip()
+        store.set(f"{prefix}_quality_profile_id", int(profile) if profile.isdigit() else None)
 
 
 # ---------------------------------------------------------------------------

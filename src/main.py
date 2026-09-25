@@ -1112,6 +1112,20 @@ def build_app(config: Config):
     asyncio.run_coroutine_threadsafe(orders_worker.run_forever(), loop)
     logger.info("Orders watcher scheduled")
 
+    # Movie/TV request chats: screen with JEV, add to Radarr/Sonarr, and
+    # track with ⏳ → ✅ reactions. Always wired; idle until enabled on
+    # admin → Media (every setting there is live).
+    from .media_requests import MediaRequests
+    media_requests = MediaRequests(
+        settings_store=settings_store,
+        llm=llm_client,
+        jev=llm_factory.jev,
+        signal_pool=signal_pool,
+        state_path=str(Path(config.watchlist_db_path).parent / "media_requests.json"),
+    )
+    dispatcher.media_requests = media_requests
+    asyncio.run_coroutine_threadsafe(media_requests.run_forever(), loop)
+
     # Daily oracle worker — per-context, multi-oracle. Each enabled
     # oracle fires once per day at its configured time (sunrise/sunset
     # +/- offset, or fixed clock time). On first boot of this code,

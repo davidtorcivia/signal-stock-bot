@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Media{% endblock %}
+{% block content %}
+
+{% macro arr_fields(prefix, name, placeholder) %}
+    <h2 style="margin-top: 32px;">{{ name }}</h2>
+    <label for="{{ prefix }}_url">URL</label>
+    <input type="text" name="{{ prefix }}_url" id="{{ prefix }}_url"
+           value="{{ values[prefix ~ '_url'] or '' }}" placeholder="{{ placeholder }}">
+
+    <label for="{{ prefix }}_api_key">
+        API key
+        {% if keys_set[prefix] %}<span class="muted" style="text-transform: none; font-size: 11px;">(configured — leave blank to keep)</span>{% endif %}
+    </label>
+    <input type="password" name="{{ prefix }}_api_key" id="{{ prefix }}_api_key"
+           value="" placeholder="{{ '•••••••• (already set)' if keys_set[prefix] else 'Settings → General → API Key' }}">
+
+    <label for="{{ prefix }}_quality_profile_id">Quality profile</label>
+    {% set p = profiles.get(prefix) %}
+    {% if p is iterable and p is not string %}
+        <select name="{{ prefix }}_quality_profile_id" id="{{ prefix }}_quality_profile_id">
+            <option value="">First profile ({{ p[0].name if p else '—' }})</option>
+            {% for prof in p %}
+                <option value="{{ prof.id }}" {% if values[prefix ~ '_quality_profile_id'] == prof.id %}selected{% endif %}>{{ prof.name }}</option>
+            {% endfor %}
+        </select>
+        <p class="muted" style="font-size: 12px;">Connected.</p>
+    {% else %}
+        <input type="number" name="{{ prefix }}_quality_profile_id" id="{{ prefix }}_quality_profile_id"
+               min="1" value="{{ values[prefix ~ '_quality_profile_id'] or '' }}" placeholder="first profile">
+        {% if p %}<div class="error">Can't reach {{ name }}: {{ p }}</div>
+        {% else %}<p class="muted" style="font-size: 12px;">Save a URL and key to load profiles.</p>{% endif %}
+    {% endif %}
+{% endmacro %}
+
+<div class="panel">
+    <h1>Media requests</h1>
+    <p class="muted" style="font-size: 12px;">
+        In the chosen groups the bot reads each message for movie/TV requests,
+        adds them to Radarr/Sonarr, and reacts: ⏳ requested, ✅ on the server,
+        ❓ not found. Commands and @-mentions there work as usual. All values
+        apply live.
+    </p>
+
+    {% if saved %}<div class="ok">Saved.</div>{% endif %}
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    <form method="post" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+            <input type="checkbox" name="media_requests_enabled" {% if values.media_requests_enabled %}checked{% endif %}>
+            <span>Enabled</span>
+        </label>
+
+        <label>Request groups</label>
+        {% if groups %}
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">
+                {% for g in groups %}
+                    <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                        <input type="checkbox" name="media_request_groups" value="{{ g.key }}"
+                               {% if g.key in (values.media_request_groups or []) %}checked{% endif %}>
+                        <span>{{ g.label or g.key[:16] ~ '…' }}</span>
+                    </label>
+                {% endfor %}
+            </div>
+            <p class="muted" style="font-size: 12px;">Groups appear here once the bot has seen a message in them; name them on the Contexts page.</p>
+        {% else %}
+            <p class="muted">No groups yet — add the bot to the request chat and send a message there.</p>
+        {% endif %}
+
+        <label for="media_poll_minutes">Download check interval (minutes)</label>
+        <input type="number" name="media_poll_minutes" id="media_poll_minutes" min="1"
+               value="{{ values.media_poll_minutes or 10 }}">
+        <p class="muted" style="font-size: 12px;">
+            Unreleased movies and unaired seasons skip checks until their release date (daily when there's no date).
+        </p>
+
+        {{ arr_fields('radarr', 'Radarr', 'http://host.docker.internal:7878') }}
+        {{ arr_fields('sonarr', 'Sonarr', 'http://host.docker.internal:8989') }}
+
+        <div style="margin-top: 24px;">
+            <button type="submit">Save</button>
+        </div>
+    </form>
+</div>
+
+<div class="panel">
+    <h2>Waiting on downloads</h2>
+    {% if pending %}
+        <table>
+            <tr><th>Group</th><th>Titles</th><th>Requested</th><th>Next check</th></tr>
+            {% for p in pending %}
+                <tr>
+                    <td>{{ p.group }}</td>
+                    <td>{{ p.titles | join(', ') }}</td>
+                    <td>{{ p.requested }}</td>
+                    {% set wait = p.next_check - now %}
+                    <td>{% if wait > 172800 %}in {{ (wait / 86400) | round | int }} days{% elif wait > 0 %}in {{ (wait / 3600) | round(1) }}h{% else %}next poll{% endif %}</td>
+                </tr>
+            {% endfor %}
+        </table>
+    {% else %}
+        <p class="muted">Nothing pending.</p>
+    {% endif %}
+</div>
+
+{% endblock %}

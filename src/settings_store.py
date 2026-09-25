@@ -120,8 +120,22 @@ RESTART_KEYS = {
     "MASSIVE_PRO",
 }
 
+# Movie/TV request chat (media_requests.py) — live, edited on admin → Media
+# rather than the generic settings page.
+MEDIA_KEYS = {
+    "media_requests_enabled",
+    "media_request_groups",
+    "media_poll_minutes",
+    "radarr_url",
+    "radarr_api_key",
+    "radarr_quality_profile_id",
+    "sonarr_url",
+    "sonarr_api_key",
+    "sonarr_quality_profile_id",
+}
+
 # All keys that the admin UI is allowed to write. Anything else is rejected.
-ALLOWED_KEYS = LIVE_KEYS | RESTART_KEYS
+ALLOWED_KEYS = LIVE_KEYS | RESTART_KEYS | MEDIA_KEYS
 
 
 class SettingsStore:

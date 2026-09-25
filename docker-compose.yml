@@ -48,6 +48,10 @@ services:
     environment:
       - SIGNAL_API_URL=http://signal-api:8080
       - ADMIN_PASSWORD_HASH_PATH=/app/admin_password.hash
+    # Lets the bot reach Radarr/Sonarr published on the host
+    # (RADARR_URL=http://host.docker.internal:7878).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # ADMIN_BIND_HOST controls which interface the admin UI listens on.
       # Default 127.0.0.1 = loopback only. Set to 0.0.0.0 for LAN access

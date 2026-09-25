@@ -149,6 +149,7 @@ class CommandDispatcher:
         # message.
         self.signal_handler: Any = None
         self.signal_pool: Any = None
+        self.media_requests: Any = None  # late-bound by main.py when configured
         self.commands: dict[str, BaseCommand] = {}
         self._rate_limiter = UserRateLimiter(limit=rate_limit)
         self._corn_cooldown: dict[str, float] = {}  # sender -> last triggered timestamp
@@ -312,6 +313,27 @@ class CommandDispatcher:
                 sender_tail=(sender or "")[-4:],
                 group_id=group_id,
             ))
+
+        # Movie/TV request chat: everything that isn't a command or a
+        # mention belongs to the request handler. Returns before the reactor
+        # so it can't overwrite the ⏳/✅ status reaction with its own pick.
+        if (
+            self.media_requests is not None
+            and target_timestamp
+            and self.media_requests.handles(group_id)
+            and not mentioned
+            and not message.strip().startswith(self.prefix)
+        ):
+            import asyncio
+            handler = self.signal_handler
+            if self.signal_pool is not None:
+                handler = self.signal_pool.for_bot(self._resolve_bot(
+                    group_id, policy=policy, addressed_bot=addressed_bot,
+                ))
+            asyncio.create_task(self.media_requests.handle(
+                handler, sender, message, group_id, target_timestamp,
+            ))
+            return None
 
         # Fire-and-forget emoji reactor (groups only). Runs in parallel with
         # the rest of dispatch — never blocks command execution and never
