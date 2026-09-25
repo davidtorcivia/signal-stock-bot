@@ -10,13 +10,16 @@
 # This does NOT affect the bot's own dependencies -- those come from
 # requirements.txt via pip, and the bot's MCP *client* runs the 2.x SDK.
 #
-# Currently needed by: mcp-server-fetch, sec-edgar-mcp, yahoo-finance-mcp.
-# They still import APIs that 2.0 removed:
+# Currently needed by: mcp-server-fetch, sec-edgar-mcp. They still import
+# APIs that 2.0 removed:
 #   * `mcp.server.fastmcp`  -- the bundled FastMCP server framework, split out
 #     of the SDK in 2.0 (it lives in the separate `fastmcp` package now)
 #   * `McpError`            -- renamed to `MCPError`
 # Each declares a bare `mcp>=1.x`, so an unconstrained uvx resolves 2.x and
 # the server dies on import.
+#
+# yahoo-finance-mcp 0.1.1 moved to `mcp[cli]>=2.1.0,<3`, so the pin now makes
+# it unresolvable; its UV_CONSTRAINT was cleared.
 #
 # Exit path: when one ships a 2.x-compatible release, clear UV_CONSTRAINT from
 # that server's env and restart. When the last one goes, delete this file and
