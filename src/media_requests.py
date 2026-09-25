@@ -226,7 +226,9 @@ class Arr:
                  and (not seasons or s["seasonNumber"] in seasons)}
                 for s in found.get("seasons", [])
             ]
-            body["monitorNewItems"] = "none" if seasons else "all"
+            known = {x["seasonNumber"] for x in found.get("seasons", [])}
+            # A requested season Sonarr doesn't list yet must be picked up when it appears.
+            body["monitorNewItems"] = "none" if seasons and set(seasons) <= known else "all"
             body["seasonFolder"] = True
             body["addOptions"] = {
                 "searchForMissingEpisodes": True, "ignoreEpisodesWithFiles": True,
@@ -246,6 +248,8 @@ class Arr:
             {**s, "monitored": s.get("monitored") or s["seasonNumber"] in seasons}
             for s in item.get("seasons", [])
         ]
+        if set(seasons) - {s["seasonNumber"] for s in item["seasons"]}:
+            item["monitorNewItems"] = "all"
         await self._req("PUT", f"series/{item['id']}", json=item)
         await self._req("POST", "command",
                         json={"name": "SeriesSearch", "seriesId": item["id"]})
@@ -259,6 +263,7 @@ class MediaRequests:
         self.signal_pool = signal_pool
         self.state_path = Path(state_path)
         self._arrs: dict[str, tuple[tuple, Arr]] = {}
+        self._lock = asyncio.Lock()
         # In-memory list, mutated in place by both handle() and the poll and
         # written through after each change — never load-modify-save across
         # an await, or a request landing mid-poll would be overwritten.
@@ -434,6 +439,11 @@ class MediaRequests:
         if not found:
             return {"status": "missing", "name": req["title"]}
 
+        if seasons and kind == "tv":
+            known = {s["seasonNumber"] for s in found.get("seasons", [])}
+            if not set(seasons) & known and found.get("status") == "ended":
+                return {"status": "missing", "name": f"{found.get('title')} season "
+                        + ", ".join(map(str, seasons))}
         name = f"{found.get('title')} ({found.get('year')})"
         if seasons:
             name += (" season " if len(seasons) == 1 else " seasons ") + ", ".join(map(str, seasons))
@@ -445,9 +455,16 @@ class MediaRequests:
             if kind == "movie":
                 note = movie_release(created, now)[2]
             else:
+                # Sonarr usually hasn't filled in episodes yet right after the
+                # add; the lookup's season list and firstAired stand in.
+                note = tv_progress(await arr.episodes(created["id"]), seasons, now)[2]
                 first = _ts(found.get("firstAired"))
-                note = (f"it doesn't start airing until {_day(first)}"
-                        if first and first > now else "")
+                unknown = sorted(set(seasons or []) - {s["seasonNumber"] for s in found.get("seasons", [])})
+                if not note and first and first > now:
+                    note = f"it doesn't start airing until {_day(first)}"
+                elif not note and unknown:
+                    note = (("season " if len(unknown) == 1 else "seasons ")
+                            + ", ".join(map(str, unknown)) + " has no air date yet")
             return {"status": "added", "name": name, "note": note, "item": item}
 
         item["id"] = found["id"]
@@ -520,12 +537,15 @@ class MediaRequests:
             return
         now = time.time()
         results = []
-        for req in reqs:
-            try:
-                results.append(await self._resolve(req, text, now))
-            except Exception as e:
-                logger.error(f"Media request for {req['title']!r} failed: {e}")
-                results.append({"status": "missing", "name": req["title"]})
+        # One request at a time: two people asking for the same new title
+        # would otherwise both POST it and the second add fails.
+        async with self._lock:
+            for req in reqs:
+                try:
+                    results.append(await self._resolve(req, text, now))
+                except Exception as e:
+                    logger.error(f"Media request for {req['title']!r} failed: {e}")
+                    results.append({"status": "missing", "name": req["title"]})
 
         items = [r["item"] for r in results if r["status"] in ("added", "waiting")]
         if items:
@@ -534,6 +554,12 @@ class MediaRequests:
             emoji = NOT_FOUND
         else:
             emoji = AVAILABLE
+        if items:  # tracked before any send, so a failed send can't orphan it
+            self.pending.append({
+                "phone": handler.config.phone_number, "group_id": group_id,
+                "author": sender, "ts": int(ts), "requested_at": now, "items": items,
+            })
+            self._save()
         await handler.send_reaction(
             recipient=sender, target_author=sender, target_timestamp=int(ts),
             emoji=emoji, group_id=group_id,
@@ -543,16 +569,13 @@ class MediaRequests:
         lines = [line for r in results if (line := self._line(r, now))]
         if lines:
             facts = [r for r in results if r["status"] == "available" or r.get("note")]
-            await handler.send_message(
-                recipient=sender, group_id=group_id,
-                message=await self._voice(lines, facts),
-            )
-        if items:
-            self.pending.append({
-                "phone": handler.config.phone_number, "group_id": group_id,
-                "author": sender, "ts": int(ts), "requested_at": now, "items": items,
-            })
-            self._save()
+            try:
+                await handler.send_message(
+                    recipient=sender, group_id=group_id,
+                    message=await self._voice(lines, facts),
+                )
+            except Exception as e:
+                logger.warning(f"Media request reply failed: {e}")
 
     # ── availability poll ───────────────────────────────────────────────
 
@@ -573,8 +596,10 @@ class MediaRequests:
                 return True, 0
             released, next_check, _ = movie_release(data, now)
             return False, 0 if released else next_check or 0
-        if not data:  # just added; Sonarr hasn't filled in episodes yet
-            return False, 0
+        if not data:
+            # Sonarr answers 200 [] for a deleted series; get() 404s instead.
+            await arr.get(it["id"])
+            return False, 0  # just added; episodes not filled in yet
         done, next_check, _, _ = tv_progress(data, it.get("seasons"), now)
         return done, next_check or 0
 
@@ -582,7 +607,7 @@ class MediaRequests:
         now, fetched, changed = time.time(), {}, False
         for entry in list(self.pending):
             for it in entry["items"]:
-                if it.get("done") or it.get("next_check", 0) > now:
+                if it.get("done") or it.get("gone") or it.get("next_check", 0) > now:
                     continue
                 try:
                     it["done"], it["next_check"] = await self._progress(it, fetched, now)
@@ -590,18 +615,20 @@ class MediaRequests:
                     if e.status != 404:
                         logger.warning(f"Media request check failed: {e}")
                         continue
-                    it["done"] = True  # deleted from Radarr/Sonarr: stop tracking
+                    it["gone"] = True  # deleted from Radarr/Sonarr: stop tracking
                 except Exception as e:
                     logger.warning(f"Media request check failed: {e}")
                     continue
                 changed = True
-            if not all(it.get("done") for it in entry["items"]):
+            if not all(it.get("done") or it.get("gone") for it in entry["items"]):
                 continue
             handler = self.signal_pool.for_phone(entry["phone"]) or self.signal_pool.default()
+            arrived = any(it.get("done") for it in entry["items"])
             if await handler.send_reaction(
                 recipient=entry["author"], target_author=entry["author"],
-                target_timestamp=entry["ts"], emoji=AVAILABLE,
-                group_id=entry["group_id"],
+                target_timestamp=entry["ts"], group_id=entry["group_id"],
+                # Nothing arrived (all deleted): take the ⏳ back instead of ✅.
+                emoji=AVAILABLE if arrived else WAITING, remove=not arrived,
             ):
                 self.pending.remove(entry)
                 changed = True

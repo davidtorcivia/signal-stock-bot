@@ -3,9 +3,12 @@ the ⏳ → ✅ poll (with release-date skipping and per-poll dedupe), the
 already-on-server shame line, season-aware TV progress, and the dispatcher
 hook that keeps the reactor off these messages."""
 
+import asyncio
 import json
 import time
 from types import SimpleNamespace
+
+import aiohttp
 
 from src.media_requests import (
     AVAILABLE, NOT_FOUND, WAITING, Arr, MediaRequests, movie_release, tv_progress,
@@ -28,10 +31,13 @@ class FakeArr(Arr):
         self.added, self.searched, self.gets = [], [], 0
 
     async def lookup(self, term):
+        await asyncio.sleep(0)  # let concurrent requests interleave
         return self.catalog
 
     async def get(self, item_id):
         self.gets += 1
+        if item_id not in self.library:
+            raise aiohttp.ClientResponseError(None, (), status=404)
         return self.library[item_id]
 
     async def episodes(self, series_id):
@@ -42,7 +48,9 @@ class FakeArr(Arr):
                 for e in self.eps.get(series_id, []) if e.get("hasFile")]
 
     async def add(self, found, seasons):
+        await asyncio.sleep(0)
         item = {**found, "id": 100 + len(self.added), "hasFile": False}
+        found["id"] = item["id"]  # later lookups see it in the library
         self.added.append((item, seasons))
         self.library[item["id"]] = item
         return item
@@ -60,6 +68,8 @@ class FakeLLM:
 
     async def chat_messages(self, **kw):
         self.calls += 1
+        if kw.get("purpose") == "media_reply":
+            return {"content": ""}  # no paraphrase: the template goes out
         return {"content": json.dumps(self.reply)}
 
 
@@ -76,13 +86,16 @@ class FakeHandler:
     config = SimpleNamespace(phone_number="+1555")
 
     def __init__(self):
-        self.reactions, self.messages = [], []
+        self.reactions, self.messages, self.removed = [], [], []
+        self.fail_send = False
 
     async def send_reaction(self, **kw):
-        self.reactions.append(kw["emoji"])
+        (self.removed if kw.get("remove") else self.reactions).append(kw["emoji"])
         return True
 
     async def send_message(self, **kw):
+        if self.fail_send:
+            raise RuntimeError("signal send failed")
         self.messages.append(kw["message"])
 
 
@@ -236,7 +249,6 @@ async def test_season_request_on_existing_show(tmp_path):
 
 
 async def test_dispatcher_hands_off_before_reactor():
-    import asyncio
     from src.commands.dispatcher import CommandDispatcher
     calls = []
 
@@ -249,10 +261,19 @@ async def test_dispatcher_hands_off_before_reactor():
     d.prefix, d.context_registry, d.max_message_length = "!", None, 4000
     d.reactor = SimpleNamespace(maybe_react=lambda **kw: calls.append("reactor"))
     d._refresh_live_settings = lambda: None
+    d.group_log, d.settings_store = None, None
+    allowed = [True]
+    d._rate_limiter = SimpleNamespace(check=lambda s: (allowed[0], 30))
 
     assert await d.dispatch(sender="u", message="dune pls", group_id="g1", target_timestamp=5) is None
     await asyncio.sleep(0)
     assert calls == [("H", "u", "dune pls", "g1", 5)]
+
+    # Rate-limited senders don't reach the request handler.
+    allowed[0] = False
+    result = await d.dispatch(sender="u", message="more", group_id="g1", target_timestamp=6)
+    await asyncio.sleep(0)
+    assert result is not None and "Slow down" in result.text and len(calls) == 1
 
 
 async def test_replies_are_paraphrased_but_keep_facts(tmp_path):
@@ -276,3 +297,49 @@ async def test_replies_are_paraphrased_but_keep_facts(tmp_path):
     replies = iter([req("Heat"), "Heat's already here, check first"])
     await mr.handle(h, "uuid-a", "heat", "g1", 2)
     assert h.messages[-1].startswith("Heat (1995) has been on the server since Jun 8, 2024")
+
+
+async def test_failed_reply_still_tracks_request(tmp_path):
+    radarr = FakeArr("movie", catalog=[{"title": "Soon", "year": 2027, "status": "announced"}])
+    mr, h = make(tmp_path, req("Soon"), radarr)
+    h.fail_send = True  # the heads-up reply blows up
+    await mr.handle(h, "uuid-a", "soon pls", "g1", 1)
+    assert h.reactions == [WAITING] and len(mr.pending) == 1
+
+
+async def test_deleted_titles_drop_the_hourglass_not_check(tmp_path):
+    radarr = FakeArr("movie")
+    sonarr = FakeArr("tv")  # episodes() answers [] for unknown ids, like Sonarr
+    mr, h = make(tmp_path, {}, radarr, sonarr)
+    mr.pending = [
+        {"phone": "+1555", "group_id": "g1", "author": "a", "ts": 1,
+         "items": [{"kind": "movie", "id": 7, "title": "M", "next_check": 0}]},
+        {"phone": "+1555", "group_id": "g1", "author": "b", "ts": 2,
+         "items": [{"kind": "tv", "id": 9, "seasons": None, "title": "S", "next_check": 0}]},
+    ]
+    await mr.check_pending()
+    assert h.reactions == [] and h.removed == [WAITING, WAITING] and mr.pending == []
+
+
+async def test_missing_season_of_ended_show_is_not_found(tmp_path):
+    sonarr = FakeArr("tv", catalog=[{"title": "The Office", "year": 2005, "status": "ended",
+                                     "seasons": [{"seasonNumber": n} for n in range(10)]}])
+    mr, h = make(tmp_path, req("The Office", "tv", seasons=[10]), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "office s10", "g1", 1)
+    assert h.reactions == [NOT_FOUND] and not sonarr.added
+
+
+async def test_new_show_with_unannounced_season_warns(tmp_path):
+    sonarr = FakeArr("tv", catalog=[{"title": "Severance", "year": 2022, "status": "continuing",
+                                     "firstAired": iso(NOW - 900 * DAY),
+                                     "seasons": [{"seasonNumber": n} for n in range(3)]}])
+    mr, h = make(tmp_path, req("Severance", "tv", seasons=[3]), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "severance s3", "g1", 1)
+    assert h.reactions == [WAITING] and "season 3 has no air date yet" in h.messages[0]
+
+
+async def test_simultaneous_requests_add_once(tmp_path):
+    radarr = FakeArr("movie", catalog=[{"title": "Dune", "year": 2021, "status": "released"}])
+    mr, h = make(tmp_path, req("Dune", year=2021), radarr)
+    await asyncio.gather(mr.handle(h, "a", "dune", "g1", 1), mr.handle(h, "b", "dune", "g1", 2))
+    assert len(radarr.added) == 1 and h.reactions == [WAITING, WAITING] and len(mr.pending) == 2
