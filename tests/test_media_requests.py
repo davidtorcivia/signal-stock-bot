@@ -9,12 +9,20 @@ import time
 from types import SimpleNamespace
 
 import aiohttp
+import pytest
 
+import src.media_requests as media_requests
 from src.media_requests import (
     AVAILABLE, NOT_FOUND, WAITING, Arr, MediaRequests, movie_release, tv_progress,
 )
 
 DAY = 86400
+
+
+@pytest.fixture(autouse=True)
+def no_episode_wait(monkeypatch):
+    monkeypatch.setattr(media_requests, "EPISODE_WAIT_SECONDS", 0)
+
 NOW = time.time()
 
 
@@ -343,3 +351,39 @@ async def test_simultaneous_requests_add_once(tmp_path):
     mr, h = make(tmp_path, req("Dune", year=2021), radarr)
     await asyncio.gather(mr.handle(h, "a", "dune", "g1", 1), mr.handle(h, "b", "dune", "g1", 2))
     assert len(radarr.added) == 1 and h.reactions == [WAITING, WAITING] and len(mr.pending) == 2
+
+
+async def test_ended_show_drops_seasons_that_dont_exist(tmp_path):
+    sonarr = FakeArr("tv", catalog=[{"title": "The Office", "year": 2005, "status": "ended",
+                                     "seasons": [{"seasonNumber": n} for n in range(10)]}])
+    mr, h = make(tmp_path, req("The Office", "tv", seasons=[9, 10]), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "office s9-10", "g1", 1)
+    assert sonarr.added[0][1] == [9] and mr.pending[0]["items"][0]["seasons"] == [9]
+
+
+async def test_new_show_waits_for_episode_air_dates(tmp_path):
+    sonarr = FakeArr("tv", catalog=[{"title": "TLOU", "year": 2023, "status": "continuing",
+                                     "firstAired": iso(NOW - 900 * DAY),
+                                     "seasons": [{"seasonNumber": n} for n in range(4)]}])
+    calls = []
+
+    async def episodes(series_id):  # empty until Sonarr's refresh lands
+        calls.append(series_id)
+        return [] if len(calls) < 3 else [_ep(1, -900, True), _ep(3, 40, False)]
+    sonarr.episodes = episodes
+    mr, h = make(tmp_path, req("TLOU", "tv", seasons=[3]), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "tlou s3", "g1", 1)
+    assert len(calls) == 3 and "season 3 doesn't start airing until" in h.messages[0]
+
+
+async def test_future_season_on_monitored_show_turns_on_new_seasons(tmp_path):
+    sonarr = FakeArr(
+        "tv",
+        library={5: {"id": 5, "title": "Show", "monitored": True, "monitorNewItems": "none",
+                     "seasons": [{"seasonNumber": 1, "monitored": True}]}},
+        catalog=[{"id": 5, "title": "Show", "year": 2024, "status": "continuing"}],
+        episodes={5: [_ep(1, -100, True)]},
+    )
+    mr, h = make(tmp_path, req("Show", "tv", seasons=[3]), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "show s3", "g1", 1)
+    assert sonarr.searched == [(5, [3])] and h.reactions == [WAITING]

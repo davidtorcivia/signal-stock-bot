@@ -39,6 +39,7 @@ WAITING, AVAILABLE, NOT_FOUND = "⏳", "✅", "❓"
 MAX_TITLES_PER_MESSAGE = 5
 LOOKUP_CANDIDATES = 5
 UNDATED_RECHECK_SECONDS = 86400  # unreleased with no date yet: look daily
+EPISODE_WAIT_TRIES, EPISODE_WAIT_SECONDS = 5, 2  # after adding a series
 
 MEDIA_DEFAULTS = {
     "media_requests_enabled": False,
@@ -439,11 +440,13 @@ class MediaRequests:
         if not found:
             return {"status": "missing", "name": req["title"]}
 
-        if seasons and kind == "tv":
+        if seasons and kind == "tv" and found.get("status") == "ended":
+            # An ended show gets no new seasons: ask only for ones that exist.
             known = {s["seasonNumber"] for s in found.get("seasons", [])}
-            if not set(seasons) & known and found.get("status") == "ended":
+            if not set(seasons) & known:
                 return {"status": "missing", "name": f"{found.get('title')} season "
                         + ", ".join(map(str, seasons))}
+            seasons = [n for n in seasons if n in known]
         name = f"{found.get('title')} ({found.get('year')})"
         if seasons:
             name += (" season " if len(seasons) == 1 else " seasons ") + ", ".join(map(str, seasons))
@@ -455,9 +458,15 @@ class MediaRequests:
             if kind == "movie":
                 note = movie_release(created, now)[2]
             else:
-                # Sonarr usually hasn't filled in episodes yet right after the
-                # add; the lookup's season list and firstAired stand in.
-                note = tv_progress(await arr.episodes(created["id"]), seasons, now)[2]
+                # Sonarr fills in episodes a few seconds after the add; wait
+                # briefly for air dates, then fall back to the lookup's data.
+                eps: list[dict] = []
+                for _ in range(EPISODE_WAIT_TRIES):
+                    eps = await arr.episodes(created["id"])
+                    if eps:
+                        break
+                    await asyncio.sleep(EPISODE_WAIT_SECONDS)
+                note = tv_progress(eps, seasons, now)[2]
                 first = _ts(found.get("firstAired"))
                 unknown = sorted(set(seasons or []) - {s["seasonNumber"] for s in found.get("seasons", [])})
                 if not note and first and first > now:
@@ -485,7 +494,12 @@ class MediaRequests:
                                  and (d := _ts(f.get("dateAdded")))), default=since)
                 return {"status": "available", "name": name, "since": since}
         wanted = [s for s in record.get("seasons", []) if s["seasonNumber"] in targets]
-        if not record.get("monitored") or any(not s.get("monitored") for s in wanted):
+        unlisted = set(targets) - {s["seasonNumber"] for s in record.get("seasons", [])}
+        if (
+            not record.get("monitored")
+            or any(not s.get("monitored") for s in wanted)
+            or (unlisted and record.get("monitorNewItems") != "all")
+        ):
             await arr.monitor_and_search(record, targets)
         return {"status": "waiting", "name": name, "note": note, "item": item}
 
