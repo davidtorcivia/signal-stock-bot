@@ -204,6 +204,19 @@ async def test_jev_picks_ambiguous_match_or_none(tmp_path):
     assert h.reactions[-1] == NOT_FOUND
 
 
+
+async def test_same_name_shows_pick_the_best_known(tmp_path):
+    # Sonarr suffixes the year onto duplicate names; JEV is unsure here.
+    catalog = [
+        {"title": "BROTHERS", "year": 2014, "tvdbId": 1, "ratings": {"votes": 3}},
+        {"title": "Brothers (2026)", "year": 2026, "tvdbId": 2, "ratings": {"votes": 0}},
+        {"title": "Brothers (2026)", "year": 2026, "tvdbId": 3, "ratings": {"votes": 747}},
+    ]
+    sonarr = FakeArr("tv", catalog=catalog)
+    mr, h = make(tmp_path, req("Brothers", type="tv", year=2026), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "Brothers (2026)", "g1", 1)
+    assert sonarr.added[0][0]["tvdbId"] == 3
+
 def _ep(season, days_from_now, has_file):
     return {"seasonNumber": season, "airDateUtc": iso(NOW + days_from_now * DAY), "hasFile": has_file}
 

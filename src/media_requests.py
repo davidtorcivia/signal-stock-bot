@@ -104,6 +104,19 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def _bare_title(s: str) -> str:
+    # Sonarr disambiguates same-named shows as "Brothers (2026)".
+    return _norm(re.sub(r"\s*\(\d{4}\)\s*$", "", s or ""))
+
+
+def _votes(c: dict) -> int:
+    # Sonarr: {votes, value}; Radarr: {imdb: {votes, ...}, tmdb: {...}}.
+    r = c.get("ratings") or {}
+    if isinstance(r.get("votes"), int):
+        return r["votes"]
+    return sum((v.get("votes") or 0) for v in r.values() if isinstance(v, dict))
+
+
 def movie_release(movie: dict, now: float) -> tuple[bool, Optional[float], str]:
     """(released, next_check, note). Radarr's `status` goes 'released' once
     a home release date passes (or ~90 days after theaters), which also
@@ -387,10 +400,10 @@ class MediaRequests:
         cands = results[:LOOKUP_CANDIDATES]
         if not cands:
             return None
-        title, year = _norm(req["title"]), req.get("year")
+        title, year = _bare_title(req["title"]), req.get("year")
         exact = [
             c for c in cands
-            if _norm(c.get("title", "")) == title and (not year or c.get("year") == year)
+            if _bare_title(c.get("title", "")) == title and (not year or c.get("year") == year)
         ]
         if len(exact) == 1:
             return exact[0]
@@ -403,6 +416,7 @@ class MediaRequests:
                     "request": req,
                     "candidates": [
                         {"id": str(i), "title": c.get("title"), "year": c.get("year"),
+                         "network": c.get("network"), "votes": _votes(c),
                          "overview": (c.get("overview") or "")[:300]}
                         for i, c in enumerate(cands)
                     ],
@@ -424,7 +438,10 @@ class MediaRequests:
             if pick is not None:
                 return cands[int(pick)]
         by_year = [c for c in cands if year and c.get("year") == year]
-        return (exact or by_year or cands)[0]
+        if exact or by_year:
+            # Same-name ties: the best-known one is almost always meant.
+            return max(exact or by_year, key=_votes)
+        return cands[0]
 
     # ── resolving one request ───────────────────────────────────────────
 
