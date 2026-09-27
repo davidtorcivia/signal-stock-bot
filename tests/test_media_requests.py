@@ -428,3 +428,30 @@ async def test_episode_read_failure_after_add_still_tracks(tmp_path):
     mr, h = make(tmp_path, req("New", "tv"), sonarr=sonarr)
     await mr.handle(h, "uuid-a", "new show", "g1", 1)
     assert h.reactions == [WAITING] and len(mr.pending) == 1
+
+
+async def test_rerequest_of_monitored_missing_title_searches_again(tmp_path):
+    rec = {"id": 7, "title": "Dune", "year": 2021, "monitored": True,
+           "hasFile": False, "status": "released"}
+    radarr = FakeArr("movie", library={7: rec}, catalog=[dict(rec)])
+    mr, h = make(tmp_path, req("Dune", year=2021), radarr)
+    await mr.handle(h, "uuid-a", "dune never showed up", "g1", 1)
+    assert radarr.searched == [(7, [])] and h.reactions[-1] == WAITING
+
+
+async def test_string_season_numbers_are_kept(tmp_path):
+    mr, _ = make(tmp_path, {"requests": [{"title": "Severance", "type": "tv", "seasons": ["2", 3, "x"]}]})
+    assert (await mr._extract("severance s2 and 3"))[0]["seasons"] == [2, 3]
+
+
+def test_media_form_is_all_or_nothing():
+    from werkzeug.datastructures import MultiDict
+    from src.admin.blueprint import _apply_media_form
+
+    class S(dict):
+        set = dict.__setitem__
+    store = S()
+    with pytest.raises(ValueError):
+        _apply_media_form(store, MultiDict({"media_requests_enabled": "on",
+                                            "radarr_url": "http://r", "sonarr_url": "ftp://x"}))
+    assert store == {}

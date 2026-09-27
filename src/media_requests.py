@@ -24,6 +24,7 @@ All settings are live (admin → Media).
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -324,7 +325,9 @@ class MediaRequests:
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(self.pending))
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.pending))
+        os.replace(tmp, self.state_path)  # a crash mid-write can't wipe pending
 
     # ── understanding the message ───────────────────────────────────────
 
@@ -390,7 +393,8 @@ class MediaRequests:
                     "title": m.group(1) if m else str(r["title"]),
                     "year": year or (int(m.group(2)) if m else None),
                     "type": "tv" if r.get("type") == "tv" else "movie",
-                    "seasons": sorted({s for s in seasons if isinstance(s, int) and s > 0})
+                    "seasons": sorted({int(s) for s in seasons
+                                       if str(s).strip().isdigit() and int(s) > 0})
                     if isinstance(seasons, list) and r.get("type") == "tv" else None,
                 })
             return out[:MAX_TITLES_PER_MESSAGE]
@@ -473,7 +477,9 @@ class MediaRequests:
                 return {"status": "missing", "name": f"{found.get('title')} season "
                         + ", ".join(map(str, seasons))}
             seasons = [n for n in seasons if n in known]
-        name = f"{found.get('title')} ({found.get('year')})"
+        name = found.get("title") or req["title"]
+        if not re.search(r"\(\d{4}\)$", name):  # Sonarr may already suffix it
+            name += f" ({found.get('year')})"
         if seasons:
             name += (" season " if len(seasons) == 1 else " seasons ") + ", ".join(map(str, seasons))
         item = {"kind": kind, "seasons": seasons, "title": name, "next_check": 0}
@@ -524,14 +530,9 @@ class MediaRequests:
                     since = min((d for f in files if f.get("seasonNumber") in targets
                                  and (d := _ts(f.get("dateAdded")))), default=since)
                 return {"status": "available", "name": name, "since": since}
-        wanted = [s for s in record.get("seasons", []) if s["seasonNumber"] in targets]
-        unlisted = set(targets) - {s["seasonNumber"] for s in record.get("seasons", [])}
-        if (
-            not record.get("monitored")
-            or any(not s.get("monitored") for s in wanted)
-            or (unlisted and record.get("monitorNewItems") != "all")
-        ):
-            await arr.monitor_and_search(record, targets)
+        # Always search: a re-request usually means a download failed on a
+        # title that's still monitored, and Radarr/Sonarr won't retry alone.
+        await arr.monitor_and_search(record, targets)
         return {"status": "waiting", "name": name, "note": note, "item": item}
 
     @staticmethod

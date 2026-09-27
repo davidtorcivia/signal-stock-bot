@@ -20,9 +20,13 @@
     {% if p is iterable and p is not string %}
         <select name="{{ prefix }}_quality_profile_id" id="{{ prefix }}_quality_profile_id">
             <option value="">First profile ({{ p[0].name if p else '—' }})</option>
+            {% set cur = values[prefix ~ '_quality_profile_id'] %}
             {% for prof in p %}
-                <option value="{{ prof.id }}" {% if values[prefix ~ '_quality_profile_id'] == prof.id %}selected{% endif %}>{{ prof.name }}</option>
+                <option value="{{ prof.id }}" {% if cur == prof.id %}selected{% endif %}>{{ prof.name }}</option>
             {% endfor %}
+            {% if cur and cur not in p|map(attribute='id')|list %}
+                <option value="{{ cur }}" selected>Profile #{{ cur }} (not found on {{ name }})</option>
+            {% endif %}
         </select>
         <p class="muted" style="font-size: 12px;">Connected.</p>
     {% else %}
@@ -54,8 +58,17 @@
         </label>
 
         <label>Request groups</label>
-        {% if groups %}
+        {# Configured groups the registry no longer lists stay checked, so a save can't drop them. #}
+        {% set shown = groups|map(attribute='key')|list %}
+        {% set unseen = (values.media_request_groups or [])|reject('in', shown)|list %}
+        {% if groups or unseen %}
             <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">
+                {% for key in unseen %}
+                    <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                        <input type="checkbox" name="media_request_groups" value="{{ key }}" checked>
+                        <span>{{ key[:16] ~ '…' }} (not seen)</span>
+                    </label>
+                {% endfor %}
                 {% for g in groups %}
                     <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
                         <input type="checkbox" name="media_request_groups" value="{{ g.key }}"

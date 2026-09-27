@@ -1613,10 +1613,13 @@ def _register_media_routes(
 
 
 def _apply_media_form(store: SettingsStore, form) -> None:
-    store.set("media_requests_enabled", form.get("media_requests_enabled") == "on")
-    store.set("media_request_groups", form.getlist("media_request_groups"))
+    # Validate everything before writing anything: no partial saves.
+    updates = {
+        "media_requests_enabled": form.get("media_requests_enabled") == "on",
+        "media_request_groups": form.getlist("media_request_groups"),
+    }
     try:
-        store.set("media_poll_minutes", max(1, int(form.get("media_poll_minutes") or 10)))
+        updates["media_poll_minutes"] = max(1, int(form.get("media_poll_minutes") or 10))
     except ValueError:
         raise ValueError("Check interval must be a whole number of minutes") from None
     for prefix in ("radarr", "sonarr"):
@@ -1624,12 +1627,14 @@ def _apply_media_form(store: SettingsStore, form) -> None:
         parsed = urlparse(url)
         if url and (parsed.scheme not in ("http", "https") or not parsed.hostname):
             raise ValueError(f"{prefix.title()} URL must be an http(s) URL")
-        store.set(f"{prefix}_url", url)
+        updates[f"{prefix}_url"] = url
         key = (form.get(f"{prefix}_api_key") or "").strip()
         if key:  # blank keeps the stored key
-            store.set(f"{prefix}_api_key", key)
+            updates[f"{prefix}_api_key"] = key
         profile = (form.get(f"{prefix}_quality_profile_id") or "").strip()
-        store.set(f"{prefix}_quality_profile_id", int(profile) if profile.isdigit() else None)
+        updates[f"{prefix}_quality_profile_id"] = int(profile) if profile.isdigit() else None
+    for k, v in updates.items():
+        store.set(k, v)
 
 
 # ---------------------------------------------------------------------------
