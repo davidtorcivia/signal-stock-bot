@@ -383,9 +383,12 @@ class MediaRequests:
                 if not isinstance(r, dict) or not r.get("title"):
                     continue
                 seasons = r.get("seasons")
+                year = r["year"] if isinstance(r.get("year"), int) else None
+                # "Brothers (2026)" with year null: the year is in the title.
+                m = re.fullmatch(r"(.+?)\s*\((\d{4})\)", str(r["title"]).strip())
                 out.append({
-                    "title": str(r["title"]),
-                    "year": r["year"] if isinstance(r.get("year"), int) else None,
+                    "title": m.group(1) if m else str(r["title"]),
+                    "year": year or (int(m.group(2)) if m else None),
                     "type": "tv" if r.get("type") == "tv" else "movie",
                     "seasons": sorted({s for s in seasons if isinstance(s, int) and s > 0})
                     if isinstance(seasons, list) and r.get("type") == "tv" else None,
@@ -453,7 +456,13 @@ class MediaRequests:
         if arr is None:
             return {"status": "missing", "name": req["title"]}
         term = f"{req['title']} {req['year']}" if req["year"] and kind == "movie" else req["title"]
-        found = await self._pick(req, text, await arr.lookup(term))
+        results = await arr.lookup(term)
+        if kind == "tv" and req["year"] and not any(
+            c.get("year") == req["year"] for c in results[:LOOKUP_CANDIDATES]
+        ):
+            # A common name can push the show asked for past the candidate cut.
+            results = await arr.lookup(f"{req['title']} {req['year']}") or results
+        found = await self._pick(req, text, results)
         if not found:
             return {"status": "missing", "name": req["title"]}
 

@@ -217,6 +217,22 @@ async def test_same_name_shows_pick_the_best_known(tmp_path):
     await mr.handle(h, "uuid-a", "Brothers (2026)", "g1", 1)
     assert sonarr.added[0][0]["tvdbId"] == 3
 
+
+async def test_tv_year_retries_lookup_and_is_read_from_title(tmp_path):
+    common = [{"title": f"Brothers {i}", "year": 2000 + i} for i in range(5)]
+    wanted = {"title": "Brothers (2026)", "year": 2026, "tvdbId": 9}
+    sonarr = FakeArr("tv")
+    terms = []
+
+    async def lookup(term):
+        terms.append(term)
+        return [wanted] if term.endswith("2026") else common + [wanted]
+    sonarr.lookup = lookup
+    mr, h = make(tmp_path, req("Brothers (2026)", type="tv"), sonarr=sonarr)
+    await mr.handle(h, "uuid-a", "Brothers (2026)", "g1", 1)
+    assert terms == ["Brothers", "Brothers 2026"]
+    assert sonarr.added[0][0]["tvdbId"] == 9
+
 def _ep(season, days_from_now, has_file):
     return {"seasonNumber": season, "airDateUtc": iso(NOW + days_from_now * DAY), "hasFile": has_file}
 
