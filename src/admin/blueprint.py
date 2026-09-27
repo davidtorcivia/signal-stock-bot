@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 import os.path
+import re
 import socket
 import time
 from datetime import timedelta
@@ -1622,6 +1623,10 @@ def _apply_media_form(store: SettingsStore, form) -> None:
         updates["media_poll_minutes"] = max(1, int(form.get("media_poll_minutes") or 10))
     except ValueError:
         raise ValueError("Check interval must be a whole number of minutes") from None
+    alert = re.sub(r"[\s()-]", "", form.get("media_alert_recipient") or "")
+    if alert and not re.fullmatch(r"\+\d{8,15}", alert):
+        raise ValueError("Outage alert number must look like +16785551234")
+    updates["media_alert_recipient"] = alert
     for prefix in ("radarr", "sonarr"):
         url = (form.get(f"{prefix}_url") or "").strip()
         parsed = urlparse(url)

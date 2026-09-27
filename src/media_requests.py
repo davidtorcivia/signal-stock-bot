@@ -36,7 +36,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-WAITING, AVAILABLE, NOT_FOUND = "⏳", "✅", "❓"
+WAITING, AVAILABLE, NOT_FOUND, ERROR = "⏳", "✅", "❓", "⚠️"
 MAX_TITLES_PER_MESSAGE = 5
 LOOKUP_CANDIDATES = 5
 UNDATED_RECHECK_SECONDS = 86400  # unreleased with no date yet: look daily
@@ -52,6 +52,7 @@ MEDIA_DEFAULTS = {
     "sonarr_url": "",
     "sonarr_api_key": "",
     "sonarr_quality_profile_id": None,
+    "media_alert_recipient": "",  # gets a DM when Radarr/Sonarr is unreachable
 }
 
 SHAME = [
@@ -71,6 +72,7 @@ VOICE_PROMPT = """You post short replies in a friendly group chat where people r
 Rewrite the notes below as one casual chat message in your own words, no greeting, no emoji spam.
 - "Already on the server" notes: tease the person a little for not checking first.
 - "Heads up" notes: a friendly warning that it'll be a while.
+- "Couldn't find" notes: say plainly that title couldn't be found.
 Keep every title and every date exactly as written. Reply with the message only."""
 
 
@@ -108,6 +110,13 @@ def _norm(s: str) -> str:
 def _bare_title(s: str) -> str:
     # Sonarr disambiguates same-named shows as "Brothers (2026)".
     return _norm(re.sub(r"\s*\(\d{4}\)\s*$", "", s or ""))
+
+
+def _outage(e: Exception) -> bool:
+    """Radarr/Sonarr down or erroring, as opposed to a title not existing."""
+    return isinstance(e, (aiohttp.ClientConnectionError, asyncio.TimeoutError)) or (
+        isinstance(e, aiohttp.ClientResponseError) and e.status >= 500
+    )
 
 
 def _votes(c: dict) -> int:
@@ -279,6 +288,7 @@ class MediaRequests:
         self.state_path = Path(state_path)
         self._arrs: dict[str, tuple[tuple, Arr]] = {}
         self._lock = asyncio.Lock()
+        self._alerted = False  # one outage DM until Radarr/Sonarr answers again
         # In-memory list, mutated in place by both handle() and the poll and
         # written through after each change — never load-modify-save across
         # an await, or a request landing mid-poll would be overwritten.
@@ -546,6 +556,8 @@ class MediaRequests:
             return f"{r['name']} has been on the server{when}. {random.choice(SHAME)}"
         if r.get("note"):
             return f"Heads up on {r['name']}: {r['note']}."
+        if r["status"] == "missing":  # only sent when the reaction isn't ❓
+            return f"Couldn't find {r['name']}."
         return None
 
     async def _voice(self, lines: list[str], facts: list[dict]) -> str:
@@ -582,6 +594,14 @@ class MediaRequests:
         if not reqs:
             return
         now = time.time()
+        entry = {
+            "phone": handler.config.phone_number, "group_id": group_id,
+            "author": sender, "ts": int(ts), "requested_at": now, "text": text,
+            "items": [], "retry": [],
+        }
+        await self._answer(handler, entry, await self._resolve_all(reqs, text, now), now)
+
+    async def _resolve_all(self, reqs: list[dict], text: str, now: float) -> list[dict]:
         results = []
         # One request at a time: two people asking for the same new title
         # would otherwise both POST it and the second add fails.
@@ -591,37 +611,73 @@ class MediaRequests:
                     results.append(await self._resolve(req, text, now))
                 except Exception as e:
                     logger.error(f"Media request for {req['title']!r} failed: {e}")
-                    results.append({"status": "missing", "name": req["title"]})
+                    status = "error" if _outage(e) else "missing"
+                    results.append({"status": status, "name": req["title"], "req": req,
+                                    "error": f"{type(e).__name__}: {e}"[:200]})
+        return results
 
-        items = [r["item"] for r in results if r["status"] in ("added", "waiting")]
-        if items:
+    async def _answer(self, handler, entry: dict, results: list[dict], now: float) -> None:
+        """React to (and track) a request's results. Titles that hit a
+        Radarr/Sonarr outage get ⚠️ and are retried each poll; the entry is
+        answered again once they all resolve."""
+        entry["items"] += [r["item"] for r in results if r["status"] in ("added", "waiting")]
+        errors = [r for r in results if r["status"] == "error"]
+        entry["retry"] = [r["req"] for r in errors]
+        tracked = any(e is entry for e in self.pending)
+        # Tracked before any send, so a failed send can't orphan it.
+        if (entry["items"] or entry["retry"]) and not tracked:
+            self.pending.append(entry)
+            self._save()
+        elif not (entry["items"] or entry["retry"]) and tracked:
+            self.pending.remove(entry)  # retries resolved to nothing to wait on
+            self._save()
+        if errors:
+            emoji = ERROR
+        elif entry["items"]:
             emoji = WAITING
         elif any(r["status"] == "missing" for r in results):
             emoji = NOT_FOUND
         else:
             emoji = AVAILABLE
-        if items:  # tracked before any send, so a failed send can't orphan it
-            self.pending.append({
-                "phone": handler.config.phone_number, "group_id": group_id,
-                "author": sender, "ts": int(ts), "requested_at": now, "items": items,
-            })
-            self._save()
         await handler.send_reaction(
-            recipient=sender, target_author=sender, target_timestamp=int(ts),
-            emoji=emoji, group_id=group_id,
+            recipient=entry["author"], target_author=entry["author"],
+            target_timestamp=entry["ts"], emoji=emoji, group_id=entry["group_id"],
         )
+        if errors:
+            await self._alert(handler, errors[0])
         # The reaction is the answer; text only for the _line exceptions,
-        # to keep the request chat quiet.
-        lines = [line for r in results if (line := self._line(r, now))]
+        # to keep the request chat quiet. "Couldn't find" only when the
+        # reaction doesn't already say it.
+        shown = [r for r in results if emoji != NOT_FOUND or r["status"] != "missing"]
+        lines = [line for r in shown if (line := self._line(r, now))]
         if lines:
-            facts = [r for r in results if r["status"] == "available" or r.get("note")]
+            facts = [r for r in shown if r["status"] in ("available", "missing") or r.get("note")]
             try:
                 await handler.send_message(
-                    recipient=sender, group_id=group_id,
+                    recipient=entry["author"], group_id=entry["group_id"],
                     message=await self._voice(lines, facts),
                 )
             except Exception as e:
                 logger.warning(f"Media request reply failed: {e}")
+
+    async def _alert(self, handler, r: dict) -> None:
+        """DM the configured admin once per outage."""
+        to = (self.setting("media_alert_recipient") or "").strip()
+        if self._alerted or not to:
+            return
+        self._alerted = True
+        kind = r["kind"] if "kind" in r else r["req"]["type"]
+        service = "Radarr" if kind == "movie" else "Sonarr"
+        minutes = self.setting("media_poll_minutes") or 10
+        try:
+            await handler.send_message(
+                recipient=to,
+                message=f"⚠️ Media requests can't reach {service} ({r.get('error')}). "
+                        f"Requests are marked ⚠️ and retry every {minutes} min.",
+            )
+        except Exception as e:
+            self._alerted = False
+            logger.warning(f"Media outage alert failed: {e}")
 
     # ── availability poll ───────────────────────────────────────────────
 
@@ -652,23 +708,36 @@ class MediaRequests:
     async def check_pending(self) -> None:
         now, fetched, changed = time.time(), {}, False
         for entry in list(self.pending):
+            handler = self.signal_pool.for_phone(entry["phone"]) or self.signal_pool.default()
+            if entry.get("retry"):
+                results = await self._resolve_all(entry["retry"], entry.get("text", ""), now)
+                errors = [r for r in results if r["status"] == "error"]
+                if errors:
+                    # Re-resolving is idempotent (an added title is found in
+                    # the library next time), so only a clean pass is kept.
+                    await self._alert(handler, errors[0])
+                    continue
+                self._alerted = False
+                await self._answer(handler, entry, results, now)
+                continue
             for it in entry["items"]:
                 if it.get("done") or it.get("gone") or it.get("next_check", 0) > now:
                     continue
                 try:
                     it["done"], it["next_check"] = await self._progress(it, fetched, now)
-                except aiohttp.ClientResponseError as e:
-                    if e.status != 404:
-                        logger.warning(f"Media request check failed: {e}")
-                        continue
-                    it["gone"] = True  # deleted from Radarr/Sonarr: stop tracking
+                    self._alerted = False
                 except Exception as e:
-                    logger.warning(f"Media request check failed: {e}")
-                    continue
+                    if isinstance(e, aiohttp.ClientResponseError) and e.status == 404:
+                        it["gone"] = True  # deleted from Radarr/Sonarr: stop tracking
+                    else:
+                        logger.warning(f"Media request check failed: {e}")
+                        if _outage(e):
+                            await self._alert(handler, {"kind": it["kind"],
+                                                        "error": f"{type(e).__name__}: {e}"[:200]})
+                        continue
                 changed = True
             if not all(it.get("done") or it.get("gone") for it in entry["items"]):
                 continue
-            handler = self.signal_pool.for_phone(entry["phone"]) or self.signal_pool.default()
             arrived = any(it.get("done") for it in entry["items"])
             if await handler.send_reaction(
                 recipient=entry["author"], target_author=entry["author"],

@@ -89,6 +89,13 @@
             Unreleased movies and unaired seasons skip checks until their release date (daily when there's no date).
         </p>
 
+        <label for="media_alert_recipient">Outage alert number</label>
+        <input type="text" name="media_alert_recipient" id="media_alert_recipient"
+               value="{{ values.media_alert_recipient or '' }}" placeholder="+16785551234 (blank: no alerts)">
+        <p class="muted" style="font-size: 12px;">
+            Gets one Signal DM when Radarr or Sonarr can't be reached. Requests hit by an outage get ⚠️ and retry each check.
+        </p>
+
         {{ arr_fields('radarr', 'Radarr', 'http://host.docker.internal:7878') }}
         {{ arr_fields('sonarr', 'Sonarr', 'http://host.docker.internal:8989') }}
 

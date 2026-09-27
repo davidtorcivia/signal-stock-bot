@@ -132,6 +132,7 @@ MEDIA_KEYS = {
     "sonarr_url",
     "sonarr_api_key",
     "sonarr_quality_profile_id",
+    "media_alert_recipient",
 }
 
 # All keys that the admin UI is allowed to write. Anything else is rejected.

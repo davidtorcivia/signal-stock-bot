@@ -34,6 +34,7 @@ class SignalPoller:
         on_message: Callable[[dict], Awaitable[None]],
         poll_interval: float = 5.0,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        ready: Optional[asyncio.Event] = None,
     ):
         """
         Initialize the WebSocket listener.
@@ -52,6 +53,10 @@ class SignalPoller:
         self.poll_interval = poll_interval
         self._running = False
         self._loop = loop
+        # Connect early, dispatch late: signal-api (json-rpc) drops messages
+        # while nothing is connected, so startup connects before the bot is
+        # wired and holds each message here until `ready` is set.
+        self.ready = ready
         self._thread: Optional[threading.Thread] = None
         self._task: Optional[concurrent.futures.Future] = None
 
@@ -160,7 +165,9 @@ class SignalPoller:
         
         # Forward as webhook format
         webhook_data = {"envelope": envelope}
-        
+        if self.ready is not None:
+            await self.ready.wait()
+
         try:
             await self.on_message(webhook_data)
         except Exception as e:

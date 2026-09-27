@@ -879,6 +879,34 @@ def build_app(config: Config):
     )
     signal_pool.build()
     signal_handler = signal_pool.default()
+
+    # Single shared event loop for all async work
+    loop = _start_background_loop()
+
+    # WebSocket message pollers — one per registered phone, connected as
+    # early as the handlers exist: signal-api (json-rpc mode) drops what
+    # arrives while nothing is connected, so every second of startup before
+    # this is a window where messages are lost. They hold messages until
+    # `pollers_ready` is set at the end of wiring. Each poller feeds its own
+    # handler; the handler filters envelopes so only the one whose phone
+    # matches the answering bot actually dispatches.
+    pollers_ready = asyncio.Event()
+    pollers: list[SignalPoller] = []
+    for handler in signal_pool.handlers():
+        p = SignalPoller(
+            api_url=handler.config.api_url,
+            phone_number=handler.config.phone_number,
+            on_message=handler.handle_webhook,
+            poll_interval=1.0,
+            loop=loop,
+            ready=pollers_ready,
+        )
+        p.start()
+        pollers.append(p)
+    # Keep a primary `poller` reference for the legacy app attribute set
+    # below; the rest are tracked in `pollers` and attached to the app
+    # to keep them alive.
+    poller = pollers[0] if pollers else None
     reactor.signal_pool = signal_pool
     reactor.signal = signal_handler  # legacy single-handler ref kept for compatibility
     ask_command.signal_pool = signal_pool
@@ -947,9 +975,6 @@ def build_app(config: Config):
         )
     phones_summary = ", ".join(f"...{p[-4:]}" for p in signal_pool.phones())
     logger.info(f"Signal pool configured: {phones_summary}")
-
-    # Single shared event loop for all async work
-    loop = _start_background_loop()
 
     # Async backfill pass. The bots table itself was created by the
     # sync warm_sync() above so LLMClient could be constructed with the
@@ -1199,24 +1224,6 @@ def build_app(config: Config):
             f"signal_pool.bootstrap_uuids failed (will populate lazily): {e}"
         )
 
-    # WebSocket message pollers — one per registered phone. Each poller
-    # feeds its own handler; the handler filters envelopes so only the
-    # one whose phone matches the answering bot actually dispatches.
-    pollers: list[SignalPoller] = []
-    for handler in signal_pool.handlers():
-        p = SignalPoller(
-            api_url=handler.config.api_url,
-            phone_number=handler.config.phone_number,
-            on_message=handler.handle_webhook,
-            poll_interval=1.0,
-            loop=loop,
-        )
-        p.start()
-        pollers.append(p)
-    # Keep a primary `poller` reference for the legacy app attribute set
-    # below; the rest are tracked in `pollers` and attached to the app
-    # to keep them alive.
-    poller = pollers[0] if pollers else None
 
     admin_phone = config.admin_numbers[0] if config.admin_numbers else ""
 
@@ -1256,6 +1263,8 @@ def build_app(config: Config):
     app.signal_pollers = pollers
     app.signal_pool = signal_pool
     app.async_loop = loop
+    loop.call_soon_threadsafe(pollers_ready.set)  # fully wired: start dispatching
+    logger.info("Signal pollers released")
     return app
 
 

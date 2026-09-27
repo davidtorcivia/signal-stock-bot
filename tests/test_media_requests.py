@@ -13,7 +13,7 @@ import pytest
 
 import src.media_requests as media_requests
 from src.media_requests import (
-    AVAILABLE, NOT_FOUND, WAITING, Arr, MediaRequests, movie_release, tv_progress,
+    AVAILABLE, NOT_FOUND, WAITING, ERROR, Arr, MediaRequests, movie_release, tv_progress,
 )
 
 DAY = 86400
@@ -94,7 +94,7 @@ class FakeHandler:
     config = SimpleNamespace(phone_number="+1555")
 
     def __init__(self):
-        self.reactions, self.messages, self.removed = [], [], []
+        self.reactions, self.messages, self.removed, self.dms = [], [], [], []
         self.fail_send = False
 
     async def send_reaction(self, **kw):
@@ -104,7 +104,7 @@ class FakeHandler:
     async def send_message(self, **kw):
         if self.fail_send:
             raise RuntimeError("signal send failed")
-        self.messages.append(kw["message"])
+        (self.messages if kw.get("group_id") else self.dms).append(kw["message"])
 
 
 class Store(dict):
@@ -455,3 +455,37 @@ def test_media_form_is_all_or_nothing():
         _apply_media_form(store, MultiDict({"media_requests_enabled": "on",
                                             "radarr_url": "http://r", "sonarr_url": "ftp://x"}))
     assert store == {}
+
+
+
+async def test_mixed_request_names_the_title_not_found(tmp_path):
+    radarr = FakeArr("movie", catalog=[{"title": "Dune", "year": 2021, "status": "released"}])
+    reply = {"requests": [{"title": "Dune", "type": "movie", "year": 2021},
+                          {"title": "Xyzzyx", "type": "tv"}]}
+    mr, h = make(tmp_path, reply, radarr, sonarr=FakeArr("tv"))
+    await mr.handle(h, "uuid-a", "add dune and xyzzyx", "g1", 1)
+    assert h.reactions == [WAITING] and h.messages == ["Couldn't find Xyzzyx."]
+
+
+async def test_outage_warns_alerts_once_and_retries(tmp_path):
+    radarr = FakeArr("movie", catalog=[{"title": "Dune", "year": 2021, "status": "released"}])
+    real_lookup = radarr.lookup
+
+    async def down(term):
+        raise aiohttp.ClientConnectionError("refused")
+    radarr.lookup = down
+    mr, h = make(tmp_path, req("Dune", year=2021), radarr)
+    mr.store["media_alert_recipient"] = "+16785550000"
+    await mr.handle(h, "uuid-a", "add dune", "g1", 1)
+    await mr.handle(h, "uuid-b", "add dune pls", "g1", 2)
+    assert h.reactions == [ERROR, ERROR] and h.messages == [] and len(h.dms) == 1
+    assert "Radarr" in h.dms[0] and len(mr.pending) == 2
+
+    await mr.check_pending()  # still down: nothing changes, no second DM
+    assert h.reactions == [ERROR, ERROR] and len(h.dms) == 1
+
+    radarr.lookup = real_lookup
+    await mr.check_pending()
+    assert h.reactions[2:] == [WAITING, WAITING] and len(radarr.added) == 1
+    assert all(e["items"] and not e["retry"] for e in mr.pending)
+    assert not mr._alerted
