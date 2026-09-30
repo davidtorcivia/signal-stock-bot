@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aioresponses import aioresponses
+from aiohttp import web
 
 from src.admin.blueprint import _apply_llm_form
 from src.bots.models import Bot
@@ -34,26 +34,58 @@ def store(tmp_path, monkeypatch):
     return store
 
 
+@pytest.fixture
+async def jev_server(monkeypatch):
+    """A real local HTTP server standing in for OpenRouter's decisions API.
+
+    Queue replies with `server.replies.append(...)`: a (status, json) tuple,
+    or "hang" to never answer. Received requests land in `server.requests`.
+    """
+    server = SimpleNamespace(replies=[], requests=[])
+    released = asyncio.Event()
+
+    async def decisions(request):
+        server.requests.append({"json": await request.json(), "headers": dict(request.headers)})
+        reply = server.replies.pop(0)
+        if reply == "hang":
+            await released.wait()
+            return web.Response(status=504)
+        status, body = reply
+        return web.json_response(body, status=status)
+
+    app = web.Application()
+    app.router.add_post("/decisions", decisions)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(jev_module, "JEV_URL", f"http://127.0.0.1:{port}/decisions")
+    yield server
+    released.set()
+    await runner.cleanup()
+
+
 QUESTION = {"route": {"type": "choice", "instructions": "Choose a capability.",
                       "criteria": {"weather": "Weather", "finance": "Stock quotes"}}}
 
 
-async def test_transport_uses_decisions_endpoint_and_validates_choices(store):
+async def test_transport_uses_decisions_endpoint_and_validates_choices(store, jev_server):
+    assert JEV_URL == "https://openrouter.ai/api/alpha/decisions"
     client = JevClient(store)
-    with aioresponses() as http:
-        http.post(JEV_URL, payload={"answers": {"route": {
-            "type": "choice", "choice": "weather", "confidence": 0.95,
-        }}, "usage": {"input_tokens": 123, "output_tokens": 20}})
-        try:
-            assert await client.choose(state="weather please", questions=QUESTION, purpose="test") == {"route": "weather"}
-            request = next(iter(http.requests.values()))[0].kwargs
-            assert request["json"] == {
-                "model": "~typesafe/jev-latest", "state": "weather please", "questions": QUESTION,
-            }
-            assert request["headers"]["Authorization"] == "Bearer test-key"
-            assert jev_module.get_metrics()._llm.tokens_in == 123
-        finally:
-            await client.close()
+    jev_server.replies.append((200, {"answers": {"route": {
+        "type": "choice", "choice": "weather", "confidence": 0.95,
+    }}, "usage": {"input_tokens": 123, "output_tokens": 20}}))
+    try:
+        assert await client.choose(state="weather please", questions=QUESTION, purpose="test") == {"route": "weather"}
+        [request] = jev_server.requests
+        assert request["json"] == {
+            "model": "~typesafe/jev-latest", "state": "weather please", "questions": QUESTION,
+        }
+        assert request["headers"]["Authorization"] == "Bearer test-key"
+        assert jev_module.get_metrics()._llm.tokens_in == 123
+    finally:
+        await client.close()
     assert client._session is None
 
 
@@ -67,46 +99,46 @@ async def test_transport_uses_decisions_endpoint_and_validates_choices(store):
     {"type": "score", "choice": "weather", "confidence": 1},
     None,
 ])
-async def test_uncertain_or_malformed_choice_falls_back(store, answer):
+async def test_uncertain_or_malformed_choice_falls_back(store, jev_server, answer):
     client = JevClient(store)
-    with aioresponses() as http:
-        http.post(JEV_URL, payload={"answers": {"route": answer}})
-        try:
+    jev_server.replies.append((200, {"answers": {"route": answer}}))
+    try:
+        assert await client.choose(state="x", questions=QUESTION, purpose="test") == {}
+    finally:
+        await client.close()
+
+
+async def test_errors_open_circuit_and_cancellation_propagates(store, jev_server):
+    store.set("jev_timeout_seconds", 1)
+    client = JevClient(store)
+    jev_server.replies += [(429, {}), "hang", (200, [])]
+    try:
+        for _ in range(4):
             assert await client.choose(state="x", questions=QUESTION, purpose="test") == {}
-        finally:
-            await client.close()
+        assert len(jev_server.requests) == 3
+        jev_module.get_metrics().get_provider_metrics("jev:~typesafe/jev-latest").close_circuit()
+        jev_server.replies.append("hang")
+        task = asyncio.create_task(client.choose(state="x", questions=QUESTION, purpose="test"))
+        while len(jev_server.requests) < 4 and not task.done():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await client.close()
 
 
-async def test_errors_open_circuit_and_cancellation_propagates(store):
-    client = JevClient(store)
-    with aioresponses() as http:
-        http.post(JEV_URL, status=429)
-        http.post(JEV_URL, exception=asyncio.TimeoutError())
-        http.post(JEV_URL, payload=[])
-        try:
-            for _ in range(4):
-                assert await client.choose(state="x", questions=QUESTION, purpose="test") == {}
-            assert sum(map(len, http.requests.values())) == 3
-            jev_module.get_metrics().get_provider_metrics("jev:~typesafe/jev-latest").close_circuit()
-            http.post(JEV_URL, exception=asyncio.CancelledError())
-            with pytest.raises(asyncio.CancelledError):
-                await client.choose(state="x", questions=QUESTION, purpose="test")
-        finally:
-            await client.close()
-
-
-async def test_disabled_oversized_and_non_openrouter_credentials_never_send(store):
+async def test_disabled_oversized_and_non_openrouter_credentials_never_send(store, jev_server):
     client = JevClient(store)
     assert client.enabled()
     store.set("llm_base_url", "https://openrouter.ai.evil.example/api/v1")
     assert not client.enabled()
     store.set("jev_api_key", "dedicated")
     assert client.enabled()
-    with aioresponses() as http:
-        assert await client.choose(state="x" * 100_000, questions=QUESTION, purpose="test") == {}
-        store.set("jev_enabled", False)
-        assert await client.choose(state="x", questions=QUESTION, purpose="test") == {}
-        assert not http.requests
+    assert await client.choose(state="x" * 100_000, questions=QUESTION, purpose="test") == {}
+    store.set("jev_enabled", False)
+    assert await client.choose(state="x", questions=QUESTION, purpose="test") == {}
+    assert not jev_server.requests
 
 
 def test_admin_form_retains_secret_and_enables_defaults(store):

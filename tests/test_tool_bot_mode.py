@@ -213,16 +213,13 @@ async def test_tool_bot_direct_mcp_call_routes_to_invoke(store, monkeypatch):
     assert "NEWS RESULTS" in out
 
 
-def test_deep_think_still_rejects_direct_mcp(store: SettingsStore):
+async def test_deep_think_still_rejects_direct_mcp(store: SettingsStore):
     """Regression: base DeepThinkClient must still reject direct MCP calls
     (it only reaches MCP through the broker)."""
-    import asyncio
     from src.llm.deep_think import DeepThinkClient
 
     dt = DeepThinkClient(store, bot_id=2)
-    out = asyncio.get_event_loop().run_until_complete(
-        dt._handle_direct_mcp_call("brave-search__x", {}, None)
-    )
+    out = await dt._handle_direct_mcp_call("brave-search__x", {}, None)
     assert "mcp__invoke" in out and "unavailable" in out
 
 
