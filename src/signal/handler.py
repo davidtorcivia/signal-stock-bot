@@ -725,6 +725,13 @@ class SignalHandler:
             return None
         return (group_id or "dm", source_uuid, int(ts))
 
+    def _all_served_disabled(self) -> bool:
+        registry = getattr(self.dispatcher, "bot_registry", None)
+        if registry is None:
+            return False
+        bots = [registry.get_sync(i) for i in self.served_bot_ids]
+        return all(b is not None and not b.enabled for b in bots)
+
     def _owns_bot(self, bot) -> bool:
         """True if this handler should send-as the given bot.
 
@@ -1175,6 +1182,11 @@ class SignalHandler:
         Parses the webhook payload, extracts message info,
         dispatches to command handler, and sends response.
         """
+        # Handlers are built once at boot, so disabling a bot leaves its
+        # poller running. Without this it keeps taking over for its sibling
+        # and sending fallback DMs from the disabled bot's number.
+        if self.served_bot_ids and self._all_served_disabled():
+            return
         envelope = data.get("envelope", {})
         # `source` is a phone on one account's view of a contact and a UUID
         # on another's; `sourceUuid` is always present. Key identity off the

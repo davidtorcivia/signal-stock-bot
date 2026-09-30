@@ -194,9 +194,10 @@ class SignalHandlerPool:
                 served = list(handler.served_bot_ids)
                 if len(served) == 1 and self._bot_registry is not None:
                     try:
-                        return self._bot_registry.get_sync(served[0])
+                        bot = self._bot_registry.get_sync(served[0])
                     except Exception:
                         return None
+                    return bot if bot is not None and bot.enabled else None
                 return None
         return None
 

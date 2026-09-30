@@ -553,3 +553,21 @@ async def test_answer_secondary_skips_user_turn_and_sends_from_own_phone():
     # Sent from Artaud's own handler (its phone), not Sigil's.
     artaud_h.send_message.assert_awaited_once()
     assert artaud_h.send_message.call_args.kwargs["message"] == "the artist speaks"
+
+
+@pytest.mark.asyncio
+async def test_disabled_bot_handler_goes_silent():
+    """Disabling Artaud left his poller running: it took over for Sigil and
+    sent fallback DMs from Artaud's number, and UUID mentions still fanned
+    out as him."""
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    dispatch_mock, _sigil_h, artaud_h = _wire_dispatch_test(pool, bots)
+    artaud_h._bot_uuid = "artaud-uuid"
+    bots[1].enabled = False
+    assert pool.bot_for_uuid("artaud-uuid") is None
+    await artaud_h.handle_webhook({"envelope": {
+        "source": "+15559999999", "sourceUuid": "u-1", "timestamp": 1,
+        "dataMessage": {"message": "hello", "timestamp": 1},
+    }})
+    dispatch_mock.assert_not_called()
