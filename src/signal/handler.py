@@ -946,6 +946,21 @@ class SignalHandler:
         active_bot = None
         if self.dispatcher is not None:
             active_bot = self.dispatcher._resolve_bot(group_id, policy=policy)
+        # A DM to a phone that serves exactly one bot is for that bot, unless
+        # the text names another one. Without this default_for_dm wins and a
+        # DM to Artaud's number gets answered by Sigil, from Sigil's number.
+        dm_bot = None
+        if (
+            not group_id
+            and len(self.served_bot_ids) == 1
+            and self.dispatcher is not None
+            and self.dispatcher.bot_registry is not None
+        ):
+            dm_bot = self.dispatcher.bot_registry.get_sync(next(iter(self.served_bot_ids)))
+            if dm_bot is not None and dm_bot.enabled:
+                active_bot = dm_bot
+            else:
+                dm_bot = None
 
         # 1) Structured @-mention — phone/UUID match means the message
         # was directed at a Signal account we recognize. With multi-
@@ -1046,6 +1061,9 @@ class SignalHandler:
             if self._bot_uuid and quote_author_uuid == self._bot_uuid:
                 return active_bot, True
 
+        # Routing only: a mention flag would send small talk to the help intro.
+        if dm_bot is not None:
+            return dm_bot, False
         return None, False
 
     async def _resolve_addressed_bot_set(

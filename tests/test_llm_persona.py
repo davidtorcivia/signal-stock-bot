@@ -110,3 +110,17 @@ def test_persona_provider_optional_when_none():
     store = FakeStore(global_settings={"llm_system_prompt": "GLOBAL"})
     cfg = _client(store, bot_id=2, persona_provider=None)._config()
     assert cfg["system_prompt"] == "GLOBAL"
+
+
+def test_context_prompt_only_applies_to_pinned_bot():
+    """Woo's on First's "You are Sigil…" prompt made a summoned Artaud
+    introduce itself as Sigil."""
+    from types import SimpleNamespace as NS
+    from src.commands.ask_command import _context_prompt_for
+
+    policy = NS(system_prompt="You are Sigil.", default_bot_id=1)
+    assert _context_prompt_for(NS(policy=policy, bot=NS(id=1))) == "You are Sigil."
+    assert _context_prompt_for(NS(policy=policy, bot=NS(id=2))) is None
+    unpinned = NS(system_prompt="Be terse.", default_bot_id=None)
+    assert _context_prompt_for(NS(policy=unpinned, bot=NS(id=2))) == "Be terse."
+    assert _context_prompt_for(NS(policy=NS(system_prompt=None, default_bot_id=1), bot=NS(id=1))) is None

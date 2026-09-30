@@ -372,6 +372,24 @@ def _wrap_xml(tag: str, body: str) -> str:
     return f"<{tag}>\n{inner}\n</{tag}>"
 
 
+def _context_prompt_for(ctx) -> Optional[str]:
+    """The context's system prompt, if it applies to the answering bot.
+
+    The prompt is written for the context's pinned bot ("You are Sigil…").
+    A different bot summoned into the chat keeps its own persona; otherwise
+    it introduces itself as the pinned bot.
+    """
+    policy = getattr(ctx, "policy", None)
+    prompt = getattr(policy, "system_prompt", None)
+    if not prompt:
+        return None
+    pinned = getattr(policy, "default_bot_id", None)
+    bot_id = getattr(getattr(ctx, "bot", None), "id", None)
+    if pinned is None or bot_id is None or pinned == bot_id:
+        return prompt
+    return None
+
+
 class AskCommand(BaseCommand):
     name = "ask"
     aliases = ["a"]
@@ -3494,9 +3512,7 @@ class AskCommand(BaseCommand):
                     "this chat may have stored about someone."
                 )
 
-            prompt_override = None
-            if ctx.policy is not None and ctx.policy.system_prompt:
-                prompt_override = ctx.policy.system_prompt
+            prompt_override = _context_prompt_for(ctx)
             writer = self._llm_for(ctx)
             base_system_prompt = writer._resolve_system_prompt(
                 prompt_override, None

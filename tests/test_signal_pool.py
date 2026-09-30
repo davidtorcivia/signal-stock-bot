@@ -399,6 +399,20 @@ async def test_uuid_only_mention_resolves_to_named_bot_on_every_handler():
 
 
 @pytest.mark.asyncio
+async def test_dm_to_bot_number_addresses_that_bot():
+    """A DM to Artaud's number is for Artaud, even though Sigil is
+    default_for_dm. Regression: Sigil answered from Sigil's number."""
+    bots = _phoned_bots()
+    pool = _make_pool(bots)
+    _, sigil_h, artaud_h = _wire_dispatch_test(pool, bots)
+    env = {"message": "What's up?"}
+    bot_a, m_a = await artaud_h._resolve_addressed_bot(env, None, _FakePolicy())
+    bot_s, m_s = await sigil_h._resolve_addressed_bot(env, None, _FakePolicy())
+    assert (m_a, bot_a.slug) == (False, "artaud")
+    assert (m_s, bot_s.slug) == (False, "sigil")
+
+
+@pytest.mark.asyncio
 async def test_resolve_addressed_bot_set_both_mentioned():
     bots = _phoned_bots()
     pool = _make_pool(bots)
