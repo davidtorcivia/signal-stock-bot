@@ -752,12 +752,13 @@ class MediaRequests:
 
     async def run_forever(self) -> None:
         logger.info(f"Media request watcher started ({len(self.pending)} pending)")
+        # Check before the first sleep, so a restart doesn't hold back
+        # downloads that landed while the bot was down.
         while True:
+            if self.pending:
+                try:
+                    await self.check_pending()
+                except Exception as e:
+                    logger.error(f"Media request watcher error: {e}")
             minutes = self.setting("media_poll_minutes") or 10
             await asyncio.sleep(max(1, int(minutes)) * 60)
-            if not self.pending:
-                continue
-            try:
-                await self.check_pending()
-            except Exception as e:
-                logger.error(f"Media request watcher error: {e}")

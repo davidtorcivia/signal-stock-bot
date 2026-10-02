@@ -88,7 +88,9 @@ class SignalHandlerPool:
 
         Phones are: the global default phone (always present, so single-bot
         installs keep working when bot_registry is cold or empty) plus
-        every enabled bot's `signal_phone` override.
+        every bot's `signal_phone` override, disabled bots included: a bot
+        can be switched on and off at runtime, and its handler's
+        `_all_served_disabled` guard keeps it silent while it's off.
         """
         if self._built:
             return
@@ -99,11 +101,14 @@ class SignalHandlerPool:
         if self._default_phone:
             seen[self._default_phone] = (self._default_api_url, set())
 
-        for bot in self._bot_registry.list_sync():
-            if not bot.enabled or bot.id is None:
+        # Enabled bots first, so a disabled bot never joins another bot's
+        # served set and silences a shared phone.
+        bots = sorted(self._bot_registry.list_sync(), key=lambda b: not b.enabled)
+        for bot in bots:
+            if bot.id is None:
                 continue
             phone = (bot.signal_phone or "").strip() or self._default_phone
-            if not phone:
+            if not phone or (not bot.enabled and phone in seen):
                 continue
             api_url = (bot.signal_api_url or "").strip() or self._default_api_url
             existing = seen.get(phone)
@@ -159,7 +164,9 @@ class SignalHandlerPool:
         resolved bot still get a working channel."""
         if not self._built:
             self.build()
-        if bot is not None and bot.signal_phone:
+        # A disabled bot's number stays quiet; whatever still sends as it
+        # goes out from the default number, as it did before it had a handler.
+        if bot is not None and bot.signal_phone and bot.enabled:
             handler = self._handlers.get(bot.signal_phone)
             if handler is not None:
                 return handler

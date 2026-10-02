@@ -930,11 +930,14 @@ def build_app(config: Config):
     def _bot_for_phone(phone: str):
         if not phone:
             return None
+        # Disabled bots count too: the voter is wired once at boot and a
+        # bot switched on later should vote with its own writer.
         matches = [
             b for b in bot_registry.list_sync()
             if (getattr(b, "signal_phone", None) or "") == phone
-               and getattr(b, "enabled", True)
         ]
+        if any(getattr(b, "enabled", True) for b in matches):
+            matches = [b for b in matches if getattr(b, "enabled", True)]
         if len(matches) > 1:
             # Shared-phone deploy: log loudly so the operator notices
             # the routing ambiguity. We pick the registry's

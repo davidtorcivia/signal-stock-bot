@@ -200,8 +200,8 @@ class TestLookupBotByPhone:
         bots[1].enabled = False
         pool = _make_pool(bots)
         h = pool.default()
-        # Disabled bots don't get a handler in build(), but the registry
-        # might still hold their row — _lookup must filter them out.
+        # The registry still holds a disabled bot's row; _lookup must
+        # filter it out.
         assert h._lookup_bot_by_phone("+15550000002") is None
 
 
@@ -550,3 +550,28 @@ def test_uuid_mention_of_disabled_bot_resolves_to_nothing():
     assert pool.bot_for_uuid("artaud-uuid").slug == "artaud"
     bots[1].enabled = False
     assert pool.bot_for_uuid("artaud-uuid") is None
+
+
+def test_bot_disabled_at_boot_can_be_switched_on_without_restart():
+    bots = _phoned_bots()
+    bots[1].enabled = False
+    pool = _make_pool(bots)
+    artaud_h = pool.for_phone("+15550000002")
+    assert artaud_h is not None and artaud_h.served_bot_ids == {2}
+    assert pool.default().served_bot_ids == {1}
+    assert artaud_h._all_served_disabled()
+    assert pool.for_bot(bots[1]) is pool.default()
+    bots[1].enabled = True
+    assert not artaud_h._all_served_disabled()
+    assert pool.for_bot(bots[1]) is artaud_h
+
+
+def test_disabled_bot_on_a_shared_phone_does_not_silence_it():
+    bots = [
+        _bot(2, "artaud", signal_phone="+15550000001"),
+        _bot(1, "sigil", signal_phone="+15550000001", default_group=True),
+    ]
+    bots[0].enabled = False
+    pool = _make_pool(bots)
+    assert pool.default().served_bot_ids == {1}
+    assert not pool.default()._all_served_disabled()
