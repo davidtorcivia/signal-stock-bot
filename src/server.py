@@ -22,7 +22,6 @@ def create_app(
     signal_handler: SignalHandler,
     loop: asyncio.AbstractEventLoop,
     webhook_secret: str = "",
-    handler_timeout: float = 60.0,
     *,
     flask_secret_key: Optional[str] = None,
     session_cookie_secure: bool = False,
@@ -77,6 +76,19 @@ def create_app(
                 return jsonify({"status": "error", "message": "unauthorized"}), 401
 
         data = request.get_json(silent=True)
+        # signal-api's RECEIVE_WEBHOOK_URL posts the raw json-rpc line,
+        # {"method": "receive", "params": {"envelope", "account"}}. Route it
+        # to the handler for the number that received it.
+        handler = signal_handler
+        if data and "params" in data:
+            params = data["params"] or {}
+            data = {"envelope": params.get("envelope") or {}}
+            if signal_pool is not None:
+                # signal-api posts for every account it hosts; one with no
+                # handler has no poller either, so ignore it.
+                handler = signal_pool.for_phone(params.get("account") or "")
+                if handler is None:
+                    return jsonify({"status": "ok"})
         if not data:
             logger.warning("Received empty or invalid webhook payload")
             return jsonify({"status": "error", "message": "Empty payload"}), 400
@@ -93,15 +105,20 @@ def create_app(
                 sorted(envelope.keys()),
             )
 
-        future = asyncio.run_coroutine_threadsafe(
-            signal_handler.handle_webhook(data), loop
-        )
-        try:
-            future.result(timeout=handler_timeout)
-        except Exception as e:
-            logger.exception(f"Error handling webhook: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+        # Typing/receipt envelopes carry "dataMessage": null; the handler
+        # only wants messages (same filter as the websocket poller).
+        if not (data.get("envelope") or {}).get("dataMessage"):
+            return jsonify({"status": "ok"})
 
+        # Don't wait for the handler: signal-api blocks its receive loop on
+        # this POST, and that loop also carries the responses to our own
+        # sends, so waiting here stalls every reply the handler makes.
+        future = asyncio.run_coroutine_threadsafe(handler.handle_webhook(data), loop)
+        future.add_done_callback(
+            lambda f: not f.cancelled() and f.exception() and logger.error(
+                "Error handling webhook: %s", f.exception()
+            )
+        )
         return jsonify({"status": "ok"})
 
     @app.route("/health", methods=["GET"])

@@ -17,6 +17,12 @@ services:
     environment:
       - MODE=json-rpc
       - LOG_LEVEL=debug
+      # Lossless copy of every envelope. The websocket fan-out uses an
+      # unbuffered channel and drops an envelope that lands while the
+      # previous one is still being written (lost media requests); this
+      # POST is synchronous in the receive loop. The handler dedups the two.
+      # It sends no headers, so setting WEBHOOK_SECRET would 401 every POST.
+      - RECEIVE_WEBHOOK_URL=http://stock-bot:5000/webhook
     volumes:
       - ./data/signal-cli:/home/.local/share/signal-cli
     networks:

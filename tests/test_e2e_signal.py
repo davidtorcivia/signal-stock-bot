@@ -5,6 +5,7 @@ Only signal-cli-rest-api is faked, by a local HTTP server that records every
 /v2/send, so the assertions are on which number actually sent what.
 """
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from src.bots.models import Bot
 from src.bots.registry import BotRegistry
 from src.commands.base import BaseCommand, CommandResult
 from src.commands.dispatcher import CommandDispatcher
+from src.server import create_app
 from src.signal.pool import SignalHandlerPool
 
 SIGIL, ARTAUD = "+15550000001", "+15550000002"
@@ -91,7 +93,7 @@ async def bot(tmp_path, signal_api):
     def sends():
         return [(s["number"], s["message"]) for s in signal_api.sent]
 
-    yield SimpleNamespace(receive=receive, disable=disable, sends=sends)
+    yield SimpleNamespace(receive=receive, disable=disable, sends=sends, pool=pool)
     for phone in (SIGIL, ARTAUD):
         await pool.for_phone(phone).close()
 
@@ -113,3 +115,33 @@ async def test_disabled_bot_number_goes_silent_without_restart(bot):
     assert bot.sends() == []
     await bot.receive(SIGIL, "!who")
     assert bot.sends() == [(SIGIL, "this is sigil")]
+
+
+async def test_signal_api_webhook_routes_by_account_and_dedups_with_poller(bot):
+    """signal-api's RECEIVE_WEBHOOK_URL posts the raw json-rpc line. It must
+    land on the receiving number's handler, and the same message arriving
+    over the websocket too must only be answered once."""
+    app = create_app(bot.pool.default(), loop=asyncio.get_running_loop(),
+                     signal_pool=bot.pool)
+    envelope = {
+        "source": USER, "sourceNumber": USER, "sourceUuid": "user-uuid",
+        "timestamp": 5_000, "dataMessage": {"message": "!who", "timestamp": 5_000},
+    }
+    client = app.test_client()
+    typing = {"method": "receive", "params": {"account": ARTAUD, "envelope": {
+        "source": USER, "sourceUuid": "user-uuid", "timestamp": 4_999}}}
+    assert client.post("/webhook", json=typing).status_code == 200
+    stranger = {"method": "receive", "params": {"account": "+15550000009",
+                                                "envelope": {**envelope, "timestamp": 4_998}}}
+    assert client.post("/webhook", json=stranger).status_code == 200
+    rpc = {"jsonrpc": "2.0", "method": "receive",
+           "params": {"account": ARTAUD, "envelope": envelope}}
+    assert client.post("/webhook", json=rpc).status_code == 200
+    for _ in range(100):
+        if bot.sends():
+            break
+        await asyncio.sleep(0.01)
+    assert bot.sends() == [(ARTAUD, "this is artaud")]
+    # The websocket poller's copy of the same message.
+    await bot.pool.for_phone(ARTAUD).handle_webhook({"envelope": envelope})
+    assert bot.sends() == [(ARTAUD, "this is artaud")]

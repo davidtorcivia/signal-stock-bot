@@ -1209,7 +1209,15 @@ class SignalHandler:
         # vote. Don't return immediately though — a `pollCreate` envelope
         # doesn't carry text to dispatch, so falling through to the normal
         # path is fine (it'll be filtered by the empty-text check below).
-        if data_message.get("pollCreate") and self.poll_voter is not None:
+        # A poll reaches us twice (websocket poller + signal-api webhook) and
+        # returns at the empty-text check before the dedup below, so it gets
+        # its own seen-key here — otherwise it's two LLM calls and two votes.
+        poll_key = ("poll", sender, message_ts)
+        if (
+            data_message.get("pollCreate") and self.poll_voter is not None
+            and poll_key not in self._seen_messages
+        ):
+            self._seen_messages[poll_key] = time.time()
             try:
                 asyncio.create_task(
                     self.poll_voter.handle_poll(envelope, data_message)
