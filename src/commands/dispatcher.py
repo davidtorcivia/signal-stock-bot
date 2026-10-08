@@ -312,6 +312,7 @@ class CommandDispatcher:
                 bot_id=getattr(bot, "id", None) if bot else None,
                 sender_tail=(sender or "")[-4:],
                 group_id=group_id,
+                named=policy.kind != "default",
             ))
 
         # Movie/TV request chat: everything that isn't a command or a
@@ -916,6 +917,7 @@ class CommandDispatcher:
                 bot_id=getattr(bot, "id", None) if bot else None,
                 sender_tail=(sender or "")[-4:],
                 group_id=group_id,
+                named=policy.kind != "default",
             ))
 
         from .base import CommandContext

@@ -378,9 +378,24 @@ def _register_dashboard_routes(
             deep_think_view["usage_today"] = {"total_calls": 0, "per_user": {}, "per_group": {}}
             deep_think_view["recent_calls"] = []
 
+        claude_spend = None
+        try:
+            from ..llm import anthropic_backend
+            metrics_db = get_metrics_log().db_path
+            mtd = anthropic_backend.spend(metrics_db, anthropic_backend.cycle_start())
+            claude_spend = {
+                "window": anthropic_backend.spend(metrics_db, time.time() - window_seconds),
+                "mtd": mtd,
+                "credit": anthropic_backend.MONTHLY_CREDIT,
+                "pct": min(100.0, 100.0 * mtd["total"] / anthropic_backend.MONTHLY_CREDIT),
+            }
+        except Exception as e:
+            logger.error(f"Dashboard Claude spend failed: {e}")
+
         return render_template(
             "dashboard.html",
             metrics=metrics,
+            claude_spend=claude_spend,
             provider_status=provider_status,
             mcp_view=mcp_view,
             context_view=context_view,

@@ -44,3 +44,4 @@ mcp>=1.0
 
 # uv / uvx for launching Python-based MCP servers from wheels/URLs
 uv>=0.4
+anthropic==1.12.1

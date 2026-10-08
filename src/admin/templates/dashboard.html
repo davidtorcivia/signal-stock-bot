@@ -157,6 +157,49 @@
     {% endif %}
 </div>
 
+{# ── Claude spend ────────────────────────────────────────────────── #}
+{% if claude_spend %}
+<div class="panel">
+    <h2>Claude spend <span class="muted" style="font-size: 12px;">· estimated from logged tokens</span></h2>
+    {% set mtd = claude_spend.mtd %}
+    <table>
+        <tr>
+            <th>This cycle <span class="muted">(since the 10th)</span></th>
+            <td>
+                ${{ '%.2f'|format(mtd.total) }} of ${{ '%.0f'|format(claude_spend.credit) }}
+                <span class="muted">({{ '%.0f'|format(claude_spend.pct) }}%)</span>
+                <div style="margin-top: 6px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;">
+                    <div style="width: {{ claude_spend.pct }}%; height: 100%; background: {{ 'var(--bad)' if claude_spend.pct >= 80 else 'var(--accent)' }};"></div>
+                </div>
+            </td>
+        </tr>
+        <tr>
+            <th>This window ({{ metrics.window_key }})</th>
+            <td>${{ '%.2f'|format(claude_spend.window.total) }}</td>
+        </tr>
+    </table>
+    {% if claude_spend.window.models %}
+    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By model · {{ metrics.window_key }}</h3>
+    <table>
+        <tr><th>Model</th><th>Calls</th><th>Fell back</th><th>Tokens in / out</th><th>Cache hit</th><th>Est. cost</th></tr>
+        {% for m in claude_spend.window.models %}
+        <tr>
+            <td>{{ m.model }}</td>
+            <td>{{ m.calls }}</td>
+            <td>{{ m.fallbacks }}</td>
+            <td>{{ '{:,}'.format(m.tokens_in) }} / {{ '{:,}'.format(m.tokens_out) }}</td>
+            <td>{{ '%.0f'|format(100 * m.hit_rate) }}%</td>
+            <td>${{ '%.2f'|format(m.cost) }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">No Claude calls in this window.</p>
+    {% endif %}
+    <p class="muted" style="font-size: 12px; margin-top: 8px;">Exact billing: platform.claude.com/cost. Cycle resets on the 10th with your plan's credits.</p>
+</div>
+{% endif %}
+
 {# ── Deep think ──────────────────────────────────────────────────── #}
 <div class="panel">
     <h2>Deep think</h2>

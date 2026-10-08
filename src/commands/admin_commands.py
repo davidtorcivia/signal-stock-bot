@@ -5,6 +5,8 @@ Provides: !metrics, !cache, !admin
 """
 
 import json
+import re
+import time
 from datetime import datetime
 from .base import BaseCommand, CommandContext, CommandResult
 from ..cache import get_cache_manager, get_metrics
@@ -150,18 +152,21 @@ class AdminCommand(BaseCommand):
     name = "admin"
     aliases = []
     description = "Admin utilities"
-    usage = "!admin [backup|alerts|users]"
+    usage = "!admin [backup|alerts|users|claude]"
     help_explanation = """Admin-only utilities:
 
 **Commands:**
 • !admin backup — Export all watchlists as JSON (sent as DM)
 • !admin alerts — List all active alerts across users
-• !admin users — Show user count and activity"""
+• !admin users — Show user count and activity
+• !admin claude — Claude-fallback alerts (mute 6h / unmute)"""
     
-    def __init__(self, admin_numbers: list[str], watchlist_db=None, alerts_db=None):
+    def __init__(self, admin_numbers: list[str], watchlist_db=None, alerts_db=None,
+                 settings_store=None):
         self.admin_numbers = admin_numbers
         self.watchlist_db = watchlist_db
         self.alerts_db = alerts_db
+        self.settings_store = settings_store
     
     def _is_admin(self, sender: str) -> bool:
         if not self.admin_numbers:
@@ -177,7 +182,8 @@ class AdminCommand(BaseCommand):
                 "◈ Admin Commands\n\n"
                 "!admin backup — Export watchlists\n"
                 "!admin alerts — List all alerts\n"
-                "!admin users — User activity"
+                "!admin users — User activity\n"
+                "!admin claude — Claude alerts (mute 6h / unmute)"
             )
         
         action = ctx.args[0].lower()
@@ -188,9 +194,36 @@ class AdminCommand(BaseCommand):
             return await self._list_alerts(ctx)
         elif action == "users":
             return await self._user_stats(ctx)
+        elif action == "claude":
+            return self._claude_alerts(ctx.args[1:])
         else:
             return CommandResult.error(f"Unknown action: {action}")
     
+    def _claude_alerts(self, args: list[str]) -> CommandResult:
+        """!admin claude [mute 30m|6h|2d | unmute] — Claude-fallback DMs."""
+        from ..llm.anthropic_backend import MUTE_KEY
+        if self.settings_store is None:
+            return CommandResult.error("Settings store not configured")
+        now = time.time()
+        if args[:1] == ["mute"] and len(args) == 2:
+            m = re.fullmatch(r"(\d+)([mhd])", args[1].lower())
+            if not m:
+                return CommandResult.error("Usage: !admin claude mute 30m|6h|2d")
+            until = now + int(m[1]) * {"m": 60, "h": 3600, "d": 86400}[m[2]]
+            self.settings_store.set(MUTE_KEY, until)
+            return CommandResult.ok(f"Claude alerts muted for {args[1]}.")
+        if args[:1] == ["unmute"]:
+            self.settings_store.set(MUTE_KEY, 0)
+            return CommandResult.ok("Claude alerts unmuted.")
+        try:
+            left = float(self.settings_store.get(MUTE_KEY) or 0) - now
+        except (TypeError, ValueError):
+            left = 0
+        state = f"muted for {left / 3600:.1f}h more" if left > 0 else "on"
+        return CommandResult.ok(
+            f"Claude alerts: {state}.\n!admin claude mute 30m|6h|2d · !admin claude unmute"
+        )
+
     async def _backup(self, ctx: CommandContext) -> CommandResult:
         """Export all watchlists as JSON."""
         if not self.watchlist_db:

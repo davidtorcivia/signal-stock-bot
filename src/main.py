@@ -383,6 +383,7 @@ def create_dispatcher(
         admin_numbers=admin_numbers,
         watchlist_db=watchlist_db,
         alerts_db=alerts_db,
+        settings_store=settings_store,
     )
     dispatcher.register(metrics_cmd)
     dispatcher.register(cache_cmd)
@@ -879,6 +880,15 @@ def build_app(config: Config):
     )
     signal_pool.build()
     signal_handler = signal_pool.default()
+
+    from .llm import anthropic_backend
+
+    async def _dm_admins(text: str) -> None:
+        for number in config.admin_numbers:
+            if number.startswith("+"):  # UUID entries are for auth only
+                await signal_handler.send_message(recipient=number, message=text)
+
+    anthropic_backend.alert_sender = _dm_admins
 
     # Single shared event loop for all async work
     loop = _start_background_loop()

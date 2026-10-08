@@ -136,7 +136,10 @@ MEDIA_KEYS = {
 }
 
 # All keys that the admin UI is allowed to write. Anything else is rejected.
-ALLOWED_KEYS = LIVE_KEYS | RESTART_KEYS | MEDIA_KEYS
+# Written by `!admin claude mute`, not shown on the settings form (a stale
+# form save would otherwise undo a mute).
+COMMAND_KEYS = {"anthropic_alerts_muted_until"}
+ALLOWED_KEYS = LIVE_KEYS | RESTART_KEYS | MEDIA_KEYS | COMMAND_KEYS
 
 
 class SettingsStore:

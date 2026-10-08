@@ -16,6 +16,7 @@ import aiohttp
 
 from ..admin.events import get_bus
 from ..commands.dispatcher import CommandDispatcher
+from ..llm.transcript import set_active as set_active_transcript
 from .audio import (
     AUDIO_ALLOWED_MIMES,
     AUDIO_MAX_CLIPS,
@@ -1185,6 +1186,11 @@ class SignalHandler:
         # Handlers are built once at boot, so disabling a bot leaves its
         # poller running. Without this it keeps taking over for its sibling
         # and sending fallback DMs from the disabled bot's number.
+        # The websocket poller handles every envelope in one long-lived task,
+        # so the previous message's ActiveContext would otherwise leak into
+        # tasks spawned before dispatch (the poll voter) — wrong chat, wrong
+        # time, and a DM poll could pass the Claude credit gate.
+        set_active_transcript(None)
         if self.served_bot_ids and self._all_served_disabled():
             return
         envelope = data.get("envelope", {})

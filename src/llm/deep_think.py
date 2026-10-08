@@ -44,8 +44,10 @@ from ..bots.settings import (
 )
 from ..cache import get_metrics
 from ..memory import dispatch_memory_tool, memory_tool_schemas
+from . import anthropic_backend
 from .client import _ensure_reasoning_content, _extract_cache_tokens
 from .mcp_broker import (
+    server_directory,
     MCP_BROKER_TOOLS,
     MCP_DISCOVER_NAME,
     MCP_INVOKE_NAME,
@@ -386,6 +388,7 @@ class DeepThinkClient:
         context_id: Optional[int] = None,
         bot_id: Optional[int] = None,
         cache_plan: Optional[PromptCachePlan] = None,
+        cache_tools: Optional[list[dict]] = None,
     ) -> dict:
         """One chat-completion call. Records per-round metrics. Raises
         RuntimeError on failure — the outer loop catches and converts to
@@ -396,6 +399,12 @@ class DeepThinkClient:
         # reasoning_content is missing, so without this every tool loop
         # died on round 2+.
         messages = _ensure_reasoning_content(messages)
+        claude = await self._try_claude(
+            messages, tools or cache_tools, cfg, allow_tools=tools is not None,
+        )
+        if claude is not None:
+            return claude
+        messages = anthropic_backend.strip_raw(messages)
         payload: dict = {
             "model": cfg["model"],
             "messages": messages,
@@ -526,6 +535,49 @@ class DeepThinkClient:
         msg["_dt_tokens_out"] = tokens_out
         return msg
 
+    async def _try_claude(
+        self, messages: list[dict], tools: Optional[list[dict]], cfg: dict,
+        allow_tools: bool = True,
+    ) -> Optional[dict]:
+        """Opus at high effort for named group chats (same gate and
+        failover as the writer — see anthropic_backend.credentials); None
+        means "use the configured deep-think model instead". The key lives
+        on the bot's writer settings. Deep-think only — the ToolBotClient
+        subclass keeps its configured model."""
+        if self.role != "deep_think":
+            return None
+        creds = anthropic_backend.credentials(self.store, self.bot_id)
+        if creds is None:
+            return None
+        model = anthropic_backend.WORKHORSE_MODEL
+        metrics = get_metrics()
+        started = time.time()
+        result = await anthropic_backend.try_chat(
+            self.store, creds, label="purpose=deep_think", fallback=cfg["model"],
+            on_error=lambda reason: metrics.record_deep_think_error(
+                model=model, error_msg=reason,
+            ),
+            model=model,
+            messages=messages,
+            tools=tools,
+            max_tokens=int(cfg["max_tokens"]),
+            timeout=cfg["timeout"],
+            effort="high",
+            allow_tools=allow_tools,
+        )
+        if result is None:
+            return None
+        msg, usage = result
+        cache_hit, cache_miss = _extract_cache_tokens(usage)
+        metrics.record_deep_think_success(
+            model=model, latency_ms=(time.time() - started) * 1000.0,
+            tokens_in=usage["prompt_tokens"], tokens_out=usage["completion_tokens"],
+            cache_hit_tokens=cache_hit, cache_miss_tokens=cache_miss,
+        )
+        msg["_dt_tokens_in"] = usage["prompt_tokens"]
+        msg["_dt_tokens_out"] = usage["completion_tokens"]
+        return msg
+
     def _collect_tools(self, policy=None) -> Optional[list[dict]]:
         """Build the tool list the deep model gets — same allow-listing as
         the writer, with deep_think itself never exposed (no recursion)."""
@@ -591,7 +643,7 @@ class DeepThinkClient:
             working_messages: list[dict], active_tools: Optional[list[dict]],
         ) -> dict:
             return await self._chat_call(
-                working_messages, tools=active_tools, cfg=cfg,
+                working_messages, tools=active_tools, cache_tools=tools, cfg=cfg,
                 sender_tail=sender_tail, group_id=group_id,
                 context_id=context_id, bot_id=bot_id, cache_plan=cache_plan,
             )
@@ -867,6 +919,9 @@ class DeepThinkClient:
             f"Sub-question to think carefully about:\n{question}\n\n"
             f"Supporting context (may be empty):\n{context.strip() or '(none provided)'}"
         )
+        directory = server_directory(self.mcp_manager, policy) if tools else ""
+        if directory:
+            user_content += f"\n\n{directory}"
         messages: list[dict] = [
             {"role": "system", "content": cfg["system_prompt"]},
             {"role": "user", "content": user_content},

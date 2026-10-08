@@ -12,6 +12,8 @@ and tear it down by setting an asyncio.Event it's awaiting.
 """
 
 import asyncio
+import re
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -26,10 +28,11 @@ try:
 except ImportError:  # older SDKs
     sse_client = None  # type: ignore
 
-try:
-    from mcp.client.streamable_http import streamablehttp_client
+try:  # mcp 2.x renamed it and moved headers onto the http client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
 except ImportError:
-    streamablehttp_client = None  # type: ignore
+    streamable_http_client = None  # type: ignore
 
 from .models import MCPServerConfig, MCPTool
 from .registry import MCPRegistry
@@ -72,6 +75,7 @@ class _MCPSession:
     def __init__(self, config: MCPServerConfig):
         self.config = config
         self.tools: list[MCPTool] = []
+        self.instructions: str = ""  # server's self-description from initialize
         self.started_at: Optional[float] = None
         self.last_error: Optional[str] = None
 
@@ -177,11 +181,13 @@ class _MCPSession:
                 raise MCPSessionError("sse server is missing url")
             return sse_client(cfg.url, headers=cfg.headers or None)
         if cfg.transport == "http":
-            if streamablehttp_client is None:
-                raise MCPSessionError("streamablehttp_client unavailable in installed mcp SDK")
+            if streamable_http_client is None:
+                raise MCPSessionError("streamable_http_client unavailable in installed mcp SDK")
             if not cfg.url:
                 raise MCPSessionError("http server is missing url")
-            return streamablehttp_client(cfg.url, headers=cfg.headers or None)
+            if not cfg.headers:
+                return streamable_http_client(cfg.url)
+            return _http_with_headers(cfg.url, cfg.headers)
         raise MCPSessionError(f"Unknown transport: {cfg.transport}")
 
     async def _run(
@@ -194,10 +200,11 @@ class _MCPSession:
         try:
             transport_cm = await self._open_transport()
             async with transport_cm as transport:
-                # stdio/sse: (read, write); http: (read, write, maybe session_id_fn)
+                # Every transport yields (read, write) first.
                 read, write = transport[0], transport[1]
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    init = await session.initialize()
+                    self.instructions = (getattr(init, "instructions", None) or "").strip()
                     listing = await session.list_tools()
                     self.tools = [
                         MCPTool(
@@ -223,6 +230,14 @@ class _MCPSession:
             startup_error.append(e)
             logger.error(f"MCP session {self.config.name} exited: {e}")
             raise
+
+
+@asynccontextmanager
+async def _http_with_headers(url: str, headers: dict):
+    """streamable_http_client never closes a client it's handed, so own it."""
+    async with create_mcp_http_client(headers=headers) as client:
+        async with streamable_http_client(url, http_client=client) as transport:
+            yield transport
 
 
 def _flatten_result(result) -> str:
@@ -317,6 +332,18 @@ class MCPManager:
             if s.running:
                 tools.extend(s.tools)
         return tools
+
+    def server_summaries(self) -> dict[str, str]:
+        """Server name -> first sentence of its own description
+        (capped), so models can tell which server covers which topics."""
+        # Last-known text even while a server restarts: these feed the cached
+        # system prompt, which must not change with session health.
+        out = {}
+        for s in self._sessions.values():
+            if s.instructions:
+                first = re.split(r"(?<=[.!?])\s", s.instructions, maxsplit=1)[0]
+                out[s.config.name] = first[:300]
+        return out
 
     def status(self) -> dict[int, dict]:
         """Snapshot of per-server state."""

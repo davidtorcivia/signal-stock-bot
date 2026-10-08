@@ -70,6 +70,7 @@ from ..llm import (
 from ..llm.client import DEFAULT_SYSTEM_PROMPT
 from ..llm.mcp_broker import (
     MCP_BROKER_TOOLS,
+    server_directory,
     MCP_DISCOVER_NAME,
     MCP_INVOKE_NAME,
     broker_should_be_exposed,
@@ -1184,8 +1185,11 @@ class AskCommand(BaseCommand):
                 "LLM tool runtime: requesting completion (%d msgs)",
                 len(working_messages),
             )
+            # Synthesis rounds drop tools; cache_tools keeps them in Claude's
+            # cached prefix (sent with tool_choice none).
+            extra = {"cache_tools": tools} if active_tools is None and tools else {}
             return await llm.chat_messages(
-                working_messages, tools=active_tools, cache_plan=cache_plan,
+                working_messages, tools=active_tools, cache_plan=cache_plan, **extra,
                 overrides=_adaptive_response_overrides(
                     llm, question, working_messages,
                 ),
@@ -3372,6 +3376,9 @@ class AskCommand(BaseCommand):
                     "arguments. Do not invent or directly call hidden MCP "
                     "tool names."
                 )
+                directory = server_directory(self.mcp_manager, ctx.policy)
+                if directory:
+                    mcp_broker_directive += "\n\n" + directory
 
             # Implicit / spontaneous trigger: the reactor's should_respond
             # tool decided this message warrants a reply, but the user did

@@ -311,3 +311,38 @@ async def test_discovery_recovers_semantic_matches_without_exposing_blocked_tool
     jev.choose.reset_mock()
     await discover_mcp_tools(manager, policy, query="")
     jev.choose.assert_not_awaited()
+
+
+async def test_discovery_puts_a_named_server_first():
+    """'use theinfoweb ...' must surface theinfoweb's generically named tools
+    even when JEV prefers better-described tools from other servers."""
+    tools = [MCPTool(server_name="brave-search", name=f"web{i}", description="Web search", input_schema={})
+             for i in range(5)]
+    tools.append(MCPTool(server_name="theinfoweb", name="search", description="Archive", input_schema={}))
+    jev = SimpleNamespace(choose=AsyncMock(return_value={
+        **{t.qualified_name: "direct" for t in tools[:5]}, "theinfoweb__search": "irrelevant"}))
+    manager = SimpleNamespace(all_tools=lambda: tools, jev=jev)
+    result = json.loads(await discover_mcp_tools(manager, None, query="use theinfoweb search", limit=5))
+    assert result["matches"][0]["name"] == "theinfoweb__search"
+    assert result["available_servers"] == ["brave-search", "theinfoweb"]
+
+
+async def test_server_directory_and_jev_see_server_descriptions():
+    from src.llm.mcp_broker import server_directory
+    tools = [MCPTool(server_name="theinfoweb", name="search", description="Search", input_schema={}),
+             MCPTool(server_name="private", name="x", description="X", input_schema={})]
+    about = {"theinfoweb": "Archive of intelligence history and political scandal.",
+             "private": "Secret stuff."}
+    jev = SimpleNamespace(choose=AsyncMock(return_value={}))
+    manager = SimpleNamespace(all_tools=lambda: tools, jev=jev, server_summaries=lambda: about)
+    policy = ContextPolicy(id=1, kind="group", key="g", mcp_mode="allow_list", mcp_servers=["theinfoweb"])
+
+    directory = server_directory(manager, policy)
+    assert "theinfoweb: Archive of intelligence history" in directory
+    assert "private" not in directory
+    assert server_directory(SimpleNamespace(), policy) == ""
+
+    await discover_mcp_tools(manager, policy, query="cia coup")
+    sent = jev.choose.await_args.kwargs["state"]["tools"]
+    assert sent == [{"name": "theinfoweb__search", "description": "Search",
+                     "server_about": about["theinfoweb"]}]

@@ -81,6 +81,27 @@ def allowed_mcp_tools(mcp_manager, policy=None) -> list:
     return sorted(tools, key=lambda tool: tool.qualified_name)
 
 
+def server_directory(mcp_manager, policy=None) -> str:
+    """Prompt block naming the allowed MCP servers and what each covers.
+
+    Without it the model can't know, say, that theinfoweb holds parapolitical
+    history, so it never searches there unless a user names the server."""
+    summaries = getattr(mcp_manager, "server_summaries", lambda: {})() if mcp_manager else {}
+    names = sorted(
+        name for name in summaries
+        if policy is None or policy.allows_mcp(name)
+    )
+    if not names:
+        return ""
+    lines = "\n".join(f"- {name}: {summaries[name]}" for name in names)
+    return (
+        "MCP servers available here (pass `server` to mcp__discover to search "
+        f"one):\n{lines}\n"
+        "When a question falls in one of these servers' domains, consult that "
+        "server before answering from memory, even if nobody named it."
+    )
+
+
 def broker_should_be_exposed(mcp_manager, policy=None) -> bool:
     """Keep broker presence stable across MCP process restarts.
 
@@ -131,6 +152,7 @@ async def discover_mcp_tools(
 
     jev = getattr(mcp_manager, "jev", None)
     if jev is not None and terms and tools:
+        about = getattr(mcp_manager, "server_summaries", lambda: {})()
         semantic = []
         judged = set()
         # Bound each request without excluding tools that lack a keyword match.
@@ -138,7 +160,9 @@ async def discover_mcp_tools(
             batch = tools[offset:offset + 20]
             choices = await jev.choose(
                 state={"query": query, "tools": [
-                    {"name": tool.qualified_name, "description": tool.description or tool.name}
+                    {"name": tool.qualified_name,
+                     "description": tool.description or tool.name,
+                     "server_about": about.get(tool.server_name, "")}
                     for tool in batch
                 ]},
                 questions={tool.qualified_name: {
@@ -163,6 +187,22 @@ async def discover_mcp_tools(
         semantic.sort(key=lambda row: (row[0], row[1]))
         ranked = semantic + [row for row in ranked if row[1] not in judged]
 
+    # A query that names a server ("use theinfoweb ...") wants that server:
+    # its generic tool names (search, get_entry) otherwise lose to better
+    # described tools and fall past the cap.
+    named = {
+        tool.server_name for tool in tools
+        if _terms(tool.server_name) and set(_terms(tool.server_name)) <= set(terms)
+    }
+    if named:
+        kept = {row[1] for row in ranked}
+        ranked = (
+            [row for row in ranked if row[2].server_name in named]
+            + [(0, t.qualified_name, t) for t in tools
+               if t.server_name in named and t.qualified_name not in kept]
+            + [row for row in ranked if row[2].server_name not in named]
+        )
+
     try:
         cap = max(1, min(10, int(limit)))
     except (TypeError, ValueError):
@@ -186,8 +226,8 @@ async def discover_mcp_tools(
             for tool in selected
         ],
     }
+    result["available_servers"] = sorted({tool.server_name for tool in tools})
     if not selected:
-        result["available_servers"] = sorted({tool.server_name for tool in tools})
         result["hint"] = "Try broader capability words or omit server."
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 

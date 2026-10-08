@@ -25,6 +25,7 @@ from ..bots.settings import (
     resolve_stripped,
 )
 from ..cache import get_metrics
+from . import anthropic_backend
 from .prompt_cache import PromptCachePlan, automatic_cache_plan
 from .output_safety import sanitize_assistant_message
 from .resilience import LLMHTTPFailure, resilient_chat_post
@@ -306,6 +307,7 @@ class LLMClient:
         suppress_response_style: bool = False,
         purpose: str = "ask",
         cache_plan: Optional[PromptCachePlan] = None,
+        cache_tools: Optional[list[dict]] = None,
     ) -> dict:
         """Send a full messages array and return the assistant message dict.
 
@@ -334,7 +336,10 @@ class LLMClient:
         if not all([cfg["base_url"], cfg["api_key"], effective_model]):
             raise LLMNotConfigured("LLM base URL, API key, and model must all be set")
 
-        messages = _inject_current_time(list(messages))
+        turn = get_active_transcript_context()
+        messages = _inject_current_time(
+            list(messages), now=(turn.started_at if turn is not None else None),
+        )
         messages = _ensure_reasoning_content(messages)
 
         style = ""
@@ -444,6 +449,16 @@ class LLMClient:
             context_id=(active.context_id if active is not None else None),
             bot_id=(active.bot_id if active is not None else self.bot_id),
         )
+
+        claude = await self._try_anthropic(
+            purpose=purpose, overrides=overrides, messages=messages,
+            tools=tools or cache_tools, allow_tools=tools is not None,
+            payload=payload, cfg=cfg,
+            cache_manifest=cache_manifest,
+        )
+        if claude is not None:
+            return claude
+        payload["messages"] = anthropic_backend.strip_raw(payload["messages"])
 
         # Retries and pinned-provider fallback share this one deadline. This
         # retains the slow-trickle backstop without multiplying the configured
@@ -585,6 +600,67 @@ class LLMClient:
             )
             raise LLMError("Unexpected response from LLM") from e
 
+    async def _try_anthropic(
+        self, *, purpose, overrides, messages, tools, payload, cfg,
+        cache_manifest, allow_tools=True,
+    ) -> Optional[dict]:
+        """Serve this round from Claude when allowed; None means "use the
+        normal OpenRouter path" — not eligible (see
+        anthropic_backend.credentials), the caller pinned its own model
+        (reactor, JEV), or Claude failed (credits drained, outage, refusal,
+        audio input). `ask` gets the workhorse; everything else the cheap
+        model."""
+        creds = (
+            None if overrides.get("model")
+            else anthropic_backend.credentials(self.store, self.bot_id, self.role)
+        )
+        if creds is None:
+            return None
+        model = (
+            anthropic_backend.WORKHORSE_MODEL if purpose == "ask"
+            else anthropic_backend.CHEAP_MODEL
+        )
+        metrics = get_metrics()
+        started = time.time()
+        result = await anthropic_backend.try_chat(
+            self.store, creds, label=f"purpose={purpose}", fallback=cfg["model"],
+            on_error=lambda reason: metrics.record_llm_error(
+                purpose=purpose, model=model, error_msg=reason,
+            ),
+            model=model,
+            messages=messages,
+            tools=tools,
+            max_tokens=int(payload["max_tokens"]),
+            timeout=cfg["timeout"],
+            allow_tools=allow_tools,
+        )
+        if result is None:
+            return None
+        msg, usage = result
+        latency_ms = (time.time() - started) * 1000.0
+        if not msg["content"].strip() and not msg.get("tool_calls"):
+            logger.warning(
+                f"Claude returned no content: stop_reason={usage['stop_reason']!r} "
+                f"model={model} purpose={purpose}"
+            )
+        cache_hit, cache_miss = _extract_cache_tokens(usage)
+        metrics.record_llm_success(
+            purpose=purpose, model=model, latency_ms=latency_ms,
+            tokens_in=usage["prompt_tokens"], tokens_out=usage["completion_tokens"],
+            cache_hit_tokens=cache_hit, cache_miss_tokens=cache_miss,
+        )
+        cache_event = metrics.record_prompt_cache_observation(
+            cache_manifest, cache_hit_tokens=cache_hit,
+            cache_miss_tokens=cache_miss, latency_ms=latency_ms,
+        )
+        self._maybe_capture_transcript(
+            purpose=purpose, model=model, messages=messages, tools=tools,
+            assistant_msg=msg, payload={"max_tokens": payload["max_tokens"]},
+            latency_ms=latency_ms, usage=usage,
+            cache_manifest=cache_manifest, cache_event=cache_event,
+        )
+        return msg
+
     def _maybe_capture_transcript(
         self,
         *,
@@ -626,9 +702,11 @@ class LLMClient:
         record = build_record(
             purpose=purpose,
             model=model,
-            messages=messages,
+            messages=anthropic_backend.strip_raw(messages),
             tools=tools,
-            assistant_msg=sanitize_assistant_message(assistant_msg),
+            assistant_msg=sanitize_assistant_message(
+                anthropic_backend.strip_raw([assistant_msg])[0]
+            ),
             params=params,
             latency_ms=latency_ms,
             bot_id=active.bot_id,
@@ -828,7 +906,7 @@ def _ensure_reasoning_content(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _inject_current_time(messages: list[dict]) -> list[dict]:
+def _inject_current_time(messages: list[dict], now: Optional[float] = None) -> list[dict]:
     """Prepend the current time (UTC + ET, with weekday) to the last user
     message — explicitly NOT to the system block.
 
@@ -848,7 +926,10 @@ def _inject_current_time(messages: list[dict]) -> list[dict]:
     responses) still attaches the time to the user's question rather than
     to an intermediate tool message.
     """
-    now_utc = datetime.now(timezone.utc)
+    now_utc = (
+        datetime.fromtimestamp(now, timezone.utc) if now is not None
+        else datetime.now(timezone.utc)
+    )
     now_et = now_utc.astimezone(_NY)
     weekday = now_et.strftime("%A")
     et_str = now_et.strftime("%Y-%m-%d %H:%M %Z")

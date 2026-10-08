@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -111,6 +111,11 @@ class ActiveContext:
     bot_id: Optional[int]
     sender_tail: Optional[str] = None
     group_id: Optional[str] = None
+    # A registered context, not a default:* catch-all. Gates Claude routing.
+    named: bool = False
+    # One "current time" per inbound message: re-stamping each tool round
+    # changes the user turn when the minute rolls and breaks the prompt cache.
+    started_at: float = field(default_factory=time.time)
 
 
 _active: contextvars.ContextVar[Optional[ActiveContext]] = contextvars.ContextVar(
