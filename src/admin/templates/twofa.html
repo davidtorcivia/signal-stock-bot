@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Verify{% endblock %}
 {% block content %}
-<div class="panel" style="max-width: 420px; margin: 60px auto;">
+<div class="brand" style="margin-bottom: 18px;"><span class="brand-mark">◈</span>Sigil admin</div>
+<div class="panel">
     <h1>Enter 6-digit code</h1>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <p class="muted">Check your Signal messages for the code.</p>

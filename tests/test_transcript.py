@@ -202,10 +202,13 @@ async def test_stats_reports_current_and_backups(monkeypatch, tmp_logger):
 
 
 def test_admin_clear_button_does_not_nest_a_form():
-    """The clear action must override the settings form's endpoint.
+    """The clear button must post to its own endpoint without nesting a form
+    or being the settings form's default button.
 
-    Browsers do not support nested forms. The old markup silently submitted
-    the surrounding context-settings form, leaving transcript files intact.
+    Browsers do not support nested forms (an old version silently submitted
+    the settings form instead). A formaction button inside the settings form
+    was its first submit button, so pressing Enter in a field triggered the
+    delete. The button now targets a separate form via form="tx-clear".
     """
     template_path = (
         Path(__file__).resolve().parents[1]
@@ -220,6 +223,9 @@ def test_admin_clear_button_does_not_nest_a_form():
     settings_form = template[settings_start:settings_end]
 
     assert settings_form.count("<form") == 1
-    assert "admin.context_transcript_clear" in settings_form
-    assert 'formmethod="post"' in settings_form
-    assert "formnovalidate" in settings_form
+    assert 'form="tx-clear"' in settings_form
+    assert "admin.context_transcript_clear" not in settings_form
+    clear_start = template.index('<form id="tx-clear"')
+    clear_form = template[clear_start:template.index("</form>", clear_start)]
+    assert "admin.context_transcript_clear" in clear_form
+    assert 'method="post"' in clear_form and "csrf_token" in clear_form

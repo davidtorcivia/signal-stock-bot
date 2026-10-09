@@ -17,13 +17,12 @@
 </div>
 {% else %}
 
-<div class="panel">
-    <h1>Paper-trading portfolios</h1>
-    {% if not portfolios %}
-        <p class="muted">No portfolios yet — they auto-seed on first <code>!portfolio</code> or <code>!tip</code> in a chat.</p>
-    {% else %}
-        <p class="muted">{{ portfolios|length }} portfolio{{ 's' if portfolios|length != 1 else '' }}. Each chat has its own; auto-seeded with $1000.</p>
-    {% endif %}
+<div class="page-head">
+    <div>
+        <h1>Portfolios</h1>
+        <p class="page-sub">Paper trading, one portfolio per chat, seeded with $1,000.
+        {% if not portfolios %}None yet: one is created on the first <code>!portfolio</code> or <code>!tip</code> in a chat.{% endif %}</p>
+    </div>
 </div>
 
 {% for p in portfolios %}

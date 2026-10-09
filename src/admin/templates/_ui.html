@@ -1,0 +1,64 @@
+{# Shared form pieces. Hints and "more" text are template-authored, never user data. #}
+
+{% macro field(name, label, value='', type='text', placeholder='', hint='', more='', attrs='') -%}
+<div class="field">
+    <label for="{{ name }}">{{ label }}</label>
+    <input type="{{ type }}" name="{{ name }}" id="{{ name }}"
+           value="{{ '' if value is none else value }}" placeholder="{{ placeholder }}" {{ attrs|safe }}>
+    {% if hint %}<p class="hint">{{ hint|safe }}</p>{% endif %}
+    {% if more %}<details class="more"><summary>More</summary><div>{{ more|safe }}</div></details>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro area(name, label, value='', rows=4, placeholder='', hint='', more='') -%}
+<div class="field">
+    <label for="{{ name }}">{{ label }}</label>
+    <textarea name="{{ name }}" id="{{ name }}" rows="{{ rows }}" placeholder="{{ placeholder }}">{{ '' if value is none else value }}</textarea>
+    {% if hint %}<p class="hint">{{ hint|safe }}</p>{% endif %}
+    {% if more %}<details class="more"><summary>More</summary><div>{{ more|safe }}</div></details>{% endif %}
+</div>
+{%- endmacro %}
+
+{# `off` sends an explicit value when unchecked, for handlers that skip
+   missing keys. The checkbox comes first so form.get() sees it when on. #}
+{% macro toggle(name, label, checked, hint='', value='true', off=none, more='') -%}
+{# Older saves stored booleans as text ("True"/"False"); a bare truthiness test would show "False" as on. #}
+{% set on = (checked|lower in ('true', '1', 'yes', 'on')) if checked is string else checked %}
+<label class="toggle">
+    <input type="checkbox" class="switch" name="{{ name }}" value="{{ value }}" {% if on %}checked{% endif %}>
+    <span class="t-text">
+        <span>{{ label }}</span>
+        {% if hint %}<span class="t-hint">{{ hint|safe }}</span>{% endif %}
+    </span>
+</label>
+{% if off is not none %}<input type="hidden" name="{{ name }}" value="{{ off }}">{% endif %}
+{% if more %}<details class="more" style="margin: -2px 0 6px 46px;"><summary>More</summary><div>{{ more|safe }}</div></details>{% endif %}
+{%- endmacro %}
+
+{% macro select(name, label, options, current, hint='', more='') -%}
+<div class="field">
+    <label for="{{ name }}">{{ label }}</label>
+    <select name="{{ name }}" id="{{ name }}">
+        {% for value, text in options %}
+            <option value="{{ value }}" {% if (value|string) == (current|string) %}selected{% endif %}>{{ text }}</option>
+        {% endfor %}
+    </select>
+    {% if hint %}<p class="hint">{{ hint|safe }}</p>{% endif %}
+    {% if more %}<details class="more"><summary>More</summary><div>{{ more|safe }}</div></details>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro secret(name, label, is_set, hint='') -%}
+<div class="field">
+    <label for="{{ name }}">{{ label }} {% if is_set %}<span class="badge ok" style="margin-left:6px;">set</span>{% endif %}</label>
+    <input type="password" name="{{ name }}" id="{{ name }}" value="" autocomplete="new-password"
+           placeholder="{{ 'Leave blank to keep the saved key' if is_set else 'Not set' }}">
+    {% if hint %}<p class="hint">{{ hint|safe }}</p>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro toc(sections) -%}
+<nav class="toc" aria-label="Sections">
+    {% for id, title in sections %}<a href="#{{ id }}">{{ title }}</a>{% endfor %}
+</nav>
+{%- endmacro %}

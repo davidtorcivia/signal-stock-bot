@@ -197,30 +197,21 @@
   }
 </style>
 
-<div class="panel">
-    <h1>Memories — {{ policy.label or policy.key }}</h1>
-    <p class="muted" style="font-size: 12px;">
-        <strong>{{ policy.kind }}</strong> · <code>{{ policy.key|truncate(48) }}</code>
-        · {{ total }} memor{{ 'y' if total == 1 else 'ies' }}
-        across {{ total_subjects }} subject{{ '' if total_subjects == 1 else 's' }}
-        · <a href="{{ url_for('admin.context_edit', context_id=policy.id) }}">back to context</a>
-    </p>
-    <p class="muted" style="font-size: 12px;">
-        Click a memory to expand. Source provenance:
-        <code>reactor</code> = passively learned;
-        <code>explicit</code> = the writer LLM was told to remember;
-        <code>admin</code> = saved from this page.
-    </p>
+<div class="page-head">
+    <div>
+        <a class="crumb" href="{{ url_for('admin.context_edit', context_id=policy.id) }}">← {{ policy.label or 'Context' }}</a>
+        <h1>Memories</h1>
+        <p class="page-sub">{{ total }} memor{{ 'y' if total == 1 else 'ies' }} about {{ total_subjects }} subject{{ '' if total_subjects == 1 else 's' }}.
+            Sources: <code>reactor</code> learned passively, <code>explicit</code> the bot was asked to remember, <code>admin</code> saved here.</p>
+    </div>
     {% if total %}
-    <form method="POST" action="{{ url_for('admin.memories_wipe', context_id=policy.id) }}"
-          onsubmit="return confirm('Delete all {{ total }} memories for this chat? This cannot be undone.');"
-          style="margin-top:10px;">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn"
-                style="background: transparent; color: var(--bad); border: 1px solid var(--bad); padding: 4px 10px; font-size: 12px;">
-            Wipe all memories in this chat
-        </button>
-    </form>
+    <div class="page-actions">
+        <form method="POST" action="{{ url_for('admin.memories_wipe', context_id=policy.id) }}" class="inline"
+              onsubmit="return confirm('Delete all {{ total }} memories for this chat? This cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="danger">Delete all</button>
+        </form>
+    </div>
     {% endif %}
 </div>
 
@@ -318,7 +309,7 @@
                         {% endif %}
                         {% if r.source_message_at %}
                             <span class="mem-sep">·</span>
-                            at {{ r.source_message_at|int }}
+                            at {{ r.source_message_at|when }}
                         {% endif %}
                     </span>
                     <button type="submit">Save</button>

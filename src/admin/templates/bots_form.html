@@ -1,319 +1,228 @@
 {% extends "base.html" %}
-{% block title %}{% if is_new %}New bot{% else %}Edit {{ bot.display_name }}{% endif %}{% endblock %}
+{% from "_ui.html" import field, area, toggle, toc %}
+{% block title %}{% if is_new %}New bot{% else %}{{ bot.display_name }}{% endif %}{% endblock %}
 {% block content %}
 
-<div class="panel">
-    <h1>{% if is_new %}New bot{% else %}Edit {{ bot.display_name }}{% endif %}</h1>
-    <p class="muted" style="font-size: 12px;">
-        <a href="{{ url_for('admin.bots_list') }}">← Back to bots</a>
-    </p>
+{% set labels = {
+    "base_url": "Base URL", "api_key": "API key", "model": "Model", "temperature": "Temperature",
+    "max_tokens": "Max tokens", "extended_max_tokens": "Extended max tokens", "timeout_seconds": "Timeout (s)",
+    "system_prompt": "System prompt", "extra_body": "Extra body (JSON)", "min_length": "Min message length",
+    "sender_cooldown": "Per-sender cooldown (s)", "group_cooldown": "Per-group cooldown (s)",
+    "context_messages": "Recent messages shown", "natural_response_enabled": "Natural response (true/false)",
+    "natural_response_cooldown": "Natural response cooldown (s)", "natural_response_extra_prompt": "Natural response prompt",
+    "anthropic_api_key": "Anthropic API key", "anthropic_workspace_id": "Workspace ID",
+} %}
+{% set role_titles = {"writer": "Writer model", "reactor": "Reactor model", "deep_think": "Deep think model", "tool_bot": "Tool bot model"} %}
+{% set role_inherits = {
+    "writer": "the global LLM settings",
+    "reactor": "the global reactor settings, then the LLM settings",
+    "deep_think": "the global deep-think settings, then the LLM settings",
+    "tool_bot": "the global deep-think settings, then the LLM settings",
+} %}
+{% set claude_keys = ("anthropic_api_key", "anthropic_workspace_id") %}
 
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-
-    <form method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-
-        <h2>Identity</h2>
-
-        <label>Slug
-          <input type="text" name="slug" value="{{ values.slug }}"
-                 {% if not is_new %}readonly{% endif %} pattern="[a-z0-9_-]+">
-          <span class="muted" style="font-size: 11px;">
-            Stable identifier (lowercase, letters/digits/_/- only).
-            Cannot be changed once set; not user-facing.
-          </span>
-        </label>
-
-        <label>Display name
-          <input type="text" name="display_name" value="{{ values.display_name }}">
-          <span class="muted" style="font-size: 11px;">
-            Shown to chat and used as the default trigger alias.
-          </span>
-        </label>
-
-        <label>Aliases
-          <textarea name="aliases" rows="3"
-                    placeholder="One per line. Defaults to the display name when blank."
-            >{{ values.aliases }}</textarea>
-          <span class="muted" style="font-size: 11px;">
-            Whole-word, case-insensitive triggers. Adding "Sig" lets
-            users say "hey Sig" and reach the bot.
-          </span>
-        </label>
-
-        <label>Persona / system-prompt prefix
-          <textarea name="persona" rows="4"
-                    placeholder="Leave blank if the model is trained to know its own persona (e.g. Artaud).">{{ values.persona }}</textarea>
-          <span class="muted" style="font-size: 11px;">
-            Layered above the global writer system prompt. Empty is
-            fine when the model itself carries the persona.
-          </span>
-        </label>
-
-        <label>Routing blurb (multi-bot chats)
-          <textarea name="routing_blurb" rows="2"
-                    placeholder="One short line. e.g. 'Artaud — poetry, art, philosophy.'">{{ values.routing_blurb }}</textarea>
-          <span class="muted" style="font-size: 11px;">
-            Read by the reactor in multi-bot chats to pick which bot
-            should answer an unaddressed message. Keep it short
-            (under ~140 chars). Empty falls back to the persona's
-            first sentence.
-          </span>
-        </label>
-
-        <label>Signal phone (override)
-          <input type="text" name="signal_phone" value="{{ values.signal_phone }}"
-                 placeholder="+1...  (blank = share the system default)">
-        </label>
-        <label>Signal API URL (override)
-          <input type="text" name="signal_api_url" value="{{ values.signal_api_url }}"
-                 placeholder="http://...  (blank = use SIGNAL_API_URL)">
-        </label>
-
-        <label style="display:flex;gap:8px;align-items:center;">
-          <input type="checkbox" name="enabled" value="1" {% if values.enabled %}checked{% endif %} style="width:auto;">
-          <span>Enabled</span>
-        </label>
-        <label style="display:flex;gap:8px;align-items:center;">
-          <input type="checkbox" name="default_for_group" value="1" {% if values.default_for_group %}checked{% endif %} style="width:auto;">
-          <span>Default bot for groups (only one bot can hold this)</span>
-        </label>
-        <label style="display:flex;gap:8px;align-items:center;">
-          <input type="checkbox" name="default_for_dm" value="1" {% if values.default_for_dm %}checked{% endif %} style="width:auto;">
-          <span>Default bot for DMs</span>
-        </label>
-
-        <h2 style="margin-top: 24px;">Deep think</h2>
-
-        <label>Mode
-          <select name="deep_think_mode" style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
-            {% for m in deep_think_modes %}
-              <option value="{{ m }}" {% if values.deep_think_mode == m %}selected{% endif %}>{{ m }}</option>
-            {% endfor %}
-          </select>
-          <span class="muted" style="font-size: 11px;">
-            <code>replace</code>: deep_think writes the user-facing reply directly
-            (Sigil's behavior).
-            <code>research</code>: deep_think runs the tool loop <em>every</em> turn
-            and returns notes; the writer composes the final reply with those notes
-            injected as a handoff prompt (Artaud's flow when paired with a
-            locally-trained writer).
-            <code>tool_bot</code>: like <code>research</code>, but the tool loop runs
-            on the dedicated <code>tool_bot</code> role (its own model/key/url below)
-            and self-gates — it answers <code>NOTOOLS</code> when the turn needs no
-            live data, so the writer replies directly and only pays for the tool
-            model when tools are actually needed. Best for writer models with poor
-            native tool-calling.
-          </span>
-        </label>
-
-        <label>Handoff prompt (research / tool_bot modes)
-          <textarea name="deep_think_handoff_prompt" rows="3"
-                    placeholder="Optional. Instructs the writer how to fold the tool/research notes into its reply.">{{ values.deep_think_handoff_prompt }}</textarea>
-        </label>
-
-        {# Hidden marker so the backend can tell "unchecked" apart from
-           "field not in form" (legacy clients). Both `vision_enabled`
-           and `deep_think_enabled` checkboxes default-on at the DB
-           level for new bots; this lets the admin actually flip them
-           off via the form. #}
-        <input type="hidden" name="_deep_think_enabled_in_form" value="1">
-
-        <label style="display:flex;align-items:center;gap:8px;margin-top:16px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-          <input type="checkbox" name="deep_think_enabled" value="1"
-                 {% if values.deep_think_enabled %}checked{% endif %} style="width:auto;">
-          <span>Deep_think enabled for this bot</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-          Master kill switch for deep_think on this bot specifically.
-          When OFF, the <code>deep_think</code> tool is hidden from the
-          writer (it can't invoke it) AND <code>research</code> mode is
-          treated as <code>replace</code> mode (no handoff). Overrides
-          the global setting and per-context flag. Useful for bots
-          whose writer already handles long reasoning natively, or for
-          cost containment on one bot without touching globals.
-        </p>
-
-        <label style="display:flex;align-items:center;gap:8px;margin-top:16px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-          <input type="checkbox" name="vision_enabled" value="1"
-                 {% if values.vision_enabled %}checked{% endif %} style="width:auto;">
-          <span>Vision (pass inbound images to the writer LLM)</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-          When on, image attachments from inbound Signal messages are
-          base64-encoded and sent to the writer in OpenAI multimodal shape
-          (text + <code>image_url</code> parts). Only enable for bots whose
-          writer model actually supports vision — non-vision endpoints will
-          reject the request. Images are one-shot: they reach the model for
-          the round that received them and are <em>not</em> persisted into
-          conversation history, so follow-up turns won't re-see them.
-          Caps: jpeg/png/webp/gif only, 5 MB per image, max 4 images per
-          message.
-        </p>
-
-        <label style="display:flex;align-items:center;gap:8px;margin-top:16px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-          <input type="checkbox" name="audio_enabled" value="1"
-                 {% if values.audio_enabled %}checked{% endif %} style="width:auto;">
-          <span>Audio (pass inbound voice notes to the writer LLM)</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-          When on, voice notes and audio attachments are transcoded to
-          mono 16&nbsp;kHz mp3 (via <code>ffmpeg</code>) and sent to the
-          writer as a multimodal audio part. Only enable for bots whose
-          writer model can actually listen — a text-only endpoint will
-          either reject the request or invent a transcript. Unlike
-          images, audio is <em>never</em> written to conversation
-          history; the turn keeps a <code>[voice note, 0:23]</code>
-          descriptor in its place, which is also what the reactor and
-          any tool-bot sibling see. A caption-less voice note is
-          answered on the audio alone. Caps: 2 clips per message, first
-          5 minutes of each, 25 MB source.
-        </p>
-
-        <label>Audio part shape
-          <select name="audio_part_style">
-            <option value="input_audio" {% if values.audio_part_style == 'input_audio' %}selected{% endif %}>input_audio (OpenAI, recent vLLM)</option>
-            <option value="audio_url" {% if values.audio_part_style == 'audio_url' %}selected{% endif %}>audio_url (vLLM native, data URI)</option>
-          </select>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-          Which shape this bot's endpoint wants audio framed in. There's
-          no single convention: <code>input_audio</code> carries bare
-          base64 plus a format string, <code>audio_url</code> carries a
-          <code>data:</code> URI exactly like <code>image_url</code>
-          does. If audio requests come back as HTTP 400, try the other
-          one. Ignored when audio is off.
-        </p>
-
-        {% for role in roles %}
-          <h2 style="margin-top: 24px;">{{ role|capitalize }} LLM overrides</h2>
-          <p class="muted" style="font-size: 11px;">
-            Leave fields blank to inherit the global
-            {% if role == 'writer' %}<code>llm_*</code>{% elif role == 'reactor' %}<code>reactor_*</code> (with <code>llm_*</code> fallback){% elif role == 'tool_bot' %}<code>deep_think_*</code> then <code>llm_*</code> (these per-bot fields are the tool_bot executor's config){% else %}<code>deep_think_*</code> (with <code>llm_*</code> fallback){% endif %}
-            settings from the LLM page. Save with a value to pin it for this bot.
-          </p>
-
-          {% set role_vals = bot_settings.fields[role] %}
-          {% set role_secrets = bot_settings.secrets_set[role] %}
-          {% for key, kind in role_fields[role] %}
-            <label>
-              {{ key }}
-              {% if kind == 'secret' %}
-                <input type="password" name="{{ role }}__{{ key }}" value=""
-                       placeholder="{% if role_secrets[key] %}(set — type to replace){% else %}(not set){% endif %}">
-                {% if role_secrets[key] %}
-                  <label style="display:flex;gap:8px;align-items:center;margin-top:4px;font-size:11px;">
-                    <input type="checkbox" name="{{ role }}__{{ key }}__clear" value="1" style="width:auto;">
-                    <span>Clear (revert to global)</span>
-                  </label>
-                {% endif %}
-              {% elif kind == 'int' %}
-                <input type="number" step="1" name="{{ role }}__{{ key }}"
-                       value="{{ role_vals[key] }}" placeholder="(inherit global)">
-              {% elif kind == 'float' %}
-                <input type="number" step="0.01" name="{{ role }}__{{ key }}"
-                       value="{{ role_vals[key] }}" placeholder="(inherit global)">
-              {% elif kind == 'json' %}
-                <textarea name="{{ role }}__{{ key }}" rows="3"
-                          placeholder='(inherit global) — JSON object, e.g. {"top_k": 40}'>{{ role_vals[key] }}</textarea>
-              {% else %}
-                <input type="text" name="{{ role }}__{{ key }}"
-                       value="{{ role_vals[key] }}" placeholder="(inherit global)">
-              {% endif %}
+{% macro role_field(role, key, kind) -%}
+    {% set role_vals = bot_settings.fields[role] %}
+    {% set role_secrets = bot_settings.secrets_set[role] %}
+    {% set name = role ~ "__" ~ key %}
+    <div class="field">
+        <label for="{{ name }}">{{ labels.get(key, key) }}
+            {% if kind == 'secret' and role_secrets[key] %}<span class="badge ok" style="margin-left: 6px;">set</span>{% endif %}</label>
+        {% if kind == 'secret' %}
+            <input type="password" name="{{ name }}" id="{{ name }}" value="" autocomplete="new-password"
+                   placeholder="{{ 'Leave blank to keep' if role_secrets[key] else 'Inherit' }}">
+            {% if role_secrets[key] %}
+            <label class="row small muted" style="margin-top: 6px; font-weight: 400;">
+                <input type="checkbox" name="{{ name }}__clear" value="1"> Clear (inherit again)
             </label>
-          {% endfor %}
+            {% endif %}
+        {% elif kind == 'int' %}
+            <input type="number" step="1" name="{{ name }}" id="{{ name }}" value="{{ role_vals[key] }}" placeholder="Inherit">
+        {% elif kind == 'float' %}
+            <input type="number" step="0.01" name="{{ name }}" id="{{ name }}" value="{{ role_vals[key] }}" placeholder="Inherit">
+        {% elif kind == 'json' or key in ("system_prompt", "natural_response_extra_prompt") %}
+            <textarea name="{{ name }}" id="{{ name }}" rows="3" placeholder="Inherit">{{ role_vals[key] }}</textarea>
+        {% else %}
+            <input type="text" name="{{ name }}" id="{{ name }}" value="{{ role_vals[key] }}" placeholder="Inherit">
+        {% endif %}
+    </div>
+{%- endmacro %}
 
-          {% if not is_new %}
-            <div style="margin-top: 12px; padding: 12px; border: 1px dashed var(--border); border-radius: 4px;">
-              <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
-                <button type="button" class="secondary"
-                        data-test-role="{{ role }}"
-                        data-test-bot="{{ bot.id }}"
-                        style="background: var(--border); color: var(--text);">
-                  Test connection
-                </button>
-                <span class="muted" style="font-size: 11px;">
-                  Sends one short prompt against the saved {{ role }} config and shows the reply. Saves first if you've edited fields above.
-                </span>
-              </div>
-              <div data-test-result="{{ role }}" style="margin-top: 10px; font-size: 12px;"></div>
-            </div>
-          {% endif %}
-        {% endfor %}
-
-        <p style="margin-top: 24px;">
-          <button type="submit">Save</button>
-          {% if not is_new %}
-            <a href="{{ url_for('admin.bots_list') }}" class="btn secondary"
-               style="display:inline-block;text-decoration:none;margin-left:8px;">Cancel</a>
-          {% endif %}
-        </p>
-    </form>
+<div class="page-head">
+    <div>
+        <a class="crumb" href="{{ url_for('admin.bots_list') }}">← Bots</a>
+        <h1>{% if is_new %}New bot{% else %}{{ bot.display_name }}{% endif %}</h1>
+        {% if not is_new %}<p class="page-sub">
+            {% if values.enabled %}<span class="badge ok">Enabled</span>{% else %}<span class="badge">Disabled</span>{% endif %}
+            {% if values.default_for_group %}<span class="badge plain">Default in groups</span>{% endif %}
+            {% if values.default_for_dm %}<span class="badge plain">Default in DMs</span>{% endif %}
+        </p>{% endif %}
+    </div>
 </div>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form method="post" class="form-layout" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% set ns = namespace(sections=[("identity", "Identity"), ("signal", "Signal"), ("capabilities", "Capabilities")]) %}
+    {% if "writer" in roles %}{% set ns.sections = ns.sections + [("claude", "Claude")] %}{% endif %}
+    {% for role in roles %}{% set ns.sections = ns.sections + [("role-" ~ role, role_titles.get(role, role))] %}{% endfor %}
+    {{ toc(ns.sections) }}
+
+    <div>
+    <section class="section" id="identity">
+        <h2>Identity</h2>
+        <div class="fields">
+            {{ field("slug", "Slug", values.slug, attrs=('pattern="[a-z0-9_-]+"' ~ (' readonly' if not is_new else '')),
+                     hint="Lowercase letters, digits, _ and -. Fixed once created.") }}
+            {{ field("display_name", "Display name", values.display_name, hint="Also the default trigger name.") }}
+        </div>
+        <div class="fields two">
+            {{ area("aliases", "Aliases", values.aliases, rows=3, placeholder="One per line. Blank = the display name.",
+                    hint="Whole-word, case-insensitive names that reach this bot.") }}
+            {{ area("routing_blurb", "Routing blurb", values.routing_blurb, rows=3, placeholder="Artaud: poetry, art, philosophy.",
+                    hint="One short line the reactor reads to pick a bot in multi-bot chats.") }}
+        </div>
+        {{ area("persona", "Persona", values.persona, rows=4,
+                placeholder="Blank if the model already knows its persona.",
+                hint="Placed above the global system prompt.") }}
+    </section>
+
+    <section class="section" id="signal">
+        <h2>Signal</h2>
+        <div class="fields two">
+            {{ field("signal_phone", "Phone number", values.signal_phone, placeholder="Blank = the system default number") }}
+            {{ field("signal_api_url", "Signal API URL", values.signal_api_url, placeholder="Blank = SIGNAL_API_URL") }}
+        </div>
+        <div class="toggles" style="margin-top: 12px;">
+            {{ toggle("enabled", "Enabled", values.enabled, value="1") }}
+            {{ toggle("default_for_group", "Default bot in groups", values.default_for_group, value="1", hint="Only one bot can hold this.") }}
+            {{ toggle("default_for_dm", "Default bot in DMs", values.default_for_dm, value="1") }}
+        </div>
+    </section>
+
+    <section class="section" id="capabilities">
+        <h2>Capabilities</h2>
+        <div class="fields">
+            <div class="field">
+                <label for="deep_think_mode">Deep think mode</label>
+                <select name="deep_think_mode" id="deep_think_mode">
+                    {% for m in deep_think_modes %}<option value="{{ m }}" {% if values.deep_think_mode == m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+                </select>
+                <details class="more"><summary>What the modes do</summary><div>
+                    <code>replace</code>: deep think writes the reply itself (Sigil).
+                    <code>research</code>: deep think runs the tools every turn and hands notes to the writer.
+                    <code>tool_bot</code>: like research, but on the tool-bot model, which answers NOTOOLS when no live data is needed so the writer replies directly. Best for writers with weak tool calling.
+                </div></details>
+            </div>
+            {{ area("deep_think_handoff_prompt", "Handoff prompt", values.deep_think_handoff_prompt, rows=2,
+                    placeholder="How the writer should use the notes.", hint="research and tool_bot modes only.") }}
+        </div>
+        <input type="hidden" name="_deep_think_enabled_in_form" value="1">
+        <div class="toggles" style="margin-top: 12px;">
+            {{ toggle("deep_think_enabled", "Deep think", values.deep_think_enabled, value="1",
+                      hint="Off hides the deep_think tool and treats research mode as replace.") }}
+            {{ toggle("vision_enabled", "Vision", values.vision_enabled, value="1",
+                      hint="Send inbound images to the writer. Only for vision-capable models.",
+                      more="Images are base64 <code>image_url</code> parts, one-shot (not kept in history). jpeg/png/webp/gif, 5 MB each, up to 4 per message.") }}
+            {{ toggle("audio_enabled", "Audio", values.audio_enabled, value="1",
+                      hint="Send inbound voice notes to the writer. Only for models that can listen.",
+                      more="Transcoded to mono 16 kHz mp3. Never stored in history; the turn keeps a <code>[voice note, 0:23]</code> marker instead. 2 clips per message, first 5 minutes each, 25 MB source.") }}
+        </div>
+        <div class="fields" style="margin-top: 8px;">
+            <div class="field">
+                <label for="audio_part_style">Audio part shape</label>
+                <select name="audio_part_style" id="audio_part_style">
+                    <option value="input_audio" {% if values.audio_part_style == 'input_audio' %}selected{% endif %}>input_audio (OpenAI, recent vLLM)</option>
+                    <option value="audio_url" {% if values.audio_part_style == 'audio_url' %}selected{% endif %}>audio_url (vLLM native)</option>
+                </select>
+                <p class="hint">If audio requests return HTTP 400, try the other one.</p>
+            </div>
+        </div>
+    </section>
+
+    {% if "writer" in roles %}
+    <section class="section" id="claude">
+        <h2>Claude</h2>
+        <p class="section-desc">With a key set, this bot answers named group chats with Claude (Opus for replies and deep think, Haiku for small tasks) and falls back to its writer model on any failure. DMs and default contexts never use it.</p>
+        <div class="fields">
+            {% for key, kind in role_fields["writer"] if key in claude_keys %}{{ role_field("writer", key, kind) }}{% endfor %}
+        </div>
+    </section>
+    {% endif %}
+
+    {% for role in roles %}
+    <section class="section" id="role-{{ role }}">
+        <div class="card-head" style="margin-bottom: 0;">
+            <h2>{{ role_titles.get(role, role) }}</h2>
+            {% if not is_new %}
+            <button type="button" class="secondary sm" data-test-role="{{ role }}" data-test-bot="{{ bot.id }}">Test connection</button>
+            {% endif %}
+        </div>
+        <p class="section-desc">Blank fields inherit {{ role_inherits.get(role, "the global settings") }}.</p>
+        {% if not is_new %}<div data-test-result="{{ role }}" class="small" style="margin: -6px 0 14px;"></div>{% endif %}
+        <div class="fields">
+            {% for key, kind in role_fields[role] if key not in claude_keys and kind not in ("json",) and key not in ("system_prompt", "natural_response_extra_prompt") %}
+                {{ role_field(role, key, kind) }}
+            {% endfor %}
+        </div>
+        <div class="fields two" style="margin-top: 16px;">
+            {% for key, kind in role_fields[role] if key not in claude_keys and (kind == "json" or key in ("system_prompt", "natural_response_extra_prompt")) %}
+                {{ role_field(role, key, kind) }}
+            {% endfor %}
+        </div>
+    </section>
+    {% endfor %}
+
+    <div class="savebar">
+        <button type="submit">{% if is_new %}Create bot{% else %}Save changes{% endif %}</button>
+        <a href="{{ url_for('admin.bots_list') }}" class="btn ghost">Cancel</a>
+        {% if not is_new %}<span class="muted small">Test connection uses the saved settings. Save first.</span>{% endif %}
+    </div>
+    </div>
+</form>
 
 {% if not is_new %}
 <script>
 (function () {
-  // Test-connection buttons. One per role (writer / reactor / deep_think). Sends
-  // one short prompt against the bot's saved config and renders the
-  // reply inline. Edits NOT yet saved aren't tested — admins should
-  // hit Save first, since the route reads bot_llm_settings.
   const csrf = "{{ csrf_token() }}";
-  const buttons = document.querySelectorAll("[data-test-role]");
-  buttons.forEach((btn) => {
+  document.querySelectorAll("[data-test-role]").forEach((btn) => {
     btn.addEventListener("click", async (ev) => {
       ev.preventDefault();
       const role = btn.getAttribute("data-test-role");
       const botId = btn.getAttribute("data-test-bot");
-      const result = document.querySelector(
-        `[data-test-result="${role}"]`
-      );
+      const result = document.querySelector(`[data-test-result="${role}"]`);
       btn.disabled = true;
       btn.textContent = "Testing…";
       result.innerHTML = '<span class="muted">Sending test prompt…</span>';
-
       const fd = new FormData();
       fd.append("csrf_token", csrf);
       try {
-        const resp = await fetch(
-          `{{ url_for('admin.bots_list') }}/${botId}/test/${role}`,
-          { method: "POST", body: fd, credentials: "same-origin" }
-        );
-        const data = await resp.json();
-        result.innerHTML = renderTestResult(data);
+        const resp = await fetch(`{{ url_for('admin.bots_list') }}/${botId}/test/${role}`,
+          { method: "POST", body: fd, credentials: "same-origin" });
+        result.innerHTML = renderTestResult(await resp.json());
       } catch (e) {
-        result.innerHTML = '<span class="dot-bad">○</span> ' +
-          '<strong>Network error:</strong> ' + escapeHTML(String(e));
+        result.innerHTML = '<span class="badge bad">Network error</span> ' + escapeHTML(String(e));
       } finally {
         btn.disabled = false;
         btn.textContent = "Test connection";
       }
     });
   });
-
   function escapeHTML(s) {
-    return String(s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
-
   function renderTestResult(data) {
     const meta = [];
-    if (data.model) meta.push("model=<code>" + escapeHTML(data.model) + "</code>");
-    if (typeof data.latency_ms === "number")
-      meta.push(escapeHTML(data.latency_ms.toLocaleString()) + " ms");
-    const metaLine = meta.length
-      ? '<div class="muted" style="margin-top:4px;font-size:11px;">' +
-        meta.join(" · ") + "</div>"
-      : "";
+    if (data.model) meta.push("<code>" + escapeHTML(data.model) + "</code>");
+    if (typeof data.latency_ms === "number") meta.push(escapeHTML(data.latency_ms.toLocaleString()) + " ms");
+    const metaLine = meta.length ? ' <span class="muted">' + meta.join(" · ") + "</span>" : "";
     if (data.ok) {
-      return '<span class="dot-ok">●</span> <strong>Reply:</strong> ' +
-        '<span style="white-space:pre-wrap;">' +
+      return '<span class="badge ok">Reply</span> <span style="white-space:pre-wrap;">' +
         escapeHTML(data.reply || "(empty)") + "</span>" + metaLine;
     }
-    return '<span class="dot-bad">○</span> <strong>Failed:</strong> ' +
-      escapeHTML(data.error || "unknown error") + metaLine;
+    return '<span class="badge bad">Failed</span> ' + escapeHTML(data.error || "unknown error") + metaLine;
   }
 })();
 </script>

@@ -12,7 +12,8 @@ import os.path
 import re
 import socket
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -201,8 +202,21 @@ def create_admin_blueprint(
             }
         }
 
+    app.add_template_filter(_format_when, "when")
     app.register_blueprint(bp)
     return bp
+
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _format_when(ts) -> str:
+    """Unix seconds -> "Oct 8 2026, 6:47 PM ET" for admin pages."""
+    try:
+        dt = datetime.fromtimestamp(float(ts), _ET)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+    return dt.strftime("%b %-d %Y, %-I:%M %p ET")
 
 
 _DB_TABLES_FOR_DASH = (
@@ -733,6 +747,9 @@ _BOT_LLM_FIELDS = {
         ("timeout_seconds", "int"),
         ("system_prompt", "str"),
         ("extra_body", "json"),
+        # Claude routing for named group chats (src/llm/anthropic_backend.py).
+        ("anthropic_api_key", "secret"),
+        ("anthropic_workspace_id", "str"),
     ],
     "reactor": [
         ("base_url", "str"),
@@ -1509,6 +1526,10 @@ def _collect_setting_values(store: SettingsStore) -> dict[str, object]:
     return {key: stored.get(key) for key in sorted(ALLOWED_KEYS)}
 
 
+def _is_secret_key(key: str) -> bool:
+    return key.lower().endswith(("_api_key", "_secret"))
+
+
 def _apply_settings_form(store: SettingsStore, form) -> None:
     """Persist form values, coercing types per known schema."""
     for key in ALLOWED_KEYS:
@@ -1516,6 +1537,10 @@ def _apply_settings_form(store: SettingsStore, form) -> None:
             continue
 
         raw = form.get(key, "").strip()
+
+        # Secrets render as blank masked fields: blank means keep.
+        if _is_secret_key(key) and not raw:
+            continue
 
         if key == "admin_numbers":
             if raw:

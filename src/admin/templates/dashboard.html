@@ -1,561 +1,321 @@
 {% extends "base.html" %}
 {% block title %}Dashboard{% endblock %}
+{% block head %}
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); overflow: hidden; }
+  .seg a, .seg span { padding: 5px 12px; font-size: 13px; color: var(--text-2); }
+  .seg a:hover { background: var(--surface-2); text-decoration: none; }
+  .seg .on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .seg > * + * { border-left: 1px solid var(--border-strong); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
+</style>
+{% endblock %}
 {% block content %}
+{% set llm = metrics.llm %}
+{% set dt = deep_think_view %}
+{% set st = dt.status or {} %}
+{% set today = dt.usage_today or {} %}
+{% set r = reactor_view %}
 
-{# ── Window selector ─────────────────────────────────────────────── #}
-{# LLM, deep-think, and reactor stats below render the selected
-   time window from the persistent metric_events log. Cache hit-rate
-   and uptime are inherently process-local and stay as since-boot. #}
-<div class="panel" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-    <span style="font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Window</span>
-    {% for opt in metrics.window_options or ['24h', '7d', '30d'] %}
-        {% if opt == metrics.window_key %}
-            <strong style="padding: 4px 10px; border: 1px solid var(--accent, #888); border-radius: 4px;">{{ opt }}</strong>
-        {% else %}
-            <a href="?window={{ opt }}" style="padding: 4px 10px; border: 1px solid var(--muted); border-radius: 4px; text-decoration: none;">{{ opt }}</a>
-        {% endif %}
-    {% endfor %}
-    <span class="muted" style="margin-left: auto; font-size: 11px;">
-        Persisted across restarts. Data older than 30d is pruned.
-    </span>
+<div class="page-head">
+    <div>
+        <h1>Dashboard</h1>
+        <p class="page-sub">Last {{ metrics.window_key }}, from the persistent event log (kept 30 days). Uptime and cache counters are since the last restart.</p>
+    </div>
+    <div class="page-actions">
+        <div class="seg" role="group" aria-label="Time window">
+            {% for opt in metrics.window_options or ['24h', '7d', '30d'] %}
+                {% if opt == metrics.window_key %}<span class="on">{{ opt }}</span>{% else %}<a href="?window={{ opt }}">{{ opt }}</a>{% endif %}
+            {% endfor %}
+        </div>
+    </div>
 </div>
 
-{# ── Health ──────────────────────────────────────────────────────── #}
-<div class="panel">
-    <h2>Health</h2>
-    <table>
-        <tr>
-            <th>Uptime</th>
-            <td>{{ '%dh %dm'|format(metrics.uptime_seconds // 3600, (metrics.uptime_seconds % 3600) // 60) }}</td>
-        </tr>
-        <tr>
-            <th>Inbound msgs / min</th>
-            <td>{{ '%.0f'|format(metrics.requests_per_minute) }}</td>
-        </tr>
-        <tr>
-            <th>Inbound msgs ({{ metrics.window_key }})</th>
-            <td>{{ '{:,}'.format(metrics.window_request_count or 0) }}</td>
-        </tr>
-        <tr>
-            <th>Cache hit rate</th>
-            <td>{{ metrics.cache.overall_hit_rate }}</td>
-        </tr>
-    </table>
-</div>
-
-{# ── LLM ─────────────────────────────────────────────────────────── #}
-<div class="panel">
-    <h2>LLM <span class="muted" style="font-size: 12px;">· {{ metrics.window_key }}</span></h2>
-    {% set llm = metrics.llm %}
-    <table>
-        <tr>
-            <th>Calls</th>
-            <td>{{ llm.calls }} <span class="muted">({{ llm.success_rate }} success)</span></td>
-        </tr>
-        <tr>
-            <th>Errors</th>
-            <td>
-                {{ llm.errors }}
-                {% if llm.last_error_msg %}
-                    <span class="muted" style="margin-left: 12px;">last: {{ llm.last_error_msg|truncate(80) }}</span>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Tokens</th>
-            <td>{{ '{:,}'.format(llm.tokens_in or 0) }} in &nbsp;·&nbsp; {{ '{:,}'.format(llm.tokens_out or 0) }} out</td>
-        </tr>
-        <tr>
-            <th>Prompt cache</th>
-            <td>
-                {% set hit = llm.cache_hit_tokens or 0 %}
-                {% set miss = llm.cache_miss_tokens or 0 %}
-                {% if hit or miss %}
-                    {{ '{:,}'.format(hit) }} hit &nbsp;·&nbsp;
-                    {{ '{:,}'.format(miss) }} miss &nbsp;·&nbsp;
-                    {{ '%.1f%%'|format((llm.cache_hit_ratio or 0) * 100) }}
-                {% else %}
-                    <span class="muted">— (provider not reporting cache, or no calls yet)</span>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Cache contract</th>
-            <td>
-                {{ llm.prompt_observations or 0 }} observations &nbsp;·&nbsp;
-                {{ llm.system_fingerprint_changes or 0 }} system changes &nbsp;·&nbsp;
-                {{ llm.tool_fingerprint_changes or 0 }} tool changes
-                {% if llm.unexpected_cache_misses %}
-                    <span style="color:var(--warn,#d9a441);margin-left:8px;">
-                        {{ llm.unexpected_cache_misses }} unchanged-prefix misses
-                    </span>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Resilience</th>
-            <td>
-                {{ llm.retries or 0 }} retries &nbsp;·&nbsp;
-                {{ llm.circuit_rejections or 0 }} circuit rejections
-            </td>
-        </tr>
-        <tr>
-            <th>Avg latency</th>
-            <td>{% if llm.avg_latency_ms %}{{ '%.0f'|format(llm.avg_latency_ms) }}ms{% else %}—{% endif %}</td>
-        </tr>
-    </table>
-
-    {% if llm.by_purpose %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By purpose</h3>
-    <table>
-        {% for purpose, count in llm.by_purpose.items() %}
-        <tr><th>{{ purpose }}</th><td>{{ count }}</td></tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-
-    {% if llm.by_model %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By model</h3>
-    <table>
-        {% for model, count in llm.by_model.items() %}
-        <tr><th>{{ model }}</th><td>{{ count }}</td></tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-
-    {% if llm.recent_prompt_cache %}
-    <h3 style="margin-top:16px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;">Recent prompt fingerprints</h3>
-    <div style="overflow-x:auto;">
-    <table>
-        <tr>
-            <th>Context</th><th>Purpose</th><th>System</th><th>Tools</th>
-            <th>Payload</th><th>Cache</th><th>Change</th>
-        </tr>
-        {% for row in llm.recent_prompt_cache %}
-        <tr>
-            <td>#{{ row.context_id if row.context_id is not none else '—' }}</td>
-            <td>{{ row.purpose }}</td>
-            <td><code>{{ row.system_hash }}</code></td>
-            <td><code>{{ row.tools_hash }}</code></td>
-            <td>{{ row.tool_count }} tools · {{ '{:,}'.format(row.tool_schema_chars) }} chars</td>
-            <td>{{ '{:,}'.format(row.cache_hit_tokens) }} hit / {{ '{:,}'.format(row.cache_miss_tokens) }} miss</td>
-            <td>
-                {% if row.stable_changed %}
-                    <span style="color:var(--warn,#d9a441);">stable: {{ row.stable_changed|join(', ') }}</span>
-                {% elif row.system_changed or row.tools_changed %}
-                    {{ 'system ' if row.system_changed else '' }}{{ 'tools' if row.tools_changed else '' }}
-                {% elif row.unexpected_miss %}
-                    <span style="color:var(--warn,#d9a441);">miss, prefix unchanged</span>
-                {% else %}
-                    <span class="muted">unchanged</span>
-                {% endif %}
-            </td>
-        </tr>
-        {% endfor %}
-    </table>
+{# ── Headline tiles ──────────────────────────────────────────────── #}
+<div class="stats">
+    <div class="stat">
+        <div class="stat-label">Inbound messages</div>
+        <div class="stat-value">{{ '{:,}'.format(metrics.window_request_count or 0) }}</div>
+        <div class="stat-sub">{{ '%.0f'|format(metrics.requests_per_minute) }}/min right now</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">LLM calls</div>
+        <div class="stat-value">{{ '{:,}'.format(llm.calls or 0) }}</div>
+        <div class="stat-sub">{{ llm.success_rate }} success{% if llm.errors %} · <span class="warn-text">{{ llm.errors }} errors</span>{% endif %}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Prompt cache hit</div>
+        <div class="stat-value">{% if llm.cache_hit_tokens or llm.cache_miss_tokens %}{{ '%.0f%%'|format((llm.cache_hit_ratio or 0) * 100) }}{% else %}—{% endif %}</div>
+        <div class="stat-sub">of {{ '{:,}'.format((llm.tokens_in or 0)) }} input tokens</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Avg latency</div>
+        <div class="stat-value">{% if llm.avg_latency_ms %}{{ '%.1f'|format(llm.avg_latency_ms / 1000) }}s{% else %}—{% endif %}</div>
+        <div class="stat-sub">per LLM call</div>
+    </div>
+    {% if claude_spend %}
+    <div class="stat">
+        <div class="stat-label">Claude this cycle</div>
+        <div class="stat-value">${{ '%.2f'|format(claude_spend.mtd.total) }}</div>
+        <div class="stat-sub">of ${{ '%.0f'|format(claude_spend.credit) }} · resets the 10th</div>
+        <div class="meter {{ 'bad' if claude_spend.pct >= 90 else ('warn' if claude_spend.pct >= 70 else '') }}"
+             role="meter" aria-valuenow="{{ '%.0f'|format(claude_spend.pct) }}" aria-valuemin="0" aria-valuemax="100"
+             aria-label="Claude credit used"><span style="width: {{ claude_spend.pct }}%"></span></div>
     </div>
     {% endif %}
+    <div class="stat">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-value">{{ '%dh %dm'|format(metrics.uptime_seconds // 3600, (metrics.uptime_seconds % 3600) // 60) }}</div>
+        <div class="stat-sub">data cache hit {{ metrics.cache.overall_hit_rate }}</div>
+    </div>
 </div>
 
-{# ── Claude spend ────────────────────────────────────────────────── #}
-{% if claude_spend %}
-<div class="panel">
-    <h2>Claude spend <span class="muted" style="font-size: 12px;">· estimated from logged tokens</span></h2>
-    {% set mtd = claude_spend.mtd %}
-    <table>
-        <tr>
-            <th>This cycle <span class="muted">(since the 10th)</span></th>
-            <td>
-                ${{ '%.2f'|format(mtd.total) }} of ${{ '%.0f'|format(claude_spend.credit) }}
-                <span class="muted">({{ '%.0f'|format(claude_spend.pct) }}%)</span>
-                <div style="margin-top: 6px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;">
-                    <div style="width: {{ claude_spend.pct }}%; height: 100%; background: {{ 'var(--bad)' if claude_spend.pct >= 80 else 'var(--accent)' }};"></div>
+<div class="grid grid-2">
+
+    {# ── LLM usage ──────────────────────────────────────────────── #}
+    <div class="card">
+        <div class="card-head"><h2>LLM usage</h2><span class="card-meta">{{ metrics.window_key }}</span></div>
+        <table class="kv compact">
+            <tr><th>Tokens</th><td>{{ '{:,}'.format(llm.tokens_in or 0) }} in · {{ '{:,}'.format(llm.tokens_out or 0) }} out</td></tr>
+            <tr><th>Prompt cache</th><td>
+                {% if llm.cache_hit_tokens or llm.cache_miss_tokens %}
+                    {{ '{:,}'.format(llm.cache_hit_tokens or 0) }} hit · {{ '{:,}'.format(llm.cache_miss_tokens or 0) }} miss
+                {% else %}<span class="muted">Not reported yet</span>{% endif %}
+            </td></tr>
+            <tr><th>Resilience</th><td>{{ llm.retries or 0 }} retries · {{ llm.circuit_rejections or 0 }} circuit rejections</td></tr>
+            {% if llm.last_error_msg %}<tr><th>Last error</th><td class="small">{{ llm.last_error_msg|truncate(120) }}</td></tr>{% endif %}
+        </table>
+        <div class="split" style="margin-top: 14px;">
+            {% if llm.by_purpose %}
+            <div>
+                <div class="subhead" style="margin-top: 0;">By purpose</div>
+                <table class="compact">
+                    {% for purpose, count in llm.by_purpose.items() %}<tr><td>{{ purpose }}</td><td class="num">{{ count }}</td></tr>{% endfor %}
+                </table>
+            </div>
+            {% endif %}
+            {% if llm.by_model %}
+            <div>
+                <div class="subhead" style="margin-top: 0;">By model</div>
+                <table class="compact">
+                    {% for model, count in llm.by_model.items() %}<tr><td class="mono small">{{ model }}</td><td class="num">{{ count }}</td></tr>{% endfor %}
+                </table>
+            </div>
+            {% endif %}
+        </div>
+        <details class="more" style="margin-top: 12px;">
+            <summary>Prompt cache diagnostics</summary>
+            <div style="max-width: none;">
+                <p style="margin: 0 0 8px;">
+                    {{ llm.prompt_observations or 0 }} observations · {{ llm.system_fingerprint_changes or 0 }} system changes · {{ llm.tool_fingerprint_changes or 0 }} tool changes
+                    {% if llm.unexpected_cache_misses %} · <span class="warn-text">{{ llm.unexpected_cache_misses }} misses with an unchanged prefix</span>{% endif %}
+                </p>
+                {% if llm.recent_prompt_cache %}
+                <div class="table-wrap">
+                <table class="compact">
+                    <thead><tr><th>Context</th><th>Purpose</th><th>System</th><th>Tools</th><th>Payload</th><th>Cache</th><th>Change</th></tr></thead>
+                    {% for row in llm.recent_prompt_cache %}
+                    <tr>
+                        <td>#{{ row.context_id if row.context_id is not none else '—' }}</td>
+                        <td>{{ row.purpose }}</td>
+                        <td><code>{{ row.system_hash }}</code></td>
+                        <td><code>{{ row.tools_hash }}</code></td>
+                        <td>{{ row.tool_count }} tools · {{ '{:,}'.format(row.tool_schema_chars) }} chars</td>
+                        <td>{{ '{:,}'.format(row.cache_hit_tokens) }} / {{ '{:,}'.format(row.cache_miss_tokens) }}</td>
+                        <td>
+                            {% if row.stable_changed %}<span class="warn-text">stable: {{ row.stable_changed|join(', ') }}</span>
+                            {% elif row.system_changed or row.tools_changed %}{{ 'system ' if row.system_changed else '' }}{{ 'tools' if row.tools_changed else '' }}
+                            {% elif row.unexpected_miss %}<span class="warn-text">miss, prefix unchanged</span>
+                            {% else %}<span class="muted">unchanged</span>{% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </table>
                 </div>
-            </td>
-        </tr>
-        <tr>
-            <th>This window ({{ metrics.window_key }})</th>
-            <td>${{ '%.2f'|format(claude_spend.window.total) }}</td>
-        </tr>
-    </table>
-    {% if claude_spend.window.models %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By model · {{ metrics.window_key }}</h3>
-    <table>
-        <tr><th>Model</th><th>Calls</th><th>Fell back</th><th>Tokens in / out</th><th>Cache hit</th><th>Est. cost</th></tr>
-        {% for m in claude_spend.window.models %}
-        <tr>
-            <td>{{ m.model }}</td>
-            <td>{{ m.calls }}</td>
-            <td>{{ m.fallbacks }}</td>
-            <td>{{ '{:,}'.format(m.tokens_in) }} / {{ '{:,}'.format(m.tokens_out) }}</td>
-            <td>{{ '%.0f'|format(100 * m.hit_rate) }}%</td>
-            <td>${{ '%.2f'|format(m.cost) }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-    {% else %}
-    <p class="muted">No Claude calls in this window.</p>
-    {% endif %}
-    <p class="muted" style="font-size: 12px; margin-top: 8px;">Exact billing: platform.claude.com/cost. Cycle resets on the 10th with your plan's credits.</p>
-</div>
-{% endif %}
+                {% endif %}
+            </div>
+        </details>
+    </div>
 
-{# ── Deep think ──────────────────────────────────────────────────── #}
-<div class="panel">
-    <h2>Deep think</h2>
-    {% set dt = deep_think_view %}
-    {% set st = dt.status or {} %}
-    {% set today = dt.usage_today or {} %}
-    <table>
-        <tr>
-            <th>Status</th>
-            <td>
-                {% if st.ready %}
-                    <span class="dot-ok">●</span> ready
-                    <span class="muted">{{ st.model }}{% if st.base_url %} @ {{ st.base_url }}{% endif %}</span>
-                {% elif st.enabled %}
-                    <span class="dot-bad">○</span> enabled but not configured
-                    {% if not st.api_key_set %}<span class="muted">(missing api_key)</span>{% endif %}
-                    {% if not st.model %}<span class="muted">(missing model)</span>{% endif %}
-                    {% if not st.base_url %}<span class="muted">(missing base_url)</span>{% endif %}
-                {% else %}
-                    <span class="muted">○ disabled</span>
+    {# ── Claude spend ───────────────────────────────────────────── #}
+    {% if claude_spend %}
+    <div class="card">
+        <div class="card-head"><h2>Claude spend</h2><span class="card-meta">estimated · {{ metrics.window_key }}</span></div>
+        {% if claude_spend.window.models %}
+        <div class="table-wrap">
+        <table class="compact">
+            <thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Fell back</th><th class="num">Tokens in</th><th class="num">Out</th><th class="num">Cache</th><th class="num">Cost</th></tr></thead>
+            {% for m in claude_spend.window.models %}
+            <tr>
+                <td class="mono small">{{ m.model }}</td>
+                <td class="num">{{ m.calls }}</td>
+                <td class="num">{{ m.fallbacks }}</td>
+                <td class="num">{{ '{:,}'.format(m.tokens_in) }}</td>
+                <td class="num">{{ '{:,}'.format(m.tokens_out) }}</td>
+                <td class="num">{{ '%.0f'|format(100 * m.hit_rate) }}%</td>
+                <td class="num">${{ '%.2f'|format(m.cost) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        </div>
+        <p class="hint">Window total ${{ '%.2f'|format(claude_spend.window.total) }}. Exact billing is on platform.claude.com/cost.</p>
+        {% else %}
+        <p class="empty">No Claude calls in this window.</p>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {# ── Deep think ─────────────────────────────────────────────── #}
+    <div class="card">
+        <div class="card-head">
+            <h2>Deep think</h2>
+            {% if st.ready %}<span class="badge ok">Ready</span>
+            {% elif st.enabled %}<span class="badge bad">Not configured</span>
+            {% else %}<span class="badge">Disabled</span>{% endif %}
+        </div>
+        <table class="kv compact">
+            {% if st.model %}<tr><th>Model</th><td class="mono small">{{ st.model }}{% if st.base_url %} <span class="muted">@ {{ st.base_url }}</span>{% endif %}</td></tr>{% endif %}
+            {% if st.enabled and not st.ready %}<tr><th>Missing</th><td class="warn-text">
+                {% if not st.api_key_set %}api key {% endif %}{% if not st.model %}model {% endif %}{% if not st.base_url %}base url{% endif %}
+            </td></tr>{% endif %}
+            <tr><th>Calls</th><td>{{ dt.calls or 0 }} <span class="muted">({{ dt.success_rate or '—' }} success{% if dt.errors %}, {{ dt.errors }} errors{% endif %})</span></td></tr>
+            <tr><th>Tokens</th><td>{{ '{:,}'.format(dt.tokens_in or 0) }} in · {{ '{:,}'.format(dt.tokens_out or 0) }} out
+                {% if dt.cache_hit_tokens or dt.cache_miss_tokens %}<span class="muted"> · {{ '%.0f%%'|format((dt.cache_hit_ratio or 0) * 100) }} cached</span>{% endif %}</td></tr>
+            <tr><th>Avg latency</th><td>{{ dt.avg_latency_ms or 0 }} ms</td></tr>
+            <tr><th>Today</th><td>{{ today.total_calls or 0 }} calls
+                {% if today.per_user %}<span class="muted"> · {{ today.per_user|length }} users</span>{% endif %}
+                {% if today.per_group %}<span class="muted"> · {{ today.per_group|length }} groups</span>{% endif %}</td></tr>
+            <tr><th>Caps</th><td>{% if st.caps_enabled %}<span class="badge ok">Enforced</span>{% else %}<span class="badge">Count only</span>{% endif %}
+                <span class="muted small"> user/day {{ st.user_daily_cap or '∞' }} · group/day {{ st.group_daily_cap or '∞' }}</span></td></tr>
+            {% if dt.last_error_msg %}<tr><th>Last error</th><td class="small">{{ dt.last_error_msg|truncate(120) }}</td></tr>{% endif %}
+        </table>
+        {% if dt.by_model or dt.recent_calls or today.per_user or today.per_group %}
+        <details class="more" style="margin-top: 10px;">
+            <summary>Recent calls and usage</summary>
+            <div style="max-width: none;">
+                {% if dt.by_model %}
+                <div class="subhead">By model</div>
+                <table class="compact">{% for model, count in dt.by_model.items() %}<tr><td class="mono small">{{ model }}</td><td class="num">{{ count }}</td></tr>{% endfor %}</table>
                 {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Calls</th>
-            <td>{{ dt.calls or 0 }} <span class="muted">({{ dt.success_rate or '—' }} success)</span></td>
-        </tr>
-        <tr>
-            <th>Errors</th>
-            <td>
-                {{ dt.errors or 0 }}
-                {% if dt.last_error_msg %}
-                    <span class="muted" style="margin-left: 12px;">last: {{ dt.last_error_msg|truncate(80) }}</span>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Tokens</th>
-            <td>{{ '{:,}'.format(dt.tokens_in or 0) }} in &nbsp;·&nbsp; {{ '{:,}'.format(dt.tokens_out or 0) }} out</td>
-        </tr>
-        <tr>
-            <th>Prompt cache</th>
-            <td>
-                {% set dt_hit = dt.cache_hit_tokens or 0 %}
-                {% set dt_miss = dt.cache_miss_tokens or 0 %}
-                {% if dt_hit or dt_miss %}
-                    {{ '{:,}'.format(dt_hit) }} hit &nbsp;·&nbsp;
-                    {{ '{:,}'.format(dt_miss) }} miss &nbsp;·&nbsp;
-                    {{ '%.1f%%'|format((dt.cache_hit_ratio or 0) * 100) }}
-                {% else %}
-                    <span class="muted">— (provider not reporting cache, or no calls yet)</span>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Avg latency</th>
-            <td>{{ dt.avg_latency_ms or '0' }}ms</td>
-        </tr>
-        <tr>
-            <th>Today ({{ today.date or '—' }})</th>
-            <td>
-                {{ today.total_calls or 0 }} calls
                 {% if today.per_user %}
-                    <span class="muted" style="margin-left: 12px;">
-                        users: {{ today.per_user|length }}
-                    </span>
+                <div class="subhead">Today by user</div>
+                <table class="compact">{% for k, n in today.per_user.items() %}<tr><td><code>{{ k[:12] }}…</code></td><td class="num">{{ n }}{% if st.user_daily_cap %} / {{ st.user_daily_cap }}{% endif %}</td></tr>{% endfor %}</table>
                 {% endif %}
                 {% if today.per_group %}
-                    <span class="muted" style="margin-left: 12px;">
-                        groups: {{ today.per_group|length }}
-                    </span>
+                <div class="subhead">Today by group</div>
+                <table class="compact">{% for k, n in today.per_group.items() %}<tr><td><code>{{ k[:16] }}…</code></td><td class="num">{{ n }}{% if st.group_daily_cap %} / {{ st.group_daily_cap }}{% endif %}</td></tr>{% endfor %}</table>
                 {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Caps</th>
-            <td>
-                {% if st.caps_enabled %}
-                    <span class="dot-ok">●</span> enforced
-                {% else %}
-                    <span class="muted">○ visibility-only</span>
+                {% if dt.recent_calls %}
+                <div class="subhead">Recent calls</div>
+                <table class="compact">
+                    {% for call in dt.recent_calls %}
+                    <tr>
+                        <td style="word-break: break-word;">{{ call.question|truncate(120) }}</td>
+                        <td class="num nowrap">{{ call.latency_ms }} ms</td>
+                        <td>{% if call.ok %}<span class="badge ok">OK</span>{% else %}<span class="badge bad" title="{{ call.error_msg }}">Failed</span>{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
                 {% endif %}
-                <span class="muted" style="margin-left: 12px;">
-                    user/day: {{ st.user_daily_cap or '∞' }} ·
-                    group/day: {{ st.group_daily_cap or '∞' }}
-                </span>
-            </td>
-        </tr>
-    </table>
-
-    {% if dt.by_model %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">By model</h3>
-    <table>
-        {% for model, count in dt.by_model.items() %}
-        <tr><th>{{ model }}</th><td>{{ count }}</td></tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-
-    {% if today.per_user or today.per_group %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Today's usage</h3>
-    {% if today.per_user %}
-    <p style="font-size: 12px; margin: 4px 0;"><span class="muted">By user (8-char hash prefix):</span></p>
-    <table>
-        {% for user_key, count in today.per_user.items() %}
-        <tr><th><code>{{ user_key[:12] }}…</code></th><td>{{ count }}{% if st.user_daily_cap %} <span class="muted">/ {{ st.user_daily_cap }}</span>{% endif %}</td></tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-    {% if today.per_group %}
-    <p style="font-size: 12px; margin: 4px 0;"><span class="muted">By group:</span></p>
-    <table>
-        {% for group_key, count in today.per_group.items() %}
-        <tr><th><code>{{ group_key[:16] }}…</code></th><td>{{ count }}{% if st.group_daily_cap %} <span class="muted">/ {{ st.group_daily_cap }}</span>{% endif %}</td></tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-    {% endif %}
-
-    {% if dt.recent_calls %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Recent calls</h3>
-    <table style="font-size: 12px;">
-        <tr>
-            <th>Question</th>
-            <th>Latency</th>
-            <th>Tokens</th>
-            <th>Status</th>
-        </tr>
-        {% for call in dt.recent_calls %}
-        <tr>
-            <td style="max-width: 380px; word-break: break-word;">
-                {{ call.question|truncate(120) }}
-                {% if call.user_tail or call.group_id %}
-                <div class="muted" style="font-size: 11px;">
-                    {% if call.user_tail %}<code>{{ call.user_tail }}</code>{% endif %}
-                    {% if call.group_id %} · group <code>{{ call.group_id[:12] }}…</code>{% endif %}
-                </div>
-                {% endif %}
-            </td>
-            <td>{{ call.latency_ms }}ms</td>
-            <td>{{ call.tokens_in }}+{{ call.tokens_out }}</td>
-            <td>
-                {% if call.ok %}
-                    <span class="dot-ok">●</span>
-                {% else %}
-                    <span class="dot-bad">○</span>
-                    <span class="muted">{{ call.error_msg|truncate(40) }}</span>
-                {% endif %}
-            </td>
-        </tr>
-        {% endfor %}
-    </table>
-    {% endif %}
-</div>
-
-{# ── Reactor ────────────────────────────────────────────────────── #}
-<div class="panel">
-    <h2>Emoji reactor</h2>
-    {% set r = reactor_view %}
-    <table>
-        <tr><th>LLM evaluations</th><td>{{ r.evaluations }}</td></tr>
-        <tr>
-            <th>Reactions sent</th>
-            <td>
-                {{ r.reactions_sent }}
-                {% if r.evaluations and r.reactions_sent %}
-                    <span class="muted">({{ '%.0f%%'|format(r.reactions_sent / r.evaluations * 100) }} react rate)</span>
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <th>Skipped before the call</th>
-            <td>
-                <span class="muted">disabled:</span> {{ r.skipped_disabled }} ·
-                <span class="muted">cooldown:</span> {{ r.skipped_cooldown }} ·
-                <span class="muted">short:</span> {{ r.skipped_short }} ·
-                <span class="muted">already replying:</span> {{ r.skipped_will_reply }}
-            </td>
-        </tr>
-        <tr>
-            <th>Dropped after the call</th>
-            <td>
-                <span class="muted">no react:</span> {{ r.skipped_no_tool }} ·
-                <span class="muted">budget:</span> {{ r.skipped_budget }} ·
-                <span class="muted">repeat:</span> {{ r.skipped_repeat }} ·
-                <span class="muted">low score:</span> {{ r.skipped_low_score }}
-            </td>
-        </tr>
-        <tr><th>Errors</th><td>{{ r.errors }}</td></tr>
-        {% if r.top_emojis %}
-        <tr>
-            <th>Top emoji</th>
-            <td>
-                {% for emoji, n in r.top_emojis %}
-                    {{ emoji }}<span class="muted">×{{ n }}</span>{% if not loop.last %} &nbsp; {% endif %}
-                {% endfor %}
-            </td>
-        </tr>
+            </div>
+        </details>
         {% endif %}
-        {# Self-reported worthiness spread. The readout that tells you where to
-           set reactor_min_score once enough calls have been scored. #}
-        {% if r.by_score %}
-        <tr>
-            <th>Score spread</th>
-            <td>
-                {% for s, n in r.by_score %}
-                    <span class="muted">{{ s }}:</span>{{ n }}{% if not loop.last %} &nbsp; {% endif %}
-                {% endfor %}
-                {% if r.avg_score %}
-                    <span class="muted">(avg {{ '%.1f'|format(r.avg_score) }})</span>
-                {% endif %}
-            </td>
-        </tr>
-        {% endif %}
-    </table>
-</div>
+    </div>
 
-{# ── MCP servers ────────────────────────────────────────────────── #}
-{% if mcp_view %}
-<div class="panel">
-    <h2>MCP servers</h2>
-    <table>
-        <tr>
-            <th>Name</th>
-            <th>Transport</th>
-            <th>Status</th>
-            <th>Tools</th>
-        </tr>
-        {% for s in mcp_view %}
-        <tr>
-            <td><a href="{{ url_for('admin.mcp_list') }}">{{ s.name }}</a></td>
-            <td class="muted">{{ s.transport }}</td>
-            <td>
-                {% if s.running %}
-                    <span class="dot-ok">●</span> running
-                {% elif s.last_error %}
-                    <span class="dot-bad">○</span>
-                    <span class="muted">{{ s.last_error|truncate(60) }}</span>
-                {% else %}
-                    <span class="muted">○ stopped</span>
-                {% endif %}
-            </td>
-            <td>{{ s.tool_count }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-</div>
-{% endif %}
+    {# ── Reactor ────────────────────────────────────────────────── #}
+    <div class="card">
+        <div class="card-head"><h2>Emoji reactor</h2><span class="card-meta">{{ metrics.window_key }}</span></div>
+        <table class="kv compact">
+            <tr><th>Evaluated</th><td>{{ r.evaluations }}</td></tr>
+            <tr><th>Reacted</th><td>{{ r.reactions_sent }}{% if r.evaluations and r.reactions_sent %} <span class="muted">({{ '%.0f%%'|format(r.reactions_sent / r.evaluations * 100) }})</span>{% endif %}
+                {% if r.top_emojis %}<span class="muted"> · {% for emoji, n in r.top_emojis %}{{ emoji }}×{{ n }}{% if not loop.last %} {% endif %}{% endfor %}</span>{% endif %}</td></tr>
+            <tr><th>Skipped before</th><td class="small">disabled {{ r.skipped_disabled }} · cooldown {{ r.skipped_cooldown }} · short {{ r.skipped_short }} · replying {{ r.skipped_will_reply }}</td></tr>
+            <tr><th>Dropped after</th><td class="small">no react {{ r.skipped_no_tool }} · budget {{ r.skipped_budget }} · repeat {{ r.skipped_repeat }} · low score {{ r.skipped_low_score }}</td></tr>
+            {% if r.by_score %}<tr><th>Score spread</th><td class="small">{% for s, n in r.by_score %}{{ s }}: {{ n }}{% if not loop.last %} · {% endif %}{% endfor %}{% if r.avg_score %} <span class="muted">(avg {{ '%.1f'|format(r.avg_score) }})</span>{% endif %}</td></tr>{% endif %}
+            <tr><th>Errors</th><td>{{ r.errors }}</td></tr>
+        </table>
+    </div>
 
-{# ── Caches ────────────────────────────────────────────────────── #}
-<div class="panel">
-    <h2>Caches</h2>
-    <table>
-        <tr><th>Name</th><th>Size</th><th>Hits</th><th>Misses</th><th>Hit rate</th></tr>
-        {% for name, cache in metrics.cache.caches.items() %}
-        <tr>
-            <td>{{ name }}</td>
-            <td>{{ cache.size }}</td>
-            <td>{{ cache.hits }}</td>
-            <td>{{ cache.misses }}</td>
-            <td>{{ '%.1f%%'|format(cache.hit_rate) }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-    <form method="post" action="{{ url_for('admin.cache_clear') }}" style="margin-top: 16px;">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button class="secondary" type="submit" onclick="return confirm('Clear all caches?')">Clear all caches</button>
-    </form>
-</div>
-
-{# ── Providers ──────────────────────────────────────────────────── #}
-<div class="panel">
-    <h2>Providers</h2>
-    <table>
-        <tr><th>Name</th><th>Status</th><th>Rate-limited</th><th>Capabilities</th></tr>
-        {% for name, prov in metrics.providers.items() %}
-        <tr>
-            <td>{{ name }}</td>
-            <td>
-                {% if prov.healthy %}<span class="dot-ok">●</span>{% else %}<span class="dot-bad">○</span>{% endif %}
-                {{ prov.success_rate }} ({{ prov.avg_latency_ms }})
-            </td>
-            <td>
-                {% set status = provider_status.get(name, {}) %}
-                {% if status.rate_limited %}{{ status.rate_limit_remaining_seconds }}s{% else %}—{% endif %}
-            </td>
-            <td class="muted">{{ status.capabilities | default([]) | join(', ') }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-</div>
-
-{# ── Contexts ──────────────────────────────────────────────────── #}
-{% if context_view and context_view.total %}
-<div class="panel">
-    <h2>Contexts</h2>
-    <table>
-        <tr>
-            <th>Total</th>
-            <td>{{ context_view.total }}</td>
-        </tr>
-        <tr>
-            <th>Groups</th>
-            <td>{{ context_view.group }}</td>
-        </tr>
-        <tr>
-            <th>DMs</th>
-            <td>{{ context_view.dm }}</td>
-        </tr>
-        <tr>
-            <th>Defaults</th>
-            <td>{{ context_view.default }}</td>
-        </tr>
-        <tr>
-            <th>With LLM intent</th>
-            <td>{{ context_view.with_intent }}</td>
-        </tr>
-        <tr>
-            <th>With reactor enabled</th>
-            <td>{{ context_view.with_reactor }}</td>
-        </tr>
-        <tr>
-            <th>With custom prompt</th>
-            <td>{{ context_view.with_prompt }}</td>
-        </tr>
-    </table>
-    <p style="margin-top: 12px;"><a href="{{ url_for('admin.context_list') }}">Manage contexts →</a></p>
-</div>
-{% endif %}
-
-{# ── Storage ──────────────────────────────────────────────────── #}
-{% if storage_view %}
-<div class="panel">
-    <h2>Storage</h2>
-    <table>
-        <tr>
-            <th>Database</th>
-            <td><code>{{ storage_view.path }}</code></td>
-        </tr>
-        <tr>
-            <th>Size</th>
-            <td>{{ storage_view.size_human }}</td>
-        </tr>
-    </table>
-    {% if storage_view.counts %}
-    <h3 style="margin-top: 16px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;">Row counts</h3>
-    <table>
-        {% for table, count in storage_view.counts.items() %}
-        <tr>
-            <th>{{ table }}</th>
-            <td>{% if count is none %}<span class="muted">—</span>{% else %}{{ '{:,}'.format(count) }}{% endif %}</td>
-        </tr>
-        {% endfor %}
-    </table>
+    {# ── MCP servers ────────────────────────────────────────────── #}
+    {% if mcp_view %}
+    <div class="card">
+        <div class="card-head"><h2>MCP servers</h2><a class="card-meta" href="{{ url_for('admin.mcp_list') }}">Manage</a></div>
+        <table class="compact">
+            {% for s in mcp_view %}
+            <tr>
+                <td>{{ s.name }} <span class="muted small">{{ s.transport }}</span></td>
+                <td>{% if s.running %}<span class="badge ok">Running</span>{% elif s.last_error %}<span class="badge bad" title="{{ s.last_error }}">Error</span>{% else %}<span class="badge">Stopped</span>{% endif %}</td>
+                <td class="num muted small">{{ s.tool_count }} tools</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
     {% endif %}
-</div>
-{% endif %}
 
+    {# ── Providers ──────────────────────────────────────────────── #}
+    <div class="card">
+        <div class="card-head"><h2>Data providers</h2></div>
+        <table class="compact">
+            {% for name, prov in metrics.providers.items() %}
+            {% set status = provider_status.get(name, {}) %}
+            <tr>
+                <td>{{ name }}<div class="muted small">{{ status.capabilities | default([]) | join(', ') }}</div></td>
+                <td>{% if status.rate_limited %}<span class="badge warn">Rate-limited {{ status.rate_limit_remaining_seconds }}s</span>
+                    {% elif prov.healthy %}<span class="badge ok">Healthy</span>{% else %}<span class="badge bad">Unhealthy</span>{% endif %}</td>
+                <td class="num small">{{ prov.success_rate }}<div class="muted">{{ prov.avg_latency_ms }}</div></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+
+    {# ── Caches ─────────────────────────────────────────────────── #}
+    <div class="card">
+        <div class="card-head">
+            <h2>Data caches</h2>
+            <form method="post" action="{{ url_for('admin.cache_clear') }}" class="inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="secondary sm" type="submit" onclick="return confirm('Clear all caches?')">Clear all</button>
+            </form>
+        </div>
+        <table class="compact">
+            <thead><tr><th>Cache</th><th class="num">Size</th><th class="num">Hits</th><th class="num">Misses</th><th class="num">Hit rate</th></tr></thead>
+            {% for name, cache in metrics.cache.caches.items() %}
+            <tr><td>{{ name }}</td><td class="num">{{ cache.size }}</td><td class="num">{{ cache.hits }}</td><td class="num">{{ cache.misses }}</td><td class="num">{{ '%.0f%%'|format(cache.hit_rate) }}</td></tr>
+            {% endfor %}
+        </table>
+    </div>
+
+    {# ── Contexts + storage ─────────────────────────────────────── #}
+    {% if (context_view and context_view.total) or storage_view %}
+    <div class="card">
+        <div class="card-head"><h2>Contexts and storage</h2>
+            {% if context_view and context_view.total %}<a class="card-meta" href="{{ url_for('admin.context_list') }}">Manage contexts</a>{% endif %}</div>
+        {% if context_view and context_view.total %}
+        <table class="kv compact">
+            <tr><th>Contexts</th><td>{{ context_view.total }} <span class="muted">({{ context_view.group }} groups · {{ context_view.dm }} DMs · {{ context_view.default }} defaults)</span></td></tr>
+            <tr><th>Using</th><td class="small">LLM intent {{ context_view.with_intent }} · reactor {{ context_view.with_reactor }} · custom prompt {{ context_view.with_prompt }}</td></tr>
+        </table>
+        {% endif %}
+        {% if storage_view %}
+        <table class="kv compact" style="margin-top: 6px;">
+            <tr><th>Database</th><td><code>{{ storage_view.path }}</code> <span class="muted">{{ storage_view.size_human }}</span></td></tr>
+        </table>
+        {% if storage_view.counts %}
+        <details class="more" style="margin-top: 8px;">
+            <summary>Row counts</summary>
+            <div style="max-width: none;">
+                <table class="compact">
+                    {% for table, count in storage_view.counts.items() %}
+                    <tr><td class="mono small">{{ table }}</td><td class="num">{% if count is none %}—{% else %}{{ '{:,}'.format(count) }}{% endif %}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+        </details>
+        {% endif %}
+        {% endif %}
+    </div>
+    {% endif %}
+
+</div>
 {% endblock %}

@@ -2,22 +2,23 @@
 {% block title %}Live{% endblock %}
 {% block content %}
 
+<div class="page-head">
+    <div>
+        <h1>Live</h1>
+        <p class="page-sub">Events from the dispatcher, Signal handler and reactor as they happen. Recent history replays on connect.</p>
+    </div>
+</div>
 <div class="panel">
-    <h1>Live activity</h1>
-    <p class="muted" style="font-size: 12px;">
-        Streaming events from the dispatcher, signal handler, and reactor.
-        Recent history is replayed on connect; new events arrive as they happen.
-    </p>
-    <p style="font-size: 12px;">
-        <label><input type="checkbox" id="autoscroll" checked> Auto-scroll</label>
-        &nbsp;
-        <label><input type="checkbox" data-filter="inbound" checked> inbound</label>
-        <label><input type="checkbox" data-filter="outbound" checked> outbound</label>
-        <label><input type="checkbox" data-filter="reactor" checked> reactor</label>
-        <label><input type="checkbox" data-filter="deep_think" checked> deep_think</label>
-        &nbsp;
-        <button class="btn" id="clear">Clear</button>
-        &nbsp;
+    <p class="row small" style="margin: 0;">
+        <label class="chip"><input type="checkbox" id="autoscroll" checked> Auto-scroll</label>
+
+        <label class="chip"><input type="checkbox" data-filter="inbound" checked> inbound</label>
+        <label class="chip"><input type="checkbox" data-filter="outbound" checked> outbound</label>
+        <label class="chip"><input type="checkbox" data-filter="reactor" checked> reactor</label>
+        <label class="chip"><input type="checkbox" data-filter="deep_think" checked> deep_think</label>
+
+        <button class="secondary sm" id="clear">Clear</button>
+
         <span id="conn" class="muted">connecting…</span>
     </p>
 </div>

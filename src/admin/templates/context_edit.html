@@ -1,595 +1,350 @@
 {% extends "base.html" %}
+{% from "_ui.html" import field, area, toggle, toc %}
 {% block title %}{% if is_new %}New context{% else %}{{ policy.label or policy.key }}{% endif %}{% endblock %}
+{% block head %}
+<style>
+  .rule-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .rule-row select { width: auto; min-width: 210px; }
+  .chip-tools { display: flex; gap: 6px; }
+  .payload { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--inset); font-size: 12.5px; color: var(--text-2); }
+  .daypicker { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 6px; }
+  .daypicker .chip { padding: 4px 10px; }
+  .daypresets { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0; }
+  .oracle-form { margin-top: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--inset); }
+</style>
+{% endblock %}
 {% block content %}
 
-<div class="panel">
-    <h1>{% if is_new %}New context{% else %}Edit context{% endif %}</h1>
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-
-    {% if not is_new %}
-        <p class="muted">
-            <strong>{{ policy.kind }}</strong> · <code>{{ policy.key }}</code>
-        </p>
-    {% endif %}
-
-    <form method="post" autocomplete="off">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-
-        {% if is_new %}
-            <label for="kind">Kind</label>
-            <select name="kind" id="kind"
-                    style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
-                <option value="group" {% if values.kind == 'group' %}selected{% endif %}>Group chat</option>
-                <option value="dm" {% if values.kind == 'dm' %}selected{% endif %}>Direct message (phone number)</option>
-            </select>
-
-            <label for="key">Key</label>
-            <input type="text" name="key" id="key" required
-                   value="{{ values.key }}"
-                   placeholder="abc123def... (group id)  OR  +15551234567 (phone)">
-            <p class="muted" style="font-size: 11px; margin-top: 4px;">
-                For groups, paste the Signal group_id (auto-registered rows show it in the list).
-                For DMs, use the sender's phone number in E.164 format.
-            </p>
+<div class="page-head">
+    <div>
+        <a class="crumb" href="{{ url_for('admin.context_list') }}">← Contexts</a>
+        <h1>{% if is_new %}New context{% else %}{{ policy.label or 'Untitled context' }}{% endif %}</h1>
+        {% if not is_new %}
+        <p class="page-sub"><span class="badge plain">{{ policy.kind }}</span> <code>{{ policy.key }}</code></p>
         {% endif %}
+    </div>
+    {% if not is_new %}
+    <div class="page-actions">
+        <a class="btn secondary" href="{{ url_for('admin.context_memories', context_id=policy.id) }}">Memories</a>
+    </div>
+    {% endif %}
+</div>
 
-        <label for="label">Label</label>
-        <input type="text" name="label" id="label"
-               value="{{ values.label }}" placeholder="e.g. Stock chat / Geopolitics group / My DMs">
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}<div class="{{ 'ok' if category == 'ok' else 'error' }}">{{ msg }}</div>{% endfor %}
+{% endwith %}
 
-        <h2 style="margin-top: 32px;">Commands</h2>
-        <label for="command_mode">Access rule</label>
-        <select name="command_mode" id="command_mode"
-                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
-            <option value="allow_all" {% if values.command_mode == 'allow_all' %}selected{% endif %}>Allow all commands</option>
-            <option value="allow_list" {% if values.command_mode == 'allow_list' %}selected{% endif %}>Allow only selected</option>
-            <option value="deny_list" {% if values.command_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
-        </select>
+<div class="form-layout">
+    {% set ns = namespace(sections=[("basics", "Basics"), ("access", "Access"), ("prompt", "Prompt"), ("behavior", "Behavior"), ("memory", "Memory"), ("history", "History and logs")]) %}
+    {% if not is_new and policy.kind == 'group' %}{% set ns.sections = ns.sections + [("oracles", "Daily oracles")] %}{% endif %}
+    {% if not is_new and policy.kind != 'default' %}{% set ns.sections = ns.sections + [("danger", "Danger zone")] %}{% endif %}
+    {{ toc(ns.sections) }}
 
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;">
+<div>
+<form method="post" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <section class="section" id="basics">
+        <h2>Basics</h2>
+        {% if is_new %}
+        <div class="fields">
+            <div class="field">
+                <label for="kind">Kind</label>
+                <select name="kind" id="kind">
+                    <option value="group" {% if values.kind == 'group' %}selected{% endif %}>Group chat</option>
+                    <option value="dm" {% if values.kind == 'dm' %}selected{% endif %}>Direct message</option>
+                </select>
+            </div>
+            {{ field("key", "Key", values.key, placeholder="Group id or +15551234567", attrs="required",
+                     hint="Signal group id (shown in the list for auto-registered chats) or an E.164 phone number.") }}
+        </div>
+        {% endif %}
+        <div class="fields">
+            {{ field("label", "Label", values.label, placeholder="Stock chat") }}
+            <div class="field">
+                <label for="default_bot_id">Bot</label>
+                <select name="default_bot_id" id="default_bot_id">
+                    <option value="" {% if not values.default_bot_id %}selected{% endif %}>Inherit the default {{ values.kind }} bot</option>
+                    {% for b in all_bots %}
+                        <option value="{{ b.id }}" {% if values.default_bot_id == (b.id|string) %}selected{% endif %}>{{ b.display_name }} ({{ b.slug }})</option>
+                    {% endfor %}
+                </select>
+                <p class="hint">Another bot can still answer when someone addresses it by name.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="access">
+        <h2>Access</h2>
+        <div class="subhead">Commands</div>
+        <div class="rule-row">
+            <select name="command_mode" id="command_mode" aria-label="Command access rule">
+                <option value="allow_all" {% if values.command_mode == 'allow_all' %}selected{% endif %}>Allow all commands</option>
+                <option value="allow_list" {% if values.command_mode == 'allow_list' %}selected{% endif %}>Allow only selected</option>
+                <option value="deny_list" {% if values.command_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
+            </select>
+            <span class="muted small" id="cmd-count"></span>
+        </div>
+        <div class="chips" id="cmd-chips">
             {% for cmd in all_commands %}
-                <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
-                    <input type="checkbox" name="commands" value="{{ cmd }}"
-                           {% if cmd in values.commands %}checked{% endif %}>
-                    <span>!{{ cmd }}</span>
-                </label>
+                <label class="chip"><input type="checkbox" name="commands" value="{{ cmd }}" {% if cmd in values.commands %}checked{% endif %}> !{{ cmd }}</label>
             {% endfor %}
         </div>
 
-        <h2 style="margin-top: 32px;">MCP servers</h2>
-        <label for="mcp_mode">Access rule</label>
-        <select name="mcp_mode" id="mcp_mode"
-                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
-            <option value="allow_all" {% if values.mcp_mode == 'allow_all' %}selected{% endif %}>Allow all servers</option>
-            <option value="allow_list" {% if values.mcp_mode == 'allow_list' %}selected{% endif %}>Allow only selected</option>
-            <option value="deny_list" {% if values.mcp_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
-        </select>
-
-        <div id="mcp-schema-summary"
+        <div class="subhead" style="margin-top: 22px;">MCP servers</div>
+        <div class="rule-row">
+            <select name="mcp_mode" id="mcp_mode" aria-label="MCP access rule">
+                <option value="allow_all" {% if values.mcp_mode == 'allow_all' %}selected{% endif %}>Allow all servers</option>
+                <option value="allow_list" {% if values.mcp_mode == 'allow_list' %}selected{% endif %}>Allow only selected</option>
+                <option value="deny_list" {% if values.mcp_mode == 'deny_list' %}selected{% endif %}>Block selected</option>
+            </select>
+            <span id="mcp-allow-all-warning" class="warn-text small" style="display: none;">Every running server is available; the selection below is ignored.</span>
+        </div>
+        {% if all_servers %}
+        <div class="chips wide">
+            {% for s in all_servers %}
+                {% set tool_stat = mcp_tool_stats.get(s, {}) %}
+                <label class="chip">
+                    <input type="checkbox" name="mcp_servers" value="{{ s }}"
+                           data-tool-count="{{ tool_stat.get('tools', 0) }}" data-schema-chars="{{ tool_stat.get('chars', 0) }}"
+                           {% if s in values.mcp_servers %}checked{% endif %}>
+                    {{ s }}
+                    {% if tool_stat.get('tools', 0) %}<span class="chip-meta">{{ tool_stat.get('tools', 0) }} tools</span>{% endif %}
+                </label>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="hint">No MCP servers yet. Add one on the <a href="{{ url_for('admin.mcp_list') }}">MCP page</a>.</p>
+        {% endif %}
+        <div id="mcp-schema-summary" class="payload"
              data-native-tools="{{ tool_payload_stats.get('native_tools', 0) }}"
              data-native-chars="{{ tool_payload_stats.get('native_chars', 0) }}"
              data-broker-tools="{{ tool_payload_stats.get('broker_available_tools', 0) }}"
-             data-broker-chars="{{ tool_payload_stats.get('broker_available_chars', 0) }}"
-             style="margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:4px;background:#0b0d10;font-size:12px;color:var(--text);">
-            Sent on every writer round:
-            <strong id="tool-effective-tools">{{ tool_payload_stats.get('total_tools', 0) }} tool schemas</strong>,
+             data-broker-chars="{{ tool_payload_stats.get('broker_available_chars', 0) }}">
+            Sent each writer round: <strong id="tool-effective-tools">{{ tool_payload_stats.get('total_tools', 0) }} tool schemas</strong>,
             <strong id="tool-effective-size">{{ '{:,}'.format(tool_payload_stats.get('total_chars', 0)) }} JSON characters</strong>
             <span class="muted" id="tool-effective-tokens"></span>
-            <br>
-            <span class="muted" id="tool-effective-breakdown">
-                {{ tool_payload_stats.get('native_tools', 0) }} native +
-                {{ tool_payload_stats.get('broker_tools', 0) }} MCP broker
-            </span>
-            <br>
-            Available behind the broker:
-            <strong id="mcp-catalog-tools">0 MCP tools</strong>,
-            <strong id="mcp-catalog-size">0 catalog characters</strong>
-            <span class="muted">(loaded only after discovery)</span>
+            <span class="muted" id="tool-effective-breakdown"></span><br>
+            Behind the MCP broker: <strong id="mcp-catalog-tools">0 MCP tools</strong>, <strong id="mcp-catalog-size">0 catalog characters</strong>
+            <span class="muted">(loaded only when the model searches)</span>
         </div>
-        <p id="mcp-allow-all-warning" class="muted"
-           style="font-size:11px;margin-top:5px;color:var(--warn,#d9a441);display:none;">
-            “Allow all servers” lets the broker discover every tool from every
-            running MCP server. The selections below have no effect in this mode.
-        </p>
-        <p class="muted" style="font-size:11px;margin-top:5px;">
-            Once MCP access is enabled, the writer receives the same compact
-            broker pair. Changing servers alters capability while the broker
-            payload stays fixed.
-        </p>
+    </section>
 
-        {% if all_servers %}
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;">
-            {% for s in all_servers %}
-                {% set tool_stat = mcp_tool_stats.get(s, {}) %}
-                <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
-                    <input type="checkbox" name="mcp_servers" value="{{ s }}"
-                           data-tool-count="{{ tool_stat.get('tools', 0) }}"
-                           data-schema-chars="{{ tool_stat.get('chars', 0) }}"
-                           {% if s in values.mcp_servers %}checked{% endif %}>
-                    <span>
-                        {{ s }}
-                        {% if tool_stat.get('tools', 0) %}
-                            <span class="muted" style="font-size:10px;">
-                                ({{ tool_stat.get('tools', 0) }} tools,
-                                {{ '{:,}'.format(tool_stat.get('chars', 0)) }} chars)
-                            </span>
-                        {% endif %}
-                    </span>
-                </label>
-            {% endfor %}
+    <section class="section" id="prompt">
+        <h2>Prompt</h2>
+        {{ area("system_prompt", "System prompt override", values.system_prompt, rows=7, placeholder="Empty = the global LLM prompt.") }}
+    </section>
+
+    <section class="section" id="behavior">
+        <h2>Behavior</h2>
+        <div class="toggles">
+            {{ toggle("llm_intent", "Send non-command messages to the LLM", values.llm_intent, value="on",
+                      hint="With all allowed commands and tools. DMs always; groups when the bot is addressed.") }}
+            {{ toggle("deep_think_enabled", "Allow deep think", values.deep_think_enabled, value="on",
+                      hint="Lets the writer hand hard questions to the deep-think model.") }}
+            {{ toggle("reactor_enabled", "Emoji reactions", values.reactor_enabled, value="on",
+                      hint="Needs the reactor on in LLM settings.") }}
+            {{ toggle("natural_response", "Reply without being addressed", values.natural_response, value="on",
+                      hint="Needs reactions on here and natural response on in LLM settings. The writer can still stay silent.") }}
         </div>
-        {% else %}
-        <p class="muted" style="font-size: 12px;">No MCP servers configured yet. Add one at <a href="{{ url_for('admin.mcp_list') }}">MCP</a>.</p>
-        {% endif %}
+        {{ area("reactor_prompt", "Reactor prompt override", values.reactor_prompt, rows=5, placeholder="Empty = the global reactor prompt.") }}
+    </section>
 
-        <h2 style="margin-top: 32px;">Bot</h2>
-        <label for="default_bot_id">Default bot for this context</label>
-        <select name="default_bot_id" id="default_bot_id"
-                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
-            <option value="" {% if not values.default_bot_id %}selected{% endif %}>
-                — Inherit (use registry default for this kind) —
-            </option>
-            {% for b in all_bots %}
-                <option value="{{ b.id }}"
-                    {% if values.default_bot_id == (b.id|string) %}selected{% endif %}>
-                    {{ b.display_name }} <span class="muted">({{ b.slug }})</span>
-                </option>
-            {% endfor %}
-        </select>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Pin a specific bot to answer in this chat (e.g. an Artaud-only group).
-            Inherit means the bot flagged "default for {{ values.kind }}" on
-            <a href="{{ url_for('admin.bots_list') }}">/admin/bots</a> answers here.
-            Mention-routing in PR4 still lets a non-default bot reply when
-            explicitly addressed by alias.
-        </p>
+    <section class="section" id="memory">
+        <h2>Memory</h2>
+        <div class="toggles">
+            {{ toggle("memory_enabled", "Memory", values.memory_enabled, value="on",
+                      hint="Off injects nothing and hides memory tools. Stored memories are kept.") }}
+            {{ toggle("memory_writes_enabled", "Let the bot remember and forget", values.memory_writes_enabled, value="on",
+                      hint="Off makes memory read-only for the bot.") }}
+        </div>
+        {% if not is_new %}<p class="hint"><a href="{{ url_for('admin.context_memories', context_id=policy.id) }}">View and edit stored memories →</a></p>{% endif %}
+    </section>
 
-        <h2 style="margin-top: 32px;">System prompt</h2>
-        <label for="system_prompt">Override (leave empty to use the global LLM prompt)</label>
-        <textarea name="system_prompt" id="system_prompt" rows="6"
-                  placeholder="Optional. Specific instructions for the LLM in this chat.">{{ values.system_prompt }}</textarea>
-
-        <h2 style="margin-top: 32px;">LLM intent routing</h2>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-            <input type="checkbox" name="llm_intent" {% if values.llm_intent %}checked{% endif %}>
-            <span>Route non-command messages through the LLM (tool-calling)</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When enabled, any message in this chat that isn't a prefixed command
-            goes to the LLM with all allowed bot commands and MCP tools available.
-            Replaces the default NLP fallback. DMs trigger always; groups trigger
-            only when the bot is @mentioned.
-        </p>
-
-        <h2 style="margin-top: 32px;">Emoji reactor</h2>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-            <input type="checkbox" name="reactor_enabled" {% if values.reactor_enabled %}checked{% endif %}>
-            <span>Enabled in this chat</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Only effective when the global reactor is enabled at <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>.
-            Uncheck to silence reactions in this specific chat without disabling them globally.
-        </p>
-
-        <label for="reactor_prompt">Reactor prompt override (empty = use global)</label>
-        <textarea name="reactor_prompt" id="reactor_prompt" rows="6"
-                  placeholder="Optional. Specific reaction guidance for this chat (e.g. tone, what merits a react).">{{ values.reactor_prompt }}</textarea>
-
-        <h2 style="margin-top: 32px;">Natural response</h2>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-            <input type="checkbox" name="natural_response" {% if values.natural_response %}checked{% endif %}>
-            <span>Let the bot reply spontaneously in this chat</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When on (and the reactor is enabled here), the reactor's LLM call
-            also considers whether the message warrants a real text reply —
-            for open-ended questions it can answer or obvious follow-ups to
-            its own messages without an @mention or quote-reply. The writer
-            model still gets a final say and may stay silent. Requires the
-            global switch at <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>
-            and a working reactor.
-        </p>
-
-        <h2 style="margin-top: 32px;">Memory</h2>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-            <input type="checkbox" name="memory_enabled" {% if values.memory_enabled %}checked{% endif %}>
-            <span>Memory on in this chat</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Master switch. Off = no memories injected, no recall/remember
-            tools; stored memories are kept.
-        </p>
-
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;margin-top:12px;">
-            <input type="checkbox" name="memory_writes_enabled" {% if values.memory_writes_enabled %}checked{% endif %}>
-            <span>Let the writer LLM remember/forget in this chat</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When on, the LLM gets <code>remember</code> / <code>forget</code>
-            tools alongside <code>recall</code> so it can store durable facts
-            about people, the room, or free-text entities. Saved memories
-            auto-inject into future replies in this chat. Off makes
-            <code>recall</code> read-only — the LLM can use existing memories
-            but can't add new ones. Turn off in chats where you want to view
-            memories without letting the model edit them.
-        </p>
-
-        {% if not is_new %}
-        <p style="margin-top: 12px;">
-            <a href="{{ url_for('admin.context_memories', context_id=policy.id) }}">
-                → View / edit stored memories for this chat
-            </a>
-        </p>
-        {% endif %}
-
-        <h2 style="margin-top: 32px;">History window</h2>
-        <label for="history_turns_override">History turns override (blank = inherit global)</label>
-        <input type="number" name="history_turns_override" id="history_turns_override"
-               min="0" step="1"
-               value="{{ values.history_turns_override }}"
-               placeholder="{% if global_history_turns is defined %}global is {{ global_history_turns }}{% else %}leave blank{% endif %}">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Number of role-pairs (one user + one assistant = one pair) of prior
-            history to send to the writer LLM in this chat.
-            {% if global_history_turns is defined %}
-                Global default is <strong>{{ global_history_turns }}</strong>.
-            {% endif %}
-            Blank means inherit. <strong>0</strong> means no history at all
-            (one-shot mode — useful for oracle-only or stateless chats).
-            Higher values give the model more context but cost more tokens
-            and slow each round; lower values clip memory of earlier turns.
-        </p>
-
-        <h2 style="margin-top: 32px;">Transcript logging</h2>
+    <section class="section" id="history">
+        <h2>History and logs</h2>
+        <div class="fields">
+            {{ field("history_turns_override", "History turns", values.history_turns_override, type="number", attrs='min="0" step="1"',
+                     placeholder=("Inherit (" ~ global_history_turns ~ ")") if global_history_turns is defined else "Inherit",
+                     hint="Prior user+bot pairs sent to the writer. 0 = no history.") }}
+        </div>
         {% if policy is none or policy.kind == 'default' %}
-        <p class="muted" style="font-size: 12px;">
-            Transcript logging is only available on explicit (non-default)
-            contexts. Default rows fan out across every unregistered chat,
-            so logging there would pool training data from multiple chats
-            into one file.
-        </p>
+            <p class="hint">Transcript logging is only available on named contexts, so one file never mixes several chats.</p>
         {% else %}
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-            <input type="checkbox" name="transcript_logging_enabled"
-                   {% if values.transcript_logging_enabled %}checked{% endif %}>
-            <span>Log every writer LLM round in this chat</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When on, every writer call (including tool-call rounds with their
-            inputs and outputs) is appended to a per-context JSONL file in
-            OpenAI chat-completions shape. Designed to harvest fine-tuning
-            corpora for models trained against this harness. Reactor, summary,
-            and healthcheck calls are <em>not</em> captured. Files rotate
-            at 100 MB and keep 3 backups.
-        </p>
-
+        <div class="toggles" style="margin-top: 12px;">
+            {{ toggle("transcript_logging_enabled", "Log every writer round", values.transcript_logging_enabled, value="on",
+                      hint="Appends each call, tool rounds included, to a JSONL file for fine-tuning. Rotates at 100 MB, keeps 3.") }}
+        </div>
         {% if transcript_stats is defined and transcript_stats %}
-        <div style="margin-top: 12px; padding: 10px 12px; background: #0b0d10; border: 1px solid var(--border); border-radius: 4px; font-size: 13px;">
+        <div class="payload">
             {% if transcript_stats.exists %}
                 <strong>{{ transcript_stats.line_count }}</strong> round{{ '' if transcript_stats.line_count == 1 else 's' }} logged,
-                <strong>{{ '%.2f'|format(transcript_stats.size_bytes / 1024 / 1024) }} MB</strong> on disk.
-                <div style="margin-top: 8px;">
-                    <a href="{{ url_for('admin.context_transcript_download', context_id=policy.id) }}"
-                       style="color: var(--accent); text-decoration: underline;">
-                        ↓ Download current
-                    </a>
-                </div>
-                {% if transcript_stats.backups %}
-                <div style="margin-top: 6px; color: var(--muted); font-size: 12px;">
-                    Rotated backups:
-                    {% for b in transcript_stats.backups %}
-                        <a href="{{ url_for('admin.context_transcript_download', context_id=policy.id) }}?backup={{ b.index }}"
-                           style="color: var(--accent); text-decoration: underline; margin-right: 8px;">
-                            .{{ b.index }} ({{ '%.1f'|format(b.size_bytes / 1024 / 1024) }} MB)
-                        </a>
-                    {% endfor %}
-                </div>
-                {% endif %}
+                <strong>{{ '%.2f'|format(transcript_stats.size_bytes / 1024 / 1024) }} MB</strong>.
+                <a href="{{ url_for('admin.context_transcript_download', context_id=policy.id) }}">Download</a>
+                {% for b in transcript_stats.backups %}
+                    · <a href="{{ url_for('admin.context_transcript_download', context_id=policy.id) }}?backup={{ b.index }}">.{{ b.index }} ({{ '%.1f'|format(b.size_bytes / 1024 / 1024) }} MB)</a>
+                {% endfor %}
             {% else %}
-                <span class="muted">No transcript file yet. Enable logging above and have a conversation in this chat.</span>
+                <span class="muted">No transcript yet.</span>
             {% endif %}
         </div>
-
         {% if transcript_stats.exists %}
-        {# This button lives inside the context-settings form. A nested form
-           is invalid HTML and browsers submit the outer form instead. Use
-           per-button overrides to target the destructive endpoint while
-           retaining the outer form's CSRF field. formnovalidate prevents
-           unrelated required settings fields from blocking the action. #}
-        <button type="submit"
-                class="secondary"
-                formaction="{{ url_for('admin.context_transcript_clear', context_id=policy.id) }}"
-                formmethod="post"
-                formnovalidate
-                onclick="return confirm('Delete the transcript file and all backups for this chat? Cannot be undone.');"
-                style="margin-top: 10px; background: var(--bad); color: white;">
-            Clear transcript files
+        {# Submits the separate tx-clear form below; inside this form it would be
+           the default button, so pressing Enter in a field would trigger it. #}
+        <button type="submit" form="tx-clear" class="danger sm" style="margin-top: 10px;"
+                onclick="return confirm('Delete the transcript file and all backups for this chat? Cannot be undone.');">
+            Delete transcript files
         </button>
         {% endif %}
         {% endif %}
         {% endif %}
+    </section>
 
-        <h2 style="margin-top: 32px;">Deep think</h2>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-            <input type="checkbox" name="deep_think_enabled" {% if values.deep_think_enabled %}checked{% endif %}>
-            <span>Allow deep_think tool in this chat</span>
-        </label>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When on (and the global deep-think client is configured), the
-            writer LLM gets a <code>deep_think</code> tool to delegate hard
-            sub-problems to a smarter, slower, more expensive model. Turn
-            off in chats where cost containment matters more than answer
-            quality. Configure the model + key at
-            <a href="{{ url_for('admin.llm_page') }}">/admin/llm</a>.
-        </p>
-
-        <div style="margin-top: 24px; display:flex; gap:16px; align-items:center;">
-            <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
-            <a href="{{ url_for('admin.context_list') }}" class="muted">Cancel</a>
-            {% if not is_new and policy.kind != 'default' %}
-                <span style="flex:1"></span>
-            {% endif %}
-        </div>
-    </form>
-
-    {% if not is_new and policy.kind != 'default' %}
-    <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);">
-        <h3 style="margin-top: 0;">Purge conversation context</h3>
-        <p class="muted" style="font-size: 12px;">
-            Wipes the rolling conversation history, the rolling summary,
-            the bot's prior replies inside this chat's group log, and
-            the in-memory reactor-decision log. Stamps a permanent
-            purge floor on this context — the bot can never see anything
-            it said or summarized before this moment, even if a row
-            survives. Useful when the bot has fallen into a bad pattern
-            and you want a clean restart.
-            <br><br>
-            <strong>Preserved:</strong>
-            <a href="{{ url_for('admin.context_memories', context_id=policy.id) }}">per-context memories</a>,
-            inbound user messages in the group log, transcripts,
-            per-context settings. Review memories first if the trap
-            might be anchored there.
-        </p>
-        {% if policy.purge_floor_at %}
-        <p class="muted" style="font-size: 12px;">
-            Current floor: <code>{{ policy.purge_floor_at|int }}</code>
-            (only data created after this unix timestamp is visible to
-            the bot).
-        </p>
-        {% endif %}
-        <form method="post" action="{{ url_for('admin.context_purge', context_id=policy.id) }}"
-              onsubmit="return confirm('Purge this context\'s conversation history and stamp a permanent floor? The bot will no longer see anything it said or summarized before now. This cannot be undone.');"
-              style="margin-top: 8px;">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button class="secondary" type="submit" style="background: var(--bad); color: white;">
-                Purge context
-            </button>
-        </form>
+    <div class="savebar">
+        <button type="submit">{% if is_new %}Create context{% else %}Save changes{% endif %}</button>
+        <a href="{{ url_for('admin.context_list') }}" class="btn ghost">Cancel</a>
     </div>
+</form>
+{% if not is_new and policy.kind != 'default' %}
+<form id="tx-clear" method="post" action="{{ url_for('admin.context_transcript_clear', context_id=policy.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+</form>
+{% endif %}
 
-    <form method="post" action="{{ url_for('admin.context_delete', context_id=policy.id) }}"
-          onsubmit="return confirm('Delete this context? (Default row protected.)');"
-          style="margin-top: 16px;">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete</button>
-    </form>
-    {% endif %}
-</div>
-
-{# ── Daily oracles ──────────────────────────────────────────────────── #}
+{# ── Daily oracles ─────────────────────────────────────────────────── #}
 {% if not is_new and policy.kind == 'group' %}
-<div class="panel">
-    <h2>Daily oracles</h2>
-    <p class="muted" style="font-size: 12px;">
-        Sigil can post to this group on its own schedule — once per day,
-        per oracle. Multiple oracles per chat are fine (e.g. a morning
-        market check + a closing recap). Oracles fire at the configured
-        time using NYC ET as the sunrise/sunset anchor; clock schedules
-        use the per-oracle timezone. Errors stay inside the worker — a
-        broken oracle won't affect anything else.
-    </p>
-
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, msg in messages %}
-          <div class="{{ 'ok' if category == 'ok' else 'error' }}">{{ msg }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
-
-    <div style="margin: 8px 0 18px; padding: 12px; border: 1px solid var(--line, #333); border-radius: 6px;">
-        <strong style="font-size: 13px;">📊 WSB daily digest</strong>
-        <p class="muted" style="font-size: 12px; margin: 4px 0 10px;">
-            Run the WSB pipeline for this group now — crawl r/wallstreetbets, have
-            deep-think analyze it, publish the static read (page + index + og:image),
-            and optionally post the teaser + link here. Useful for testing before the
-            scheduled fire. Takes ~1 minute; watch for the result in the logs / on the
-            page. (deep-think must be configured, or it skips.)
-        </p>
-        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <form method="post"
-                  action="{{ url_for('admin.oracle_run_wsb', context_id=policy.id) }}"
-                  onsubmit="return confirm('Run the WSB digest now and POST it to this chat?');">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <input type="hidden" name="post_to_chat" value="1">
-                <button class="secondary" type="submit">Run now + post to chat</button>
-            </form>
-            <form method="post"
-                  action="{{ url_for('admin.oracle_run_wsb', context_id=policy.id) }}">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <input type="hidden" name="post_to_chat" value="0">
-                <button class="secondary" type="submit">Preview (publish page, no post)</button>
-            </form>
-        </div>
+{% macro oracle_fields(o) -%}
+    <div class="fields">
+        <div class="field"><label>Kind</label>
+            <select name="kind">{% for k in oracle_kinds %}<option value="{{ k }}" {% if o and k == o.kind %}selected{% endif %}>{{ k }}</option>{% endfor %}</select></div>
+        <div class="field"><label>Schedule</label>
+            <select name="schedule_kind">{% for s in oracle_schedule_kinds %}<option value="{{ s }}" {% if o and s == o.schedule_kind %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div>
+        <div class="field"><label>Label</label><input type="text" name="label" value="{{ o.label if o else '' }}" placeholder="morning tarot"></div>
     </div>
+    <div class="fields" style="margin-top: 14px;">
+        <div class="field"><label>Offset minutes</label><input type="number" name="offset_minutes" value="{{ o.offset_minutes if o else 0 }}"><p class="hint">Sunrise and sunset schedules. Signed.</p></div>
+        <div class="field"><label>Clock time</label><input type="text" name="clock_time" value="{{ o.clock_time if o else '' }}" placeholder="09:25"><p class="hint">Clock schedule, HH:MM.</p></div>
+        <div class="field"><label>Timezone</label><input type="text" name="timezone" value="{{ o.timezone if o else 'America/New_York' }}" placeholder="America/New_York"></div>
+    </div>
+    <div class="field" style="margin-top: 14px;"><label>Prompt</label><textarea name="prompt" rows="3" placeholder="Freeform oracles only: what should Sigil post?">{{ o.prompt if o else '' }}</textarea></div>
+    <div class="field" style="margin-top: 14px;">
+        <label>Days</label>
+        <div class="daypicker">
+            {% for dn, dv in [('Mon',0),('Tue',1),('Wed',2),('Thu',3),('Fri',4),('Sat',5),('Sun',6)] %}
+            <label class="chip"><input type="checkbox" name="days" value="{{ dv }}" {% if not o or dv in o.days_checked %}checked{% endif %}> {{ dn }}</label>
+            {% endfor %}
+        </div>
+        <div class="daypresets">
+            <button type="button" class="ghost sm" onclick="setDays(this,[0,1,2,3,4])">Weekdays</button>
+            <button type="button" class="ghost sm" onclick="setDays(this,[6,0,1,2,3])">Sun-Thu</button>
+            <button type="button" class="ghost sm" onclick="setDays(this,[0,1,2,3,4,5,6])">Every day</button>
+        </div>
+        <p class="hint">All or none checked = every day.</p>
+    </div>
+    <div class="toggles" style="margin-top: 8px;">{{ toggle("enabled", "Enabled", o.enabled if o else false, value="on") }}</div>
+{%- endmacro %}
+
+<section class="section" id="oracles">
+    <div class="card-head" style="margin-bottom: 0;"><h2>Daily oracles</h2></div>
+    <p class="section-desc">Scheduled posts to this chat, once a day each. Sunrise and sunset use New York; clock times use each oracle's timezone.</p>
 
     {% if oracles %}
-    <table style="margin-bottom: 16px;">
-        <thead>
-            <tr>
-                <th>#</th>
-                <th>Kind</th>
-                <th>Schedule</th>
-                <th>Label</th>
-                <th>Enabled</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
+    <div class="table-wrap">
+    <table>
+        <thead><tr><th>Label</th><th>Kind</th><th>Schedule</th><th>Status</th><th></th></tr></thead>
         {% for o in oracles %}
-            <tr>
-                <td>{{ o.id }}</td>
-                <td>{{ o.kind }}</td>
-                <td>{{ o.description }}</td>
-                <td>{{ o.label or '—' }}</td>
-                <td>{{ '✓' if o.enabled else '—' }}</td>
-                <td>
-                    <details>
-                        <summary style="cursor:pointer;color:var(--accent);">edit</summary>
-                        <form method="post"
-                              action="{{ url_for('admin.oracle_edit', context_id=policy.id, oracle_id=o.id) }}"
-                              style="margin-top:8px;">
-                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                            <label>Kind</label>
-                            <select name="kind">
-                                {% for k in oracle_kinds %}
-                                    <option value="{{ k }}" {% if k == o.kind %}selected{% endif %}>{{ k }}</option>
-                                {% endfor %}
-                            </select>
-                            <label>Schedule</label>
-                            <select name="schedule_kind">
-                                {% for s in oracle_schedule_kinds %}
-                                    <option value="{{ s }}" {% if s == o.schedule_kind %}selected{% endif %}>{{ s }}</option>
-                                {% endfor %}
-                            </select>
-                            <label>Offset minutes (sunrise/sunset only; +/- signed)</label>
-                            <input type="number" name="offset_minutes" value="{{ o.offset_minutes }}">
-                            <label>Clock time HH:MM (clock only)</label>
-                            <input type="text" name="clock_time" value="{{ o.clock_time }}" placeholder="09:25">
-                            <label>Timezone</label>
-                            <input type="text" name="timezone" value="{{ o.timezone }}" placeholder="America/New_York">
-                            <label>Label (admin-readable)</label>
-                            <input type="text" name="label" value="{{ o.label }}" placeholder="morning tarot">
-                            <label>Prompt (freeform only)</label>
-                            <textarea name="prompt" rows="3" placeholder="What should Sigil post about?">{{ o.prompt }}</textarea>
-                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-                                <input type="checkbox" name="enabled" {% if o.enabled %}checked{% endif %}>
-                                <span>Enabled</span>
-                            </label>
-                            <label>Days of week</label>
-                            <div class="daypicker">
-                                {% for dn, dv in [('Mon',0),('Tue',1),('Wed',2),('Thu',3),('Fri',4),('Sat',5),('Sun',6)] %}
-                                <label class="day"><input type="checkbox" name="days" value="{{ dv }}" {% if dv in o.days_checked %}checked{% endif %}> {{ dn }}</label>
-                                {% endfor %}
-                            </div>
-                            <div class="daypresets">
-                                <button type="button" onclick="setDays(this,[0,1,2,3,4])">Weekdays</button>
-                                <button type="button" onclick="setDays(this,[6,0,1,2,3])">Sun-Thu</button>
-                                <button type="button" onclick="setDays(this,[0,1,2,3,4,5,6])">Every day</button>
-                            </div>
-                            <p class="muted" style="font-size:11px;margin:2px 0 0;">Days this oracle runs. All or none checked = every day.</p>
-                            <div style="margin-top: 12px; display:flex; gap:12px;">
-                                <button type="submit">Save</button>
-                            </div>
-                        </form>
-                        <form method="post"
-                              action="{{ url_for('admin.oracle_delete', context_id=policy.id, oracle_id=o.id) }}"
-                              onsubmit="return confirm('Delete this oracle?');"
-                              style="margin-top: 8px;">
-                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                            <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete oracle</button>
-                        </form>
-                    </details>
-                </td>
-            </tr>
+        <tr>
+            <td>{{ o.label or '—' }}</td>
+            <td>{{ o.kind }}</td>
+            <td class="small">{{ o.description }}</td>
+            <td>{% if o.enabled %}<span class="badge ok">On</span>{% else %}<span class="badge">Off</span>{% endif %}</td>
+            <td class="num">
+                <details>
+                    <summary class="btn ghost sm" style="list-style: none;">Edit</summary>
+                    <form method="post" action="{{ url_for('admin.oracle_edit', context_id=policy.id, oracle_id=o.id) }}" class="oracle-form" style="text-align: left;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        {{ oracle_fields(o) }}
+                        <div class="row" style="margin-top: 12px;"><button type="submit" class="sm">Save oracle</button></div>
+                    </form>
+                    <form method="post" action="{{ url_for('admin.oracle_delete', context_id=policy.id, oracle_id=o.id) }}"
+                          onsubmit="return confirm('Delete this oracle?');" style="margin-top: 8px; text-align: left;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="danger sm" type="submit">Delete oracle</button>
+                    </form>
+                </details>
+            </td>
+        </tr>
         {% endfor %}
-        </tbody>
     </table>
+    </div>
     {% else %}
-    <p class="muted">No oracles configured for this chat yet.</p>
+    <p class="empty">No oracles in this chat yet.</p>
     {% endif %}
 
     <details style="margin-top: 12px;">
-        <summary style="cursor:pointer;color:var(--accent);">+ add an oracle</summary>
-        <form method="post" action="{{ url_for('admin.oracle_new', context_id=policy.id) }}" style="margin-top: 12px;">
+        <summary class="btn secondary sm" style="list-style: none; display: inline-flex;">Add an oracle</summary>
+        <form method="post" action="{{ url_for('admin.oracle_new', context_id=policy.id) }}" class="oracle-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-
-            <label>Kind</label>
-            <select name="kind">
-                {% for k in oracle_kinds %}
-                    <option value="{{ k }}">{{ k }}</option>
-                {% endfor %}
-            </select>
-            <p class="muted" style="font-size: 11px; margin-top: 4px;">
-                {% for k, desc in oracle_kind_descriptions.items() %}
-                    <strong>{{ k }}</strong>: {{ desc }}<br>
-                {% endfor %}
-            </p>
-
-            <label>Schedule</label>
-            <select name="schedule_kind">
-                {% for s in oracle_schedule_kinds %}
-                    <option value="{{ s }}">{{ s }}</option>
-                {% endfor %}
-            </select>
-            <p class="muted" style="font-size: 11px; margin-top: 4px;">
-                {% for s, desc in oracle_schedule_descriptions.items() %}
-                    <strong>{{ s }}</strong>: {{ desc }}<br>
-                {% endfor %}
-            </p>
-
-            <label>Offset minutes (for sunrise/sunset, signed)</label>
-            <input type="number" name="offset_minutes" value="0" placeholder="1">
-
-            <label>Clock time HH:MM (for clock schedule)</label>
-            <input type="text" name="clock_time" placeholder="09:25">
-
-            <label>Timezone (IANA)</label>
-            <input type="text" name="timezone" value="America/New_York" placeholder="America/New_York">
-
-            <label>Label</label>
-            <input type="text" name="label" placeholder="morning tarot">
-
-            <label>Prompt (freeform kind only)</label>
-            <textarea name="prompt" rows="3" placeholder="What should Sigil post?"></textarea>
-
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--text);text-transform:none;letter-spacing:normal;">
-                <input type="checkbox" name="enabled">
-                <span>Enabled</span>
-            </label>
-            <label>Days of week</label>
-            <div class="daypicker">
-                {% for dn, dv in [('Mon',0),('Tue',1),('Wed',2),('Thu',3),('Fri',4),('Sat',5),('Sun',6)] %}
-                <label class="day"><input type="checkbox" name="days" value="{{ dv }}" checked> {{ dn }}</label>
-                {% endfor %}
-            </div>
-            <div class="daypresets">
-                <button type="button" onclick="setDays(this,[0,1,2,3,4])">Weekdays</button>
-                <button type="button" onclick="setDays(this,[6,0,1,2,3])">Sun-Thu</button>
-                <button type="button" onclick="setDays(this,[0,1,2,3,4,5,6])">Every day</button>
-            </div>
-            <p class="muted" style="font-size:11px;margin:2px 0 0;">Days this oracle runs. All or none checked = every day.</p>
-
-            <div style="margin-top: 12px;">
-                <button type="submit">Add oracle</button>
-            </div>
+            {{ oracle_fields(none) }}
+            <details class="more"><summary>Kinds and schedules</summary><div>
+                {% for k, desc in oracle_kind_descriptions.items() %}<strong>{{ k }}</strong>: {{ desc }}<br>{% endfor %}<br>
+                {% for s, desc in oracle_schedule_descriptions.items() %}<strong>{{ s }}</strong>: {{ desc }}<br>{% endfor %}
+            </div></details>
+            <div class="row" style="margin-top: 12px;"><button type="submit" class="sm">Add oracle</button></div>
         </form>
     </details>
-</div>
+
+    <div class="subhead" style="margin-top: 22px;">WSB daily digest</div>
+    <p class="hint" style="margin-top: 0;">Crawl r/wallstreetbets, analyze with deep think, publish the page, and optionally post the teaser here. About a minute; needs deep think configured.</p>
+    <div class="row" style="margin-top: 10px;">
+        <form method="post" action="{{ url_for('admin.oracle_run_wsb', context_id=policy.id) }}"
+              onsubmit="return confirm('Run the WSB digest now and post it to this chat?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="post_to_chat" value="1">
+            <button class="secondary sm" type="submit">Run and post</button>
+        </form>
+        <form method="post" action="{{ url_for('admin.oracle_run_wsb', context_id=policy.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="post_to_chat" value="0">
+            <button class="secondary sm" type="submit">Preview only</button>
+        </form>
+    </div>
+</section>
 {% endif %}
 
-<style>
-  .daypicker { display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 6px; }
-  .daypicker .day { display:inline-flex; align-items:center; gap:5px; cursor:pointer;
-    font-size:13px; color:var(--text); text-transform:none; letter-spacing:normal; margin:0; }
-  .daypresets { display:flex; flex-wrap:wrap; gap:8px; margin:2px 0; }
-  .daypresets button { font-size:12px; padding:3px 10px; background:var(--panel2,#1C1D24);
-    color:var(--text); border:1px solid var(--line,#262833); border-radius:6px; cursor:pointer; }
-  .daypresets button:hover { border-color:var(--accent,#8B7FD6); }
-</style>
+{# ── Danger zone ───────────────────────────────────────────────────── #}
+{% if not is_new and policy.kind != 'default' %}
+<section class="section danger-zone" id="danger">
+    <h2>Danger zone</h2>
+    <div class="row" style="justify-content: space-between; margin-top: 14px; align-items: flex-start;">
+        <div style="max-width: 70ch;">
+            <strong>Purge conversation</strong>
+            <p class="hint" style="margin-top: 2px;">Wipes history, the rolling summary, the bot's own replies in the group log and recent reactor decisions, then sets a permanent floor: the bot never sees anything from before now. Memories, user messages, transcripts and settings are kept.
+            {% if policy.purge_floor_at %}Current floor: {{ policy.purge_floor_at|when }}.{% endif %}</p>
+        </div>
+        <form method="post" action="{{ url_for('admin.context_purge', context_id=policy.id) }}"
+              onsubmit="return confirm('Purge this context\'s conversation history and set a permanent floor? This cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="danger" type="submit">Purge</button>
+        </form>
+    </div>
+    <hr style="margin: 16px 0;">
+    <div class="row" style="justify-content: space-between;">
+        <div><strong>Delete context</strong><p class="hint" style="margin-top: 2px;">The chat falls back to the default context.</p></div>
+        <form method="post" action="{{ url_for('admin.context_delete', context_id=policy.id) }}"
+              onsubmit="return confirm('Delete this context?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="danger" type="submit">Delete</button>
+        </form>
+    </div>
+</section>
+{% endif %}
+</div>
+</div>
+
 <script>
-  // Day-of-week preset buttons: tick exactly `days` (Mon=0..Sun=6) within the
-  // button's own oracle form, leaving other forms on the page untouched.
+  // Day-of-week presets: tick exactly `days` (Mon=0..Sun=6) in the button's own form.
   function setDays(btn, days) {
     var form = btn.closest('form');
     if (!form) return;
@@ -598,8 +353,23 @@
     });
   }
 
-  // Show both layers: the fixed writer payload (native schemas + a stable
-  // two-tool MCP broker) and the detailed catalog available after discovery.
+  // Command selection count.
+  (function () {
+    var mode = document.getElementById('command_mode');
+    var out = document.getElementById('cmd-count');
+    var boxes = Array.from(document.querySelectorAll('input[name="commands"]'));
+    if (!mode || !out) return;
+    function refresh() {
+      var n = boxes.filter(function (b) { return b.checked; }).length;
+      out.textContent = mode.value === 'allow_all' ? 'Selection ignored'
+        : (mode.value === 'allow_list' ? n + ' allowed' : n + ' blocked');
+    }
+    mode.addEventListener('change', refresh);
+    boxes.forEach(function (b) { b.addEventListener('change', refresh); });
+    refresh();
+  }());
+
+  // Writer payload (native schemas + fixed broker pair) and the MCP catalog behind it.
   (function () {
     var mode = document.getElementById('mcp_mode');
     var summary = document.getElementById('mcp-schema-summary');
@@ -610,14 +380,10 @@
     var catalogToolsOut = document.getElementById('mcp-catalog-tools');
     var catalogSizeOut = document.getElementById('mcp-catalog-size');
     var warning = document.getElementById('mcp-allow-all-warning');
-    if (!mode || !summary || !toolOut || !sizeOut || !tokenOut ||
-        !breakdown || !catalogToolsOut || !catalogSizeOut || !warning) return;
-
+    if (!mode || !summary || !toolOut) return;
     var boxes = Array.from(document.querySelectorAll('input[name="mcp_servers"]'));
-    function refreshMcpFootprint() {
-      var catalogToolCount = 0;
-      var catalogChars = 0;
-      var selectedServers = 0;
+    function refresh() {
+      var catalogToolCount = 0, catalogChars = 0, selectedServers = 0;
       boxes.forEach(function (box) {
         var included = mode.value === 'allow_all' ||
           (mode.value === 'allow_list' && box.checked) ||
@@ -632,23 +398,18 @@
       var brokerAvailable = mode.value !== 'allow_list' || selectedServers > 0;
       var brokerTools = brokerAvailable ? parseInt(summary.dataset.brokerTools || '0', 10) : 0;
       var brokerChars = brokerAvailable ? parseInt(summary.dataset.brokerChars || '0', 10) : 0;
-      var toolCount = nativeTools + brokerTools;
-      var schemaChars = nativeChars + brokerChars;
-      toolOut.textContent = toolCount.toLocaleString() +
-        (toolCount === 1 ? ' tool schema' : ' tool schemas');
+      var toolCount = nativeTools + brokerTools, schemaChars = nativeChars + brokerChars;
+      toolOut.textContent = toolCount.toLocaleString() + (toolCount === 1 ? ' tool schema' : ' tool schemas');
       sizeOut.textContent = schemaChars.toLocaleString() + ' JSON characters';
-      tokenOut.textContent = '(roughly ' + Math.ceil(schemaChars / 3).toLocaleString() +
-        ' prompt tokens)';
-      breakdown.textContent = nativeTools.toLocaleString() + ' native + ' +
-        brokerTools.toLocaleString() + ' MCP broker';
-      catalogToolsOut.textContent = catalogToolCount.toLocaleString() +
-        (catalogToolCount === 1 ? ' MCP tool' : ' MCP tools');
+      tokenOut.textContent = '(about ' + Math.ceil(schemaChars / 3).toLocaleString() + ' tokens;';
+      breakdown.textContent = nativeTools.toLocaleString() + ' native + ' + brokerTools.toLocaleString() + ' broker)';
+      catalogToolsOut.textContent = catalogToolCount.toLocaleString() + (catalogToolCount === 1 ? ' MCP tool' : ' MCP tools');
       catalogSizeOut.textContent = catalogChars.toLocaleString() + ' catalog characters';
-      warning.style.display = mode.value === 'allow_all' ? 'block' : 'none';
+      warning.style.display = mode.value === 'allow_all' ? 'inline' : 'none';
     }
-    mode.addEventListener('change', refreshMcpFootprint);
-    boxes.forEach(function (box) { box.addEventListener('change', refreshMcpFootprint); });
-    refreshMcpFootprint();
+    mode.addEventListener('change', refresh);
+    boxes.forEach(function (box) { box.addEventListener('change', refresh); });
+    refresh();
   }());
 </script>
 

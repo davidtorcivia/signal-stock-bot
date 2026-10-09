@@ -1,451 +1,205 @@
 {% extends "base.html" %}
+{% from "_ui.html" import field, area, toggle, select, secret, toc %}
 {% block title %}LLM{% endblock %}
 {% block content %}
 
-<div class="panel">
-    <h1>LLM configuration</h1>
-    <p class="muted" style="font-size: 12px;">
-        OpenAI-compatible endpoint. Works with OpenAI, OpenRouter, Groq, DeepSeek,
-        Ollama, llama.cpp, vLLM, etc. All values apply live — no restart needed.
-    </p>
-
-    {% if saved %}<div class="ok">Saved.</div>{% endif %}
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-
-    <form method="post" autocomplete="off">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-
-        <label for="llm_enabled">Enabled</label>
-        <input type="text" name="llm_enabled" id="llm_enabled"
-               value="{{ 'true' if values.llm_enabled else 'false' }}"
-               placeholder="true / false">
-
-        <label for="llm_base_url">Base URL</label>
-        <input type="text" name="llm_base_url" id="llm_base_url"
-               value="{{ values.llm_base_url or '' }}"
-               placeholder="https://api.openai.com/v1">
-
-        <label for="llm_model">Model</label>
-        <input type="text" name="llm_model" id="llm_model"
-               value="{{ values.llm_model or '' }}"
-               placeholder="gpt-4o-mini">
-
-        <label for="llm_api_key">
-            API key
-            {% if api_key_set %}<span class="muted" style="text-transform: none; font-size: 11px;">(configured — leave blank to keep)</span>{% endif %}
-        </label>
-        <input type="password" name="llm_api_key" id="llm_api_key"
-               value="" placeholder="{{ '•••••••• (already set)' if api_key_set else 'sk-...' }}">
-
-        <label for="llm_temperature">Temperature</label>
-        <input type="text" name="llm_temperature" id="llm_temperature"
-               value="{{ values.llm_temperature if values.llm_temperature is not none else '' }}"
-               placeholder="0.7">
-
-        <label for="llm_max_tokens">Max tokens</label>
-        <input type="number" name="llm_max_tokens" id="llm_max_tokens" min="1"
-               value="{{ values.llm_max_tokens or '' }}" placeholder="1000">
-
-        <label for="llm_extended_max_tokens">Extended-response max tokens</label>
-        <input type="number" name="llm_extended_max_tokens"
-               id="llm_extended_max_tokens" min="1"
-               value="{{ values.llm_extended_max_tokens or '' }}"
-               placeholder="1000">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Used for requested summaries, explanations, comparisons, detailed
-            answers, research handoffs, and final synthesis after tool calls.
-            Ordinary chat keeps the smaller max-token budget above.
-        </p>
-
-        <label for="llm_timeout_seconds">Request timeout (seconds)</label>
-        <input type="number" name="llm_timeout_seconds" id="llm_timeout_seconds" min="1"
-               value="{{ values.llm_timeout_seconds or '' }}" placeholder="30">
-
-        <label for="llm_history_turns">Conversation turns kept per user</label>
-        <input type="number" name="llm_history_turns" id="llm_history_turns" min="0"
-               value="{{ values.llm_history_turns or '' }}" placeholder="6">
-
-        <label for="llm_retention_days">Retention days (auto-purge)</label>
-        <input type="number" name="llm_retention_days" id="llm_retention_days" min="1"
-               value="{{ values.llm_retention_days or '' }}" placeholder="7">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Conversation turns and group messages older than this are deleted on
-            the next write. Protects against unbounded growth and long-lived PII.
-        </p>
-
-        <label for="llm_max_tool_rounds">Max tool-call rounds per !ask</label>
-        <input type="number" name="llm_max_tool_rounds" id="llm_max_tool_rounds" min="1"
-               value="{{ values.llm_max_tool_rounds or '' }}" placeholder="25">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Hard ceiling on tool-call rounds the LLM may chain. Each round can
-            include multiple parallel tool calls. If the cap is hit, the bot
-            returns an honest "task incomplete" error with the tool history
-            instead of summarising from partial results — accuracy over
-            apparent helpfulness. Raise if your typical queries genuinely need
-            deeper exploration.
-        </p>
-
-        <label for="group_context_messages">Group chat context messages</label>
-        <input type="number" name="group_context_messages" id="group_context_messages" min="0"
-               value="{{ values.group_context_messages if values.group_context_messages is not none else '' }}"
-               placeholder="0">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When <code>!ask</code> is used inside a group chat, include this many of
-            the most recent messages from that group as context. Set <code>0</code>
-            to disable (also stops recording group messages).
-        </p>
-
-        <label for="ask_command_name">Ask command alias</label>
-        <input type="text" name="ask_command_name" id="ask_command_name"
-               value="{{ values.ask_command_name or '' }}" placeholder="ask">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            The built-in name <code>!ask</code> always works. This adds an extra alias
-            (e.g. <code>ai</code> → <code>!ai</code>).
-        </p>
-
-        <label for="llm_augment_commands">Augment these commands (comma-separated)</label>
-        <input type="text" name="llm_augment_commands" id="llm_augment_commands"
-               value="{{ values.llm_augment_commands or '' }}"
-               placeholder="ta, chart, rating, tldr">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When any listed command succeeds, the LLM will add a short
-            interpretation below the regular output. Leave empty to disable.
-            Per-context policy still applies.
-        </p>
-
-        <label for="llm_augment_prompt">Augmentation prompt</label>
-        <textarea name="llm_augment_prompt" id="llm_augment_prompt" rows="4"
-                  placeholder="Instruction for how the LLM should augment command output.">{{ values.llm_augment_prompt or '' }}</textarea>
-
-        <label for="llm_system_prompt">System prompt</label>
-        <textarea name="llm_system_prompt" id="llm_system_prompt" rows="6"
-                  placeholder="Defaults to a concise stock-market assistant prompt.">{{ values.llm_system_prompt or '' }}</textarea>
-
-        <label for="llm_response_style">Response style (always appended)</label>
-        <textarea name="llm_response_style" id="llm_response_style" rows="8"
-                  placeholder="Leave empty to use the built-in default (brevity + no preamble).">{{ values.llm_response_style or '' }}</textarea>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Appended to <em>every</em> LLM call after the system prompt — including
-            per-context overrides — so it can't be talked out of by a chattier
-            prompt. Use this to enforce consistent length, tone, or formatting
-            rules across all chats. Empty = the bundled default
-            (2-4 sentences, no preamble, emphasis allowed, no headers/tables).
-        </p>
-
-        <label for="llm_extra_body">Extra request body (JSON)</label>
-        <textarea name="llm_extra_body" id="llm_extra_body" rows="6"
-                  placeholder='{"reasoning_effort": "medium"}  or  {"thinking": {"type": "enabled", "budget_tokens": 2048}}'>{{ values.llm_extra_body or '' }}</textarea>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Merged into the JSON body of every chat request. Use for provider-
-            specific knobs like <code>thinking</code>, <code>reasoning_effort</code>,
-            <code>top_p</code>, <code>presence_penalty</code>. Must be a JSON
-            object or empty. Overrides the built-in fields if keys collide.
-        </p>
-
-        <h3 style="margin-top: 24px;">OpenRouter provider routing</h3>
-        <p class="muted" style="font-size: 11px;">
-            When the base URL points at OpenRouter, pin which upstream
-            provider serves the model. Useful when a model has wildly
-            different latency between hosts (e.g. Cerebras ≪ slower
-            general-purpose providers). Ignored by non-OpenRouter
-            endpoints. If you set <code>provider</code> directly in
-            "Extra request body" above, that wins — these fields are
-            skipped to avoid double-setting.
-        </p>
-
-        <label for="llm_provider_order">Preferred providers (comma-separated)</label>
-        <input type="text" name="llm_provider_order" id="llm_provider_order"
-               value="{{ values.llm_provider_order or '' }}"
-               placeholder="Cerebras, Groq, Together">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Tried in order. Empty = default OpenRouter routing (price-based
-            with latency tie-break). Provider names must match the slugs
-            shown on the OpenRouter model page (case-sensitive).
-        </p>
-
-        <label for="llm_provider_only">Only these providers (no fallback)</label>
-        <input type="text" name="llm_provider_only" id="llm_provider_only"
-               value="{{ 'true' if values.llm_provider_only else 'false' }}"
-               placeholder="true / false">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            When <code>true</code>, requests fail if none of the preferred
-            providers can serve them — preventing silent fallback to a slow
-            host. When <code>false</code>, OpenRouter falls back to other
-            providers after the preferred list is exhausted. No effect when
-            the preferred list is empty.
-        </p>
-
-        <label for="llm_provider_sort">Sort by (advanced)</label>
-        <input type="text" name="llm_provider_sort" id="llm_provider_sort"
-               value="{{ values.llm_provider_sort or '' }}"
-               placeholder="throughput  ·  latency  ·  price">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Optional. <code>throughput</code> picks the fastest-tokens-per-
-            second provider, <code>latency</code> the lowest-time-to-first-
-            token, <code>price</code> the cheapest. Combine with the
-            preferred list to sort within it. Empty = no sort.
-        </p>
-
-        <h2 style="margin-top: 32px;">JEV decisions via OpenRouter</h2>
-        <p class="muted" style="font-size: 12px;">
-            Routes background reactions and replies, votes in polls, classifies WSB sentiment
-            per ticker, and ranks allowed MCP tools. Uncertain or failed decisions use the
-            existing behavior. The reactor still chooses emojis with its configured model.
-        </p>
-        <label for="jev_enabled">JEV enabled for all four uses</label>
-        <select name="jev_enabled" id="jev_enabled">
-            <option value="true" {% if values.jev_enabled %}selected{% endif %}>Enabled</option>
-            <option value="false" {% if not values.jev_enabled %}selected{% endif %}>Disabled</option>
-        </select>
-        <label for="jev_model">JEV model</label>
-        <input type="text" name="jev_model" id="jev_model" value="{{ values.jev_model }}">
-        <label for="jev_api_key">OpenRouter API key{% if jev_api_key_set %} (configured){% endif %}</label>
-        <input type="password" name="jev_api_key" id="jev_api_key" value="" autocomplete="new-password">
-        <p class="muted" style="font-size: 11px;">
-            Leave blank to keep the saved key. Without a dedicated key, uses OPENROUTER_API_KEY
-            or the global writer/research key when its URL is OpenRouter.
-        </p>
-        <label for="jev_timeout_seconds">Decision timeout (seconds)</label>
-        <input type="number" name="jev_timeout_seconds" id="jev_timeout_seconds" min="1" max="30"
-               value="{{ values.jev_timeout_seconds }}">
-        <label for="jev_min_confidence">Minimum confidence (0 to 1)</label>
-        <input type="number" name="jev_min_confidence" id="jev_min_confidence" min="0" max="1" step="0.05"
-               value="{{ values.jev_min_confidence }}">
-
-        <h2 style="margin-top: 32px;">Emoji reactor</h2>
-        <p class="muted" style="font-size: 12px;">
-            Cheap secondary LLM call on every group message that decides whether
-            to react with an emoji (and which one). Runs in the background, never
-            blocks command handling, never surfaces output. Per-context toggle on
-            <code>/admin/contexts/&lt;id&gt;</code>.
-        </p>
-
-        <label for="reactor_enabled">Reactor enabled</label>
-        <input type="text" name="reactor_enabled" id="reactor_enabled"
-               value="{{ 'true' if values.reactor_enabled else 'false' }}"
-               placeholder="true / false">
-
-        <label for="reactor_model">Reactor model (empty = same as main)</label>
-        <input type="text" name="reactor_model" id="reactor_model"
-               value="{{ values.reactor_model or '' }}"
-               placeholder="gpt-4o-mini  or  anthropic/claude-haiku-4-5">
-
-        <label for="reactor_temperature">Reactor temperature</label>
-        <input type="text" name="reactor_temperature" id="reactor_temperature"
-               value="{{ values.reactor_temperature if values.reactor_temperature is not none else '' }}"
-               placeholder="0.3">
-
-        <label for="reactor_max_tokens">Reactor max tokens</label>
-        <input type="number" name="reactor_max_tokens" id="reactor_max_tokens" min="1"
-               value="{{ values.reactor_max_tokens or '' }}" placeholder="50">
-
-        <label for="reactor_extra_body">Reactor extra body (JSON)</label>
-        <textarea name="reactor_extra_body" id="reactor_extra_body" rows="3"
-                  placeholder='{"thinking": {"type": "disabled"}}  or  {"reasoning_effort": "minimal"}'>{{ values.reactor_extra_body or '' }}</textarea>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Replaces (not merged with) the main extra body for reactor calls.
-            Typical use: disable thinking / pick the cheap reasoning tier.
-        </p>
-
-        <label for="reactor_min_length">Min message length</label>
-        <input type="number" name="reactor_min_length" id="reactor_min_length" min="0"
-               value="{{ values.reactor_min_length if values.reactor_min_length is not none else '' }}"
-               placeholder="0">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Skip messages shorter than this without an LLM call. <code>0</code> = no minimum.
-        </p>
-
-        <label for="reactor_sender_cooldown">Per-sender cooldown (seconds)</label>
-        <input type="number" name="reactor_sender_cooldown" id="reactor_sender_cooldown" min="0"
-               value="{{ values.reactor_sender_cooldown if values.reactor_sender_cooldown is not none else '' }}"
-               placeholder="30">
-
-        <label for="reactor_group_cooldown">Per-group cooldown (seconds)</label>
-        <input type="number" name="reactor_group_cooldown" id="reactor_group_cooldown" min="0"
-               value="{{ values.reactor_group_cooldown if values.reactor_group_cooldown is not none else '' }}"
-               placeholder="10">
-
-        <label for="reactor_context_messages">Recent group messages fed to reactor</label>
-        <input type="number" name="reactor_context_messages" id="reactor_context_messages" min="0"
-               value="{{ values.reactor_context_messages if values.reactor_context_messages is not none else '' }}"
-               placeholder="5">
-
-        <h3 style="margin-top: 24px; font-size: 14px;">Post-LLM brakes</h3>
-        <p class="muted" style="font-size: 11px;">
-            The cooldowns above decide which messages get <em>evaluated</em>;
-            these decide how many evaluations may become actual reactions. They
-            run after the model has already picked an emoji, so they cap the
-            aggregate even when every individual decision was defensible.
-            Counted per (chat, bot) from in-memory history, which resets on
-            restart. <code>0</code> disables each independently.
-        </p>
-
-        <label for="reactor_hourly_budget">Max reactions per hour, per chat</label>
-        <input type="number" name="reactor_hourly_budget" id="reactor_hourly_budget" min="0"
-               value="{{ values.reactor_hourly_budget if values.reactor_hourly_budget is not none else '' }}"
-               placeholder="3">
-
-        <label for="reactor_daily_budget">Max reactions per day, per chat</label>
-        <input type="number" name="reactor_daily_budget" id="reactor_daily_budget" min="0"
-               value="{{ values.reactor_daily_budget if values.reactor_daily_budget is not none else '' }}"
-               placeholder="12">
-
-        <label for="reactor_repeat_window">No-repeat window (reactions)</label>
-        <input type="number" name="reactor_repeat_window" id="reactor_repeat_window" min="0"
-               value="{{ values.reactor_repeat_window if values.reactor_repeat_window is not none else '' }}"
-               placeholder="3">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Drop a pick whose emoji was already used within the last N reactions
-            in that chat. Stops one emoji becoming the model's house style,
-            which is what makes reactions read as automatic rather than
-            considered.
-        </p>
-
-        <label for="reactor_min_score">Minimum self-reported score (1-10, 0 = log only)</label>
-        <input type="number" name="reactor_min_score" id="reactor_min_score" min="0" max="10"
-               value="{{ values.reactor_min_score if values.reactor_min_score is not none else '' }}"
-               placeholder="0">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            The model rates how much each message warranted its reaction; picks
-            below this are dropped. Leave at <code>0</code> at first — scores
-            are recorded either way, and the dashboard's score distribution
-            tells you where to actually put the threshold. Self-scores cluster
-            high, so guessing it cold sets it too low to matter.
-        </p>
-
-        <label for="reactor_system_prompt">Reactor system prompt</label>
-        <textarea name="reactor_system_prompt" id="reactor_system_prompt" rows="6"
-                  placeholder="Empty = built-in default (sparing, sentiment-led, skip transactional).">{{ values.reactor_system_prompt or '' }}</textarea>
-
-        <h2 style="margin-top: 32px;">Natural response</h2>
-        <p class="muted" style="font-size: 12px;">
-            Lets the bot decide to reply to a group message even when not
-            mentioned, quoted, or addressed by name — for open-ended questions
-            the bot might know about, or obvious follow-ups to its own prior
-            replies. Decision runs inside the reactor's existing LLM call (no
-            extra cost). The writer model may still bail with no message after
-            looking at the full context. Per-context opt-in lives on
-            <code>/admin/contexts/&lt;id&gt;</code>.
-        </p>
-
-        <label for="natural_response_enabled">Natural response enabled (global kill switch)</label>
-        <input type="text" name="natural_response_enabled" id="natural_response_enabled"
-               value="{{ 'true' if values.natural_response_enabled else 'false' }}"
-               placeholder="true / false">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Off by default. Per-context flag is required in addition to this
-            switch. Requires the emoji reactor to be enabled.
-        </p>
-
-        <label for="natural_response_cooldown">Per-group cooldown (seconds)</label>
-        <input type="number" name="natural_response_cooldown" id="natural_response_cooldown" min="0"
-               value="{{ values.natural_response_cooldown if values.natural_response_cooldown is not none else '' }}"
-               placeholder="300">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Minimum time between spontaneous replies in the same group.
-            Prevents runaway interjections. Mentions/quotes always bypass this.
-        </p>
-
-        <label for="natural_response_extra_prompt">Extra reactor prompt (appended)</label>
-        <textarea name="natural_response_extra_prompt" id="natural_response_extra_prompt" rows="4"
-                  placeholder="Empty = built-in guidance for when to call should_respond.">{{ values.natural_response_extra_prompt or '' }}</textarea>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Optional. Appended to the reactor system prompt only when the
-            should_respond tool is exposed (per-context flag on, global flag
-            on, cooldown clear).
-        </p>
-
-        <h2 style="margin-top: 32px;">Deep think</h2>
-        <p class="muted" style="font-size: 12px;">
-            A separate (smarter, slower, more expensive) model exposed to the
-            writer LLM as a <code>deep_think(question, context)</code> tool.
-            The writer decides when to delegate hard sub-problems. Empty
-            fields fall back to the corresponding LLM setting above, so
-            typically you only need to set the model + max_tokens (and maybe
-            api_key/base_url) to point at a different endpoint. Per-context
-            opt-out lives on <code>/admin/contexts/&lt;id&gt;</code>.
-        </p>
-
-        <label for="deep_think_enabled">Deep think enabled</label>
-        <input type="text" name="deep_think_enabled" id="deep_think_enabled"
-               value="{{ 'true' if values.deep_think_enabled else 'false' }}"
-               placeholder="true / false">
-
-        <label for="deep_think_base_url">Base URL (empty = same as main)</label>
-        <input type="text" name="deep_think_base_url" id="deep_think_base_url"
-               value="{{ values.deep_think_base_url or '' }}"
-               placeholder="https://api.openai.com/v1">
-
-        <label for="deep_think_api_key">API key
-            {% if deep_think_api_key_set %}<span class="muted" style="font-size:11px;">(configured — leave blank to keep)</span>{% endif %}
-        </label>
-        <input type="password" name="deep_think_api_key" id="deep_think_api_key"
-               value="" placeholder="{{ 'leave blank to keep existing' if deep_think_api_key_set else 'sk-...' }}">
-
-        <label for="deep_think_model">Model</label>
-        <input type="text" name="deep_think_model" id="deep_think_model"
-               value="{{ values.deep_think_model or '' }}"
-               placeholder="gpt-5  or  anthropic/claude-opus-4-7">
-
-        <label for="deep_think_temperature">Temperature</label>
-        <input type="text" name="deep_think_temperature" id="deep_think_temperature"
-               value="{{ values.deep_think_temperature if values.deep_think_temperature is not none else '' }}"
-               placeholder="0.7">
-
-        <label for="deep_think_max_tokens">Max tokens (deep models burn budget on reasoning)</label>
-        <input type="number" name="deep_think_max_tokens" id="deep_think_max_tokens" min="100"
-               value="{{ values.deep_think_max_tokens or '' }}" placeholder="8000">
-
-        <label for="deep_think_timeout_seconds">Timeout (seconds)</label>
-        <input type="number" name="deep_think_timeout_seconds" id="deep_think_timeout_seconds" min="10"
-               value="{{ values.deep_think_timeout_seconds or '' }}" placeholder="120">
-
-        <label for="deep_think_extra_body">Extra body (JSON, empty = inherit)</label>
-        <textarea name="deep_think_extra_body" id="deep_think_extra_body" rows="3"
-                  placeholder='{"reasoning": {"effort": "high"}}  or  {"thinking": {"type": "enabled", "budget_tokens": 4000}}'>{{ values.deep_think_extra_body or '' }}</textarea>
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Replaces (not merged with) main extra_body. Typical use: enable
-            high-effort reasoning on the deep model.
-        </p>
-
-        <label for="deep_think_system_prompt">System prompt (empty = built-in careful-reasoner default)</label>
-        <textarea name="deep_think_system_prompt" id="deep_think_system_prompt" rows="6"
-                  placeholder="Empty = built-in default optimized for careful step-by-step reasoning, plain prose, honest about uncertainty.">{{ values.deep_think_system_prompt or '' }}</textarea>
-
-        <label for="deep_think_context_max_chars">Writer-supplied context budget (chars)</label>
-        <input type="number" name="deep_think_context_max_chars" id="deep_think_context_max_chars" min="0"
-               value="{{ values.deep_think_context_max_chars or '' }}" placeholder="8000">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Hard cap on the optional <code>context</code> arg the writer
-            passes. Truncated server-side — protects against runaway prompts.
-        </p>
-
-        <h3 style="margin-top: 24px;">Caps (currently visibility-only)</h3>
-        <p class="muted" style="font-size: 11px;">
-            Counters always advance; enforcement only runs when "Caps enforced"
-            is true. Use the dashboard to monitor usage before flipping
-            enforcement on.
-        </p>
-
-        <label for="deep_think_caps_enabled">Caps enforced</label>
-        <input type="text" name="deep_think_caps_enabled" id="deep_think_caps_enabled"
-               value="{{ 'true' if values.deep_think_caps_enabled else 'false' }}"
-               placeholder="false">
-
-        <label for="deep_think_user_daily_cap">Per-user daily cap (0 = unlimited)</label>
-        <input type="number" name="deep_think_user_daily_cap" id="deep_think_user_daily_cap" min="0"
-               value="{{ values.deep_think_user_daily_cap if values.deep_think_user_daily_cap is not none else '' }}"
-               placeholder="10">
-
-        <label for="deep_think_group_daily_cap">Per-group daily cap (0 = unlimited)</label>
-        <input type="number" name="deep_think_group_daily_cap" id="deep_think_group_daily_cap" min="0"
-               value="{{ values.deep_think_group_daily_cap if values.deep_think_group_daily_cap is not none else '' }}"
-               placeholder="50">
-
-        <div style="margin-top: 24px;">
-            <button type="submit">Save</button>
-        </div>
-    </form>
+<div class="page-head">
+    <div>
+        <h1>LLM</h1>
+        <p class="page-sub">Global model settings for every bot. Per-bot overrides live on each bot's page. Changes apply live, no restart.</p>
+    </div>
 </div>
+
+{% if saved %}<div class="ok">Saved.</div>{% endif %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form method="post" autocomplete="off" class="form-layout">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {{ toc([
+        ("writer", "Writer model"),
+        ("conversation", "Conversation"),
+        ("prompts", "Prompts"),
+        ("commands", "Commands"),
+        ("deep-think", "Deep think"),
+        ("reactor", "Emoji reactor"),
+        ("natural", "Natural response"),
+        ("jev", "JEV decisions"),
+    ]) }}
+
+    <div>
+    <section class="section" id="writer">
+        <h2>Writer model</h2>
+        <p class="section-desc">Any OpenAI-compatible endpoint: OpenRouter, OpenAI, DeepSeek, Ollama, vLLM and so on. Named group chats on a bot with an Anthropic key use Claude first and fall back to this.</p>
+        <div class="toggles">
+            {{ toggle("llm_enabled", "LLM enabled", values.llm_enabled, off="false") }}
+        </div>
+        <div class="fields two">
+            {{ field("llm_base_url", "Base URL", values.llm_base_url, placeholder="https://openrouter.ai/api/v1") }}
+            {{ field("llm_model", "Model", values.llm_model, placeholder="z-ai/glm-5.3-flash") }}
+        </div>
+        <div class="fields">
+            {{ secret("llm_api_key", "API key", api_key_set) }}
+            {{ field("llm_temperature", "Temperature", values.llm_temperature, placeholder="0.7") }}
+            {{ field("llm_timeout_seconds", "Timeout (seconds)", values.llm_timeout_seconds, type="number", placeholder="30", attrs='min="1"') }}
+        </div>
+        <div class="fields">
+            {{ field("llm_max_tokens", "Max tokens", values.llm_max_tokens, type="number", placeholder="1000", attrs='min="1"', hint="Ordinary chat replies.") }}
+            {{ field("llm_extended_max_tokens", "Extended max tokens", values.llm_extended_max_tokens, type="number", placeholder="1000", attrs='min="1"',
+                     hint="Detailed answers and synthesis after tool calls.") }}
+        </div>
+        {{ area("llm_extra_body", "Extra request body (JSON)", values.llm_extra_body, rows=3,
+                placeholder='{"reasoning_effort": "medium"}',
+                hint="Merged into every chat request. Must be a JSON object.",
+                more="Use for provider-specific knobs like <code>thinking</code>, <code>reasoning_effort</code>, <code>top_p</code>. Keys here override the built-in fields.") }}
+
+        <div class="subhead">OpenRouter provider routing</div>
+        <div class="fields">
+            {{ field("llm_provider_order", "Preferred providers", values.llm_provider_order, placeholder="Cerebras, Groq",
+                     hint="Comma-separated OpenRouter provider slugs, tried in order.") }}
+            {{ select("llm_provider_sort", "Sort by", [("", "No sort"), ("throughput", "Throughput"), ("latency", "Latency"), ("price", "Price")], values.llm_provider_sort or "") }}
+        </div>
+        <div class="toggles" style="margin-top: 8px;">
+            {{ toggle("llm_provider_only", "Only use the preferred providers", values.llm_provider_only, off="false",
+                      hint="Fail instead of falling back to other hosts. No effect when the list is empty.") }}
+        </div>
+        <details class="more"><summary>About provider routing</summary><div>Ignored by non-OpenRouter endpoints. A <code>provider</code> key set in the extra request body wins over these fields.</div></details>
+    </section>
+
+    <section class="section" id="conversation">
+        <h2>Conversation</h2>
+        <p class="section-desc">How much history the writer sees and how long it is kept.</p>
+        <div class="fields">
+            {{ field("llm_history_turns", "Turns kept per user", values.llm_history_turns, type="number", placeholder="6", attrs='min="0"') }}
+            {{ field("group_context_messages", "Group messages as context", values.group_context_messages, type="number", placeholder="0", attrs='min="0"',
+                     hint="0 disables (and stops recording group messages).") }}
+            {{ field("llm_retention_days", "Retention (days)", values.llm_retention_days, type="number", placeholder="7", attrs='min="1"',
+                     hint="Older turns and group messages are deleted.") }}
+            {{ field("llm_max_tool_rounds", "Max tool rounds per ask", values.llm_max_tool_rounds, type="number", placeholder="25", attrs='min="1"',
+                     more="Each round can hold several parallel tool calls. When the cap is hit the bot summarizes only what it actually found and says what is unfinished.") }}
+        </div>
+    </section>
+
+    <section class="section" id="prompts">
+        <h2>Prompts</h2>
+        <p class="section-desc">Per-context prompts override the system prompt. The response style is always appended last.</p>
+        {{ area("llm_system_prompt", "System prompt", values.llm_system_prompt, rows=6, placeholder="Defaults to a concise market-assistant prompt.") }}
+        {{ area("llm_response_style", "Response style", values.llm_response_style, rows=5,
+                placeholder="Empty = built-in default (2-4 sentences, no preamble).",
+                hint="Appended to every call, after any per-context prompt, so a chattier prompt can't override it.") }}
+    </section>
+
+    <section class="section" id="commands">
+        <h2>Commands</h2>
+        <div class="fields">
+            {{ field("ask_command_name", "Extra alias for !ask", values.ask_command_name, placeholder="ask", hint="<code>!ask</code> always works too.") }}
+            {{ field("llm_augment_commands", "Commands to augment", values.llm_augment_commands, placeholder="ta, tldr, rating",
+                     hint="The LLM adds a short read below these commands' output.") }}
+        </div>
+        {{ area("llm_augment_prompt", "Augmentation prompt", values.llm_augment_prompt, rows=3, placeholder="How the LLM should interpret command output.") }}
+    </section>
+
+    <section class="section" id="deep-think">
+        <h2>Deep think</h2>
+        <p class="section-desc">A slower, smarter model the writer can hand hard questions to. Empty fields fall back to the writer settings. Named group chats on a bot with an Anthropic key use Claude Opus at high effort first.</p>
+        <div class="toggles">
+            {{ toggle("deep_think_enabled", "Deep think enabled", values.deep_think_enabled, off="false") }}
+        </div>
+        <div class="fields two">
+            {{ field("deep_think_base_url", "Base URL", values.deep_think_base_url, placeholder="Same as writer") }}
+            {{ field("deep_think_model", "Model", values.deep_think_model, placeholder="deepseek-flash") }}
+        </div>
+        <div class="fields">
+            {{ secret("deep_think_api_key", "API key", deep_think_api_key_set) }}
+            {{ field("deep_think_temperature", "Temperature", values.deep_think_temperature, placeholder="0.7") }}
+            {{ field("deep_think_timeout_seconds", "Timeout (seconds)", values.deep_think_timeout_seconds, type="number", placeholder="120", attrs='min="10"') }}
+        </div>
+        <div class="fields">
+            {{ field("deep_think_max_tokens", "Max tokens", values.deep_think_max_tokens, type="number", placeholder="8000", attrs='min="100"', hint="Reasoning spends from this too.") }}
+            {{ field("deep_think_max_tool_rounds", "Max tool rounds", values.deep_think_max_tool_rounds, type="number", placeholder="25", attrs='min="1"') }}
+            {{ field("deep_think_context_max_chars", "Context budget (chars)", values.deep_think_context_max_chars, type="number", placeholder="8000", attrs='min="0"',
+                     hint="Cap on the context the writer passes in.") }}
+        </div>
+        {{ area("deep_think_extra_body", "Extra body (JSON)", values.deep_think_extra_body, rows=3, placeholder='{"reasoning": {"effort": "high"}}',
+                hint="Replaces the writer's extra body for deep-think calls.") }}
+        {{ area("deep_think_system_prompt", "System prompt", values.deep_think_system_prompt, rows=5, placeholder="Empty = built-in careful-reasoner prompt.") }}
+
+        <div class="subhead">Daily caps</div>
+        <div class="toggles">
+            {{ toggle("deep_think_caps_enabled", "Enforce caps", values.deep_think_caps_enabled, off="false",
+                      hint="Off = count only. The dashboard shows usage against the caps.") }}
+        </div>
+        <div class="fields">
+            {{ field("deep_think_user_daily_cap", "Per user per day", values.deep_think_user_daily_cap, type="number", placeholder="10", attrs='min="0"', hint="0 = unlimited.") }}
+            {{ field("deep_think_group_daily_cap", "Per group per day", values.deep_think_group_daily_cap, type="number", placeholder="50", attrs='min="0"', hint="0 = unlimited.") }}
+        </div>
+    </section>
+
+    <section class="section" id="reactor">
+        <h2>Emoji reactor</h2>
+        <p class="section-desc">A cheap background call on each group message that decides whether to react with an emoji. Turn it off per chat on the context page.</p>
+        <div class="toggles">
+            {{ toggle("reactor_enabled", "Reactor enabled", values.reactor_enabled, off="false") }}
+        </div>
+        <div class="fields">
+            {{ field("reactor_model", "Model", values.reactor_model, placeholder="Same as writer") }}
+            {{ field("reactor_temperature", "Temperature", values.reactor_temperature, placeholder="0.3") }}
+            {{ field("reactor_max_tokens", "Max tokens", values.reactor_max_tokens, type="number", placeholder="50", attrs='min="1"') }}
+        </div>
+        {{ area("reactor_extra_body", "Extra body (JSON)", values.reactor_extra_body, rows=2, placeholder='{"thinking": {"type": "disabled"}}',
+                hint="Replaces the writer's extra body for reactor calls.") }}
+
+        <div class="subhead">Before the call</div>
+        <div class="fields">
+            {{ field("reactor_min_length", "Min message length", values.reactor_min_length, type="number", placeholder="0", attrs='min="0"') }}
+            {{ field("reactor_sender_cooldown", "Per-sender cooldown (s)", values.reactor_sender_cooldown, type="number", placeholder="30", attrs='min="0"') }}
+            {{ field("reactor_group_cooldown", "Per-group cooldown (s)", values.reactor_group_cooldown, type="number", placeholder="10", attrs='min="0"') }}
+            {{ field("reactor_context_messages", "Recent messages shown", values.reactor_context_messages, type="number", placeholder="5", attrs='min="0"') }}
+        </div>
+
+        <div class="subhead">After the call</div>
+        <div class="fields">
+            {{ field("reactor_hourly_budget", "Max per hour, per chat", values.reactor_hourly_budget, type="number", placeholder="3", attrs='min="0"') }}
+            {{ field("reactor_daily_budget", "Max per day, per chat", values.reactor_daily_budget, type="number", placeholder="12", attrs='min="0"') }}
+            {{ field("reactor_repeat_window", "No-repeat window", values.reactor_repeat_window, type="number", placeholder="3", attrs='min="0"',
+                     hint="Skip an emoji used in the last N reactions.") }}
+            {{ field("reactor_min_score", "Min self-score (1-10)", values.reactor_min_score, type="number", placeholder="0", attrs='min="0" max="10"',
+                     hint="0 = log only.",
+                     more="Scores are recorded either way. Set this from the dashboard's score spread once enough calls are in; self-scores cluster high, so a guessed threshold is usually too low to matter.") }}
+        </div>
+        <p class="hint">Limits are per chat and bot, kept in memory (reset on restart). 0 turns each off.</p>
+        {{ area("reactor_system_prompt", "Reactor prompt", values.reactor_system_prompt, rows=5, placeholder="Empty = built-in default (sparing, sentiment-led).") }}
+    </section>
+
+    <section class="section" id="natural">
+        <h2>Natural response</h2>
+        <p class="section-desc">Lets the bot answer an unaddressed group message when it has something to add. The decision rides on the reactor's call, so the reactor must be on. Each chat also has to opt in.</p>
+        <div class="toggles">
+            {{ toggle("natural_response_enabled", "Natural response enabled", values.natural_response_enabled, off="false") }}
+        </div>
+        <div class="fields">
+            {{ field("natural_response_cooldown", "Per-group cooldown (s)", values.natural_response_cooldown, type="number", placeholder="300", attrs='min="0"',
+                     hint="Mentions and quotes skip this.") }}
+        </div>
+        {{ area("natural_response_extra_prompt", "Extra reactor prompt", values.natural_response_extra_prompt, rows=3,
+                placeholder="Empty = built-in guidance.", hint="Appended to the reactor prompt when a spontaneous reply is possible.") }}
+    </section>
+
+    <section class="section" id="jev">
+        <h2>JEV decisions</h2>
+        <p class="section-desc">OpenRouter's decision engine routes background replies, votes in polls, scores WSB sentiment and ranks MCP tools. Uncertain or failed decisions fall back to the old behavior.</p>
+        <div class="toggles">
+            {{ toggle("jev_enabled", "JEV enabled", values.jev_enabled, off="false") }}
+        </div>
+        <div class="fields">
+            {{ field("jev_model", "Model", values.jev_model) }}
+            {{ secret("jev_api_key", "OpenRouter API key", jev_api_key_set, hint="Blank uses OPENROUTER_API_KEY or the writer key.") }}
+            {{ field("jev_timeout_seconds", "Timeout (s)", values.jev_timeout_seconds, type="number", attrs='min="1" max="30"') }}
+            {{ field("jev_min_confidence", "Min confidence (0-1)", values.jev_min_confidence, type="number", attrs='min="0" max="1" step="0.05"') }}
+        </div>
+    </section>
+
+    <div class="savebar"><button type="submit">Save changes</button></div>
+    </div>
+</form>
 
 {% endblock %}

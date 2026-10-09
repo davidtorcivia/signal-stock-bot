@@ -1,99 +1,90 @@
 {% extends "base.html" %}
 {% block title %}Users{% endblock %}
+{% block head %}
+<style>
+  .sender { border-top: 1px solid var(--border); padding: 14px 0; }
+  .sender:first-of-type { border-top: 0; padding-top: 4px; }
+  .sender-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .name-form { display: flex; gap: 6px; min-width: 300px; }
+  .samples { margin: 8px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--text-2); }
+  .samples li { margin-bottom: 4px; }
+  .name-input { max-width: 280px; }
+  .save-btn { visibility: hidden; }
+  form:focus-within .save-btn, .save-btn.dirty { visibility: visible; }
+</style>
+{% endblock %}
 {% block content %}
 
-<div class="panel">
-    <h1>Known users</h1>
-    <p class="muted" style="font-size: 12px;">
-        Map a sender to a display name. The bot will refer to them as
-        <code>[Name]</code> in LLM context instead of <code>[...4137]</code>.
-        Names are stored against the sha256 of the phone number — the raw
-        number never reaches this table.
-    </p>
+<div class="page-head">
+    <div>
+        <h1>Users</h1>
+        <p class="page-sub">Names the bot uses for people instead of <code>[...4137]</code>. Stored against a hash of the sender; raw numbers never reach this table.</p>
+    </div>
 </div>
 
 {% if unnamed %}
-<div class="panel">
-    <h2>Recent senders awaiting a name</h2>
-    <p class="muted" style="font-size: 12px;">
-        Recent messages and groups shown to help you identify each sender.
-        Same last-4 across different groups likely = different people.
-    </p>
+<div class="card">
+    <div class="card-head"><h2>Waiting for a name</h2><span class="card-meta">{{ unnamed|length }} recent senders</span></div>
+    <p class="hint" style="margin-top: -4px;">The same last four digits in different groups are probably different people.</p>
     {% for u in unnamed %}
-    <div style="border-top: 1px solid #333; padding: 12px 0; margin-top: 8px;">
-        <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 8px;">
+    <div class="sender">
+        <div class="sender-head">
             <div>
-                <strong style="font-family: monospace;">...{{ u.sender_tail or '????' }}</strong>
-                <span class="muted" style="margin-left: 8px;">{{ u.turn_count }} turn{{ '' if u.turn_count == 1 else 's' }}</span>
-                {% if u.contexts %}
-                <span class="muted" style="margin-left: 8px;">
-                    in: {% for label in u.contexts %}<em>{{ label }}</em>{% if not loop.last %}, {% endif %}{% endfor %}
-                </span>
-                {% endif %}
+                <strong class="mono">...{{ u.sender_tail or '????' }}</strong>
+                <span class="muted small"> · {{ u.turn_count }} turn{{ '' if u.turn_count == 1 else 's' }}{% if u.contexts %} in {{ u.contexts|join(', ') }}{% endif %}</span>
             </div>
-            <form method="POST" action="{{ url_for('admin.users_save') }}" style="display:flex;gap:6px; min-width: 320px;">
+            <form method="POST" action="{{ url_for('admin.users_save') }}" class="name-form">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="user_hash" value="{{ u.user_hash }}">
-                <input type="text" name="name" placeholder="e.g. David" required style="flex:1;">
-                <button type="submit" class="btn">Save</button>
+                <input type="text" name="name" placeholder="Name" required aria-label="Name for ...{{ u.sender_tail }}">
+                <button type="submit" class="secondary">Save</button>
             </form>
         </div>
         {% if u.samples %}
-        <ul style="margin: 0 0 0 16px; padding: 0; list-style: '› '; font-size: 13px;">
-            {% for s in u.samples %}
-            <li style="margin-bottom: 4px;">
-                <span class="muted" style="font-size: 11px;">[{{ s.context_label|truncate(20) }}]</span>
-                {{ s.text|truncate(200) }}
-            </li>
-            {% endfor %}
+        <ul class="samples">
+            {% for s in u.samples %}<li><span class="muted small">{{ s.context_label|truncate(20) }} ·</span> {{ s.text|truncate(200) }}</li>{% endfor %}
         </ul>
         {% else %}
-        <p class="muted" style="font-size: 12px; margin: 0;">No recent messages from this sender.</p>
+        <p class="hint">No recent messages.</p>
         {% endif %}
     </div>
     {% endfor %}
 </div>
 {% endif %}
 
-<div class="panel">
-    <h2>Named users</h2>
+<div class="card">
+    <div class="card-head"><h2>Named users</h2><span class="card-meta">{{ named|length }}</span></div>
     {% if named %}
+    <div class="table-wrap">
     <table>
-        <tr>
-            <th>Name</th>
-            <th>Hash</th>
-            <th>Updated</th>
-            <th></th>
-        </tr>
+        <thead><tr><th>Name</th><th>Hash</th><th>Updated</th><th></th></tr></thead>
         {% for u in named %}
         <tr>
             <td>
-                <form method="POST" action="{{ url_for('admin.users_save') }}" style="display:flex;gap:6px;">
+                <form method="POST" action="{{ url_for('admin.users_save') }}" class="row" style="gap: 6px; flex-wrap: nowrap;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="user_hash" value="{{ u.user_hash }}">
-                    <input type="text" name="name" value="{{ u.name }}" required style="flex:1;">
-                    <button type="submit" class="btn">Save</button>
+                    <input type="text" name="name" value="{{ u.name }}" required class="name-input" aria-label="Name"
+                           oninput="this.nextElementSibling.classList.add('dirty')">
+                    <button type="submit" class="sm save-btn">Save</button>
                 </form>
             </td>
-            <td class="muted"><code>{{ u.user_hash|truncate(12, true, '') }}</code></td>
-            <td class="muted">
-                {% if u.updated_at %}
-                {{ u.updated_at|int }}
-                {% endif %}
-            </td>
-            <td>
-                <form method="POST" action="{{ url_for('admin.users_delete') }}" style="display:inline;"
+            <td><code>{{ u.user_hash|truncate(12, true, '') }}</code></td>
+            <td class="muted small nowrap">{{ u.updated_at|when }}</td>
+            <td class="num">
+                <form method="POST" action="{{ url_for('admin.users_delete') }}" class="inline"
                       onsubmit="return confirm('Remove the name for {{ u.name }}?');">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="user_hash" value="{{ u.user_hash }}">
-                    <button type="submit" class="btn" style="background:#aa3333;">Delete</button>
+                    <button type="submit" class="ghost sm" style="color: var(--bad);">Remove</button>
                 </form>
             </td>
         </tr>
         {% endfor %}
     </table>
+    </div>
     {% else %}
-    <p class="muted">No named users yet. Pick someone from the list above to start.</p>
+    <p class="empty">No named users yet.</p>
     {% endif %}
 </div>
 

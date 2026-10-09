@@ -34,6 +34,8 @@ from .store import WSBDigestRecord, WSBDigestStore
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PUBLIC_BASE_URL = "https://sigil.disinfo.zone"
+
 # Marks every deep-think non-answer (unavailable / rate-limited / no content).
 _DT_FAILURE_PREFIX = "(deep_think "
 
@@ -243,12 +245,14 @@ class WSBDigestService:
 
     def _cfg(self) -> dict:
         s = self.settings
+        # `or`: a saved-but-blank admin field means "use the default"
+        # (get_stripped only falls back when the key is unset).
         return {
-            "base_url": s.get_stripped("wsb_redlib_base_url", DEFAULT_BASE_URL),
-            "subreddit": s.get_stripped("wsb_subreddit", DEFAULT_SUBREDDIT),
-            "public_base_url": s.get_stripped("wsb_public_base_url", "https://sigil.disinfo.zone"),
+            "base_url": s.get_stripped("wsb_redlib_base_url") or DEFAULT_BASE_URL,
+            "subreddit": s.get_stripped("wsb_subreddit") or DEFAULT_SUBREDDIT,
+            "public_base_url": s.get_stripped("wsb_public_base_url") or DEFAULT_PUBLIC_BASE_URL,
             "indexable": s.get_bool("wsb_indexable", True),
-            "user_agent": s.get_stripped("wsb_user_agent", DEFAULT_USER_AGENT),
+            "user_agent": s.get_stripped("wsb_user_agent") or DEFAULT_USER_AGENT,
         }
 
     async def _fetch_price_data(self, tickers: list) -> list[dict]:

@@ -37,14 +37,13 @@
     {% endif %}
 {% endmacro %}
 
+<div class="page-head">
+    <div>
+        <h1>Media requests</h1>
+        <p class="page-sub">In the chosen groups the bot picks movie and TV requests out of messages, adds them to Radarr or Sonarr, and reacts: ⏳ requested, ✅ on the server, ❓ not found. Applies live.</p>
+    </div>
+</div>
 <div class="panel">
-    <h1>Media requests</h1>
-    <p class="muted" style="font-size: 12px;">
-        In the chosen groups the bot reads each message for movie/TV requests,
-        adds them to Radarr/Sonarr, and reacts: ⏳ requested, ✅ on the server,
-        ❓ not found. Commands and @-mentions there work as usual. All values
-        apply live.
-    </p>
 
     {% if saved %}<div class="ok">Saved.</div>{% endif %}
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
@@ -52,9 +51,9 @@
     <form method="post" autocomplete="off">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-            <input type="checkbox" name="media_requests_enabled" {% if values.media_requests_enabled %}checked{% endif %}>
-            <span>Enabled</span>
+        <label class="toggle">
+            <input type="checkbox" class="switch" name="media_requests_enabled" {% if values.media_requests_enabled %}checked{% endif %}>
+            <span class="t-text"><span>Media requests enabled</span></span>
         </label>
 
         <label>Request groups</label>
@@ -62,15 +61,15 @@
         {% set shown = groups|map(attribute='key')|list %}
         {% set unseen = (values.media_request_groups or [])|reject('in', shown)|list %}
         {% if groups or unseen %}
-            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">
+            <div class="chips wide">
                 {% for key in unseen %}
-                    <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                    <label class="chip">
                         <input type="checkbox" name="media_request_groups" value="{{ key }}" checked>
                         <span>{{ key[:16] ~ '…' }} (not seen)</span>
                     </label>
                 {% endfor %}
                 {% for g in groups %}
-                    <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer;font-size:13px;color:var(--text);text-transform:none;letter-spacing:normal;">
+                    <label class="chip">
                         <input type="checkbox" name="media_request_groups" value="{{ g.key }}"
                                {% if g.key in (values.media_request_groups or []) %}checked{% endif %}>
                         <span>{{ g.label or g.key[:16] ~ '…' }}</span>

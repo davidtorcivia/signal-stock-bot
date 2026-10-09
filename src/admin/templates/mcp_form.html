@@ -1,114 +1,110 @@
 {% extends "base.html" %}
+{% from "_ui.html" import field, area, toggle %}
 {% block title %}{% if is_new %}New MCP server{% else %}{{ server.name }}{% endif %}{% endblock %}
 {% block content %}
 
-<div class="panel">
-    <h1>{% if is_new %}New MCP server{% else %}{{ server.name }}{% endif %}</h1>
-
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-
+<div class="page-head">
+    <div>
+        <a class="crumb" href="{{ url_for('admin.mcp_list') }}">← MCP servers</a>
+        <h1>{% if is_new %}New MCP server{% else %}{{ server.name }}{% endif %}</h1>
+        {% if not is_new %}
+        <p class="page-sub">
+            {% if status and status.running %}<span class="badge ok">Running</span> {{ status.tool_count }} tools{% if status.started_at %} · since {{ status.started_at|when }}{% endif %}
+            {% elif status and status.last_error %}<span class="badge bad">Error</span> {{ status.last_error }}
+            {% else %}<span class="badge">Stopped</span>{% endif %}
+        </p>
+        {% endif %}
+    </div>
     {% if not is_new %}
-        <p>
-            {% if status and status.running %}
-                <span class="dot-ok">●</span> Running —
-                {{ status.tool_count }} tool(s)
-                {% if status.started_at %} · since
-                    <span class="muted">{{ status.started_at|int }}</span>
-                {% endif %}
-            {% elif status and status.last_error %}
-                <span class="muted">○ Stopped</span> —
-                <span class="muted">{{ status.last_error }}</span>
-            {% else %}
-                <span class="muted">○ Stopped</span>
-            {% endif %}
-        </p>
-
-        <div style="display:flex; gap:8px; margin-bottom:16px;">
-            {% if status and status.running %}
-                <form method="post" action="{{ url_for('admin.mcp_stop', server_id=server.id) }}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button class="secondary" type="submit">Stop</button>
-                </form>
-            {% else %}
-                <form method="post" action="{{ url_for('admin.mcp_start', server_id=server.id) }}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit">Start</button>
-                </form>
-            {% endif %}
-            <form method="post" action="{{ url_for('admin.mcp_delete', server_id=server.id) }}"
-                  onsubmit="return confirm('Delete {{ server.name }}? This removes the config and stops the server.');">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <button class="secondary" type="submit" style="background: var(--bad); color: white;">Delete</button>
-            </form>
-        </div>
+    <div class="page-actions">
+        {% if status and status.running %}
+        <form method="post" action="{{ url_for('admin.mcp_stop', server_id=server.id) }}" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="secondary" type="submit">Stop</button>
+        </form>
+        {% else %}
+        <form method="post" action="{{ url_for('admin.mcp_start', server_id=server.id) }}" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="secondary" type="submit">Start</button>
+        </form>
+        {% endif %}
+        <form method="post" action="{{ url_for('admin.mcp_delete', server_id=server.id) }}" class="inline"
+              onsubmit="return confirm('Delete {{ server.name }}? This removes the config and stops the server.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="danger" type="submit">Delete</button>
+        </form>
+    </div>
     {% endif %}
-
-    <form method="post" autocomplete="off">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-
-        <label for="name">Name</label>
-        <input type="text" name="name" id="name" required
-               value="{{ values.name }}" placeholder="weather">
-        <p class="muted" style="font-size: 11px; margin-top: 4px;">
-            Used to namespace this server's tools as <code>{name}__{tool}</code>.
-        </p>
-
-        <label for="transport">Transport</label>
-        <select name="transport" id="transport"
-                style="width:100%;padding:8px 10px;background:#0b0d10;border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:inherit;font-size:14px;">
-            {% for t in transports %}
-                <option value="{{ t }}" {% if values.transport == t %}selected{% endif %}>{{ t }}</option>
-            {% endfor %}
-        </select>
-
-        <label for="enabled">Auto-start on boot</label>
-        <input type="text" name="enabled" id="enabled"
-               value="{{ values.enabled }}" placeholder="true / false">
-
-        <h2 style="margin-top: 32px;">stdio</h2>
-
-        <label for="command">Command</label>
-        <input type="text" name="command" id="command"
-               value="{{ values.command }}" placeholder="npx  or  /usr/local/bin/mcp-server-foo">
-
-        <label for="args">Args (one per line)</label>
-        <textarea name="args" id="args" rows="4"
-                  placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/data/shared">{{ values.args }}</textarea>
-
-        <label for="env">Env (KEY=value, one per line)</label>
-        <textarea name="env" id="env" rows="4"
-                  placeholder="API_KEY=sk-...&#10;SOMETHING_ELSE=value">{{ values.env }}</textarea>
-
-        <h2 style="margin-top: 32px;">sse / http</h2>
-
-        <label for="url">URL</label>
-        <input type="text" name="url" id="url"
-               value="{{ values.url }}" placeholder="https://mcp.example.com/sse">
-
-        <label for="headers">Headers (KEY=value, one per line)</label>
-        <textarea name="headers" id="headers" rows="4"
-                  placeholder="Authorization=Bearer abc123">{{ values.headers }}</textarea>
-
-        <div style="margin-top: 24px;">
-            <button type="submit">{% if is_new %}Create{% else %}Save{% endif %}</button>
-            <a href="{{ url_for('admin.mcp_list') }}" class="muted" style="margin-left: 16px;">Cancel</a>
-        </div>
-    </form>
 </div>
+
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<form method="post" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <section class="section">
+        <h2>Server</h2>
+        <div class="fields">
+            {{ field("name", "Name", values.name, placeholder="weather", attrs="required", hint="Tools are named <code>name__tool</code>.") }}
+            <div class="field">
+                <label for="transport">Transport</label>
+                <select name="transport" id="transport">
+                    {% for t in transports %}<option value="{{ t }}" {% if values.transport == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+                </select>
+                <p class="hint">stdio runs a local command; sse and http connect to a URL.</p>
+            </div>
+        </div>
+        <div class="toggles" style="margin-top: 12px;">
+            {{ toggle("enabled", "Start automatically on boot", values.enabled == "true") }}
+        </div>
+    </section>
+
+    <section class="section" data-transport="stdio">
+        <h2>Local command <span class="muted small" style="font-weight: 400;">stdio</span></h2>
+        {{ field("command", "Command", values.command, placeholder="npx  or  /usr/local/bin/mcp-server-foo") }}
+        <div class="fields two" style="margin-top: 16px;">
+            {{ area("args", "Arguments", values.args, rows=4, placeholder="-y\n@modelcontextprotocol/server-filesystem\n/data/shared", hint="One per line.") }}
+            {{ area("env", "Environment", values.env, rows=4, placeholder="API_KEY=sk-...", hint="KEY=value, one per line. The server gets only these, not the bot's environment.") }}
+        </div>
+    </section>
+
+    <section class="section" data-transport="sse http">
+        <h2>Remote server <span class="muted small" style="font-weight: 400;">sse / http</span></h2>
+        {{ field("url", "URL", values.url, placeholder="https://mcp.example.com/mcp") }}
+        {{ area("headers", "Headers", values.headers, rows=3, placeholder="Authorization=Bearer abc123", hint="KEY=value, one per line.") }}
+    </section>
+
+    <div class="savebar">
+        <button type="submit">{% if is_new %}Create server{% else %}Save changes{% endif %}</button>
+        <a href="{{ url_for('admin.mcp_list') }}" class="btn ghost">Cancel</a>
+    </div>
+</form>
 
 {% if not is_new and tools %}
-<div class="panel">
-    <h2>Discovered tools ({{ tools|length }})</h2>
-    <table>
-        <tr><th>Name</th><th>Description</th></tr>
+<div class="card">
+    <div class="card-head"><h2>Tools</h2><span class="card-meta">{{ tools|length }}</span></div>
+    <div class="table-wrap">
+    <table class="compact">
         {% for t in tools %}
-        <tr>
-            <td><code>{{ t.qualified_name }}</code></td>
-            <td class="muted">{{ t.description|truncate(120) }}</td>
-        </tr>
+        <tr><td class="nowrap"><code>{{ t.qualified_name }}</code></td><td class="muted small">{{ t.description|truncate(140) }}</td></tr>
         {% endfor %}
     </table>
+    </div>
 </div>
 {% endif %}
+
+<script>
+  // Dim the transport section that doesn't apply; nothing is hidden or cleared.
+  (function () {
+    var sel = document.getElementById('transport');
+    var sections = document.querySelectorAll('[data-transport]');
+    function refresh() {
+      sections.forEach(function (s) {
+        s.style.opacity = s.dataset.transport.split(' ').indexOf(sel.value) === -1 ? '0.45' : '1';
+      });
+    }
+    sel.addEventListener('change', refresh); refresh();
+  }());
+</script>
 
 {% endblock %}
