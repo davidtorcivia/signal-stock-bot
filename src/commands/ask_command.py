@@ -596,6 +596,12 @@ class AskCommand(BaseCommand):
             return []
         try:
             images = await enricher_images(text)
+            # "Sigil?" right after someone drops a tweet carries no URL of
+            # its own — look at what it's replying to instead.
+            if not images:
+                fallback = await self._referenced_link_text(ctx)
+                if fallback:
+                    images = await enricher_images(fallback)
         except Exception as e:
             logger.debug(f"Link image enrichment failed: {e}")
             return []
@@ -605,6 +611,34 @@ class AskCommand(BaseCommand):
                 f"pasted links for bot={bot.slug}"
             )
         return images[:room]
+
+    async def _referenced_link_text(self, ctx) -> str:
+        """Text of the message a link-less turn is most likely about.
+
+        The Signal quote if there is one, else the newest human line in
+        the group from the last 10 minutes. Enrichment snippets are cut
+        off group rows so we only chase links someone actually pasted.
+        """
+        quote = getattr(ctx, "quote_text", None)
+        if quote:
+            return quote
+        if not ctx.is_group or self.group_log is None:
+            return ""
+        floor_at = (
+            getattr(ctx.policy, "purge_floor_at", None)
+            if ctx.policy is not None else None
+        )
+        # ponytail: single-row 10-min lookback; widen if follow-ups skip a message
+        rows = await self.group_log.recent(
+            ctx.group_id, limit=3, exclude_last=1, floor_at=floor_at,
+        )
+        for row in reversed(rows):
+            if row.get("bot_id") is not None or row.get("sender") == BOT_SENDER:
+                continue
+            if time.time() - (row.get("created_at") or 0) > 600:
+                return ""
+            return (row.get("text") or "").split("\n  → ")[0]
+        return ""
 
     @staticmethod
     def _canonical_turn_text(text: object) -> str:

@@ -320,3 +320,70 @@ async def test_both_expander_sessions_use_the_guarded_connector():
             ), type(expander).__name__
         finally:
             await expander.close()
+
+
+# ── link-less follow-ups ("Sigil?" after a tweet) ──────────────────────────
+
+class _FakeEnricher:
+    def __init__(self):
+        self.seen = []
+
+    async def images(self, text):
+        self.seen.append(text)
+        return [{"mime": "image/png", "data": "x"}] if "status/" in text else []
+
+
+class _FakeGroupLog:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def recent(self, group_id, limit, exclude_last=0, floor_at=None):
+        return self.rows
+
+
+def _ask(enricher, group_log=None):
+    from src.commands.ask_command import AskCommand
+    ask = AskCommand(llm=object(), history=object(), group_log=group_log)
+    ask.enricher = enricher
+    return ask
+
+
+def _ctx(quote_text=None, group_id="g1"):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        bot=SimpleNamespace(vision_enabled=True, slug="sigil"),
+        inbound_images=[], quote_text=quote_text, group_id=group_id,
+        is_group=bool(group_id), policy=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_link_images_follow_quote():
+    enr = _FakeEnricher()
+    imgs = await _ask(enr)._link_images(
+        "what's this", _ctx(quote_text="https://x.com/a/status/123"),
+    )
+    assert len(imgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_link_images_follow_recent_group_row_without_snippets():
+    import time
+    enr = _FakeEnricher()
+    log = _FakeGroupLog([{
+        "sender": "+1", "bot_id": None, "created_at": time.time() - 60,
+        "text": "https://x.com/a/status/123\n  → [@a] see https://x.com/b/status/9",
+    }])
+    imgs = await _ask(enr, log)._link_images("Sigil?", _ctx())
+    assert len(imgs) == 1
+    assert enr.seen[-1] == "https://x.com/a/status/123"
+
+
+@pytest.mark.asyncio
+async def test_link_images_skip_stale_group_row():
+    import time
+    log = _FakeGroupLog([{
+        "sender": "+1", "bot_id": None, "created_at": time.time() - 3600,
+        "text": "https://x.com/a/status/123",
+    }])
+    assert await _ask(_FakeEnricher(), log)._link_images("Sigil?", _ctx()) == []
