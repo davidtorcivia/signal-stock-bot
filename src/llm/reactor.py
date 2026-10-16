@@ -227,6 +227,13 @@ def _bot_roster_lines(bots: list) -> str:
     return "Available responders (pick one via `bot_slug`):\n" + "\n".join(out)
 
 
+# Seconds an implicit-reply candidate waits for the chat to go quiet. A newer
+# message in that window takes over the evaluation.
+# ponytail: one global value; make it a per-context setting if chats need
+# different pacing.
+IMPLICIT_SETTLE_SECONDS = 4.0
+
+
 # Multi-bot chats: chat lines carry the author bot's name, so a follow-up
 # can be sent back to the bot it answers instead of to the topic's best fit.
 FOLLOW_UP_ROUTING = (
@@ -296,6 +303,8 @@ absence). Otherwise, don't call any tool."""
 
 
 class EmojiReactor:
+    implicit_settle_seconds = IMPLICIT_SETTLE_SECONDS
+
     def __init__(
         self,
         settings_store,
@@ -344,6 +353,11 @@ class EmojiReactor:
         # Composite (group_id, bot_id_or_0) so multi-bot cooldowns
         # don't mute each other.
         self._implicit_response_last: dict[tuple, float] = {}
+        # Fast chats: newest message timestamp per group, and groups with an
+        # implicit reply being written. Together they make a burst get one
+        # reply, to its last message, instead of one reply per message.
+        self._latest_msg: dict[str, int] = {}
+        self._replying: set[str] = set()
         # Late-bound async handler invoked when the LLM calls should_respond.
         # Signature: (sender, message, group_id, target_timestamp, policy,
         # reason) -> Awaitable[None]. Wired in main.py to dispatcher.
@@ -525,6 +539,12 @@ class EmojiReactor:
         if time.time() - last < cfg["natural_response_cooldown"]:
             return False
         return True
+
+    def _is_latest_and_idle(self, group_id: str, target_timestamp) -> bool:
+        return (
+            self._latest_msg.get(group_id) == target_timestamp
+            and group_id not in self._replying
+        )
 
     @staticmethod
     def _gb_key(group_id: str, bot_id: Optional[int] = None) -> tuple:
@@ -824,6 +844,9 @@ class EmojiReactor:
 
             text = message.strip()
             bot_id_for_scope = getattr(bot, "id", None) if bot is not None else None
+            self._latest_msg[group_id] = max(
+                self._latest_msg.get(group_id, 0), target_timestamp,
+            )
 
             # The three cheap emoji gates. Each records WHY emoji_react is
             # off the table without deciding on its own that the whole call
@@ -872,6 +895,16 @@ class EmojiReactor:
                     group_id, cfg, policy, bot_id=bot_id_for_scope,
                 )
             )
+            # Let the burst settle: only its newest message may get an
+            # implicit reply, and never while one is already being written.
+            # ponytail: a message arriving mid-reply is never reconsidered;
+            # wait for _replying to clear and re-settle if that loses replies.
+            if offer_should_respond and group_id not in self._replying:
+                await asyncio.sleep(self.implicit_settle_seconds)
+            if offer_should_respond and not self._is_latest_and_idle(
+                group_id, target_timestamp,
+            ):
+                offer_should_respond = False
             # Multi-bot routing: when more than one bot can answer in this
             # chat and we're offering should_respond, swap in the tool
             # variant that takes a bot_slug and prepend a roster to the
@@ -1158,6 +1191,17 @@ class EmojiReactor:
                 if responder_bot is not None else None
             )
 
+            # Another evaluation may have started a reply while this one was
+            # deciding. A newer message alone doesn't cancel: the decision
+            # takes long enough that a busy chat would starve every reply,
+            # and the writer sees the newer lines anyway.
+            if respond_reason and offer_should_respond and group_id in self._replying:
+                logger.info(
+                    f"Reactor: dropped should_respond on ...{sender_tail} — "
+                    "reply already in flight"
+                )
+                return
+
             if respond_reason and offer_should_respond:
                 # Mark cooldown on the RESPONDER bot (which may differ
                 # from the originally-resolved `bot` when the LLM picked
@@ -1185,6 +1229,7 @@ class EmojiReactor:
                 )
                 handler = self.implicit_response_handler
                 if handler is not None:
+                    self._replying.add(group_id)
                     try:
                         await handler(
                             sender=sender,
@@ -1199,6 +1244,12 @@ class EmojiReactor:
                     except Exception as e:
                         logger.exception(
                             f"Implicit response handler failed: {e}"
+                        )
+                    finally:
+                        self._replying.discard(group_id)
+                        # Cooldown runs from the send, not the decision.
+                        self.mark_implicit_response(
+                            group_id, bot_id=responder_bot_id,
                         )
                 return
 

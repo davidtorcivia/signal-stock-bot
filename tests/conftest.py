@@ -135,3 +135,10 @@ def integration_dispatcher(provider_manager):
     d.register(HelpCommand([price_cmd, quote_cmd, info_cmd, market_cmd, status_cmd]))
     
     return d
+
+
+@pytest.fixture(autouse=True)
+def _no_implicit_settle(monkeypatch):
+    """The reactor waits for a chat burst to settle; tests don't need to."""
+    from src.llm.reactor import EmojiReactor
+    monkeypatch.setattr(EmojiReactor, "implicit_settle_seconds", 0)

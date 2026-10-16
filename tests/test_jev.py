@@ -346,3 +346,54 @@ async def test_server_directory_and_jev_see_server_descriptions():
     sent = jev.choose.await_args.kwargs["state"]["tools"]
     assert sent == [{"name": "theinfoweb__search", "description": "Search",
                      "server_about": about["theinfoweb"]}]
+
+
+async def test_burst_gets_one_reply_to_its_last_message(store, monkeypatch):
+    """Fast chats got a reply per message; only the burst's newest message
+    should be answered, once."""
+    import asyncio
+    monkeypatch.setattr(EmojiReactor, "implicit_settle_seconds", 0.05)
+    store.set("reactor_enabled", True)
+    store.set("natural_response_enabled", True)
+    store.set("natural_response_cooldown", 0)
+    jev = SimpleNamespace(choose=AsyncMock(return_value={"action": "respond"}))
+    reactor = EmojiReactor(store, None, None, jev=jev)
+    reactor.implicit_response_handler = AsyncMock()
+    policy = ContextPolicy(id=1, kind="group", key="g", natural_response=True)
+    kw = dict(sender="alice", group_id="g", policy=policy)
+    await asyncio.gather(
+        reactor.maybe_react(message="what do you all think about this", target_timestamp=1, **kw),
+        reactor.maybe_react(message="and also what about the other thing", target_timestamp=2, **kw),
+    )
+    reactor.implicit_response_handler.assert_awaited_once()
+    assert reactor.implicit_response_handler.await_args.kwargs["message"].startswith("and also")
+
+
+async def test_reply_decided_before_newer_message_still_lands(store):
+    """A busy chat must not starve replies: a yes reached after a newer
+    message arrived is still sent (the decision takes seconds)."""
+    import asyncio
+    store.set("reactor_enabled", True)
+    store.set("natural_response_enabled", True)
+    store.set("natural_response_cooldown", 0)
+    gate = asyncio.Event()
+
+    async def choose(state, **_):
+        if "what do" in state["chat"]:
+            await gate.wait()
+            return {"action": "respond"}
+        return {"action": "ignore"}
+
+    reactor = EmojiReactor(store, None, None, jev=SimpleNamespace(choose=choose))
+    reactor.implicit_response_handler = AsyncMock()
+    policy = ContextPolicy(id=1, kind="group", key="g", natural_response=True)
+    kw = dict(sender="alice", group_id="g", policy=policy)
+    first = asyncio.create_task(reactor.maybe_react(
+        message="what do you all think about this", target_timestamp=1, **kw))
+    await asyncio.sleep(0.01)  # first is past the settle check, deciding
+    await reactor.maybe_react(
+        message="lol yeah that is pretty wild honestly", target_timestamp=2, **kw)
+    gate.set()
+    await first
+    reactor.implicit_response_handler.assert_awaited_once()
+    assert reactor.implicit_response_handler.await_args.kwargs["message"].startswith("what do")
