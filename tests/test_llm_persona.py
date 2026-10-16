@@ -124,3 +124,51 @@ def test_context_prompt_only_applies_to_pinned_bot():
     unpinned = NS(system_prompt="Be terse.", default_bot_id=None)
     assert _context_prompt_for(NS(policy=unpinned, bot=NS(id=2))) == "Be terse."
     assert _context_prompt_for(NS(policy=NS(system_prompt=None, default_bot_id=1), bot=NS(id=1))) is None
+
+
+def test_per_bot_context_prompt_wins():
+    from types import SimpleNamespace as NS
+    from src.commands.ask_command import _context_prompt_for
+
+    policy = NS(system_prompt="You are Sigil.", default_bot_id=1,
+                bot_prompts={2: "You are Artaud, here."})
+    assert _context_prompt_for(NS(policy=policy, bot=NS(id=2))) == "You are Artaud, here."
+    assert _context_prompt_for(NS(policy=policy, bot=NS(id=1))) == "You are Sigil."
+
+
+def test_bot_prompts_survive_registry_round_trip(tmp_path):
+    import asyncio
+    from src.contexts.registry import ContextRegistry
+    from src.contexts.policy import ContextPolicy
+
+    async def go():
+        reg = ContextRegistry(str(tmp_path / "c.db"))
+        pid = await reg.upsert(ContextPolicy(id=None, kind="group", key="g1",
+                                             bot_prompts={2: "Artaud here"}))
+        got = await reg.get(pid)
+        assert got.bot_prompts == {2: "Artaud here"}
+    asyncio.run(go())
+
+
+def test_dm_small_talk_reaches_llm_without_name():
+    """'She works for the CIA' in a DM was dropped: only messages that
+    looked like stock queries (or named the bot) reached the LLM."""
+    import asyncio
+    from src.commands.dispatcher import CommandDispatcher
+    from src.commands.base import CommandResult
+    from src.contexts.policy import ContextPolicy
+
+    seen = []
+
+    class _Ask:
+        async def execute(self, ctx):
+            seen.append(ctx.args)
+            return CommandResult.ok("ok")
+
+    d = CommandDispatcher(ask_command=_Ask())
+    dm = ContextPolicy(id=None, kind="default", key="default:dm", llm_intent=True)
+    asyncio.run(d.dispatch("+1555", "She works for the CIA", policy=dm))
+    assert seen == [["She", "works", "for", "the", "CIA"]]
+    # Groups still need the bot addressed.
+    asyncio.run(d.dispatch("+1555", "She works for the CIA", group_id="g", policy=dm))
+    assert len(seen) == 1

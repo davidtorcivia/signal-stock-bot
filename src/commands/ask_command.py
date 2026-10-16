@@ -376,16 +376,20 @@ def _wrap_xml(tag: str, body: str) -> str:
 def _context_prompt_for(ctx) -> Optional[str]:
     """The context's system prompt, if it applies to the answering bot.
 
-    The prompt is written for the context's pinned bot ("You are Sigil…").
-    A different bot summoned into the chat keeps its own persona; otherwise
-    it introduces itself as the pinned bot.
+    A per-bot prompt for this chat wins. Otherwise the shared prompt is
+    written for the context's pinned bot ("You are Sigil…"): a different
+    bot summoned into the chat keeps its own persona; otherwise it
+    introduces itself as the pinned bot.
     """
     policy = getattr(ctx, "policy", None)
+    bot_id = getattr(getattr(ctx, "bot", None), "id", None)
+    per_bot = (getattr(policy, "bot_prompts", None) or {}).get(bot_id)
+    if per_bot:
+        return per_bot
     prompt = getattr(policy, "system_prompt", None)
     if not prompt:
         return None
     pinned = getattr(policy, "default_bot_id", None)
-    bot_id = getattr(getattr(ctx, "bot", None), "id", None)
     if pinned is None or bot_id is None or pinned == bot_id:
         return prompt
     return None

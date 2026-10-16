@@ -1741,6 +1741,7 @@ def _register_context_routes(
             "mcp_mode": MODE_ALLOW_LIST,
             "mcp_servers": [],
             "system_prompt": "",
+            "bot_prompts": {},
             "llm_intent": False,
             "reactor_enabled": True,
             "reactor_prompt": "",
@@ -1810,6 +1811,7 @@ def _register_context_routes(
             "mcp_mode": policy.mcp_mode,
             "mcp_servers": policy.mcp_servers,
             "system_prompt": policy.system_prompt or "",
+            "bot_prompts": policy.bot_prompts,
             "llm_intent": policy.llm_intent,
             "reactor_enabled": policy.reactor_enabled,
             "reactor_prompt": policy.reactor_prompt or "",
@@ -2757,6 +2759,18 @@ def _tool_payload_stats(ask_command, policy: ContextPolicy) -> dict[str, int]:
     return out
 
 
+def _form_bot_prompts(form) -> dict[int, str]:
+    """{bot_id: prompt} from the `bot_prompt_<id>` textareas; blanks dropped."""
+    out = {}
+    for name, value in form.items():
+        if name.startswith("bot_prompt_") and value.strip():
+            try:
+                out[int(name.removeprefix("bot_prompt_"))] = value.strip()
+            except ValueError:
+                raise ValueError(f"bad field {name!r}") from None
+    return out
+
+
 def _form_to_values(form) -> dict:
     return {
         "kind": form.get("kind", "group"),
@@ -2767,6 +2781,7 @@ def _form_to_values(form) -> dict:
         "mcp_mode": form.get("mcp_mode", MODE_ALLOW_LIST),
         "mcp_servers": form.getlist("mcp_servers"),
         "system_prompt": form.get("system_prompt", ""),
+        "bot_prompts": _form_bot_prompts(form),
         "llm_intent": form.get("llm_intent", "") == "on",
         "reactor_enabled": form.get("reactor_enabled", "") == "on",
         "reactor_prompt": form.get("reactor_prompt", ""),
@@ -2855,6 +2870,12 @@ def _form_to_policy(form, existing_id: Optional[int], base: Optional[ContextPoli
         mcp_mode=mcp_mode,
         mcp_servers=mcp_servers,
         system_prompt=system_prompt,
+        # Disabled bots have no textarea; keep their prompts.
+        bot_prompts={
+            **{k: v for k, v in (base.bot_prompts if base else {}).items()
+               if f"bot_prompt_{k}" not in form},
+            **_form_bot_prompts(form),
+        },
         llm_intent=llm_intent,
         reactor_enabled=reactor_enabled,
         reactor_prompt=reactor_prompt,

@@ -31,6 +31,9 @@ class ContextPolicy:
     mcp_mode: str = MODE_ALLOW_LIST
     mcp_servers: list[str] = field(default_factory=list)
     system_prompt: Optional[str] = None   # None / empty => use global LLM prompt
+    # Per-bot prompts for this chat, {bot_id: prompt}. Wins over
+    # system_prompt for that bot, so each resident bot can get its own.
+    bot_prompts: dict[int, str] = field(default_factory=dict)
     llm_intent: bool = False              # Route non-command messages through the LLM with bot+MCP tools
     # Emoji reactor: per-context override of the global setting + dedicated prompt
     reactor_enabled: bool = True          # Only matters when reactor is globally enabled

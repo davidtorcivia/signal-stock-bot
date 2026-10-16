@@ -133,7 +133,10 @@
 
     <section class="section" id="prompt">
         <h2>Prompt</h2>
-        {{ area("system_prompt", "System prompt override", values.system_prompt, rows=7, placeholder="Empty = the global LLM prompt.") }}
+        {{ area("system_prompt", "System prompt override", values.system_prompt, rows=7, placeholder="Empty = the global LLM prompt.", hint="Used by this chat's bot. Other bots keep their own prompt unless set below.") }}
+        {% for b in all_bots %}
+            {{ area("bot_prompt_" ~ b.id, b.display_name ~ " prompt in this chat", (values.bot_prompts or {}).get(b.id, ""), rows=5, placeholder="Empty = the override above if " ~ b.display_name ~ " is this chat's bot, else its own prompt.") }}
+        {% endfor %}
     </section>
 
     <section class="section" id="behavior">

@@ -124,6 +124,11 @@ class ContextRegistry:
                         "ALTER TABLE contexts ADD COLUMN "
                         "purge_floor_at REAL"
                     )
+                if "bot_prompts" not in existing_cols:
+                    await db.execute(
+                        "ALTER TABLE contexts ADD COLUMN "
+                        "bot_prompts TEXT NOT NULL DEFAULT '{}'"
+                    )
                 if "memory_enabled" not in existing_cols:
                     await db.execute(
                         "ALTER TABLE contexts ADD COLUMN "
@@ -159,7 +164,7 @@ class ContextRegistry:
         "reactor_enabled, reactor_prompt, natural_response, "
         "deep_think_enabled, memory_writes_enabled, reactor_memory_writes, "
         "default_bot_id, transcript_logging_enabled, history_turns_override, "
-        "purge_floor_at, memory_enabled"
+        "purge_floor_at, memory_enabled, bot_prompts"
     )
 
     @staticmethod
@@ -193,6 +198,10 @@ class ContextRegistry:
             ),
             memory_enabled=(
                 bool(row[20]) if len(row) > 20 and row[20] is not None else True
+            ),
+            bot_prompts=(
+                {int(k): v for k, v in json.loads(row[21] or "{}").items()}
+                if len(row) > 21 else {}
             ),
         )
 
@@ -289,8 +298,8 @@ class ContextRegistry:
                         memory_writes_enabled,
                         reactor_memory_writes, default_bot_id,
                         transcript_logging_enabled, history_turns_override,
-                        first_seen, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        bot_prompts, first_seen, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         policy.kind,
                         policy.key,
@@ -311,6 +320,7 @@ class ContextRegistry:
                         policy.default_bot_id,
                         1 if policy.transcript_logging_enabled else 0,
                         policy.history_turns_override,
+                        json.dumps(policy.bot_prompts),
                         now,
                         now,
                     ),
@@ -331,6 +341,7 @@ class ContextRegistry:
                            default_bot_id = ?,
                            transcript_logging_enabled = ?,
                            history_turns_override = ?,
+                           bot_prompts = ?,
                            updated_at = ?
                        WHERE id = ?""",
                     (
@@ -351,6 +362,7 @@ class ContextRegistry:
                         policy.default_bot_id,
                         1 if policy.transcript_logging_enabled else 0,
                         policy.history_turns_override,
+                        json.dumps(policy.bot_prompts),
                         now,
                         policy.id,
                     ),

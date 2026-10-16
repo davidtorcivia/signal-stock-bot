@@ -531,9 +531,11 @@ class CommandDispatcher:
         trigger_nlp = mentioned or (is_dm and self._looks_like_query(message))
 
         # If this context wants LLM-as-intent, route through !ask instead of
-        # the regex NLP parser. Same triggers: DM passive OR @mentioned in group.
+        # the regex NLP parser. Every DM goes (it's a conversation, not a
+        # stock query that has to pass _looks_like_query); groups only when
+        # the bot is addressed.
         if (
-            trigger_nlp
+            (mentioned or is_dm)
             and policy is not None
             and getattr(policy, "llm_intent", False)
             and self.ask_command is not None
