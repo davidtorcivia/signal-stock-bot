@@ -316,7 +316,7 @@ class PredictionResolver:
                     {"role": "system", "content": _LLM_VERDICT_PROMPT_NO_TOOLS},
                     {"role": "user", "content": user_content},
                 ],
-                overrides={"max_tokens": 200, "temperature": 0.2},
+                overrides={"max_tokens": 8000, "temperature": 0.2},
                 suppress_response_style=True,
                 purpose="predict_resolve",
             )
@@ -402,7 +402,7 @@ class PredictionResolver:
                 assistant_msg = await self.llm.chat_messages(
                     messages,
                     tools=tools,
-                    overrides={"max_tokens": 800, "temperature": 0.2},
+                    overrides={"max_tokens": 8000, "temperature": 0.2},
                     suppress_response_style=True,
                     purpose="predict_resolve",
                 )

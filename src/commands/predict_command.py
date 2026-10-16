@@ -277,7 +277,7 @@ async def _llm_extract(llm_client, raw: str) -> Optional[dict]:
                 {"role": "system", "content": _LLM_EXTRACT_PROMPT},
                 {"role": "user", "content": raw},
             ],
-            overrides={"max_tokens": 300, "temperature": 0.2},
+            overrides={"max_tokens": 8000, "temperature": 0.2},
             suppress_response_style=True,
             purpose="predict_extract",
         )

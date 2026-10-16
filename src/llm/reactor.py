@@ -227,6 +227,15 @@ def _bot_roster_lines(bots: list) -> str:
     return "Available responders (pick one via `bot_slug`):\n" + "\n".join(out)
 
 
+# Multi-bot chats: chat lines carry the author bot's name, so a follow-up
+# can be sent back to the bot it answers instead of to the topic's best fit.
+FOLLOW_UP_ROUTING = (
+    "A message continuing a bot's thread (answering it, or asking it a "
+    "follow-up) goes to THAT bot, whoever fits the topic better. Bot lines "
+    "in the chat are labeled with the name of the bot that wrote them."
+)
+
+
 # Appended to the reactor system prompt only when the should_respond tool is
 # actually exposed (per-context flag on, global flag on, cooldown clear).
 NATURAL_RESPONSE_GUIDANCE = """\
@@ -342,8 +351,19 @@ class EmojiReactor:
             Callable[..., Awaitable[None]]
         ] = None
 
-    def _sender_label(self, phone: str) -> str:
+    def _sender_label(self, phone: str, bot_id: Optional[int] = None) -> str:
         if phone == BOT_SENDER:
+            # Name the bot that wrote the line; one global name made the
+            # reactor credit Artaud's replies to Sigil and route follow-ups
+            # to the wrong bot.
+            registry = getattr(self.llm_factory, "bot_registry", None)
+            if bot_id is not None and registry is not None:
+                try:
+                    bot = registry.get_sync(bot_id)
+                except Exception:
+                    bot = None
+                if bot is not None and getattr(bot, "display_name", None):
+                    return bot.display_name
             return (
                 self.name_registry.bot_name
                 if self.name_registry is not None
@@ -702,7 +722,7 @@ class EmojiReactor:
                     floor_at=bot_floor_at,
                 )
                 for m in msgs:
-                    label = self._sender_label(m["sender"])
+                    label = self._sender_label(m["sender"], m.get("bot_id"))
                     text = (m["text"] or "").replace("\n", " ").strip()
                     if text:
                         ctx_lines.append(f"[{label}] {text}")
@@ -873,7 +893,9 @@ class EmojiReactor:
                     tools.append(_should_respond_tool_with_bots(slugs))
                     roster = _bot_roster_lines(multi_bot_candidates)
                     if roster:
-                        system_prompt = f"{system_prompt}\n\n{roster}"
+                        system_prompt = (
+                            f"{system_prompt}\n\n{roster}\n{FOLLOW_UP_ROUTING}"
+                        )
                 else:
                     tools.append(SHOULD_RESPOND_TOOL)
                 extra = cfg["natural_response_extra_prompt"].strip()
@@ -978,6 +1000,8 @@ class EmojiReactor:
                             "answer messages aimed at someone else. Prefer a useful reply over "
                             "an emoji. " + cfg["natural_response_extra_prompt"].strip()
                         )
+                        if len(multi_bot_candidates) > 1:
+                            instructions += "\n" + FOLLOW_UP_ROUTING
                     choices = await self.jev.choose(
                         state={"chat": user_content},
                         questions={"action": {

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_KEEP_RECENT = 12          # turns kept verbatim — same as history window
 DEFAULT_MIN_NEW_TURNS = 10        # don't bother summarizing < this many new turns
 DEFAULT_MAX_SUMMARY_CHARS = 2500  # hard ceiling on the stored JSON summary
-DEFAULT_MAX_TOKENS = 800          # output budget for the summarizer LLM call
+DEFAULT_MAX_TOKENS = 16000          # output budget for the summarizer LLM call
 
 SUMMARY_SECTIONS = ("facts", "decisions", "open_questions", "topics")
 

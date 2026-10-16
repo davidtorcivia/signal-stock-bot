@@ -374,7 +374,7 @@ class MediaRequests:
                     {"role": "system", "content": PARSE_PROMPT},
                     {"role": "user", "content": text},
                 ],
-                overrides={"max_tokens": 2000, "temperature": 0},
+                overrides={"max_tokens": 8000, "temperature": 0},
                 suppress_response_style=True,
                 purpose="media_request",
             )

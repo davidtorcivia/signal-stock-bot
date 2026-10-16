@@ -259,3 +259,19 @@ async def test_maybe_react_calls_per_bot_client(store):
     factory.get_reactor.assert_called_with(7)
     sentinel_client.chat_messages.assert_awaited_once()
     default_llm.chat_messages.assert_not_called()
+
+
+def test_bot_lines_labeled_with_authoring_bot(store):
+    """Artaud's replies were labeled with the global bot name, so the
+    reactor credited them to Sigil and routed follow-ups to Sigil."""
+    from types import SimpleNamespace as NS
+    from src.group_log import BOT_SENDER
+
+    bots = {1: NS(display_name="Sigil"), 2: NS(display_name="Artaud")}
+    reactor = EmojiReactor(
+        settings_store=store, llm_client=None, signal_handler=None,
+        llm_factory=NS(bot_registry=NS(get_sync=bots.get)),
+    )
+    assert reactor._sender_label(BOT_SENDER, 2) == "Artaud"
+    assert reactor._sender_label(BOT_SENDER, 1) == "Sigil"
+    assert reactor._sender_label(BOT_SENDER, None) == "Bot"
