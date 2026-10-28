@@ -23,6 +23,7 @@ command-handling path or surface diagnostics to users.
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from typing import Awaitable, Callable, Optional
@@ -234,6 +235,38 @@ def _bot_roster_lines(bots: list) -> str:
 IMPLICIT_SETTLE_SECONDS = 4.0
 
 
+# "Shut up" timeouts. Telling a bot to be quiet still gets that one message
+# answered, then the bot stops reacting and chiming in on its own in that
+# group. Each repeat doubles the timeout; a day without one resets it.
+# Explicit mentions and commands are still answered while muted.
+# ponytail: in-memory, so a restart lifts every timeout; persist if that bites.
+HUSH_BASE_SECONDS = 30 * 60
+HUSH_MAX_SECONDS = 7 * 86400
+HUSH_RESET_SECONDS = 86400
+# An unaddressed "shut up" is aimed at a bot only if one just chimed in.
+HUSH_RECENT_REPLY_SECONDS = 180
+_HUSH_STRONG = re.compile(
+    r"\b(shut\s*(it|up)|stfu|stop (talking|replying|responding|chiming in|"
+    r"butting in|interrupting)|be quiet|pipe down|zip it|knock it off|"
+    r"go away|nobody asked)\b",
+    re.I,
+)
+# Words that mean "be quiet" only in a short message: "sigil, pause" yes,
+# "sigil what happens when trading is paused" no.
+_HUSH_WEAK = re.compile(
+    r"\b(pause|time ?out|hush|shush|quiet|mute|enough|stop|silence|sleep)\b",
+    re.I,
+)
+
+
+def is_hush(text: str) -> bool:
+    if "?" in text:
+        return False
+    if _HUSH_STRONG.search(text):
+        return True
+    return len(text.split()) <= 4 and bool(_HUSH_WEAK.search(text))
+
+
 # Multi-bot chats: chat lines carry the author bot's name, so a follow-up
 # can be sent back to the bot it answers instead of to the topic's best fit.
 FOLLOW_UP_ROUTING = (
@@ -358,6 +391,8 @@ class EmojiReactor:
         # reply, to its last message, instead of one reply per message.
         self._latest_msg: dict[str, int] = {}
         self._replying: set[str] = set()
+        # (group_id, bot_id) -> (strikes, muted_until, last_hush_at)
+        self._hush: dict[tuple, tuple[int, float, float]] = {}
         # Late-bound async handler invoked when the LLM calls should_respond.
         # Signature: (sender, message, group_id, target_timestamp, policy,
         # reason) -> Awaitable[None]. Wired in main.py to dispatcher.
@@ -565,6 +600,51 @@ class EmojiReactor:
         other bot in a multi-bot group.
         """
         self._implicit_response_last[self._gb_key(group_id, bot_id)] = time.time()
+
+    def hush(self, group_id: str, bot_id: Optional[int] = None) -> float:
+        """Mute this bot's unprompted output in the group; returns seconds."""
+        key = self._gb_key(group_id, bot_id)
+        now = time.time()
+        strikes, _, last = self._hush.get(key, (0, 0.0, 0.0))
+        if now - last > HUSH_RESET_SECONDS:
+            strikes = 0
+        strikes += 1
+        secs = min(HUSH_BASE_SECONDS * 2 ** (strikes - 1), HUSH_MAX_SECONDS)
+        self._hush[key] = (strikes, now + secs, now)
+        logger.info(
+            f"Reactor: bot {bot_id} hushed in {group_id[:8]}... for "
+            f"{secs // 60:.0f}m (strike {strikes})"
+        )
+        return secs
+
+    def is_hushed(self, group_id: str, bot_id: Optional[int] = None) -> bool:
+        entry = self._hush.get(self._gb_key(group_id, bot_id))
+        return entry is not None and time.time() < entry[1]
+
+    async def _handle_hush(self, sender, group_id, target_timestamp,
+                           bot, candidate_bots, bot_will_reply) -> None:
+        # Addressed ("sigil shut up", or a quote-reply): the normal reply is
+        # its one response. Unaddressed: hush whichever bot just chimed in
+        # and let a 🤐 be its one response.
+        if bot_will_reply:
+            self.hush(group_id, getattr(bot, "id", None))
+            return
+        now = time.time()
+        for b in candidate_bots or ([bot] if bot is not None else []):
+            bid = getattr(b, "id", None)
+            last = self._implicit_response_last.get(self._gb_key(group_id, bid), 0.0)
+            if now - last > HUSH_RECENT_REPLY_SECONDS:
+                continue
+            self.hush(group_id, bid)
+            handler = self.signal_pool.for_bot(b) if self.signal_pool else self.signal
+            if handler is not None:
+                await handler.send_reaction(
+                    recipient=sender,
+                    target_author=sender,
+                    target_timestamp=int(target_timestamp),
+                    emoji="🤐",
+                    group_id=group_id,
+                )
 
     def _within_cooldown(
         self, sender: str, group_id: str, cfg: dict,
@@ -848,6 +928,18 @@ class EmojiReactor:
                 self._latest_msg.get(group_id, 0), target_timestamp,
             )
 
+            if is_hush(text):
+                await self._handle_hush(
+                    sender, group_id, target_timestamp,
+                    bot, candidate_bots, bot_will_reply,
+                )
+                return
+            if candidate_bots:
+                candidate_bots = [
+                    b for b in candidate_bots
+                    if not self.is_hushed(group_id, getattr(b, "id", None))
+                ]
+
             # The three cheap emoji gates. Each records WHY emoji_react is
             # off the table without deciding on its own that the whole call
             # is pointless — see the docstring. First match wins; the order
@@ -874,6 +966,8 @@ class EmojiReactor:
                 sender, group_id, cfg, bot_id=bot_id_for_scope,
             ):
                 emoji_skip_reason = "cooldown"
+            elif self.is_hushed(group_id, bot_id_for_scope):
+                emoji_skip_reason = "hushed"
             offer_emoji = emoji_skip_reason is None
 
             # Per-context prompt override wins over the global reactor prompt
@@ -1195,6 +1289,13 @@ class EmojiReactor:
             # deciding. A newer message alone doesn't cancel: the decision
             # takes long enough that a busy chat would starve every reply,
             # and the writer sees the newer lines anyway.
+            if respond_reason and self.is_hushed(group_id, responder_bot_id):
+                logger.info(
+                    f"Reactor: dropped should_respond on ...{sender_tail} — "
+                    f"{getattr(responder_bot, 'slug', None)!r} is hushed"
+                )
+                respond_reason = None
+
             if respond_reason and offer_should_respond and group_id in self._replying:
                 logger.info(
                     f"Reactor: dropped should_respond on ...{sender_tail} — "
